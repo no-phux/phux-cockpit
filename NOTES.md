@@ -114,3 +114,75 @@ gitignored twice over (`zig-out/` and `*.png`), so read it in-session.
 One key space spans pty, clipboard, spawn, and fetch. Pane i owns pty key
 `1 + i`; the clipboard moved from key 2 to **key 100**. Leaving it at 2 would
 make every copy silently reject the moment pane 1 spawned.
+
+---
+
+## Slice 3 — widgets beside the panes, focus routing, input dispatch
+
+`view()` is no longer a bare row of stacks. It is a `column` of:
+
+1. a spacer stack the height of the hidden-inset titlebar band
+   (`max(grid_inset, chrome_top + 4) - grid_inset`),
+2. a header `row` of `header_height` (28pt) holding the `COCKPIT` label,
+   one `.badge` per pane (index, focus marker, phase, byte count), a
+   spacer, and one REAL `ui.button` bound to `.restart_pane`,
+3. a `row` of one `.stack` per pane, each with `on_press = .focus_pane`
+   and the pane's `screenText()` as its accessibility label.
+
+The column's uniform `padding` is `grid_inset`, which is what makes the
+laid-out pane frames reproduce `paneFrames()` exactly.
+
+### The two derivations, and the test that keeps them honest
+
+`ChromeOptions.build` receives `(model, builder, size, tokens)` — never
+the laid-out tree — so `paneFrames()` (grids) and `view()` (hit targets)
+are two INDEPENDENT derivations of the same rectangles. Measured at
+980x640 with `chrome_top = 0`, they agree to the float:
+
+```
+PANEALPHA: paneFrames=(8,36,478,596)  tree=(8,36,478,596)
+PANEBRAVO: paneFrames=(494,36,478,596) tree=(494,36,478,596)
+button:    (906,8,66,28)
+```
+
+The agreement test asserts all four fields within 0.25pt. It was
+verified to FAIL when `paneFrames`' top edge was moved 3pt (it reported
+`paneFrames=(8,33,...)` vs `tree=(8,36,...)`), so it is not vacuous.
+
+### Focus model
+
+- Window activation (`model.focused`) is global; pane focus
+  (`model.focus`) is not. Only `model.focused and index == model.focus`
+  paints a filled cursor.
+- `cmd/ctrl + digit` moves pane focus. It runs before the selection and
+  terminal-input paths in `handleKey`.
+- A press on a pane's `.stack` dispatches `.focus_pane`. Because
+  `.stack` is NOT in `defaultFocusable`, that press also resolves widget
+  focus to 0 — which is the recovery path from the button.
+- **The button hazard is real and is pinned by a test, not designed
+  around.** While the Restart button holds keyboard focus, Enter and
+  Space activate the button and never reach the shell. One click on a
+  pane gives the terminal its keyboard back.
+- `on_press` fires on the RELEASE only (`Ui.Tree.msgForPointer` returns
+  null for every other phase), which is why the pre-existing tests that
+  do a lone `pointer_down` at (200,200) still leave focus on pane 0.
+
+### Wheel routing
+
+`Msg.wheel` now carries `{ x, y, delta }` and `update` resolves the pane
+by containment against `paneFrames`, falling back to the focused pane
+when the point is over the header, a gutter, or off-surface. `update`
+has no view size, so `Model.surface_size` is carried on the `.viewport`
+message (which `on_frame` already emits with the frame size in hand).
+A size change too small to move any pane's grid never updates it, so the
+midpoint can lag by up to one cell — correct for a which-half question.
+
+### Test count
+
+59 (54 from slice 2 + 5). The env-gated shot is unchanged in name and
+path and now captures the header band and the button:
+
+```sh
+COCKPIT_SHOTS=1 /nix/store/y6ihamhfl46ybmz49k7c5qs9navb6q1a-zig-0.16.0/bin/zig \
+  build test -Dplatform=null --summary all
+```

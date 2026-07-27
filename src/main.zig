@@ -31,16 +31,20 @@ const window_height: f32 = 640;
 pub const window_min_width: f32 = 640;
 pub const window_min_height: f32 = 420;
 
-/// The band the header row occupies and the grid sits below.
-/// The grid's padding inside the window: the terminal is the whole
-/// window under a standard titlebar - no header, no status bar.
+/// The grid's padding inside the window.
 const grid_inset: f32 = 8;
+
+/// The band the ORDINARY WIDGETS occupy above the grids: the cockpit's
+/// label, one status badge per pane, and a real focusable button. The
+/// pane rects start below it (`paneFrames`), so the chrome prefix never
+/// paints under the widget row.
+pub const header_height: f32 = 28;
 
 /// The cockpit paints SEVERAL terminal panes into one gpu_surface.
 pub const pane_count: usize = 2;
 
 /// The horizontal gap between two panes, in canvas points.
-const pane_gutter: f32 = 8;
+pub const pane_gutter: f32 = 8;
 
 /// One keyed-effect space spans pty, clipboard, spawn, and fetch
 /// (`effects.keyOccupiedUntilDelivery`), so the pane keys and the
@@ -241,6 +245,16 @@ pub const Model = struct {
     /// it, so the window reads as one seamless surface with only the
     /// traffic lights floating over it.
     chrome_top: f32 = 0,
+    /// The last surface size the frame pump reported, carried on the
+    /// `.viewport` message. `update` has no view size of its own, and
+    /// the wheel hit test needs one to resolve which pane the pointer
+    /// stands over — `on_wheel` cannot do it (no model access) and
+    /// `on_frame` cannot mutate. A size change too small to move any
+    /// pane's grid never lands here, so the resolved midpoint can lag
+    /// by up to one cell: correct for a which-half question, and the
+    /// hit test falls back to the focused pane when the point lands in
+    /// no rect at all.
+    surface_size: geometry.SizeF = .{},
 
     pub fn focusedPane(model: *Model) *Pane {
         return &model.panes[@min(model.focus, pane_count - 1)];
@@ -265,18 +279,28 @@ pub const Msg = union(enum) {
     shell: native_sdk.EffectPtyEvent,
     key: canvas.WidgetKeyboardEvent,
     text: canvas.WidgetKeyboardEvent,
-    viewport: struct { pane: u8, cols: u16, rows: u16 },
+    viewport: struct { pane: u8, cols: u16, rows: u16, size: geometry.SizeF },
     clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
     restart,
+    /// Move keyboard focus to a pane (cmd+digit, or a press on the
+    /// pane's own stack). Out-of-range indices clamp rather than trap:
+    /// the chord generalizes to nine panes and the app has two.
+    focus_pane: u8,
+    /// The header button's action: restart the FOCUSED pane's shell.
+    /// A distinct variant from `.restart` so the journal records which
+    /// surface asked — the chord or the widget.
+    restart_pane,
     /// The frame pump asks the update loop (which holds `fx`) to push
     /// more pending outbound bytes now that a frame elapsed — the child
     /// may have read and freed FIFO space without producing output to
     /// trigger a flush.
     flush_outbound,
-    /// A wheel/trackpad scroll over the grid: vertical delta in view
-    /// points, accumulated into whole rows of scrollback.
-    wheel: f32,
+    /// A wheel/trackpad scroll over the grid: the pointer's position in
+    /// view points plus the vertical delta, accumulated into whole rows
+    /// of scrollback. The POSITION rides along because `on_wheel` has no
+    /// model access — the pane hit test has to happen in `update`.
+    wheel: struct { x: f32, y: f32, delta: f32 },
     chrome_changed: native_sdk.platform.WindowChrome,
     focus_changed: bool,
 };
@@ -401,6 +425,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .viewport => |size| {
             const pane = &model.panes[@min(size.pane, pane_count - 1)];
+            // Remember the surface the frame pump measured against, so
+            // the wheel hit test has rectangles to resolve into.
+            model.surface_size = size.size;
             // Commit the new size only once the emulator actually took
             // it: on an allocation failure the model keeps its old
             // dimensions and the frame pump retries next frame, so the
@@ -431,15 +458,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 for (&model.panes) |*pane| pane.macos_natural_keys_held = 0;
             }
         },
-        .wheel => |delta| {
+        .wheel => |wheel| {
             // Natural direction, like every terminal: swiping the
             // content down (positive delta on hosts with natural
             // scrolling) reveals history. Inert while a selection is
             // armed - the caret and the emulator's absolute range must
             // not desynchronize (the scroll-chord rule).
-            const pane = model.focusedPane();
+            //
+            // A wheel scrolls the pane it is OVER, not the focused one:
+            // that is what every tiling terminal does and it is why the
+            // pointer position rides on the message.
+            const pane = paneAtPoint(model, wheel.x, wheel.y) orelse model.focusedPane();
             if (pane.selecting) return;
-            pane.wheel_accum += delta;
+            pane.wheel_accum += wheel.delta;
             const cell_h = @max(1, pane.session.cell_height);
             const rows = @trunc(pane.wheel_accum / cell_h);
             if (rows != 0) {
@@ -480,7 +511,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             if (model.copy_inflight and model.copy_owner == model.focus) model.copy_inflight = false;
             spawnPane(pane, fx);
         },
+        .restart_pane => update(model, .restart, fx),
+        .focus_pane => |requested| {
+            const next: u8 = @intCast(@min(requested, pane_count - 1));
+            if (next == model.focus) return;
+            // The pane losing focus may never see the releases of keys
+            // still physically down, so its natural-editing latches
+            // would strand and swallow a later matching release.
+            model.panes[@min(model.focus, pane_count - 1)].macos_natural_keys_held = 0;
+            model.focus = next;
+        },
     }
+}
+
+/// The pane whose rect contains a view point, or null when the point
+/// stands over the header band, a gutter, or outside the panes.
+fn paneAtPoint(model: *Model, x: f32, y: f32) ?*Pane {
+    const frames = paneFrames(model, model.surface_size);
+    for (&model.panes, frames) |*pane, frame| {
+        if (x >= frame.x and x < frame.x + frame.width and
+            y >= frame.y and y < frame.y + frame.height) return pane;
+    }
+    return null;
 }
 
 /// Append outbound bytes (typed keys, pastes, or query replies) to the
@@ -657,7 +709,7 @@ fn onText(event: canvas.WidgetKeyboardEvent) ?Msg {
 
 fn onWheel(wheel: native_sdk.platform.WheelEvent) ?Msg {
     if (wheel.delta_y == 0) return null;
-    return .{ .wheel = wheel.delta_y };
+    return .{ .wheel = .{ .x = wheel.x, .y = wheel.y, .delta = wheel.delta_y } };
 }
 
 fn onChrome(chrome: native_sdk.platform.WindowChrome) ?Msg {
@@ -689,7 +741,18 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         return;
     }
 
-    // App chords first: selection mode, copy, scrollback, restart.
+    // App chords first: pane focus, selection mode, copy, scrollback,
+    // restart.
+    //
+    // cmd/ctrl+digit is the conventional tab chord and nothing else
+    // binds it, so it generalizes to N panes without stealing terminal
+    // input a shell would otherwise see. It runs BEFORE the selection
+    // and terminal paths because a focus move is a window action, not
+    // something the focused child should hear.
+    if (primary and !mods.shift and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '9') {
+        update(model, .{ .focus_pane = event.key[0] - '1' }, fx);
+        return;
+    }
     if (primary and mods.shift and keyIs(event.key, "space")) {
         if (pane.selecting) {
             pane.selecting = false;
@@ -1024,22 +1087,76 @@ fn mapKey(event: canvas.WidgetKeyboardEvent) ?MappedKey {
 
 const TerminalUi = TerminalApp.Ui;
 
+/// A pane's fallback accessibility label before its shell has produced
+/// a screen. Stable per index so the layout test can find the stack.
+fn paneFallbackLabel(index: usize) []const u8 {
+    return switch (index) {
+        0 => "Terminal grid 1",
+        else => "Terminal grid 2",
+    };
+}
+
 pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
-    // The window is the panes: one non-painting stack per pane, side by
-    // side, so BOTH panes' viewport text reaches the accessibility tree.
-    // A terminal's semantic content is its cells, so screen readers hear
-    // the real screens - and the session fingerprint (the a11y-tree
-    // hash) covers cell state of every pane, not just byte counters:
-    // two runs with identical counters but different screens never
-    // verify alike. A stack paints nothing; a panel here would draw its
-    // surface chrome OVER the grid.
-    const left = model.panes[0].session.screenText();
-    const right = model.panes[1].session.screenText();
-    return ui.column(.{}, .{
-        ui.row(.{ .grow = 1, .gap = pane_gutter }, .{
-            ui.el(.stack, .{ .grow = 1, .semantics = .{ .label = if (left.len > 0) left else "Terminal grid 1" } }, .{}),
-            ui.el(.stack, .{ .grow = 1, .semantics = .{ .label = if (right.len > 0) right else "Terminal grid 2" } }, .{}),
-        }),
+    // The cockpit is panes PLUS ordinary widgets: a header row of real
+    // native chrome above a row of pane stacks.
+    //
+    // The stacks paint NOTHING (a panel would draw its surface over the
+    // grid) — they exist to put both panes' viewport text in the
+    // accessibility tree, and now to be press targets that move focus.
+    // Because `.stack` is not focusable (`defaultFocusable`), a press on
+    // one RELEASES keyboard focus back to the app's `on_key`, which is
+    // exactly the recovery path that makes the focusable button below
+    // safe to ship: click the button and Enter goes to the button;
+    // click a pane and the terminal has the keyboard again.
+    var badges: [pane_count]TerminalUi.Node = undefined;
+    for (&badges, &model.panes, 0..) |*node, *pane, index| {
+        node.* = ui.el(.badge, .{
+            .key = .{ .index = index },
+            .size = .sm,
+            .text = ui.fmt("{d}{s} {s} {d}B", .{
+                index + 1,
+                if (index == model.focus) "*" else "",
+                @tagName(pane.phase),
+                pane.output_bytes,
+            }),
+        }, .{});
+    }
+
+    const header = [_]TerminalUi.Node{
+        ui.text(.{ .cross = .center }, "COCKPIT"),
+        badges[0],
+        badges[1],
+        ui.spacer(1),
+        // A REAL focusable control, not decoration: it is the honest
+        // demonstration that panes and native widgets share one surface,
+        // and it is the one interaction hazard worth pinning — while it
+        // holds focus, Enter and Space activate the button instead of
+        // reaching the shell.
+        ui.button(.{ .size = .sm, .on_press = .restart_pane }, "Restart"),
+    };
+
+    var panes: [pane_count]TerminalUi.Node = undefined;
+    for (&panes, &model.panes, 0..) |*node, *pane, index| {
+        const screen = pane.session.screenText();
+        node.* = ui.el(.stack, .{
+            .key = .{ .index = index },
+            .grow = 1,
+            .on_press = .{ .focus_pane = @intCast(index) },
+            .semantics = .{ .label = if (screen.len > 0) screen else paneFallbackLabel(index) },
+        }, .{});
+    }
+
+    const header_nodes: []const TerminalUi.Node = &header;
+    const pane_nodes: []const TerminalUi.Node = &panes;
+    // The column's uniform padding IS `grid_inset`, and the leading
+    // spacer is the hidden-inset titlebar band: together they reproduce
+    // `paneFrames`' top edge exactly, which the layout-agreement test
+    // pins to a quarter of a point.
+    const titlebar_band = @max(0, @max(grid_inset, model.chrome_top + 4) - grid_inset);
+    return ui.column(.{ .padding = grid_inset }, .{
+        ui.el(.stack, .{ .height = titlebar_band }, .{}),
+        ui.row(.{ .height = header_height, .gap = pane_gutter, .cross = .center }, header_nodes),
+        ui.row(.{ .grow = 1, .gap = pane_gutter }, pane_nodes),
     });
 }
 
@@ -1074,11 +1191,16 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
     }
 }
 
-/// Where each pane's grid lives, in canvas points: the same top edge as
-/// the single-grid original (below the hidden-inset titlebar band),
-/// width split evenly with `pane_gutter` between.
+/// Where each pane's grid lives, in canvas points: below the
+/// hidden-inset titlebar band AND below the widget header row, width
+/// split evenly with `pane_gutter` between.
+///
+/// This is the SECOND derivation of these rectangles — `view()` is the
+/// first, and the layout engine owns that one. `ChromeOptions.build`
+/// never receives the laid-out tree, so the two cannot share a result;
+/// the layout-agreement test is what keeps them honest.
 pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometry.RectF {
-    const top = @max(grid_inset, model.chrome_top + 4);
+    const top = @max(grid_inset, model.chrome_top + 4) + header_height;
     const usable = @max(0, size.width - grid_inset * 2);
     const gutters = pane_gutter * @as(f32, @floatFromInt(pane_count - 1));
     const width = @max(0, (usable - gutters) / @as(f32, @floatFromInt(pane_count)));
@@ -1113,7 +1235,12 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
             pane_cell_ceiling,
         );
         if (proposed.x != pane.cols or proposed.y != pane.rows) {
-            return .{ .viewport = .{ .pane = @intCast(index), .cols = proposed.x, .rows = proposed.y } };
+            return .{ .viewport = .{
+                .pane = @intCast(index),
+                .cols = proposed.x,
+                .rows = proposed.y,
+                .size = frame.size,
+            } };
         }
         // No resize for this pane: if bytes are still queued (a large
         // paste draining, or a child that read without echoing), or a

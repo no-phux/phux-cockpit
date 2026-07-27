@@ -438,7 +438,16 @@ const TerminalApp = native_sdk.UiApp(app.Model, app.Msg);
 const CursorPaintKind = enum { filled, hollow };
 
 fn expectCursorPaintKind(display_list: anytype, expected: CursorPaintKind) !void {
-    const command = display_list.findCommandById(grid.cursor_command_id) orelse return error.TestExpectedCursor;
+    return expectPaneCursorPaintKind(display_list, 0, expected);
+}
+
+/// The cursor cue of ONE pane: each pane's cursor carries its own id
+/// (`cursorCommandId(paneIdBase(i))`), which is how the retained diff
+/// keeps two cursors apart and how a test can tell which pane the
+/// keyboard belongs to.
+fn expectPaneCursorPaintKind(display_list: anytype, index: usize, expected: CursorPaintKind) !void {
+    const id = grid.cursorCommandId(grid.paneIdBase(index));
+    const command = display_list.findCommandById(id) orelse return error.TestExpectedCursor;
     switch (command.command) {
         .fill_rect => try testing.expectEqual(CursorPaintKind.filled, expected),
         .stroke_rect => try testing.expectEqual(CursorPaintKind.hollow, expected),
@@ -2074,4 +2083,226 @@ test "cockpit two-pane proof shot (env-gated)" {
 
     try std.Io.Dir.cwd().createDirPath(io, "/Users/phall/workspace/phux-native-spike/cockpit/zig-out");
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cockpit_shot_path, .data = first });
+}
+
+// -------------------------------------- cockpit: widgets, focus, routing
+
+/// A full click on the canvas: press then release. `on_press` fires on
+/// the RELEASE (`Ui.Tree.msgForPointer` returns null for every other
+/// phase), so a lone `pointer_down` focuses the surface without
+/// activating anything — which is why the existing single-pane tests
+/// still reach pane 0 after clicking into it.
+fn clickCanvas(harness: anytype, app_iface: anytype, x: f32, y: f32) !void {
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = "terminal-canvas",
+        .kind = .pointer_down,
+        .x = x,
+        .y = y,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = "terminal-canvas",
+        .kind = .pointer_up,
+        .x = x,
+        .y = y,
+    } });
+}
+
+fn typeCanvasText(harness: anytype, app_iface: anytype, text: []const u8) !void {
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = "terminal-canvas",
+        .kind = .text_input,
+        .text = text,
+    } });
+}
+
+fn pressCanvasKey(harness: anytype, app_iface: anytype, key: []const u8, modifiers: native_sdk.platform.ShortcutModifiers) !void {
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = "terminal-canvas",
+        .kind = .key_down,
+        .key = key,
+        .modifiers = modifiers,
+    } });
+}
+
+/// The laid-out frame of the pane stack whose accessibility label holds
+/// a marker — the layout engine's OWN answer, independent of
+/// `paneFrames`.
+fn paneStackFrame(harness: anytype, marker: []const u8) ?geometry.RectF {
+    const layout = harness.runtime.views[0].widgetLayoutTree();
+    for (layout.nodes) |node| {
+        if (node.widget.kind != .stack) continue;
+        if (std.mem.indexOf(u8, node.widget.semantics.label, marker) == null) continue;
+        return node.frame;
+    }
+    return null;
+}
+
+fn headerButtonFrame(harness: anytype) ?geometry.RectF {
+    const layout = harness.runtime.views[0].widgetLayoutTree();
+    for (layout.nodes) |node| {
+        if (node.widget.kind == .button) return node.frame;
+    }
+    return null;
+}
+
+fn rectCenter(rect: geometry.RectF) geometry.PointF {
+    return geometry.PointF.init(rect.x + rect.width / 2, rect.y + rect.height / 2);
+}
+
+test "the widget tree's pane stacks land exactly where paneFrames paints" {
+    // THE LOAD-BEARING ONE. `ChromeOptions.build` never receives the
+    // laid-out tree, so `paneFrames()` (which places the grids) and
+    // `view()` (which places the hit targets) are two independent
+    // derivations of the same rectangles. Nothing but this test keeps
+    // them from drifting — and a drift means clicks land on the wrong
+    // pane while the picture still looks right.
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+
+    const frames = app.paneFrames(&app_state.model, size);
+    const markers = [app.pane_count][]const u8{ "PANEALPHA", "PANEBRAVO" };
+    for (frames, markers) |expected, marker| {
+        const laid_out = paneStackFrame(harness, marker) orelse return error.TestExpectedPaneStack;
+        // A quarter point. If this fails, reconcile padding/gap/header
+        // height — do NOT widen the epsilon.
+        try testing.expectApproxEqAbs(expected.x, laid_out.x, 0.25);
+        try testing.expectApproxEqAbs(expected.y, laid_out.y, 0.25);
+        try testing.expectApproxEqAbs(expected.width, laid_out.width, 0.25);
+        try testing.expectApproxEqAbs(expected.height, laid_out.height, 0.25);
+    }
+
+    // The header band is real chrome above them, not a gap.
+    const button = headerButtonFrame(harness) orelse return error.TestExpectedButton;
+    try testing.expect(button.y + button.height <= frames[0].y + 0.25);
+}
+
+test "typed keys reach the FOCUSED pane's pty and only that one" {
+    // THE ACCEPTANCE GATE for the whole spike: mis-routed input shows
+    // up as bytes on the wrong pty, not as a subtle rendering
+    // difference.
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try typeCanvasText(harness, app_iface, "alpha");
+    try testing.expectEqualStrings("alpha", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+
+    // cmd+2 moves the keyboard to pane 1.
+    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try typeCanvasText(harness, app_iface, "bravo");
+    try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+    // Pane 0's stream is untouched: the chord itself never reached it.
+    try testing.expectEqualStrings("alpha", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+
+    // ...and back.
+    try pressCanvasKey(harness, app_iface, "1", .{ .primary = true });
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try typeCanvasText(harness, app_iface, "!");
+    try testing.expectEqualStrings("alpha!", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+}
+
+test "clicking a pane moves focus to it with no chord" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    const target = rectCenter(app.paneFrames(&app_state.model, size)[1]);
+    try clickCanvas(harness, app_iface, target.x, target.y);
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+
+    // A stack is not focusable, so the press RELEASED widget focus and
+    // typing goes straight back to the terminal — pane 1's now.
+    try typeCanvasText(harness, app_iface, "clicked");
+    try testing.expectEqualStrings("clicked", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+}
+
+test "the focusable button swallows Enter while it holds focus, and a pane click gives it back" {
+    // THE HAZARD, PINNED RATHER THAN DESIGNED AROUND. A real
+    // focusable widget on the same surface as a terminal means
+    // activation keys belong to whoever holds focus. This is the
+    // documented constraint; the recovery is one click on a pane.
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    // Baseline: Enter reaches the focused pane.
+    try pressCanvasKey(harness, app_iface, "enter", .{});
+    try testing.expectEqualStrings("\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+
+    const button = rectCenter(headerButtonFrame(harness) orelse return error.TestExpectedButton);
+    try clickCanvas(harness, app_iface, button.x, button.y);
+    try testing.expect(harness.runtime.views[0].canvas_widget_focused_id != 0);
+
+    // The button owns the keyboard now: Enter activates IT (a no-op
+    // restart on a live pane) and never reaches the shell.
+    try pressCanvasKey(harness, app_iface, "enter", .{});
+    try testing.expectEqualStrings("\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqual(app.Phase.live, app_state.model.panes[0].phase);
+
+    // Clicking a pane stack is the recovery path: a non-focusable press
+    // target resolves widget focus to nothing, so keys reach `on_key`.
+    const pane0 = rectCenter(app.paneFrames(&app_state.model, size)[0]);
+    try clickCanvas(harness, app_iface, pane0.x, pane0.y);
+    try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
+    try pressCanvasKey(harness, app_iface, "enter", .{});
+    try testing.expectEqualStrings("\r\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+}
+
+test "only the focused pane paints a filled cursor, and deactivation hollows both" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .filled);
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .hollow);
+
+    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .hollow);
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .filled);
+
+    // Window activation is global: a blurred window hollows EVERY pane,
+    // not only the unfocused one.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .app_deactivated);
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .hollow);
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .hollow);
 }
