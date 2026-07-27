@@ -2318,7 +2318,7 @@ test "PORT: snapshot projects live emulator state into a canvas.TerminalGrid" {
     defer session.destroy();
 
     session.feed("hi\r\n");
-    const snap = try session.snapshot(.{}, true);
+    const snap = try session.snapshot(.{}, true, false);
 
     try testing.expectEqual(@as(usize, 4), snap.rows.len);
     try testing.expectEqual(@as(usize, 20), snap.rows[0].cells.len);
@@ -2342,12 +2342,12 @@ test "PORT: snapshot slices stay valid across a repaint and do not grow" {
     defer session.destroy();
 
     session.feed("aaa");
-    const first = try session.snapshot(.{}, true);
+    const first = try session.snapshot(.{}, true, false);
     const first_len = session.snap_text_len;
     try testing.expect(first_len > 0);
     try testing.expectEqual(@as(u21, 'a'), first.rows[0].cells[0].cp);
 
-    const second = try session.snapshot(.{}, true);
+    const second = try session.snapshot(.{}, true, false);
     try testing.expectEqual(first_len, session.snap_text_len);
     try testing.expectEqual(@as(u21, 'a'), second.rows[0].cells[0].cp);
 }

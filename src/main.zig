@@ -66,7 +66,11 @@ pub const clipboard_key: u64 = 100;
 /// may reach 896 and no further, pane 1 may reach the whole 1792 — so
 /// pane 1 inherits every command pane 0 left unspent while still being
 /// guaranteed its own 896. Neither pane can starve its neighbour.
-const widget_command_reserve: usize = 256;
+/// The widgets' share now comes from the first-party painter's own
+/// constants rather than a local copy: the port's whole point is to stop
+/// hand-maintaining numbers the framework publishes and will keep in
+/// step with its own emission.
+const widget_command_reserve: usize = canvas.terminal_grid.widget_command_reserve;
 pub const chrome_command_envelope: usize = native_sdk.runtime.max_canvas_commands_per_view - widget_command_reserve;
 pub fn paneCommandBudget(index: usize) usize {
     return chrome_command_envelope - (pane_count - 1 - index) * (chrome_command_envelope / pane_count);
@@ -75,14 +79,25 @@ pub fn paneCommandBudget(index: usize) usize {
 /// TEXT is PER-PAINT LOCAL: the painter's emitted-bytes counter resets
 /// every call while the 32 KiB text store is shared. Partitioned by a
 /// MIRRORED reserve — both panes get the same one, each capping its own
-/// local counter at 14336, so the pair can never exceed the store less
-/// the widgets' 4 KiB.
-pub const pane_text_reserve: usize = canvas.max_display_list_text_bytes - (canvas.max_display_list_text_bytes - 4096) / pane_count;
+/// local counter, so the pair can never exceed the store less the
+/// widgets' share.
+pub const pane_text_reserve: usize = canvas.max_display_list_text_bytes -
+    (canvas.max_display_list_text_bytes - canvas.terminal_grid.widget_text_reserve) / pane_count;
 
 /// GLYPHS are PER-PAINT LOCAL and a SET, not a running count. Halved
-/// per pane, with the painter now charging four atlas variants per
-/// distinct code point (the subpixel phases the rasterizer keeps).
-pub const pane_glyph_budget: usize = (native_sdk.runtime.max_canvas_glyphs_per_view - 512) / pane_count;
+/// per pane. The four-atlas-variants-per-code-point charge that the fork
+/// had to add by hand is now the painter's own
+/// (`atlas_variants_per_glyph`), so this is a plain division again.
+pub const pane_glyph_budget: usize = canvas.terminal_grid.widget_glyph_budget / pane_count;
+
+/// PATHS are PER-PAINT LOCAL, and new to the first-party painter: box
+/// drawing renders as GEOMETRY at exact cell bounds rather than font
+/// glyphs, so box-heavy content competes for path elements. The fork had
+/// no path tier at all — it widened its per-column command reserve
+/// instead, which is exactly the hand-maintained accounting this port
+/// deletes.
+pub const pane_path_reserve: usize = native_sdk.runtime.max_canvas_path_elements_per_view -
+    (native_sdk.runtime.max_canvas_path_elements_per_view - canvas.terminal_grid.widget_path_reserve) / pane_count;
 
 /// Each pane's share of the module-wide cell ceiling, so two panes
 /// together can never outgrow one view's budgets.
@@ -1186,6 +1201,7 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
             .command_budget = paneCommandBudget(index),
             .text_reserve = pane_text_reserve,
             .glyph_budget = pane_glyph_budget,
+            .path_reserve = pane_path_reserve,
             .id_base = grid.paneIdBase(index),
         });
     }

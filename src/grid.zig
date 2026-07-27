@@ -1,15 +1,25 @@
-//! The terminal grid: libghostty-vt owns cell state, damage, scrollback,
-//! and selection; this module wraps one emulator session and paints its
-//! viewport as REAL text through the canvas primitives. The palette is
+//! One emulator session, projected for the first-party painter.
+//!
+//! libghostty-vt owns cell state, damage, scrollback, and selection. This
+//! module owns the session and PROJECTS its viewport into a
+//! `canvas.TerminalGrid` (see `Session.snapshot`), which
+//! `canvas.terminal_grid.paint` turns into pixels. The palette is
 //! theme-derived where the emulator still holds its defaults (the honest
 //! ANSI-16 story) and exact everywhere an application chose a color: the
 //! 256-color cube, the grayscale ramp, and truecolor pass through
 //! untouched.
+//!
+//! It used to emit canvas commands itself — run merging, per-row ids,
+//! glyph and text accounting, box-drawing geometry, roughly 375 lines of
+//! it. All of that is the framework's now. What stays here is what the
+//! framework cannot do for us: own a libghostty session whose bytes come
+//! from wherever we choose. The framework's own session store
+//! (`runtime/terminal_session.zig`) is capped at four ptys and has no
+//! inbound byte-injection path, so a phux-fed fleet needs this layer.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const vt = @import("ghostty-vt");
-const box = @import("box.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -23,37 +33,32 @@ pub const max_cols: usize = 320;
 pub const max_rows: usize = 96;
 pub const max_cells: usize = 7168;
 
-/// Stable command-id namespace for grid commands so the retained
-/// renderer matches rows across rebuilds and damage stays row-shaped.
-const grid_id_base: u64 = 0x7e21_0000_0000_0000;
-pub const cursor_command_id: u64 = grid_id_base + 0x1_0000_0000;
+/// Our caller id for a grid painted with no explicit pane index. The
+/// first-party painter treats id 0 as the framework's ANONYMOUS
+/// convention (every command emitted with id 0, no retained identity),
+/// so the default has to be nonzero for the retained renderer to match
+/// rows across rebuilds.
+const grid_id_base: u64 = 0x7e21;
 
-/// The cursor's stable command id for a grid painted from `id_base`.
-/// One window can hold SEVERAL grids (the cockpit's panes), each with
-/// its own id namespace, so the cursor id is a function of the base
-/// rather than a single module constant. `cursor_command_id` remains the
-/// default-base answer.
-pub fn cursorCommandId(id_base: u64) u64 {
-    return id_base + 0x1_0000_0000;
-}
-
-/// The id namespace for pane `index`. The largest offset the painter
-/// emits from its base is 0x4_0000_0000 (2^34), so a 2^40 stride leaves
-/// 64x headroom before two panes could ever collide — and a collision
-/// would not be silent: the retained diff rejects duplicate object ids.
+/// The caller id for pane `index`. Under the first-party painter this is
+/// a plain small integer, not a hand-built stride: the painter scales it
+/// by 2^24 itself (`canvas.terminal_grid.paintIdBase`) and guarantees
+/// that grids whose ids differ modulo 2^40 can never collide. The
+/// forked painter needed a 2^40 stride here because it emitted raw
+/// offsets from the base; that arithmetic is now the framework's.
 pub fn paneIdBase(index: usize) u64 {
-    return grid_id_base + (@as(u64, index) << 40);
+    return grid_id_base + index;
 }
 
-/// One text run's staging capacity — shared by the paint loop's scratch
-/// and the preflight's per-cell cap so measure and emission agree.
-/// Sized to the WHOLE display-list text store, so the paint tier is
-/// never the binding constraint on a grapheme cluster: any cluster the
-/// emulator hands over paints complete, and only a cluster the store
-/// itself cannot hold skips — row-atomically, the preflight rule. (The
-/// emulator's own grapheme storage bounds clusters well below this
-/// today; the store-sized scratch keeps that true as its bound moves.)
-const text_scratch_bytes: usize = canvas.max_display_list_text_bytes;
+/// The cursor's command id for a grid painted from caller id `id_base`,
+/// derived from the painter's own scheme rather than a local guess:
+/// `paintIdBase` applies the 2^24 stride and the painter emits its
+/// cursor at offset 0x61_0002.
+pub fn cursorCommandId(id_base: u64) u64 {
+    return canvas.terminal_grid.paintIdBase(id_base) +% 0x61_0002;
+}
+
+pub const cursor_command_id: u64 = cursorCommandId(grid_id_base);
 
 /// One live emulator session. Heap-owned by the app (the model holds a
 /// pointer): the emulator allocates internally and its state is derived
@@ -174,6 +179,7 @@ pub const Session = struct {
         session: *Session,
         tokens: canvas.DesignTokens,
         running: bool,
+        selecting: bool,
     ) !canvas.TerminalGrid {
         // Push theme colors into the emulator's DEFAULTS (not the OSC
         // overrides) so ghostty itself composes the final foreground,
@@ -222,7 +228,7 @@ pub const Session = struct {
                 // grapheme (primary plus combining marks) into the
                 // session's text arena.
                 var cluster: []const u8 = "";
-                if (cp != 0 and !box.isBoxDrawing(cp)) {
+                if (cp != 0 and !canvas.terminal_box.isBoxDrawing(cp)) {
                     const start = session.snap_text_len;
                     session.snap_text_len += std.unicode.utf8Encode(
                         cp,
@@ -295,7 +301,7 @@ pub const Session = struct {
             .selection_color = palette.selection,
             .cursor = cursor,
             .running = running,
-            .select_head = if (session.select_anchor != null)
+            .select_head = if (selecting)
                 .{ .x = session.select_head.x, .y = session.select_head.y }
             else
                 null,
@@ -700,507 +706,50 @@ pub const PaintOptions = struct {
     /// whose new code points would cross it. 0 means unbounded (tests
     /// that size their own builder).
     glyph_budget: usize = 0,
-    /// The stable command-id namespace this paint emits into. One window
-    /// can hold several grids side by side (the cockpit's panes); each
-    /// needs its own band or their row ids would collide and the
-    /// retained diff would reject the frame. `grid.paneIdBase(i)` mints
-    /// them; the default is the single-grid base.
+    /// Vector path elements held back for widgets the app appends after
+    /// the grid. New under the first-party painter: it renders box
+    /// drawing as GEOMETRY under a path budget, so box-heavy content now
+    /// competes for paths rather than for the per-column command reserve
+    /// the forked painter had to widen by hand.
+    path_reserve: usize = 0,
+    /// The caller id this paint emits under. One window can hold several
+    /// grids side by side (the cockpit's panes); each needs its own id or
+    /// their row commands would collide and the retained diff would
+    /// reject the frame. `grid.paneIdBase(i)` mints them; the default is
+    /// the single-grid id. Zero selects the framework's anonymous
+    /// convention (no retained identity), so it is deliberately not the
+    /// default.
     id_base: u64 = grid_id_base,
 };
-
-/// Distinct-code-point probe set backing `PaintOptions.glyph_budget`:
-/// open-addressed, power-of-two slots, zero meaning empty (a stored
-/// value is `cp + 1` so U+0000 never aliases an empty slot). Sized at
-/// twice the runtime's per-view atlas capacity so any honest budget
-/// stays under half load and lookups stay O(1); budgets are clamped to
-/// half the slots so the probe loop can never run against a full table.
-const glyph_probe_slots: usize = 16384;
-
-fn glyphProbeInsert(slots: *[glyph_probe_slots]u32, cp: u21) bool {
-    const stored: u32 = @as(u32, cp) + 1;
-    var index: usize = (stored *% 0x9E37_79B1) >> (32 - 14);
-    while (true) {
-        const entry = slots[index];
-        if (entry == stored) return false;
-        if (entry == 0) {
-            slots[index] = stored;
-            return true;
-        }
-        index = (index + 1) & (glyph_probe_slots - 1);
-    }
-}
-
-/// Count the row's code points NOT yet in `seen`, inserting them —
-/// mirroring the paint loop's emissions exactly (spacer cells and
-/// invisible-styled cells contribute nothing). Entries inserted by a
-/// row the budget then rejects stay in the set harmlessly: painting
-/// stops at that row, so the set is never consulted again.
-fn rowNewGlyphs(row: anytype, seen: *[glyph_probe_slots]u32) usize {
-    var new_count: usize = 0;
-    var i: usize = 0;
-    while (i < row.cells.len) : (i += 1) {
-        const cell = row.cells.get(i);
-        if (cell.raw.wide == .spacer_tail or cell.raw.wide == .spacer_head) continue;
-        const cp: u21 = switch (cell.raw.content_tag) {
-            .codepoint, .codepoint_grapheme => cell.raw.content.codepoint.data,
-            else => 0,
-        };
-        if (cp == 0) continue;
-        if (cell.raw.style_id != 0 and cell.style.flags.invisible) continue;
-        // Box-drawing cells render as geometry: no atlas glyphs.
-        if (box.isBoxDrawing(cp)) continue;
-        if (glyphProbeInsert(seen, cp)) new_count += 1;
-        if (cell.raw.content_tag == .codepoint_grapheme) {
-            for (cell.grapheme) |extra| {
-                if (glyphProbeInsert(seen, extra)) new_count += 1;
-            }
-        }
-    }
-    return new_count;
-}
 
 /// Paint the session's viewport into the display list: per-row
 /// background runs, the selection wash, per-run text, decorations, the
 /// cursor, and the scrollback indicator. Row commands carry stable ids
 /// so the retained renderer's diff keeps damage row-shaped.
 pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions) !void {
-    const tokens = options.tokens;
-    session.font_size = tokens.typography.label_size;
-    session.cell_height = @round(session.font_size * 1.4);
-    const measured = canvas.measureTextWidthForFont(
-        tokens.text_measure,
-        tokens.typography.mono_font_id,
-        "M",
-        session.font_size,
-    );
-    if (measured > 0) session.cell_width = measured;
+    // Cell metrics come from the painter's OWN seam
+    // (`canvas.terminalCellMetrics`) rather than a second local
+    // measurement. The framework documents it as the one seam shared by
+    // the painter and the runtime's grid sizing, so the cells painted and
+    // the cols/rows pushed to the pty cannot disagree — the forked
+    // painter measured "M" itself and had to keep that in step by hand.
+    const metrics = canvas.terminalCellMetrics(options.tokens);
+    session.font_size = metrics.font_size;
+    session.cell_width = metrics.width;
+    session.cell_height = metrics.height;
 
-    // Push the theme colors into the emulator's DEFAULTS (not the OSC
-    // overrides), so ghostty itself composes the final foreground,
-    // background, and cursor: an unstyled terminal resolves to the
-    // theme, an application's OSC 10/11/12 override wins, and DECSCNM
-    // reverse-video swaps whichever pair is in effect. The renderer then
-    // reads `rs.colors` verbatim — no second, divergent color policy
-    // here. Setting `.default` never clobbers a live `.override`.
-    session.term.colors.foreground.default = themeRgb(tokens.colors.text);
-    session.term.colors.background.default = themeRgb(tokens.colors.background);
-    session.term.colors.cursor.default = themeRgb(tokens.colors.accent);
-
-    try session.render.update(session.gpa, &session.term);
-    const rs = &session.render;
-    const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
-
-    // The terminal surface: full-bleed theme background under the grid
-    // (and under the titlebar band, when the window chrome is hidden -
-    // one seamless surface with the traffic lights floating over it).
-    try builder.fillRect(.{
-        .id = options.id_base,
-        .rect = options.background_frame orelse options.frame,
-        .fill = .{ .color = palette.background },
+    const snap = try session.snapshot(options.tokens, options.running, options.selecting);
+    try canvas.terminal_grid.paint(snap, builder, .{
+        .frame = options.frame,
+        .tokens = options.tokens,
+        .focused = options.focused,
+        .background_frame = options.background_frame,
+        .id_base = options.id_base,
+        .command_budget = options.command_budget,
+        .text_reserve = options.text_reserve,
+        .path_reserve = options.path_reserve,
+        .glyph_budget = options.glyph_budget,
     });
-
-    // Everything the grid paints is CLIPPED to its frame: for one frame
-    // after a shrink, the emulator still holds the pre-resize grid (the
-    // resize lands via the journaled viewport Msg), and unclipped rows
-    // or wide cells would paint over the status bar and past the right
-    // edge. The clip makes the stale frame degrade to a cropped grid.
-    try builder.pushClip(.{ .id = options.id_base + 0x4_0000_0000, .rect = options.frame });
-
-    const origin_x = options.frame.x;
-    const origin_y = options.frame.y;
-    const cell_w = session.cell_width;
-    const cell_h = session.cell_height;
-
-    // Worst case for one row, when no runs merge (every cell a distinct
-    // style): a background run, a text run, AND an underline run per
-    // column — or a box-drawing cell's segments, which cost up to EIGHT
-    // commands, not four: `box.paintSegment` emits TWO fillRects for a
-    // `.double` weight and `box.paint` threads up to four sides, so one
-    // `╬` costs 8. Reserving only four per column let a row of double
-    // box drawing overshoot `command_budget` — under `variable_prefix`
-    // that is a whole-frame `error.InvalidChromeCommandCount`, not a
-    // graceful row-wise degrade. Reserved for the ACTUAL grid width so
-    // the LAST painted row can never push the list past the budget; the
-    // cursor, scrollbar, and clip push/pop (+4) fit under the same
-    // reserve.
-    const cols_actual: usize = if (rs.row_data.len > 0) rs.row_data.get(0).cells.len else max_cols;
-    const row_reserve: usize = cols_actual * 8 + 8;
-    const row_ceiling: usize = if (options.command_budget > row_reserve)
-        options.command_budget - row_reserve
-    else
-        0;
-    // The display-list TEXT store is a separate budget from the command
-    // count: a screen of multi-codepoint graphemes (emoji) can exhaust
-    // its bytes long before the command budget. Each row is emitted
-    // ATOMICALLY — its exact text-byte need is measured up front and the
-    // row is skipped WHOLE if it would not fit the remaining store — so
-    // the grid degrades to fewer complete rows, never a row torn
-    // mid-way by an allocation failure.
-    const text_store: usize = if (canvas.max_display_list_text_bytes > options.text_reserve)
-        canvas.max_display_list_text_bytes - options.text_reserve
-    else
-        0;
-    var text_bytes_emitted: usize = 0;
-
-    // The glyph-atlas proxy budget (see `PaintOptions.glyph_budget`):
-    // clamped under half the probe table so insertion can never scan a
-    // full ring; the set costs one 64 KiB clear per bounded paint.
-    const glyph_budget = @min(options.glyph_budget, glyph_probe_slots / 2);
-    var glyph_seen: [glyph_probe_slots]u32 = undefined;
-    if (glyph_budget > 0) @memset(&glyph_seen, 0);
-    var glyphs_counted: usize = 0;
-
-    // Light box-drawing line weight, scaled with the cell (roughly the
-    // stroke a terminal font would carry at this size).
-    const box_thickness: f32 = @max(1, @round(session.font_size / 8));
-
-    // A run's staging buffer, sized to the whole text store (see
-    // `text_scratch_bytes`): any cluster the store can hold stages
-    // whole. The run-break flushes when the buffer nears full, so long
-    // runs simply split across draw commands rather than overflow.
-    var text_scratch: [text_scratch_bytes]u8 = undefined;
-    var row_index: usize = 0;
-    while (row_index < rs.row_data.len) : (row_index += 1) {
-        // Command-count stop: once within one row's worst case of the
-        // command ceiling, stop painting further rows.
-        if (options.command_budget > 0 and builder.displayList().commands.len >= row_ceiling) break;
-        const row = rs.row_data.get(row_index);
-        // Text-store stop, ATOMIC per row: measure this row's exact text
-        // bytes and stop BEFORE it if the store cannot hold them — never
-        // emit a row's first runs and then fail mid-row.
-        if (text_bytes_emitted + rowTextBytes(row) > text_store) break;
-        // Glyph-budget stop, same row-atomic shape: stop BEFORE the row
-        // whose new DISTINCT code points would cross the atlas proxy —
-        // the frame degrades to fewer rows instead of failing whole on
-        // `GlyphAtlasListFull`.
-        if (glyph_budget > 0) {
-            // Each distinct code point costs FOUR atlas entries, not
-            // one: the renderer rasterizes a subpixel variant per
-            // horizontal phase. Charging 1 here would let a screen of
-            // distinct scalars pass a budget the atlas then fails.
-            glyphs_counted += rowNewGlyphs(row, &glyph_seen) * 4;
-            if (glyphs_counted > glyph_budget) break;
-        }
-        const row_y = origin_y + @as(f32, @floatFromInt(row_index)) * cell_h;
-        // Rows STARTING at or past the frame's bottom paint nothing
-        // visible; a row straddling the edge still paints and the clip
-        // crops it, so content reaches the very edge without spilling.
-        if (row_y >= options.frame.y + options.frame.height) break;
-        const row_id = options.id_base + (@as(u64, @intCast(row_index)) << 16);
-
-        // Background runs: contiguous cells sharing a non-default bg.
-        var run_start: usize = 0;
-        var run_color: ?canvas.Color = null;
-        var prev_bg: ?canvas.Color = null;
-        var x: usize = 0;
-        while (x <= row.cells.len) : (x += 1) {
-            const bg: ?canvas.Color = if (x < row.cells.len) blk: {
-                const cell = row.cells.get(x);
-                // A wide glyph's style lives on its PRIMARY cell only:
-                // the spacer tail extends the primary's background, or a
-                // styled wide character (red-on-`界`, inverse video)
-                // would paint over half its width.
-                if (cell.raw.wide == .spacer_tail) break :blk prev_bg;
-                break :blk cellBackground(cell, &palette);
-            } else null;
-            prev_bg = bg;
-            if (run_color) |color| {
-                const same = if (bg) |next| colorEql(color, next) else false;
-                if (!same) {
-                    try builder.fillRect(.{
-                        .id = row_id + 1 + run_start,
-                        .rect = geometry.RectF.init(
-                            origin_x + @as(f32, @floatFromInt(run_start)) * cell_w,
-                            row_y,
-                            @as(f32, @floatFromInt(x - run_start)) * cell_w,
-                            cell_h,
-                        ),
-                        .fill = .{ .color = color },
-                    });
-                    run_color = bg;
-                    run_start = x;
-                }
-            } else if (bg != null) {
-                run_color = bg;
-                run_start = x;
-            }
-        }
-
-        // Selection wash (under the ink, over the backgrounds).
-        if (row.selection) |range| {
-            const wash = canvas.Color.rgba(
-                palette.selection.r,
-                palette.selection.g,
-                palette.selection.b,
-                0.30,
-            );
-            try builder.fillRect(.{
-                .id = row_id + 0x4000,
-                .rect = geometry.RectF.init(
-                    origin_x + @as(f32, @floatFromInt(range[0])) * cell_w,
-                    row_y,
-                    @as(f32, @floatFromInt(@as(usize, range[1]) - range[0] + 1)) * cell_w,
-                    cell_h,
-                ),
-                .fill = .{ .color = wash },
-            });
-        }
-
-        // Text runs: contiguous cells sharing a foreground, flushed on
-        // color change (bold/italic render with the one mono face —
-        // weight axes come with registered companions, stated honestly
-        // in the recipe).
-        var run_len: usize = 0;
-        var run_x: usize = 0;
-        var run_fg: canvas.Color = palette.foreground;
-        var run_underline = false;
-        var text_len: usize = 0;
-        x = 0;
-        while (x <= row.cells.len) : (x += 1) {
-            var cp: u21 = 0;
-            var fg = palette.foreground;
-            var underline = false;
-            var skip = false;
-            var box_cp: u21 = 0;
-            if (x < row.cells.len) {
-                const cell = row.cells.get(x);
-                if (cell.raw.wide == .spacer_tail or cell.raw.wide == .spacer_head) skip = true;
-                cp = switch (cell.raw.content_tag) {
-                    .codepoint, .codepoint_grapheme => cell.raw.content.codepoint.data,
-                    else => 0,
-                };
-                if (cp != 0 and cell.raw.style_id != 0) {
-                    const style = cell.style;
-                    fg = palette.resolveFg(style, cellBackground(cell, &palette));
-                    underline = style.flags.underline != .none;
-                    if (style.flags.invisible) cp = 0;
-                }
-                // Box-drawing, block, and shade cells render as GEOMETRY
-                // at exact cell bounds, never font glyphs: glyphs fill
-                // the em box, not the padded cell, so borders drawn from
-                // them show seams between rows and columns. The cell
-                // still breaks the text run (cp zeroes) and paints below.
-                if (cp != 0 and !skip and box.isBoxDrawing(cp)) {
-                    box_cp = cp;
-                    cp = 0;
-                }
-            }
-            // The current cell's full byte need (primary code point plus
-            // any grapheme marks): the run breaks BEFORE a cell that
-            // would not fit the remaining scratch, so the cell restarts
-            // in a fresh buffer and a large grapheme landing near the
-            // buffer's end keeps all its marks instead of being cut.
-            const cell_bytes: usize = if (x < row.cells.len and cp != 0) cellTextBytes(row.cells.get(x)) else 0;
-            const breaks = x == row.cells.len or skip or cp == 0 or
-                !colorEql(fg, run_fg) or underline != run_underline or text_len + cell_bytes > text_scratch.len;
-            if (breaks and run_len > 0 and text_len > 0) {
-                // The row-wise text ceiling reserves enough that this
-                // append fits; the catch is a defensive floor that stops
-                // the run cleanly if it ever did not (never a torn cell).
-                const run_text = builder.allocTextBytes(text_scratch[0..text_len]) catch break;
-                text_bytes_emitted += text_len;
-                try builder.drawText(.{
-                    .id = row_id + 0x8000 + run_x,
-                    .font_id = tokens.typography.mono_font_id,
-                    .size = session.font_size,
-                    // `origin` is the BASELINE, not the glyph top: the
-                    // canvas boxes a run as one em of ascent above the
-                    // origin and a quarter below, so centering that
-                    // 1.25em box in the cell puts the baseline at
-                    // row top + (cell - 1.25*size)/2 + size. Anchoring
-                    // the top here instead paints every row one line
-                    // high — and the clip swallows row zero whole.
-                    .origin = geometry.PointF.init(
-                        origin_x + @as(f32, @floatFromInt(run_x)) * cell_w,
-                        row_y + (cell_h - session.font_size * 1.25) * 0.5 + session.font_size,
-                    ),
-                    .color = run_fg,
-                    .text = run_text,
-                });
-                if (run_underline) {
-                    try builder.fillRect(.{
-                        .id = row_id + 0xc000 + run_x,
-                        .rect = geometry.RectF.init(
-                            origin_x + @as(f32, @floatFromInt(run_x)) * cell_w,
-                            row_y + cell_h - 2,
-                            @as(f32, @floatFromInt(run_len)) * cell_w,
-                            1,
-                        ),
-                        .fill = .{ .color = run_fg },
-                    });
-                }
-                text_len = 0;
-                run_len = 0;
-            }
-            if (x >= row.cells.len or skip) continue;
-            if (box_cp != 0) {
-                // Merge a run of the same seamless piece (a border's
-                // long `─`) into ONE command: fewer commands and one
-                // unbroken bar instead of per-cell segments.
-                var span: usize = 1;
-                if (box.mergesHorizontally(box_cp)) {
-                    const style_id = row.cells.get(x).raw.style_id;
-                    while (x + span < row.cells.len) : (span += 1) {
-                        const next = row.cells.get(x + span);
-                        const next_cp: u21 = switch (next.raw.content_tag) {
-                            .codepoint, .codepoint_grapheme => next.raw.content.codepoint.data,
-                            else => 0,
-                        };
-                        if (next_cp != box_cp or next.raw.style_id != style_id) break;
-                    }
-                }
-                const rect = geometry.RectF.init(
-                    origin_x + @as(f32, @floatFromInt(x)) * cell_w,
-                    row_y,
-                    @as(f32, @floatFromInt(span)) * cell_w,
-                    cell_h,
-                );
-                // Stride EIGHT, matching `box.paint`'s worst case (a
-                // `.double` cross emits two rects per side): a stride of
-                // four let one cell's ids run into its neighbour's, and
-                // duplicate object ids hard-fail the retained diff.
-                // 0x6000 + 319*8 = 0x6A38, still inside the row's band.
-                box.paint(builder, row_id + 0x6000 + @as(u64, @intCast(x)) * 8, rect, box_cp, fg, box_thickness) catch break;
-                x += span - 1;
-                continue;
-            }
-            if (cp == 0) continue;
-            if (run_len == 0) {
-                run_x = x;
-                run_fg = fg;
-                run_underline = underline;
-            }
-            const cell = row.cells.get(x);
-            text_len += std.unicode.utf8Encode(cp, text_scratch[text_len..]) catch 0;
-            if (cell.raw.content_tag == .codepoint_grapheme) {
-                for (cell.grapheme) |extra| {
-                    // Stop before a partial code point: the break lands
-                    // BETWEEN combining marks, so the emitted run is
-                    // always valid UTF-8. The buffer is the whole text
-                    // store, and the row preflight already skipped any
-                    // row whose cluster bytes exceed it — this floor is
-                    // defensive, never the working bound.
-                    if (text_len + 8 > text_scratch.len) break;
-                    text_len += std.unicode.utf8Encode(extra, text_scratch[text_len..]) catch 0;
-                }
-            }
-            run_len += if (cell.raw.wide == .wide) 2 else 1;
-        }
-    }
-
-    // The cursor, over the ink: filled only while focused and live;
-    // blur or session exit leaves the conventional hollow outline.
-    if (rs.cursor.visible) {
-        if (rs.cursor.viewport) |cursor| {
-            const cursor_x = origin_x + @as(f32, @floatFromInt(cursor.x)) * cell_w;
-            const cursor_y = origin_y + @as(f32, @floatFromInt(cursor.y)) * cell_h;
-            const cursor_color = canvas.Color.rgba(
-                palette.cursor.r,
-                palette.cursor.g,
-                palette.cursor.b,
-                if (options.running) 0.45 else 0.22,
-            );
-            const rect = switch (rs.cursor.visual_style) {
-                .bar => geometry.RectF.init(cursor_x, cursor_y, 2, cell_h),
-                .underline => geometry.RectF.init(cursor_x, cursor_y + cell_h - 2, cell_w, 2),
-                else => geometry.RectF.init(cursor_x, cursor_y, cell_w, cell_h),
-            };
-            if (options.focused and options.running) {
-                try builder.fillRect(.{
-                    .id = cursorCommandId(options.id_base),
-                    .rect = rect,
-                    .fill = .{ .color = cursor_color },
-                });
-            } else {
-                try builder.strokeRect(.{
-                    .id = cursorCommandId(options.id_base),
-                    .rect = rect,
-                    .stroke = .{ .fill = .{ .color = cursor_color }, .width = 1 },
-                });
-            }
-        }
-    }
-
-    // Selection head outline while selecting (the keyboard caret).
-    if (options.selecting) {
-        const head_x = origin_x + @as(f32, @floatFromInt(session.select_head.x)) * cell_w;
-        const head_y = origin_y + @as(f32, @floatFromInt(session.select_head.y)) * cell_h;
-        try builder.strokeRect(.{
-            .id = options.id_base + 0x2_0000_0000,
-            .rect = geometry.RectF.init(head_x, head_y, cell_w, cell_h),
-            .stroke = .{ .fill = .{ .color = tokens.colors.focus_ring }, .width = 1 },
-        });
-    }
-
-    // Scrollback indicator: a right-edge thumb while the viewport is in
-    // history, sized by the visible fraction.
-    const bar = session.scrollbar();
-    if (bar.total > bar.len) {
-        const total: f32 = @floatFromInt(bar.total);
-        const offset: f32 = @floatFromInt(bar.offset);
-        const visible: f32 = @floatFromInt(bar.len);
-        const at_bottom = bar.offset + bar.len >= bar.total;
-        if (!at_bottom) {
-            const track_h = options.frame.height;
-            const thumb_h = @max(24, track_h * (visible / total));
-            const thumb_y = options.frame.y + (track_h - thumb_h) * (offset / @max(1, total - visible));
-            try builder.fillRect(.{
-                .id = options.id_base + 0x3_0000_0000,
-                .rect = geometry.RectF.init(
-                    options.frame.x + options.frame.width - 5,
-                    thumb_y,
-                    3,
-                    thumb_h,
-                ),
-                .fill = .{ .color = canvas.Color.rgba(
-                    tokens.colors.text_muted.r,
-                    tokens.colors.text_muted.g,
-                    tokens.colors.text_muted.b,
-                    0.6,
-                ) },
-            });
-        }
-    }
-    try builder.popClip();
-}
-
-/// UTF-8 byte need of one cell's rendered text: its primary code point
-/// plus every grapheme combining mark. Used to break a run before a
-/// cell that would overflow the run scratch, and to measure a row's
-/// total for the atomic text-store stop.
-/// The bytes painting will actually EMIT for one cell — the preflight
-/// (`rowTextBytes`) sums these against the text store, so this must
-/// mirror the paint loop's suppressions exactly: an invisible-styled
-/// cell paints nothing, and a cluster's marks stop at the run scratch's
-/// capacity (the store itself). Counting suppressed bytes would measure
-/// a paintable row past the budget and silently blank every row after
-/// it.
-fn cellTextBytes(cell: anytype) usize {
-    const cp: u21 = switch (cell.raw.content_tag) {
-        .codepoint, .codepoint_grapheme => cell.raw.content.codepoint.data,
-        else => 0,
-    };
-    if (cp == 0) return 0;
-    if (cell.raw.style_id != 0 and cell.style.flags.invisible) return 0;
-    // Box-drawing cells render as geometry, never text bytes.
-    if (box.isBoxDrawing(cp)) return 0;
-    var n: usize = std.unicode.utf8CodepointSequenceLength(cp) catch 1;
-    if (cell.raw.content_tag == .codepoint_grapheme) {
-        for (cell.grapheme) |extra| {
-            // The paint loop's mark cap, from a fresh buffer (an
-            // oversized cell always restarts one): stop where it stops.
-            if (n + 8 > text_scratch_bytes) break;
-            n += std.unicode.utf8CodepointSequenceLength(extra) catch 1;
-        }
-    }
-    return n;
-}
-
-fn rowTextBytes(row: anytype) usize {
-    var total: usize = 0;
-    var i: usize = 0;
-    while (i < row.cells.len) : (i += 1) total += cellTextBytes(row.cells.get(i));
-    return total;
 }
 
 fn cellBackground(cell: anytype, palette: *const Palette) ?canvas.Color {
@@ -1222,10 +771,6 @@ fn cellBackground(cell: anytype, palette: *const Palette) ?canvas.Color {
         .palette => |index| palette.indexed(index),
         .rgb => |rgb| canvas.Color.rgb8(rgb.r, rgb.g, rgb.b),
     };
-}
-
-fn colorEql(a: canvas.Color, b: canvas.Color) bool {
-    return a.r == b.r and a.g == b.g and a.b == b.b and a.a == b.a;
 }
 
 // ------------------------------------------------------------- palette

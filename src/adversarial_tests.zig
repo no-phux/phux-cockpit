@@ -245,13 +245,19 @@ test "ADVERSARIAL: the live frame's ids are unique across grids AND widgets" {
     try testing.expect(list.commands.len > 100);
     try expectNoDuplicateIds(gpa, list.commands);
 
-    // And the grids' bands really are disjoint from each other.
+    // And the grids' bands really are disjoint from each other. Under the
+    // first-party painter the emitted band for caller id `n` is
+    // `paintIdBase(n) + [0, 2^24)` — the painter applies the stride, so a
+    // band check must apply it too.
+    const stride: u64 = 1 << 24;
+    const base0 = canvas.terminal_grid.paintIdBase(grid.paneIdBase(0));
+    const base1 = canvas.terminal_grid.paintIdBase(grid.paneIdBase(1));
     var pane0: usize = 0;
     var pane1: usize = 0;
     for (list.commands) |command| {
         const id = command.objectId() orelse continue;
-        if (id >= grid.paneIdBase(0) and id < grid.paneIdBase(1)) pane0 += 1;
-        if (id >= grid.paneIdBase(1) and id < grid.paneIdBase(2)) pane1 += 1;
+        if (id >= base0 and id < base0 + stride) pane0 += 1;
+        if (id >= base1 and id < base1 + stride) pane1 += 1;
     }
     try testing.expect(pane0 > 20);
     try testing.expect(pane1 > 20);
@@ -589,4 +595,79 @@ test "ADVERSARIAL: DEFECT - before the surface is measured the wheel hit test is
     // The wrong pane scrolled.
     try testing.expect(model.panes[0].session.scrollbar().offset < bottom0);
     try testing.expectEqual(bottom1, model.panes[1].session.scrollbar().offset);
+}
+
+// -------------------------------------------------- A7: the validator's eyes
+
+const validator_shot_path = "/Users/phall/workspace/phux-native-spike/cockpit/zig-out/validator-two-panes.png";
+
+test "ADVERSARIAL: proof shot with SUBSTANTIAL distinct content in both panes (env-gated)" {
+    // The builders' shot showed one word per pane. If the panes shared a
+    // terminal, one word each is exactly what a fluke could still look
+    // right for. This drives many rows of clearly-labelled, differently
+    // styled content into each pty and renders the retained frame the
+    // GPU would present.
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    // Let the frame pump measure the surface so the panes take their
+    // real grids.
+    for (2..8) |frame_index| {
+        try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+            .label = "terminal-canvas",
+            .size = size,
+            .scale_factor = 2,
+            .frame_index = @intCast(frame_index),
+            .timestamp_ns = @as(u64, frame_index) * 1_000_000,
+        } });
+    }
+
+    var line: [128]u8 = undefined;
+    for (0..14) |i| {
+        try app_state.effects.feedPtyOutput(app.ptyKey(0), std.fmt.bufPrint(
+            &line,
+            "\x1b[32mLEFT\x1b[0m  build step {d}/14 \u{2500}\u{2500}\u{2500} ok\r\n",
+            .{i + 1},
+        ) catch unreachable);
+        try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+        try app_state.effects.feedPtyOutput(app.ptyKey(1), std.fmt.bufPrint(
+            &line,
+            "\x1b[1;35mRIGHT\x1b[0m Tue Jul 27 04:0{d}:00 PDT 2026\r\n",
+            .{i % 10},
+        ) catch unreachable);
+        try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    }
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    // Both streams landed on their own emulator, and neither saw the
+    // other's marker.
+    const left = app_state.model.panes[0].session.screenText();
+    const right = app_state.model.panes[1].session.screenText();
+    try testing.expect(std.mem.indexOf(u8, left, "build step 14/14") != null);
+    try testing.expect(std.mem.indexOf(u8, left, "RIGHT") == null);
+    try testing.expect(std.mem.indexOf(u8, right, "Tue Jul 27") != null);
+    try testing.expect(std.mem.indexOf(u8, right, "LEFT") == null);
+
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, "terminal-canvas", null);
+    const pixels = try gpa.alloc(u8, pixel_size.byte_len);
+    defer gpa.free(pixels);
+    const scratch = try gpa.alloc(u8, pixel_size.byte_len);
+    defer gpa.free(scratch);
+    const shot = try harness.runtime.renderCanvasScreenshot(1, "terminal-canvas", null, pixels, scratch);
+    const encoded = try gpa.alloc(u8, try canvas.png.encodedRgba8ByteLen(shot.width, shot.height));
+    defer gpa.free(encoded);
+    var writer = std.Io.Writer.fixed(encoded);
+    try canvas.png.writeRgba8(&writer, shot.width, shot.height, shot.rgba8);
+    try std.Io.Dir.cwd().createDirPath(io, "/Users/phall/workspace/phux-native-spike/cockpit/zig-out");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = validator_shot_path, .data = writer.buffered() });
 }
