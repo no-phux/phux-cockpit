@@ -94,6 +94,16 @@ pub const Session = struct {
     cell_width: f32 = 8,
     cell_height: f32 = 18,
     font_size: f32 = 13,
+    /// Reused projection buffers for `snapshot` (see that function). The
+    /// first-party painter takes a RESOLVED snapshot whose every slice
+    /// must outlive the build referencing it, so these are owned per
+    /// session and rewritten in place each frame — never allocated per
+    /// paint. Sized to the painter's own ceilings, so a snapshot this
+    /// session can produce is always one the painter can hold.
+    snap_rows: []canvas.TerminalRow = &.{},
+    snap_cells: []canvas.TerminalCell = &.{},
+    snap_text: []u8 = &.{},
+    snap_text_len: usize = 0,
 
     pub const CellPos = struct { x: u16 = 0, y: u16 = 0 };
 
@@ -132,9 +142,170 @@ pub const Session = struct {
         };
         errdefer session.term.deinit(gpa);
         session.response_buffer = try gpa.alloc(u8, response_capacity);
+        session.snap_rows = try gpa.alloc(canvas.TerminalRow, max_rows);
+        session.snap_cells = try gpa.alloc(canvas.TerminalCell, max_cells);
+        session.snap_text = try gpa.alloc(u8, canvas.max_display_list_text_bytes);
         session.stream = .initAlloc(gpa, .init(&session.term));
         session.installStreamEffects();
         return session;
+    }
+
+    /// Project the emulator's live viewport into a `canvas.TerminalGrid`
+    /// — the resolved, allocation-free snapshot the first-party painter
+    /// consumes (`canvas.terminal_grid.paint`).
+    ///
+    /// This is the whole reason the cockpit keeps its own `Session`
+    /// rather than the framework's terminal widget: the framework's
+    /// session store is capped at `effects.max_effect_ptys` (4) and has
+    /// no inbound byte-injection API, so a phux-fed fleet cannot use it.
+    /// The PAINTER, by contrast, is pure — it takes cells, not a
+    /// terminal — so a phux-fed pane and a local-pty pane project
+    /// identically through here.
+    ///
+    /// Every returned slice points into this session's own buffers and
+    /// stays valid until the next `snapshot` call, which satisfies the
+    /// painter's producer-owned-lifetime contract for one frame.
+    ///
+    /// Box drawing is deliberately NOT special-cased here: the painter
+    /// renders box code points as geometry at exact cell bounds under
+    /// its own `path_reserve`, so the cluster is left empty for them and
+    /// `box.zig`'s hand-rolled segments are no longer needed.
+    pub fn snapshot(
+        session: *Session,
+        tokens: canvas.DesignTokens,
+        running: bool,
+    ) !canvas.TerminalGrid {
+        // Push theme colors into the emulator's DEFAULTS (not the OSC
+        // overrides) so ghostty itself composes the final foreground,
+        // background, and cursor. Unchanged from the forked painter:
+        // one color policy, owned by the emulator.
+        session.term.colors.foreground.default = themeRgb(tokens.colors.text);
+        session.term.colors.background.default = themeRgb(tokens.colors.background);
+        session.term.colors.cursor.default = themeRgb(tokens.colors.accent);
+
+        try session.render.update(session.gpa, &session.term);
+        const rs = &session.render;
+        const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
+
+        session.snap_text_len = 0;
+        var row_count: usize = 0;
+        var cell_cursor: usize = 0;
+
+        var row_index: usize = 0;
+        while (row_index < rs.row_data.len and row_count < session.snap_rows.len) : (row_index += 1) {
+            const row = rs.row_data.get(row_index);
+            const width = @min(row.cells.len, session.snap_cells.len - cell_cursor);
+            const out = session.snap_cells[cell_cursor..][0..width];
+
+            var x: usize = 0;
+            while (x < width) : (x += 1) {
+                const cell = row.cells.get(x);
+                var cp: u21 = switch (cell.raw.content_tag) {
+                    .codepoint, .codepoint_grapheme => cell.raw.content.codepoint.data,
+                    else => 0,
+                };
+                var fg = palette.foreground;
+                var underline = false;
+                const bg = cellBackground(cell, &palette);
+                if (cp != 0 and cell.raw.style_id != 0) {
+                    const style = cell.style;
+                    fg = palette.resolveFg(style, bg);
+                    underline = style.flags.underline != .none;
+                    // An invisible cell resolves to "no ink" HERE so the
+                    // painter's measure and paint cannot disagree — the
+                    // contract `TerminalCell.cp == 0` states.
+                    if (style.flags.invisible) cp = 0;
+                }
+
+                // A box-drawing cell carries no cluster: the painter
+                // draws it as geometry. Everything else stages its full
+                // grapheme (primary plus combining marks) into the
+                // session's text arena.
+                var cluster: []const u8 = "";
+                if (cp != 0 and !box.isBoxDrawing(cp)) {
+                    const start = session.snap_text_len;
+                    session.snap_text_len += std.unicode.utf8Encode(
+                        cp,
+                        session.snap_text[session.snap_text_len..],
+                    ) catch 0;
+                    if (cell.raw.content_tag == .codepoint_grapheme) {
+                        for (cell.grapheme) |extra| {
+                            // Stop BETWEEN marks so the staged bytes are
+                            // always valid UTF-8. Defensive: the arena is
+                            // the painter's own text ceiling.
+                            if (session.snap_text_len + 8 > session.snap_text.len) break;
+                            session.snap_text_len += std.unicode.utf8Encode(
+                                extra,
+                                session.snap_text[session.snap_text_len..],
+                            ) catch 0;
+                        }
+                    }
+                    cluster = session.snap_text[start..session.snap_text_len];
+                }
+
+                out[x] = .{
+                    .cp = cp,
+                    .cluster = cluster,
+                    .fg = fg,
+                    .bg = bg,
+                    .underline = underline,
+                    .wide = switch (cell.raw.wide) {
+                        .wide => .wide,
+                        .spacer_tail, .spacer_head => .spacer,
+                        else => .narrow,
+                    },
+                };
+            }
+
+            session.snap_rows[row_count] = .{
+                .cells = out,
+                .selection = if (row.selection) |range| .{
+                    @intCast(range[0]),
+                    @intCast(range[1]),
+                } else null,
+            };
+            cell_cursor += width;
+            row_count += 1;
+        }
+
+        const bar = session.scrollbar();
+        // The cursor comes from the render snapshot, not the emulator
+        // directly: `rs.cursor.viewport` is null when the cursor sits
+        // outside the visible viewport (scrolled into history), which is
+        // exactly the painter's "no cursor" case.
+        const cursor: ?canvas.TerminalCursor = blk: {
+            if (!rs.cursor.visible) break :blk null;
+            const vp = rs.cursor.viewport orelse break :blk null;
+            break :blk .{
+                .x = @intCast(vp.x),
+                .y = @intCast(vp.y),
+                .shape = switch (rs.cursor.visual_style) {
+                    .bar => .bar,
+                    .underline => .underline,
+                    else => .block,
+                },
+            };
+        };
+
+        return .{
+            .rows = session.snap_rows[0..row_count],
+            .background = palette.background,
+            .foreground = palette.foreground,
+            .cursor_color = palette.cursor,
+            .selection_color = palette.selection,
+            .cursor = cursor,
+            .running = running,
+            .select_head = if (session.select_anchor != null)
+                .{ .x = session.select_head.x, .y = session.select_head.y }
+            else
+                null,
+            .scrollbar = .{
+                .offset = @intCast(bar.offset),
+                .len = @intCast(bar.len),
+                .total = @intCast(bar.total),
+            },
+            .screen_text = session.screen_text,
+        };
     }
 
     /// Wire the stream handler's effect callbacks — only `write_pty`
@@ -162,6 +333,9 @@ pub const Session = struct {
         session.stream.deinit();
         session.term.deinit(gpa);
         gpa.free(session.response_buffer);
+        gpa.free(session.snap_rows);
+        gpa.free(session.snap_cells);
+        gpa.free(session.snap_text);
         if (session.screen_text.len > 0) gpa.free(session.screen_text);
         gpa.destroy(session);
     }

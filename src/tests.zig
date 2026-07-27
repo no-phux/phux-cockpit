@@ -2306,3 +2306,48 @@ test "only the focused pane paints a filled cursor, and deactivation hollows bot
     try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .hollow);
     try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .hollow);
 }
+
+// ------------------------------------------- the first-party-painter port
+
+test "PORT: snapshot projects live emulator state into a canvas.TerminalGrid" {
+    // The load-bearing new code of the port: `Session.snapshot` must
+    // hand the first-party painter a resolved snapshot that matches what
+    // the emulator actually holds. If this is wrong, every pixel after
+    // it is wrong, and nothing else in the port is worth testing.
+    const session = try createSession(20, 4);
+    defer session.destroy();
+
+    session.feed("hi\r\n");
+    const snap = try session.snapshot(.{}, true);
+
+    try testing.expectEqual(@as(usize, 4), snap.rows.len);
+    try testing.expectEqual(@as(usize, 20), snap.rows[0].cells.len);
+    try testing.expectEqual(@as(u21, 'h'), snap.rows[0].cells[0].cp);
+    try testing.expectEqual(@as(u21, 'i'), snap.rows[0].cells[1].cp);
+    // An untouched cell carries no ink, per the TerminalCell contract.
+    try testing.expectEqual(@as(u21, 0), snap.rows[0].cells[2].cp);
+    // The cluster is the cell's UTF-8, staged in the session's arena.
+    try testing.expectEqualStrings("h", snap.rows[0].cells[0].cluster);
+    // The cursor advanced to row 1 after the CRLF.
+    try testing.expect(snap.cursor != null);
+    try testing.expectEqual(@as(u16, 1), snap.cursor.?.y);
+}
+
+test "PORT: snapshot slices stay valid across a repaint and do not grow" {
+    // The painter's contract is that every slice is producer-owned and
+    // outlives the build referencing it. We satisfy that with buffers
+    // REUSED per frame rather than allocated per paint, so a second
+    // snapshot must reset the text arena rather than append to it.
+    const session = try createSession(20, 4);
+    defer session.destroy();
+
+    session.feed("aaa");
+    const first = try session.snapshot(.{}, true);
+    const first_len = session.snap_text_len;
+    try testing.expect(first_len > 0);
+    try testing.expectEqual(@as(u21, 'a'), first.rows[0].cells[0].cp);
+
+    const second = try session.snapshot(.{}, true);
+    try testing.expectEqual(first_len, session.snap_text_len);
+    try testing.expectEqual(@as(u21, 'a'), second.rows[0].cells[0].cp);
+}
