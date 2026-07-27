@@ -269,7 +269,18 @@ pub const Model = struct {
     /// by up to one cell: correct for a which-half question, and the
     /// hit test falls back to the focused pane when the point lands in
     /// no rect at all.
-    surface_size: geometry.SizeF = .{},
+    ///
+    /// SEEDED with the window's CONFIGURED size rather than left zero.
+    /// Zero made every pre-first-frame wheel miss both rects and fall
+    /// back to the focused pane — so a wheel aimed squarely at pane 1
+    /// scrolled pane 0, which the adversarial suite caught and pinned.
+    /// `app.zon` declares `restore_state = false` with
+    /// `center_on_primary`, so the window always opens at exactly this
+    /// size: the seed is not a guess about the first frame, it is the
+    /// same number the shell config gives the platform. A restore policy
+    /// that ever honored a different size would leave this stale for one
+    /// frame, no worse than the resize lag documented above.
+    surface_size: geometry.SizeF = geometry.SizeF.init(window_width, window_height),
 
     pub fn focusedPane(model: *Model) *Pane {
         return &model.panes[@min(model.focus, pane_count - 1)];

@@ -541,15 +541,21 @@ test "ADVERSARIAL: a wheel over the UNFOCUSED pane scrolls that one, not the foc
     try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
 }
 
-test "ADVERSARIAL: DEFECT - before the surface is measured the wheel hit test is dead" {
-    // THE DEFECT THIS PROBE FOUND, pinned rather than repaired.
-    // `Model.surface_size` starts at {0,0} and is only written by the
-    // `.viewport` Msg. Until `onFrame` has emitted one, `paneFrames`
-    // returns zero-width rects, `paneAtPoint` can never contain a point,
-    // and EVERY wheel — including one plainly over pane 1 — silently
-    // falls back to the focused pane. The build agents' own suite never
+test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" {
+    // The defect this probe originally found, now repaired and inverted.
+    //
+    // `Model.surface_size` used to start at {0,0} and was only written by
+    // the `.viewport` Msg. Until `onFrame` emitted one, `paneFrames`
+    // returned zero-width rects, `paneAtPoint` could never contain a
+    // point, and EVERY wheel — including one plainly over pane 1 — fell
+    // back silently to the focused pane. The build agents' suite never
     // reached the measured state, so their "a wheel scrolls the pane it
-    // is OVER" claim was never exercised by any test.
+    // is OVER" claim went unexercised.
+    //
+    // The fix seeds `surface_size` from the window's CONFIGURED size,
+    // which `app.zon` pins with `restore_state = false` and
+    // `center_on_primary`. This test holds the fix in place by asserting
+    // the routing works with NO frame dispatched at all.
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -561,10 +567,10 @@ test "ADVERSARIAL: DEFECT - before the surface is measured the wheel hit test is
     const app_iface = app_state.app();
     const model = &app_state.model;
 
-    // The state the whole pre-existing suite runs in.
-    try testing.expectEqual(@as(f32, 0), model.surface_size.width);
-    try testing.expectEqual(@as(f32, 0), model.surface_size.height);
-    try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[1].width);
+    // The mirror is live before any frame, and the rects it yields are real.
+    try testing.expectEqual(size.width, model.surface_size.width);
+    try testing.expectEqual(size.height, model.surface_size.height);
+    try testing.expect(app.paneFrames(model, model.surface_size)[1].width > 0);
 
     var line: [32]u8 = undefined;
     for (0..200) |i| {
@@ -575,8 +581,10 @@ test "ADVERSARIAL: DEFECT - before the surface is measured the wheel hit test is
     const bottom0 = model.panes[0].session.scrollbar().offset;
     const bottom1 = model.panes[1].session.scrollbar().offset;
 
-    // Aim squarely at pane 1, as `paneFrames` WOULD place it.
-    const target = app.paneFrames(model, size)[1];
+    // Pane 0 holds focus; aim squarely at pane 1. The wheel must follow
+    // the POINTER, not the focus.
+    try testing.expectEqual(@as(u8, 0), model.focus);
+    const target = app.paneFrames(model, model.surface_size)[1];
     const cell_h = model.panes[1].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -588,13 +596,9 @@ test "ADVERSARIAL: DEFECT - before the surface is measured the wheel hit test is
             .delta_y = cell_h,
         } });
     }
-    std.debug.print(
-        "\nMEASURED wheel routing (surface UNMEASURED): pane0 {d}->{d}  pane1 {d}->{d}  <- went to the WRONG pane\n",
-        .{ bottom0, model.panes[0].session.scrollbar().offset, bottom1, model.panes[1].session.scrollbar().offset },
-    );
-    // The wrong pane scrolled.
-    try testing.expect(model.panes[0].session.scrollbar().offset < bottom0);
-    try testing.expectEqual(bottom1, model.panes[1].session.scrollbar().offset);
+    // Pane 1 scrolled; the focused pane 0 did NOT.
+    try testing.expect(model.panes[1].session.scrollbar().offset < bottom1);
+    try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
 }
 
 // -------------------------------------------------- A7: the validator's eyes
