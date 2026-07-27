@@ -36,35 +36,60 @@ pub const window_min_height: f32 = 420;
 /// window under a standard titlebar - no header, no status bar.
 const grid_inset: f32 = 8;
 
-/// The pty and clipboard keys (one keyed-effect space per app).
-const shell_key: u64 = 1;
-const clipboard_key: u64 = 2;
+/// The cockpit paints SEVERAL terminal panes into one gpu_surface.
+pub const pane_count: usize = 2;
 
-/// The command budget the grid may spend per rebuild: the view's 2048
-/// minus headroom for the widget header/status and their chrome.
-const grid_command_budget: usize = 1700;
+/// The horizontal gap between two panes, in canvas points.
+const pane_gutter: f32 = 8;
 
-/// Display-list text bytes held back from the grid for the header and
-/// status widgets, which draw into the same per-view text store. Their
-/// text is a handful of fixed labels plus a few formatted counters —
-/// well under 1 KiB — so 4 KiB is a generous margin that still leaves
-/// the grid far more than its clamped cell count can fill.
-const grid_text_reserve: usize = 4096;
+/// One keyed-effect space spans pty, clipboard, spawn, and fetch
+/// (`effects.keyOccupiedUntilDelivery`), so the pane keys and the
+/// clipboard key must not collide. Pane i owns key 1+i; the clipboard
+/// sits far clear of them — at key 2 (the single-pane original) every
+/// copy would be silently rejected the moment pane 1 spawned, surfacing
+/// only as `copy_failed`.
+pub fn ptyKey(index: usize) u64 {
+    return 1 + index;
+}
+pub const clipboard_key: u64 = 100;
 
-/// Distinct-code-point allowance for the grid, a proxy for the
-/// runtime's per-view glyph-atlas entries: the view's capacity minus
-/// headroom for the header/status chrome, whose labels and counters are
-/// a few dozen distinct ASCII glyphs (256 is generous). Without it, a
-/// screen of thousands of distinct scalars plus distinct combining
-/// marks overflows the atlas and fails the whole frame instead of
-/// degrading row-wise.
-const grid_glyph_budget: usize = native_sdk.runtime.max_canvas_glyphs_per_view - 256;
+/// THE BUDGET POLICY. The three per-view canvas budgets are accounted
+/// DIFFERENTLY by the painter, so each is partitioned differently.
+///
+/// COMMANDS are CUMULATIVE: the painter compares the BUILDER TOTAL
+/// against its ceiling, so `command_budget` is an absolute high-water
+/// mark, not a per-paint allowance. Partitioned floor-and-slack: pane 0
+/// may reach 896 and no further, pane 1 may reach the whole 1792 — so
+/// pane 1 inherits every command pane 0 left unspent while still being
+/// guaranteed its own 896. Neither pane can starve its neighbour.
+const widget_command_reserve: usize = 256;
+pub const chrome_command_envelope: usize = native_sdk.runtime.max_canvas_commands_per_view - widget_command_reserve;
+pub fn paneCommandBudget(index: usize) usize {
+    return chrome_command_envelope - (pane_count - 1 - index) * (chrome_command_envelope / pane_count);
+}
 
-/// The pending-outbound ring size. Generous headroom (4x the pty's
-/// 64 KiB stdin FIFO) so only a paste or reply burst far larger than
-/// this, into a child that never reads, reaches the drop path — and even
-/// then the drop is counted and shown, never silent.
-const outbound_buffer_bytes: usize = 256 * 1024;
+/// TEXT is PER-PAINT LOCAL: the painter's emitted-bytes counter resets
+/// every call while the 32 KiB text store is shared. Partitioned by a
+/// MIRRORED reserve — both panes get the same one, each capping its own
+/// local counter at 14336, so the pair can never exceed the store less
+/// the widgets' 4 KiB.
+pub const pane_text_reserve: usize = canvas.max_display_list_text_bytes - (canvas.max_display_list_text_bytes - 4096) / pane_count;
+
+/// GLYPHS are PER-PAINT LOCAL and a SET, not a running count. Halved
+/// per pane, with the painter now charging four atlas variants per
+/// distinct code point (the subpixel phases the rasterizer keeps).
+pub const pane_glyph_budget: usize = (native_sdk.runtime.max_canvas_glyphs_per_view - 512) / pane_count;
+
+/// Each pane's share of the module-wide cell ceiling, so two panes
+/// together can never outgrow one view's budgets.
+pub const pane_cell_ceiling: usize = grid.max_cells / pane_count;
+
+/// The per-pane pending-outbound ring. 64 KiB matches the pty's stdin
+/// FIFO exactly; at two panes that is 128 KiB of model, HALF the single
+/// pane's former 256 KiB. Only a paste or reply burst larger than the
+/// whole ring, into a child that never reads, reaches the drop path —
+/// and even then the drop is counted and shown, never silent.
+const outbound_buffer_bytes: usize = 64 * 1024;
 
 /// The default interactive shell per platform — a deterministic pick so
 /// a replayed update issues the identical spawn (reading $SHELL here
@@ -89,6 +114,19 @@ const default_shell_argv: []const []const u8 = if (builtin.os.tag == .windows)
 else
     &.{ default_shell, "-i" };
 
+/// The second pane's content. Two panes only prove the cockpit thesis if
+/// they show DIFFERENT things, so pane 1 runs a self-driving clock: it
+/// produces output on its own, which also exercises two concurrent live
+/// ptys feeding one surface without any typing.
+const ticker_argv: []const []const u8 = if (builtin.os.tag == .windows)
+    &.{ default_shell, "/c", "for /l %i in (1,0,2) do @(echo %date% %time%& timeout /t 1 >nul)" }
+else
+    &.{ default_shell, "-c", "while :; do date; sleep 1; done" };
+
+fn paneArgv(index: usize) []const []const u8 {
+    return if (index == 0) default_shell_argv else ticker_argv;
+}
+
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Terminal canvas", .accessibility_label = "Terminal", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
@@ -110,15 +148,20 @@ pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 pub const Phase = enum { starting, live, ended, failed };
 
-pub const Model = struct {
+/// ONE terminal pane: its emulator session, its pty, and every piece of
+/// state that belongs to that pty rather than to the window. Everything
+/// here was a field of `Model` in the single-terminal original and keeps
+/// its name, so the behaviour is the same code operating on a pane
+/// pointer instead of the model.
+pub const Pane = struct {
     /// The emulator session, heap-owned (created in main/tests before
     /// the app starts); everything inside derives from journaled inputs.
     session: *grid.Session,
+    /// This pane's key in the app's one keyed-effect space.
+    pty_key: u64 = 1,
+    /// The spawn argv for this pane's child (and its restart).
+    argv: []const []const u8 = default_shell_argv,
     phase: Phase = .starting,
-    /// This single-window app owns terminal keyboard input exactly while
-    /// the application is active. Lifecycle messages rebuild the custom
-    /// chrome so the cursor fills on focus and hollows on blur.
-    focused: bool = true,
     exit_code: i32 = 0,
     exit_signal: i32 = 0,
     exit_reason: native_sdk.EffectExitReason = .exited,
@@ -137,18 +180,9 @@ pub const Model = struct {
     /// selection stays live for a retry. Cleared by the next copy
     /// attempt and by a restart.
     copy_failed: bool = false,
-    /// A clipboard write is IN FLIGHT: further copies are no-ops until
-    /// its result lands, or the fixed-key re-request would be rejected
-    /// as a duplicate and overwrite the first copy's outcome.
-    copy_inflight: bool = false,
     /// Fractional wheel-scroll remainder in view points: deltas
     /// accumulate here and convert to whole scrollback rows.
     wheel_accum: f32 = 0,
-    /// The OS titlebar band height (hidden-inset chrome): the grid's
-    /// text starts below it while the terminal background runs under
-    /// it, so the window reads as one seamless surface with only the
-    /// traffic lights floating over it.
-    chrome_top: f32 = 0,
     /// Delivered output accounting for the status line (and the
     /// replay fingerprint: byte totals pin the fed stream).
     output_batches: u64 = 0,
@@ -179,16 +213,59 @@ pub const Model = struct {
     /// first batch, and gating input on `.live` would strand it waiting
     /// for keystrokes it discards. Only an ended or failed session
     /// refuses input.
-    pub fn acceptsInput(model: *const Model) bool {
-        return model.phase == .starting or model.phase == .live;
+    pub fn acceptsInput(pane: *const Pane) bool {
+        return pane.phase == .starting or pane.phase == .live;
     }
 };
+
+pub const Model = struct {
+    panes: [pane_count]Pane,
+    /// Which pane keyboard input reaches. Window activation is global,
+    /// pane focus is not: exactly one pane is the keyboard target and
+    /// only that one paints a filled cursor.
+    focus: u8 = 0,
+    /// This single-window app owns terminal keyboard input exactly while
+    /// the application is active. Lifecycle messages rebuild the custom
+    /// chrome so the cursor fills on focus and hollows on blur.
+    focused: bool = true,
+    /// A clipboard write is IN FLIGHT: further copies are no-ops until
+    /// its result lands, or the fixed-key re-request would be rejected
+    /// as a duplicate and overwrite the first copy's outcome. There is
+    /// ONE system clipboard, so this is a window-level fact, not a pane
+    /// one — `copy_owner` records which pane's selection is riding it,
+    /// so the result clears the right pane's highlight.
+    copy_inflight: bool = false,
+    copy_owner: u8 = 0,
+    /// The OS titlebar band height (hidden-inset chrome): the grid's
+    /// text starts below it while the terminal background runs under
+    /// it, so the window reads as one seamless surface with only the
+    /// traffic lights floating over it.
+    chrome_top: f32 = 0,
+
+    pub fn focusedPane(model: *Model) *Pane {
+        return &model.panes[@min(model.focus, pane_count - 1)];
+    }
+};
+
+/// The initial cockpit model over `pane_count` heap-owned sessions: pane
+/// i takes pty key i+1 and its own spawn argv.
+pub fn initialModel(sessions: [pane_count]*grid.Session) Model {
+    var model: Model = .{ .panes = undefined };
+    for (&model.panes, sessions, 0..) |*pane, session, index| {
+        pane.* = .{
+            .session = session,
+            .pty_key = ptyKey(index),
+            .argv = paneArgv(index),
+        };
+    }
+    return model;
+}
 
 pub const Msg = union(enum) {
     shell: native_sdk.EffectPtyEvent,
     key: canvas.WidgetKeyboardEvent,
     text: canvas.WidgetKeyboardEvent,
-    viewport: struct { cols: u16, rows: u16 },
+    viewport: struct { pane: u8, cols: u16, rows: u16 },
     clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
     restart,
@@ -208,10 +285,11 @@ const TerminalApp = native_sdk.UiApp(Model, Msg);
 const Fx = TerminalApp.Effects;
 
 fn initFx(model: *Model, fx: *Fx) void {
-    spawnShell(model, fx);
+    for (&model.panes) |*pane| spawnPane(pane, fx);
 }
 
-fn spawnShell(model: *Model, fx: *Fx) void {
+fn spawnPane(pane: *Pane, fx: *Fx) void {
+    const model = pane;
     model.phase = .starting;
     // Leave selection mode: reset() clears the emulator's selection, so
     // a lingering `selecting` flag would show a caret over no selection
@@ -221,7 +299,6 @@ fn spawnShell(model: *Model, fx: *Fx) void {
     // shell's status line must not claim its predecessor's clipboard.
     model.copied_bytes = 0;
     model.copy_failed = false;
-    model.copy_inflight = false;
     model.macos_natural_keys_held = 0;
     // Drop any bytes still queued for the session that just ended — a
     // restarted shell must not receive the dead one's unsent keystrokes.
@@ -240,96 +317,119 @@ fn spawnShell(model: *Model, fx: *Fx) void {
     model.session.reset();
     model.session.refreshScreenText();
     fx.ptySpawn(.{
-        .key = shell_key,
-        .argv = default_shell_argv,
+        .key = model.pty_key,
+        .argv = model.argv,
         .cols = model.cols,
         .rows = model.rows,
         .on_event = Fx.ptyMsg(.shell),
     });
 }
 
+/// The pane owning a keyed pty event. An event for a key no pane holds
+/// (a stale exit after a restart raced) is ignored rather than applied
+/// to the wrong terminal.
+fn paneForKey(model: *Model, key: u64) ?*Pane {
+    for (&model.panes) |*pane| {
+        if (pane.pty_key == key) return pane;
+    }
+    return null;
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     switch (msg) {
-        .shell => |event| switch (event.kind) {
-            .output => {
-                model.phase = .live;
-                model.output_batches += 1;
-                model.output_bytes += event.bytes.len;
-                feedOutput(model, fx, event.bytes);
-                // Cells changed: refresh the grid's accessibility text
-                // (which also carries real cell state into the session
-                // fingerprint — byte counters alone would verify a
-                // wrong screen).
-                model.session.refreshScreenText();
-                // An armed selection follows the TEXT the emulator's
-                // absolute pins track — output that scrolled the screen
-                // moves the caret with the selected cells, and a range
-                // that left the viewport clears selection mode rather
-                // than desynchronizing the caret from the copyable text.
-                if (model.selecting and !model.session.rebaseSelection()) {
-                    model.selecting = false;
-                }
-                // The child produced output, so it is reading: its stdin
-                // FIFO likely has room now — push any pending outbound,
-                // then let a reply the full ring retained take the room
-                // the flush just freed (stdin order: it is older than
-                // anything a later dispatch could enqueue).
-                flushOutbound(model, fx);
-                moveResponsesToOutbound(model, fx);
-            },
-            .exit => {
-                model.phase = if (event.reason == .rejected or event.reason == .spawn_failed) .failed else .ended;
-                model.exit_code = event.code;
-                model.exit_signal = event.signal;
-                model.exit_reason = event.reason;
-                model.dropped_writes = event.dropped_writes;
-                // The child is gone: bytes still queued can never land —
-                // drop them COUNTED (they are outbound loss like any
-                // other), and drop retained emulator replies too — ALSO
-                // counted (a DSR reply the full ring retained is outbound
-                // loss the same way) — or the frame pump would retry
-                // flushing them against the dead key until restart.
-                model.outbound_dropped += model.outbound_len;
-                model.outbound_dropped += model.session.pendingResponses().len;
-                model.outbound_head = 0;
-                model.outbound_len = 0;
-                model.session.clearResponses();
-            },
-            // Write-admission verdicts are journal-only (replay
-            // machinery); the engine never delivers one as an event.
-            .write => unreachable,
+        .shell => |event| {
+            // Every pty event carries its own key: route it to the pane
+            // that owns that key, never to "the" terminal.
+            const pane = paneForKey(model, event.key) orelse return;
+            switch (event.kind) {
+                .output => {
+                    pane.phase = .live;
+                    pane.output_batches += 1;
+                    pane.output_bytes += event.bytes.len;
+                    feedOutput(pane, fx, event.bytes);
+                    // Cells changed: refresh the grid's accessibility text
+                    // (which also carries real cell state into the session
+                    // fingerprint — byte counters alone would verify a
+                    // wrong screen).
+                    pane.session.refreshScreenText();
+                    // An armed selection follows the TEXT the emulator's
+                    // absolute pins track — output that scrolled the screen
+                    // moves the caret with the selected cells, and a range
+                    // that left the viewport clears selection mode rather
+                    // than desynchronizing the caret from the copyable text.
+                    if (pane.selecting and !pane.session.rebaseSelection()) {
+                        pane.selecting = false;
+                    }
+                    // The child produced output, so it is reading: its stdin
+                    // FIFO likely has room now — push any pending outbound,
+                    // then let a reply the full ring retained take the room
+                    // the flush just freed (stdin order: it is older than
+                    // anything a later dispatch could enqueue).
+                    flushOutbound(pane, fx);
+                    moveResponsesToOutbound(pane, fx);
+                },
+                .exit => {
+                    pane.phase = if (event.reason == .rejected or event.reason == .spawn_failed) .failed else .ended;
+                    pane.exit_code = event.code;
+                    pane.exit_signal = event.signal;
+                    pane.exit_reason = event.reason;
+                    pane.dropped_writes = event.dropped_writes;
+                    // The child is gone: bytes still queued can never land —
+                    // drop them COUNTED (they are outbound loss like any
+                    // other), and drop retained emulator replies too — ALSO
+                    // counted (a DSR reply the full ring retained is outbound
+                    // loss the same way) — or the frame pump would retry
+                    // flushing them against the dead key until restart.
+                    pane.outbound_dropped += pane.outbound_len;
+                    pane.outbound_dropped += pane.session.pendingResponses().len;
+                    pane.outbound_head = 0;
+                    pane.outbound_len = 0;
+                    pane.session.clearResponses();
+                },
+                // Write-admission verdicts are journal-only (replay
+                // machinery); the engine never delivers one as an event.
+                .write => unreachable,
+            }
         },
         .key => |event| handleKey(model, fx, event),
         .text => |event| {
-            if (model.selecting or !model.acceptsInput()) return;
+            const pane = model.focusedPane();
+            if (pane.selecting or !pane.acceptsInput()) return;
             if (event.text.len == 0) return;
-            model.session.scrollToBottom();
-            sendCommittedText(model, fx, event.text);
+            pane.session.scrollToBottom();
+            sendCommittedText(pane, fx, event.text);
         },
         .viewport => |size| {
+            const pane = &model.panes[@min(size.pane, pane_count - 1)];
             // Commit the new size only once the emulator actually took
             // it: on an allocation failure the model keeps its old
             // dimensions and the frame pump retries next frame, so the
             // emulator and the pty never disagree about the grid.
-            if (!model.session.resize(size.cols, size.rows)) return;
-            model.cols = size.cols;
-            model.rows = size.rows;
-            model.session.refreshScreenText();
-            fx.ptyResize(shell_key, size.cols, size.rows);
-            flushOutbound(model, fx);
+            if (!pane.session.resize(size.cols, size.rows)) return;
+            pane.cols = size.cols;
+            pane.rows = size.rows;
+            pane.session.refreshScreenText();
+            fx.ptyResize(pane.pty_key, size.cols, size.rows);
+            flushOutbound(pane, fx);
         },
         .flush_outbound => {
-            flushOutbound(model, fx);
-            // The drain may have freed room for query replies a full
-            // ring left retained in the emulator's buffer.
-            moveResponsesToOutbound(model, fx);
+            for (&model.panes) |*pane| {
+                flushOutbound(pane, fx);
+                // The drain may have freed room for query replies a full
+                // ring left retained in the emulator's buffer.
+                moveResponsesToOutbound(pane, fx);
+            }
         },
         .chrome_changed => |chrome| {
             model.chrome_top = chrome.insets.top;
         },
         .focus_changed => |focused| {
             model.focused = focused;
-            if (!focused) model.macos_natural_keys_held = 0;
+            // Window blur strands every pane's held-key latches, not
+            // only the focused one's.
+            if (!focused) {
+                for (&model.panes) |*pane| pane.macos_natural_keys_held = 0;
+            }
         },
         .wheel => |delta| {
             // Natural direction, like every terminal: swiping the
@@ -337,31 +437,35 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // scrolling) reveals history. Inert while a selection is
             // armed - the caret and the emulator's absolute range must
             // not desynchronize (the scroll-chord rule).
-            if (model.selecting) return;
-            model.wheel_accum += delta;
-            const cell_h = @max(1, model.session.cell_height);
-            const rows = @trunc(model.wheel_accum / cell_h);
+            const pane = model.focusedPane();
+            if (pane.selecting) return;
+            pane.wheel_accum += delta;
+            const cell_h = @max(1, pane.session.cell_height);
+            const rows = @trunc(pane.wheel_accum / cell_h);
             if (rows != 0) {
-                model.wheel_accum -= rows * cell_h;
-                model.session.scrollLines(-@as(isize, @intFromFloat(rows)));
+                pane.wheel_accum -= rows * cell_h;
+                pane.session.scrollLines(-@as(isize, @intFromFloat(rows)));
             }
         },
         .copy_selection => copySelection(model, fx),
         .clipboard => |result| {
             model.copy_inflight = false;
+            // The result belongs to the pane whose selection was copied,
+            // which may no longer be the focused one.
+            const pane = &model.panes[@min(model.copy_owner, pane_count - 1)];
             if (result.outcome == .ok) {
                 // Confirmed on the clipboard: the selection's job is
                 // done, and only NOW does it clear — a failed write
                 // needs it still standing to retry.
-                model.selecting = false;
-                model.session.clearSelection();
+                pane.selecting = false;
+                pane.session.clearSelection();
             } else {
                 // The write failed after a successful read: same user
                 // story as a serialization failure — loud, the
                 // selection kept, never a silent no-op the user pastes
                 // stale content after.
-                model.copied_bytes = 0;
-                model.copy_failed = true;
+                pane.copied_bytes = 0;
+                pane.copy_failed = true;
             }
         },
         .restart => {
@@ -370,8 +474,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // still holds the key, so respawning would collide on the
             // same key — a rejected exit that strands the running
             // original with no input.
-            if (model.phase != .ended and model.phase != .failed) return;
-            spawnShell(model, fx);
+            const pane = model.focusedPane();
+            if (pane.phase != .ended and pane.phase != .failed) return;
+            // The restarting pane's copy can never confirm now.
+            if (model.copy_inflight and model.copy_owner == model.focus) model.copy_inflight = false;
+            spawnPane(pane, fx);
         },
     }
 }
@@ -387,7 +494,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
 /// impossible — larger than the ring itself — and counted as dropped);
 /// `false` means it merely does not fit RIGHT NOW, is untouched and
 /// uncounted, and the caller retains it to retry as the ring drains.
-fn enqueueOutbound(model: *Model, fx: *Fx, bytes: []const u8) bool {
+fn enqueueOutbound(model: *Pane, fx: *Fx, bytes: []const u8) bool {
     const cap = model.outbound_buffer.len;
     if (bytes.len > cap) {
         model.outbound_dropped += bytes.len;
@@ -412,14 +519,14 @@ fn enqueueOutbound(model: *Model, fx: *Fx, bytes: []const u8) bool {
 /// Enqueue a TRANSIENT payload (typed text, an encoded key): the event's
 /// bytes do not outlive this dispatch, so a right-now refusal cannot be
 /// retried later — it is counted as dropped instead, never silent.
-/// Hitting this at all means the child ignored the whole 256 KiB ring.
+/// Hitting this at all means the child ignored the whole 64 KiB ring.
 ///
 /// STDIN ORDER comes first: a query reply retained behind a full ring is
 /// OLDER than this keystroke and must reach the child before it. The
 /// retained reply gets its retry now; if it still cannot enter the ring,
 /// the keystroke must not jump the queue — it drops counted rather than
 /// arrive before an answer the child may be parsing toward.
-fn enqueueTransient(model: *Model, fx: *Fx, bytes: []const u8) void {
+fn enqueueTransient(model: *Pane, fx: *Fx, bytes: []const u8) void {
     moveResponsesToOutbound(model, fx);
     if (model.session.response_len > 0) {
         model.outbound_dropped += bytes.len;
@@ -436,7 +543,7 @@ fn enqueueTransient(model: *Model, fx: *Fx, bytes: []const u8) void {
 /// ring and is retried on the next output, resize, or frame: a
 /// non-reading child pauses the stream instead of losing its tail, and a
 /// reply is never removed before it actually lands.
-fn flushOutbound(model: *Model, fx: *Fx) void {
+fn flushOutbound(model: *Pane, fx: *Fx) void {
     const cap = model.outbound_buffer.len;
     while (model.outbound_len > 0) {
         const run_to_end = cap - model.outbound_head;
@@ -444,7 +551,7 @@ fn flushOutbound(model: *Model, fx: *Fx) void {
             native_sdk.max_effect_pty_write_bytes,
             @min(model.outbound_len, run_to_end),
         );
-        if (!fx.ptyWrite(shell_key, model.outbound_buffer[model.outbound_head .. model.outbound_head + n])) break;
+        if (!fx.ptyWrite(model.pty_key, model.outbound_buffer[model.outbound_head .. model.outbound_head + n])) break;
         model.outbound_head = (model.outbound_head + n) % cap;
         model.outbound_len -= n;
     }
@@ -460,7 +567,7 @@ fn flushOutbound(model: *Model, fx: *Fx) void {
 /// query's reply is well under a slice's worth of input, so the buffer
 /// never overflows and no reply is dropped. This keeps the write-back
 /// lossless: a child that blocks on a DSR answer never hangs.
-fn feedOutput(model: *Model, fx: *Fx, bytes: []const u8) void {
+fn feedOutput(model: *Pane, fx: *Fx, bytes: []const u8) void {
     const slice_bytes = grid.Session.feed_slice_bytes;
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -485,7 +592,7 @@ fn feedOutput(model: *Model, fx: *Fx, bytes: []const u8) void {
 /// retried on the next output, resize, or frame — instead of discarding
 /// an answer the child may be blocked on. Only a queued (or impossible,
 /// counted) batch clears; never a torn escape sequence either way.
-pub fn moveResponsesToOutbound(model: *Model, fx: *Fx) void {
+pub fn moveResponsesToOutbound(model: *Pane, fx: *Fx) void {
     const pending = model.session.pendingResponses();
     if (pending.len > 0) {
         if (!enqueueOutbound(model, fx, pending)) return;
@@ -497,32 +604,36 @@ fn copySelection(model: *Model, fx: *Fx) void {
     // ONE copy in flight: the clipboard write reuses a fixed key, so a
     // second request before the first result drains would be rejected
     // as a duplicate — and that rejection would overwrite the first
-    // copy's success with `copy_failed`. A repeated Enter while the
-    // write is pending is a no-op, not a second request.
+    // copy's success with `copy_failed`. There is one system clipboard,
+    // so this holds ACROSS panes, not per pane.
     if (model.copy_inflight) return;
-    model.copy_failed = false;
-    const text = (model.session.selectionText(model.session.gpa) catch {
+    const pane = model.focusedPane();
+    pane.copy_failed = false;
+    const text = (pane.session.selectionText(pane.session.gpa) catch {
         // Serialization failed with a selection ACTIVE: keep the
         // selection for a retry and say so in the status — a copy that
         // silently does nothing would leave the user pasting stale
         // clipboard content.
-        model.copy_failed = true;
-        model.copied_bytes = 0;
+        pane.copy_failed = true;
+        pane.copied_bytes = 0;
         return;
     }) orelse {
         // No emulator range while the MODEL still holds an anchor: a
         // prior selection re-pin failed and cleared the highlight (see
         // `applySelection`), so this copy has nothing to serialize —
         // that is a failed copy, not a quiet no-op.
-        if (model.session.selectionActive()) {
-            model.copy_failed = true;
-            model.copied_bytes = 0;
+        if (pane.session.selectionActive()) {
+            pane.copy_failed = true;
+            pane.copied_bytes = 0;
         }
         return;
     };
-    defer model.session.gpa.free(text);
-    model.copied_bytes = text.len;
+    defer pane.session.gpa.free(text);
+    pane.copied_bytes = text.len;
     model.copy_inflight = true;
+    // Remember whose selection is riding the clipboard: the result may
+    // land after focus moved to the other pane.
+    model.copy_owner = model.focus;
     fx.writeClipboard(.{
         .key = clipboard_key,
         .text = text,
@@ -564,33 +675,36 @@ fn onLifecycle(event: native_sdk.LifecycleEvent) ?Msg {
 fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     const mods = event.modifiers;
     const primary = mods.hasCommandModifier();
-    const session = model.session;
+    // Keyboard input belongs to the FOCUSED pane; the window-level
+    // clipboard and restart chords still route through the model.
+    const pane = model.focusedPane();
+    const session = pane.session;
 
     // Releases are terminal input only — app chords and selection act
     // on presses. The encoder decides whether the child hears them
     // (kitty event reporting; silent under legacy modes).
     if (event.phase == .key_up) {
-        if (model.selecting or !model.acceptsInput()) return;
-        encodeKeyEvent(model, fx, event, .release);
+        if (pane.selecting or !pane.acceptsInput()) return;
+        encodeKeyEvent(pane, fx, event, .release);
         return;
     }
 
     // App chords first: selection mode, copy, scrollback, restart.
     if (primary and mods.shift and keyIs(event.key, "space")) {
-        if (model.selecting) {
-            model.selecting = false;
+        if (pane.selecting) {
+            pane.selecting = false;
             session.clearSelection();
         } else {
-            model.selecting = true;
+            pane.selecting = true;
             session.beginSelection(false);
         }
         return;
     }
-    if (primary and keyIs(event.key, "c") and (model.selecting or session.selectionActive())) {
+    if (primary and keyIs(event.key, "c") and (pane.selecting or session.selectionActive())) {
         copySelection(model, fx);
         return;
     }
-    if (primary and keyIs(event.key, "r") and (model.phase == .ended or model.phase == .failed)) {
+    if (primary and keyIs(event.key, "r") and (pane.phase == .ended or pane.phase == .failed)) {
         update(model, .restart, fx);
         return;
     }
@@ -600,13 +714,13 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // armed selection would leave the painted caret naming different
     // text than a copy returns. (The chords fall through to the
     // selection block below, where primary+arrows are simply inert.)
-    if (!model.selecting) {
+    if (!pane.selecting) {
         if (primary and keyIs(event.key, "arrowup")) {
-            session.scrollLines(-if (mods.shift) @as(isize, model.rows) else 1);
+            session.scrollLines(-if (mods.shift) @as(isize, pane.rows) else 1);
             return;
         }
         if (primary and keyIs(event.key, "arrowdown")) {
-            session.scrollLines(if (mods.shift) @as(isize, model.rows) else 1);
+            session.scrollLines(if (mods.shift) @as(isize, pane.rows) else 1);
             return;
         }
         if (primary and keyIs(event.key, "home")) {
@@ -619,9 +733,9 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         }
     }
 
-    if (model.selecting) {
+    if (pane.selecting) {
         if (keyIs(event.key, "escape")) {
-            model.selecting = false;
+            pane.selecting = false;
             session.clearSelection();
             return;
         }
@@ -641,13 +755,13 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         return;
     }
 
-    if (!model.acceptsInput()) return;
+    if (!pane.acceptsInput()) return;
 
     // Everything else is terminal input: specials and chords encode
     // through the emulator (application cursor-key mode, kitty
     // protocol, and modifier encodings all honored); plain printable
     // presses arrive through `.text` instead and are ignored here.
-    encodeKeyEvent(model, fx, event, .press);
+    encodeKeyEvent(pane, fx, event, .press);
 }
 
 /// Encode one key transition and push the bytes toward the child. macOS
@@ -658,7 +772,7 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
 /// legacy modes. (Key REPEAT is the one event type the hosts do not
 /// distinguish from a fresh press, so a TUI that enabled event reporting
 /// sees repeats as presses.)
-fn encodeKeyEvent(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent, action: vt.input.KeyAction) void {
+fn encodeKeyEvent(model: *Pane, fx: *Fx, event: canvas.WidgetKeyboardEvent, action: vt.input.KeyAction) void {
     const session = model.session;
     const natural_key_mask = macosNaturalTextKeyMask(event.key);
     if (action == .release and natural_key_mask != 0 and
@@ -759,7 +873,7 @@ fn macosNaturalTextSequence(event: canvas.WidgetKeyboardEvent) ?[]const u8 {
 /// protocol's report-all mode — raw bytes there would desynchronize the
 /// application's key decoding. Multi-scalar commits (IME words, paste)
 /// stay raw text, the protocol's rule for composed input.
-fn sendCommittedText(model: *Model, fx: *Fx, text: []const u8) void {
+fn sendCommittedText(model: *Pane, fx: *Fx, text: []const u8) void {
     single: {
         const len = std.unicode.utf8ByteSequenceLength(text[0]) catch break :single;
         if (text.len != len) break :single;
@@ -911,73 +1025,105 @@ fn mapKey(event: canvas.WidgetKeyboardEvent) ?MappedKey {
 const TerminalUi = TerminalApp.Ui;
 
 pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
-    // The window IS the terminal: a standard titlebar and the grid,
-    // nothing else. The grid region's accessibility surface carries the
-    // viewport text: a terminal's semantic content is its cells, so
-    // screen readers hear the real screen - and the session fingerprint
-    // (the a11y-tree hash) covers cell state, not just byte counters:
+    // The window is the panes: one non-painting stack per pane, side by
+    // side, so BOTH panes' viewport text reaches the accessibility tree.
+    // A terminal's semantic content is its cells, so screen readers hear
+    // the real screens - and the session fingerprint (the a11y-tree
+    // hash) covers cell state of every pane, not just byte counters:
     // two runs with identical counters but different screens never
     // verify alike. A stack paints nothing; a panel here would draw its
     // surface chrome OVER the grid.
-    const screen = model.session.screenText();
+    const left = model.panes[0].session.screenText();
+    const right = model.panes[1].session.screenText();
     return ui.column(.{}, .{
-        ui.el(.stack, .{ .grow = 1, .semantics = .{ .label = if (screen.len > 0) screen else "Terminal grid" } }, .{}),
+        ui.row(.{ .grow = 1, .gap = pane_gutter }, .{
+            ui.el(.stack, .{ .grow = 1, .semantics = .{ .label = if (left.len > 0) left else "Terminal grid 1" } }, .{}),
+            ui.el(.stack, .{ .grow = 1, .semantics = .{ .label = if (right.len > 0) right else "Terminal grid 2" } }, .{}),
+        }),
     });
 }
 
-/// The grid, painted as a variable-length chrome prefix beneath the
+/// The grids, painted as a variable-length chrome prefix beneath the
 /// widget tree: real text through the canvas primitives, damage kept
-/// row-shaped by stable command ids.
+/// row-shaped by stable command ids, one id namespace per pane.
+///
+/// The budgets are partitioned per the policy at the top of this file:
+/// commands floor-and-slack (cumulative), text mirrored (per-paint
+/// local), glyphs halved (per-paint local).
 fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
-    const frame = gridFrame(model, size);
-    try grid.paint(model.session, builder, .{
-        .frame = frame,
-        .background_frame = geometry.RectF.init(0, 0, size.width, size.height),
-        .tokens = tokens,
-        .running = model.phase == .live or model.phase == .starting,
-        .focused = model.focused,
-        .selecting = model.selecting,
-        .command_budget = grid_command_budget,
-        .text_reserve = grid_text_reserve,
-        .glyph_budget = grid_glyph_budget,
-    });
+    const frames = paneFrames(model, size);
+    for (&model.panes, frames, 0..) |*pane, frame, index| {
+        try grid.paint(pane.session, builder, .{
+            .frame = frame,
+            // Pane 0 lays the full-bleed terminal background over the
+            // WHOLE window (under the hidden-inset titlebar band too, so
+            // the window reads as one surface); the others fill only
+            // their own rect over it.
+            .background_frame = if (index == 0) geometry.RectF.init(0, 0, size.width, size.height) else null,
+            .tokens = tokens,
+            .running = pane.phase == .live or pane.phase == .starting,
+            // Window activation is global, pane focus is not: only the
+            // focused pane of an active window paints a filled cursor.
+            .focused = model.focused and index == model.focus,
+            .selecting = pane.selecting,
+            .command_budget = paneCommandBudget(index),
+            .text_reserve = pane_text_reserve,
+            .glyph_budget = pane_glyph_budget,
+            .id_base = grid.paneIdBase(index),
+        });
+    }
 }
 
-fn gridFrame(model: *const Model, size: geometry.SizeF) geometry.RectF {
-    // Text starts below the hidden-inset titlebar band (the traffic
-    // lights float over the terminal background); the background
-    // itself runs edge-to-edge behind them (see `buildChrome`).
+/// Where each pane's grid lives, in canvas points: the same top edge as
+/// the single-grid original (below the hidden-inset titlebar band),
+/// width split evenly with `pane_gutter` between.
+pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometry.RectF {
     const top = @max(grid_inset, model.chrome_top + 4);
-    return geometry.RectF.init(
-        grid_inset,
-        top,
-        @max(0, size.width - grid_inset * 2),
-        @max(0, size.height - top - grid_inset),
-    );
+    const usable = @max(0, size.width - grid_inset * 2);
+    const gutters = pane_gutter * @as(f32, @floatFromInt(pane_count - 1));
+    const width = @max(0, (usable - gutters) / @as(f32, @floatFromInt(pane_count)));
+    const height = @max(0, size.height - top - grid_inset);
+    var frames: [pane_count]geometry.RectF = undefined;
+    for (&frames, 0..) |*frame, index| {
+        frame.* = geometry.RectF.init(
+            grid_inset + @as(f32, @floatFromInt(index)) * (width + pane_gutter),
+            top,
+            width,
+            height,
+        );
+    }
+    return frames;
 }
 
-/// Frame pump: derive the grid the current canvas fits and dispatch a
-/// resize Msg exactly when it changes (journaled, so replay resizes
-/// identically).
+/// Frame pump: derive the grid each pane's rect fits and dispatch a
+/// resize Msg exactly when one changes (journaled, so replay resizes
+/// identically). At most ONE Msg per frame, so a window resize that
+/// moves both panes sequences across consecutive frames — safe, because
+/// the painter clips every pane to its (possibly stale) frame.
 fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     if (frame.size.width <= 0 or frame.size.height <= 0) return null;
-    const inner = gridFrame(model, frame.size);
-    const session = model.session;
-    if (session.cell_width <= 0 or session.cell_height <= 0) return null;
-    const proposed = grid.Session.clampGrid(
-        @intFromFloat(@max(2, inner.width / session.cell_width)),
-        @intFromFloat(@max(2, inner.height / session.cell_height)),
-    );
-    if (proposed.x == model.cols and proposed.y == model.rows) {
-        // No resize this frame: if bytes are still queued (a large paste
-        // draining, or a child that read without echoing), or a query
-        // reply sits retained in the emulator's buffer behind a full
-        // ring, nudge the update loop to push more now that the FIFO
-        // may have freed.
-        if (model.outbound_len > 0 or model.session.response_len > 0) return .flush_outbound;
-        return null;
+    const frames = paneFrames(model, frame.size);
+    var pending = false;
+    for (&model.panes, frames, 0..) |*pane, inner, index| {
+        const session = pane.session;
+        if (session.cell_width <= 0 or session.cell_height <= 0) continue;
+        const proposed = grid.Session.clampGrid(
+            @intFromFloat(@max(2, inner.width / session.cell_width)),
+            @intFromFloat(@max(2, inner.height / session.cell_height)),
+            pane_cell_ceiling,
+        );
+        if (proposed.x != pane.cols or proposed.y != pane.rows) {
+            return .{ .viewport = .{ .pane = @intCast(index), .cols = proposed.x, .rows = proposed.y } };
+        }
+        // No resize for this pane: if bytes are still queued (a large
+        // paste draining, or a child that read without echoing), or a
+        // query reply sits retained in the emulator's buffer behind a
+        // full ring, nudge the update loop to push more now that the
+        // FIFO may have freed.
+        if (pane.outbound_len > 0 or session.response_len > 0) pending = true;
     }
-    return .{ .viewport = .{ .cols = proposed.x, .rows = proposed.y } };
+    if (pending) return .flush_outbound;
+    return null;
 }
 
 // ------------------------------------------------------------------ main
@@ -1000,7 +1146,7 @@ pub fn appOptions() TerminalApp.Options {
         .on_lifecycle = onLifecycle,
         .on_frame = onFrame,
         .chrome = .{
-            .prefix_commands = grid_command_budget,
+            .prefix_commands = chrome_command_envelope,
             .variable_prefix = true,
             .build = buildChrome,
         },
@@ -1008,11 +1154,18 @@ pub fn appOptions() TerminalApp.Options {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const session = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
-    defer session.destroy();
+    var sessions: [pane_count]*grid.Session = undefined;
+    var created: usize = 0;
+    // The deferred expression runs at scope exit and reads `created`
+    // THEN, so a partial run (one session made, the next failing) frees
+    // exactly what exists — no double free, no leak.
+    defer for (sessions[0..created]) |session| session.destroy();
+    while (created < pane_count) : (created += 1) {
+        sessions[created] = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
+    }
     const app_state = try std.heap.page_allocator.create(TerminalApp);
     defer std.heap.page_allocator.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, .{ .session = session }, appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, initialModel(sessions), appOptions());
     defer app_state.deinit();
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "terminal",

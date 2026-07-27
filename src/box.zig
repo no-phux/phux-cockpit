@@ -167,7 +167,8 @@ fn lineSides(cp: u21) ?Sides {
 
 /// Paint one box-drawing cell (or a merged horizontal run of the same
 /// seamless code point) as geometry filling `rect` edge-to-edge. Emits
-/// at most four commands with ids `id_base..id_base+3`; `thickness` is
+/// at most EIGHT commands with ids `id_base..id_base+7` (four sides, and
+/// a `.double` weight draws two parallel bars per side); `thickness` is
 /// the light-line weight in canvas points.
 pub fn paint(
     builder: *canvas.Builder,
@@ -210,7 +211,13 @@ pub fn paint(
         // edges through the center, the shape box-heavy TUIs lean on.
         0x256D, 0x256E, 0x256F, 0x2570 => {
             const r = @min(rect.width, rect.height) / 2;
-            var elements: [3]canvas.PathElement = undefined;
+            // Builder-owned, NOT a stack local: `strokePath` stores the
+            // element SLICE by value and the renderer reads it long
+            // after this frame returns (at `setCanvasDisplayList`), so a
+            // `[3]canvas.PathElement` here would dangle the moment
+            // `paint` returned. `allocPathElements` exists for exactly
+            // this lifetime contract.
+            const elements = try builder.allocPathElements(3);
             switch (cp) {
                 // ╭ bottom edge to right edge
                 0x256D => {
@@ -237,7 +244,7 @@ pub fn paint(
                     elements[2] = .{ .verb = .quad_to, .points = .{ .{ .x = cx, .y = cy }, .{ .x = cx + r / 2, .y = cy }, geometry.PointF.zero() } };
                 },
             }
-            try builder.strokePath(.{ .id = id_base, .elements = &elements, .stroke = .{ .fill = .{ .color = color }, .width = t }, .cap = .butt });
+            try builder.strokePath(.{ .id = id_base, .elements = elements, .stroke = .{ .fill = .{ .color = color }, .width = t }, .cap = .butt });
             // The straight remainder to the horizontal edge.
             const run: geometry.RectF = switch (cp) {
                 0x256D => geometry.RectF.init(cx + r / 2, cy - t / 2, rect.x + rect.width - (cx + r / 2), t),

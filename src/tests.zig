@@ -18,6 +18,18 @@ fn createSession(cols: u16, rows: u16) !*grid.Session {
     return grid.Session.create(std.heap.page_allocator, testing.io, cols, rows);
 }
 
+/// One emulator session per cockpit pane. Test code owns them the same
+/// way `main` does: created before the app starts, destroyed after it.
+fn createSessions(cols: u16, rows: u16) ![app.pane_count]*grid.Session {
+    var sessions: [app.pane_count]*grid.Session = undefined;
+    for (&sessions) |*slot| slot.* = try createSession(cols, rows);
+    return sessions;
+}
+
+fn destroyModelSessions(model: *app.Model) void {
+    for (&model.panes) |*pane| pane.session.destroy();
+}
+
 test "the emulator round-trips output into real cell state" {
     const session = try createSession(40, 6);
     defer session.destroy();
@@ -217,13 +229,15 @@ test "the glyph budget degrades row-wise before the atlas can overflow" {
     var builder = canvas.Builder.init(&commands);
     // Ten distinct code points allowed: the first row's eight fit, the
     // second row's eight would cross — painting stops BEFORE it instead
-    // of failing the whole frame at the atlas.
+    // of failing the whole frame at the atlas. The budget is stated in
+    // ATLAS ENTRIES, and the painter charges four subpixel variants per
+    // distinct code point, so ten code points is forty entries.
     try grid.paint(session, &builder, .{
         .frame = geometry.RectF.init(0, 0, 400, 200),
         .tokens = .{},
         .running = true,
         .selecting = false,
-        .glyph_budget = 10,
+        .glyph_budget = 40,
     });
     var saw_first = false;
     var saw_second = false;
@@ -408,11 +422,11 @@ test "an OSC 4 palette override is honored even when it equals the default RGB" 
 }
 
 test "grid clamping trades rows for columns inside the cell budget" {
-    const clamped = grid.Session.clampGrid(4000, 4000);
+    const clamped = grid.Session.clampGrid(4000, 4000, grid.max_cells);
     try testing.expect(@as(usize, clamped.x) <= grid.max_cols);
     try testing.expect(@as(usize, clamped.y) <= grid.max_rows);
     try testing.expect(@as(usize, clamped.x) * @as(usize, clamped.y) <= grid.max_cells);
-    const tiny = grid.Session.clampGrid(1, 1);
+    const tiny = grid.Session.clampGrid(1, 1, grid.max_cells);
     try testing.expectEqual(@as(u16, 2), tiny.x);
     try testing.expectEqual(@as(u16, 2), tiny.y);
 }
@@ -477,11 +491,12 @@ fn recordTerminalSession(
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.session_recorder = recorder;
 
-    const session = try createSession(80, 24);
-    defer session.destroy();
+    const sessions = try createSessions(80, 24);
+    const session = sessions[0];
+    defer for (sessions) |each| each.destroy();
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, .{ .session = session }, app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
     defer app_state.deinit();
     app_state.effects.executor = .fake;
     const app_iface = app_state.app();
@@ -497,13 +512,13 @@ fn recordTerminalSession(
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     // init_fx spawned the shell against the fake pty.
-    try testing.expectEqual(@as(usize, 1), app_state.effects.pendingPtyCount());
+    try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
 
     // The scripted shell: prompt, then a typed command's echo + output.
     try app_state.effects.feedPtyOutput(1, "demo$ ");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
-    try testing.expectEqual(app.Phase.live, app_state.model.phase);
+    try testing.expectEqual(app.Phase.live, app_state.model.panes[0].phase);
 
     // Focus the surface with a click (a real session focuses on first
     // click/key), then type: committed text routes to the app as
@@ -530,7 +545,7 @@ fn recordTerminalSession(
     try app_state.effects.feedPtyExit(1, 0, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
-    try testing.expectEqual(app.Phase.ended, app_state.model.phase);
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
 
     recorder.finish();
     try testing.expect(!recorder.failed);
@@ -551,11 +566,11 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
     defer harness.destroy(gpa);
     harness.null_platform.gpu_surfaces = true;
 
-    const session = try createSession(80, 24);
-    defer session.destroy();
+    const sessions = try createSessions(80, 24);
+    defer for (sessions) |each| each.destroy();
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, .{ .session = session }, app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
     defer app_state.deinit();
     app_state.effects.executor = .fake;
     const app_iface = app_state.app();
@@ -572,7 +587,7 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
 
     // The shell spawned (init_fx) but produced NO output — phase is
     // still .starting, never .live. Typing must still reach the pty.
-    try testing.expectEqual(app.Phase.starting, app_state.model.phase);
+    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -591,9 +606,9 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
 
 fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
-    const session = try createSession(80, 24);
+    const sessions = try createSessions(80, 24);
     const app_state = try gpa.create(TerminalApp);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, .{ .session = session }, app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
     app_state.effects.executor = .fake;
     const app_iface = app_state.app();
     try harness.start(app_iface);
@@ -622,7 +637,7 @@ test "terminal lifecycle focus rebuilds the custom cursor fill" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -644,7 +659,7 @@ test "IME: a preedit is provisional; only the commit reaches the pty" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -676,7 +691,7 @@ test "IME: composition keys never encode into the pty - and the commit releases 
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -731,7 +746,7 @@ test "a command-chorded text event never types a literal character into the pty"
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -766,7 +781,7 @@ test "typing carried on the key event reaches the pty - the no-separate-text-eve
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -789,7 +804,7 @@ test "kitty report-all encodes committed text as CSI-u, and legacy passes it raw
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -806,7 +821,7 @@ test "kitty report-all encodes committed text as CSI-u, and legacy passes it raw
     // The TUI pushes kitty "report all keys as escape codes": the same
     // committed "a" must now encode as CSI 97 u — raw bytes would
     // desynchronize the application's key decoding.
-    app_state.model.session.feed("\x1b[>8u");
+    app_state.model.panes[0].session.feed("\x1b[>8u");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -823,7 +838,7 @@ test "kitty event reporting hears key releases; legacy modes never do" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -839,7 +854,7 @@ test "kitty event reporting hears key releases; legacy modes never do" {
     // The TUI enables kitty event reporting (with report-all): the
     // release of a printable now reaches the child as a CSI-u release
     // event (`:3` event type) — without it, key-driven state sticks.
-    app_state.model.session.feed("\x1b[>11u");
+    app_state.model.panes[0].session.feed("\x1b[>11u");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -863,11 +878,11 @@ test "a second copy while the write is in flight is a no-op, never a false failu
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.session.feed("copy me");
+    app_state.model.panes[0].session.feed("copy me");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -897,10 +912,10 @@ test "a second copy while the write is in flight is a no-op, never a false failu
         .kind = .key_down,
         .key = "enter",
     } });
-    try app_state.effects.feedClipboardResult(2, .ok, "");
+    try app_state.effects.feedClipboardResult(app.clipboard_key, .ok, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expect(!app_state.model.copy_failed);
-    try testing.expect(!app_state.model.selecting);
+    try testing.expect(!app_state.model.panes[0].copy_failed);
+    try testing.expect(!app_state.model.panes[0].selecting);
     try testing.expect(!app_state.model.copy_inflight);
 }
 
@@ -910,7 +925,7 @@ test "chorded punctuation and function keys encode their control sequences" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -956,7 +971,7 @@ test "a primary-aliased Ctrl chord still encodes its C0 byte" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -982,7 +997,7 @@ test "macOS natural text arrow gestures use shell editing bindings" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -990,7 +1005,7 @@ test "macOS natural text arrow gestures use shell editing bindings" {
     // event reporting: Option moves by words (Esc-b/f), Command moves to
     // line boundaries (Ctrl-A/E), Command+Delete clears to the start
     // (Ctrl-U), and a bound release emits nothing.
-    app_state.model.session.feed("\x1b[>11u");
+    app_state.model.panes[0].session.feed("\x1b[>11u");
     const events = [_]native_sdk.platform.GpuSurfaceInputEvent{
         .{
             .window_id = 1,
@@ -1070,18 +1085,18 @@ test "stdin order holds: a retained reply reaches the child before newer typing"
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
-    const session = app_state.model.session;
+    const session = app_state.model.panes[0].session;
 
     // A DSR reply is generated while the ring is full: retained.
     session.feed("\x1b[6n");
     const reply = try gpa.dupe(u8, session.pendingResponses());
     defer gpa.free(reply);
     app_state.effects.fake_pty_write_full = true;
-    app_state.model.outbound_len = app_state.model.outbound_buffer.len;
-    app.moveResponsesToOutbound(&app_state.model, &app_state.effects);
+    app_state.model.panes[0].outbound_len = app_state.model.panes[0].outbound_buffer.len;
+    app.moveResponsesToOutbound(&app_state.model.panes[0], &app_state.effects);
     try testing.expectEqual(reply.len, session.pendingResponses().len);
 
     // Typing while the reply is stuck must not jump the stdin queue:
@@ -1093,13 +1108,13 @@ test "stdin order holds: a retained reply reaches the child before newer typing"
         .text = "y",
     } });
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(1));
-    try testing.expectEqual(@as(u64, 1), app_state.model.outbound_dropped);
+    try testing.expectEqual(@as(u64, 1), app_state.model.panes[0].outbound_dropped);
     try testing.expectEqual(reply.len, session.pendingResponses().len);
 
     // The ring frees (the child read): the next keystroke moves the
     // retained reply FIRST, then itself — the child's stdin order.
     app_state.effects.fake_pty_write_full = false;
-    app_state.model.outbound_len = 0;
+    app_state.model.panes[0].outbound_len = 0;
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -1119,28 +1134,28 @@ test "retained replies keep accumulating while further output feeds - the buffer
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
-    const session = app_state.model.session;
+    const session = app_state.model.panes[0].session;
 
     // The outbound ring is full and the child keeps pipelining DSR
     // queries — more reply bytes than the buffer's initial capacity.
     // Every reply must accumulate (the buffer grows), none dropped:
     // clearing or dropping would strand a child blocked on an answer.
     app_state.effects.fake_pty_write_full = true;
-    app_state.model.outbound_len = app_state.model.outbound_buffer.len;
+    app_state.model.panes[0].outbound_len = app_state.model.panes[0].outbound_buffer.len;
     const burst = "\x1b[6n" ** 6000; // ~36 KiB of replies, > 16 KiB initial
     session.feed(burst);
-    app.moveResponsesToOutbound(&app_state.model, &app_state.effects);
+    app.moveResponsesToOutbound(&app_state.model.panes[0], &app_state.effects);
     try testing.expectEqual(@as(u32, 0), session.responses_dropped);
     try testing.expect(session.pendingResponses().len > grid.Session.response_capacity);
 
     // The ring drains; the whole accumulated batch moves and clears.
     app_state.effects.fake_pty_write_full = false;
-    app_state.model.outbound_len = 0;
-    app.moveResponsesToOutbound(&app_state.model, &app_state.effects);
+    app_state.model.panes[0].outbound_len = 0;
+    app.moveResponsesToOutbound(&app_state.model.panes[0], &app_state.effects);
     try testing.expectEqual(@as(usize, 0), session.pendingResponses().len);
-    try testing.expectEqual(@as(u64, 0), app_state.model.outbound_dropped);
+    try testing.expectEqual(@as(u64, 0), app_state.model.panes[0].outbound_dropped);
 }
 
 test "a query reply refused by a full ring is retained and retried, never cleared" {
@@ -1149,28 +1164,28 @@ test "a query reply refused by a full ring is retained and retried, never cleare
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
 
     // The child pipelines a DSR query; its reply waits in the
     // emulator's buffer. With the pending ring full RIGHT NOW, the move
     // must leave the reply IN PLACE — clearing it would strand a child
     // blocked on the answer.
-    app_state.model.session.feed("\x1b[6n");
-    const reply_len = app_state.model.session.pendingResponses().len;
+    app_state.model.panes[0].session.feed("\x1b[6n");
+    const reply_len = app_state.model.panes[0].session.pendingResponses().len;
     try testing.expect(reply_len > 0);
     app_state.effects.fake_pty_write_full = true;
-    app_state.model.outbound_len = app_state.model.outbound_buffer.len;
-    app.moveResponsesToOutbound(&app_state.model, &app_state.effects);
-    try testing.expectEqual(reply_len, app_state.model.session.pendingResponses().len);
-    try testing.expectEqual(@as(u64, 0), app_state.model.outbound_dropped);
+    app_state.model.panes[0].outbound_len = app_state.model.panes[0].outbound_buffer.len;
+    app.moveResponsesToOutbound(&app_state.model.panes[0], &app_state.effects);
+    try testing.expectEqual(reply_len, app_state.model.panes[0].session.pendingResponses().len);
+    try testing.expectEqual(@as(u64, 0), app_state.model.panes[0].outbound_dropped);
 
     // The ring drains (the child read); the retry moves the reply whole
     // and it reaches the pty.
     app_state.effects.fake_pty_write_full = false;
-    app_state.model.outbound_len = 0;
-    app.moveResponsesToOutbound(&app_state.model, &app_state.effects);
-    try testing.expectEqual(@as(usize, 0), app_state.model.session.pendingResponses().len);
+    app_state.model.panes[0].outbound_len = 0;
+    app.moveResponsesToOutbound(&app_state.model.panes[0], &app_state.effects);
+    try testing.expectEqual(@as(usize, 0), app_state.model.panes[0].session.pendingResponses().len);
     const written = app_state.effects.ptyWrittenBytes(1);
     try testing.expectEqual(reply_len, written.len);
     try testing.expect(std.mem.startsWith(u8, written, "\x1b["));
@@ -1182,21 +1197,21 @@ test "session exit counts retained reply bytes as loss, never silent" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
     // A DSR reply waits retained when the child dies: those bytes can
     // never land, so they count as outbound loss — a zero tally over
     // vanished bytes would misreport the session as lossless.
-    app_state.model.session.feed("\x1b[6n");
-    const reply_len = app_state.model.session.pendingResponses().len;
+    app_state.model.panes[0].session.feed("\x1b[6n");
+    const reply_len = app_state.model.panes[0].session.pendingResponses().len;
     try testing.expect(reply_len > 0);
     try app_state.effects.feedPtyExit(1, 0, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, app_state.model.phase);
-    try testing.expectEqual(@as(u64, reply_len), app_state.model.outbound_dropped);
-    try testing.expectEqual(@as(usize, 0), app_state.model.session.pendingResponses().len);
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+    try testing.expectEqual(@as(u64, reply_len), app_state.model.panes[0].outbound_dropped);
+    try testing.expectEqual(@as(usize, 0), app_state.model.panes[0].session.pendingResponses().len);
 }
 
 test "a payload the outbound ring cannot hold whole is dropped whole, never torn" {
@@ -1205,7 +1220,7 @@ test "a payload the outbound ring cannot hold whole is dropped whole, never torn
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -1213,7 +1228,7 @@ test "a payload the outbound ring cannot hold whole is dropped whole, never torn
     // prefix cut at the ring edge could tear an escape sequence, so
     // admission is all-or-nothing — dropped whole and counted, nothing
     // queued, nothing written.
-    const oversized = try gpa.alloc(u8, app_state.model.outbound_buffer.len + 1);
+    const oversized = try gpa.alloc(u8, app_state.model.panes[0].outbound_buffer.len + 1);
     defer gpa.free(oversized);
     @memset(oversized, 'z');
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -1223,7 +1238,7 @@ test "a payload the outbound ring cannot hold whole is dropped whole, never torn
         .text = oversized,
     } });
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(1));
-    try testing.expectEqual(@as(u64, oversized.len), app_state.model.outbound_dropped);
+    try testing.expectEqual(@as(u64, oversized.len), app_state.model.panes[0].outbound_dropped);
 
     // The stream is intact past the drop: the next keystroke flows.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -1289,14 +1304,14 @@ test "restart during starting is a no-op - the original session is not duplicate
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
     // Still .starting (no output yet), one live pty. Cmd+R must not
     // respawn onto the occupied key.
-    try testing.expectEqual(app.Phase.starting, app_state.model.phase);
-    try testing.expectEqual(@as(usize, 1), app_state.effects.pendingPtyCount());
+    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
+    try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -1304,8 +1319,8 @@ test "restart during starting is a no-op - the original session is not duplicate
         .key = "r",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.Phase.starting, app_state.model.phase);
-    try testing.expectEqual(@as(usize, 1), app_state.effects.pendingPtyCount());
+    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
+    try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
 }
 
 test "a restarted shell starts its refused-write tally at zero" {
@@ -1314,7 +1329,7 @@ test "a restarted shell starts its refused-write tally at zero" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -1324,8 +1339,8 @@ test "a restarted shell starts its refused-write tally at zero" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try app_state.effects.feedPtyExit(1, 0, 0, .exited, 3);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, app_state.model.phase);
-    try testing.expectEqual(@as(u32, 3), app_state.model.dropped_writes);
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+    try testing.expectEqual(@as(u32, 3), app_state.model.panes[0].dropped_writes);
 
     // Cmd+R: the new shell's tally is its own — zero, not the dead
     // session's drops.
@@ -1336,8 +1351,8 @@ test "a restarted shell starts its refused-write tally at zero" {
         .key = "r",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.Phase.starting, app_state.model.phase);
-    try testing.expectEqual(@as(u32, 0), app_state.model.dropped_writes);
+    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
+    try testing.expectEqual(@as(u32, 0), app_state.model.panes[0].dropped_writes);
 }
 
 test "scrolling into history refreshes the semantic viewport text" {
@@ -1391,20 +1406,20 @@ test "wheel scrolling over the grid scrolls history" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
     var line: [16]u8 = undefined;
     for (0..120) |index| {
-        app_state.model.session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
+        app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
     }
-    const bottom_offset = app_state.model.session.scrollbar().offset;
+    const bottom_offset = app_state.model.panes[0].session.scrollbar().offset;
     try testing.expect(bottom_offset > 0);
 
     // A trackpad swipe (several fractional deltas accumulating past one
     // cell) scrolls into history, like every terminal.
-    const cell_h = app_state.model.session.cell_height;
+    const cell_h = app_state.model.panes[0].session.cell_height;
     for (0..4) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
@@ -1413,7 +1428,7 @@ test "wheel scrolling over the grid scrolls history" {
             .delta_y = cell_h,
         } });
     }
-    try testing.expect(app_state.model.session.scrollbar().offset < bottom_offset);
+    try testing.expect(app_state.model.panes[0].session.scrollbar().offset < bottom_offset);
 
     // Typing returns the viewport to the live screen.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -1422,7 +1437,7 @@ test "wheel scrolling over the grid scrolls history" {
         .kind = .text_input,
         .text = "x",
     } });
-    try testing.expectEqual(bottom_offset, app_state.model.session.scrollbar().offset);
+    try testing.expectEqual(bottom_offset, app_state.model.panes[0].session.scrollbar().offset);
 }
 
 test "box-drawing cells render as edge-to-edge geometry, never glyphs" {
@@ -1474,14 +1489,14 @@ test "scrollback chords pause while a selection is armed" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
     // Scrollback to move through, then arm a selection.
     var line: [16]u8 = undefined;
     for (0..120) |index| {
-        app_state.model.session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
+        app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
     }
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -1490,12 +1505,12 @@ test "scrollback chords pause while a selection is armed" {
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
     } });
-    try testing.expect(app_state.model.selecting);
+    try testing.expect(app_state.model.panes[0].selecting);
 
     // The selection's coordinates are viewport-relative and the
     // emulator range is absolute: scrolling under it would desync the
     // painted caret from the copyable text, so the chord is inert.
-    const before = app_state.model.session.scrollbar().offset;
+    const before = app_state.model.panes[0].session.scrollbar().offset;
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -1503,7 +1518,7 @@ test "scrollback chords pause while a selection is armed" {
         .key = "home",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(before, app_state.model.session.scrollbar().offset);
+    try testing.expectEqual(before, app_state.model.panes[0].session.scrollbar().offset);
 
     // Selection dismissed, the same chord scrolls again.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -1519,7 +1534,7 @@ test "scrollback chords pause while a selection is armed" {
         .key = "home",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(app_state.model.session.scrollbar().offset != before);
+    try testing.expect(app_state.model.panes[0].session.scrollbar().offset != before);
 }
 
 test "a selection outlives the copy until the clipboard confirms" {
@@ -1528,11 +1543,11 @@ test "a selection outlives the copy until the clipboard confirms" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.session.feed("copy me");
+    app_state.model.panes[0].session.feed("copy me");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -1555,26 +1570,26 @@ test "a selection outlives the copy until the clipboard confirms" {
     } });
     // The write is in flight: the selection must still stand — a failed
     // result needs something to retry.
-    try testing.expect(app_state.model.selecting);
-    try testing.expect(app_state.model.session.selectionActive());
+    try testing.expect(app_state.model.panes[0].selecting);
+    try testing.expect(app_state.model.panes[0].session.selectionActive());
 
     // A FAILED write keeps it and reports; a retry that succeeds clears.
-    try app_state.effects.feedClipboardResult(2, .rejected, "");
+    try app_state.effects.feedClipboardResult(app.clipboard_key, .rejected, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expect(app_state.model.copy_failed);
-    try testing.expect(app_state.model.selecting);
-    try testing.expect(app_state.model.session.selectionActive());
+    try testing.expect(app_state.model.panes[0].copy_failed);
+    try testing.expect(app_state.model.panes[0].selecting);
+    try testing.expect(app_state.model.panes[0].session.selectionActive());
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
         .kind = .key_down,
         .key = "enter",
     } });
-    try app_state.effects.feedClipboardResult(2, .ok, "");
+    try app_state.effects.feedClipboardResult(app.clipboard_key, .ok, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expect(!app_state.model.copy_failed);
-    try testing.expect(!app_state.model.selecting);
-    try testing.expect(!app_state.model.session.selectionActive());
+    try testing.expect(!app_state.model.panes[0].copy_failed);
+    try testing.expect(!app_state.model.panes[0].selecting);
+    try testing.expect(!app_state.model.panes[0].session.selectionActive());
 }
 
 test "an armed selection follows its text when output scrolls the screen" {
@@ -1625,11 +1640,11 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.session.feed("some text\r\n");
+    app_state.model.panes[0].session.feed("some text\r\n");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -1637,12 +1652,12 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
     } });
-    try testing.expect(app_state.model.selecting);
+    try testing.expect(app_state.model.panes[0].selecting);
 
     // Simulate a failed selection re-pin: the emulator range vanished
     // while the model still holds its anchor (`applySelection` clears
     // the highlight when it cannot pin).
-    app_state.model.session.term.screens.active.clearSelection();
+    app_state.model.panes[0].session.term.screens.active.clearSelection();
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = "terminal-canvas",
@@ -1650,7 +1665,7 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
         .key = "c",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(app_state.model.copy_failed);
+    try testing.expect(app_state.model.panes[0].copy_failed);
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(1));
 }
 
@@ -1660,7 +1675,7 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     defer harness.destroy(gpa);
     const app_state = try startFocusedTerminal(gpa, harness);
     defer gpa.destroy(app_state);
-    defer app_state.model.session.destroy();
+    defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
@@ -1720,7 +1735,7 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     // (i) The prompt's cell band holds INK: pixels that differ from the
     // grid background. The first text row starts at the grid origin;
     // sample generously across the first cell row.
-    const session = app_state.model.session;
+    const session = app_state.model.panes[0].session;
     const cell_w: usize = @intFromFloat(@max(1, session.cell_width));
     const cell_h: usize = @intFromFloat(@max(1, session.cell_height));
     // The window is titlebar + grid: the grid starts at its inset.
@@ -1769,7 +1784,7 @@ test "the session fingerprint covers real cells, not just byte counters" {
         defer harness.destroy(gpa);
         const app_state = try startFocusedTerminal(gpa, harness);
         defer gpa.destroy(app_state);
-        defer app_state.model.session.destroy();
+        defer destroyModelSessions(&app_state.model);
         defer app_state.deinit();
         const app_iface = app_state.app();
         try app_state.effects.feedPtyOutput(1, output);
@@ -1797,11 +1812,12 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
     harness.null_platform.gpu_surfaces = true;
-    const session = try createSession(80, 24);
-    defer session.destroy();
+    const sessions = try createSessions(80, 24);
+    const session = sessions[0];
+    defer for (sessions) |each| each.destroy();
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, .{ .session = session }, app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
     defer app_state.deinit();
 
     const report = try native_sdk.runtime.replaySession(&harness.runtime, app_state.app(), buffer.journalBytes(), .{
@@ -1822,5 +1838,5 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     const screen = try session.plainText(gpa);
     defer gpa.free(screen);
     try testing.expectEqualStrings(recorded.screen[0..recorded.screen_len], screen[0..recorded.screen_len]);
-    try testing.expectEqual(app.Phase.ended, app_state.model.phase);
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
 }

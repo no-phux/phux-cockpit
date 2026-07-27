@@ -28,6 +28,23 @@ pub const max_cells: usize = 7168;
 const grid_id_base: u64 = 0x7e21_0000_0000_0000;
 pub const cursor_command_id: u64 = grid_id_base + 0x1_0000_0000;
 
+/// The cursor's stable command id for a grid painted from `id_base`.
+/// One window can hold SEVERAL grids (the cockpit's panes), each with
+/// its own id namespace, so the cursor id is a function of the base
+/// rather than a single module constant. `cursor_command_id` remains the
+/// default-base answer.
+pub fn cursorCommandId(id_base: u64) u64 {
+    return id_base + 0x1_0000_0000;
+}
+
+/// The id namespace for pane `index`. The largest offset the painter
+/// emits from its base is 0x4_0000_0000 (2^34), so a 2^40 stride leaves
+/// 64x headroom before two panes could ever collide — and a collision
+/// would not be silent: the retained diff rejects duplicate object ids.
+pub fn paneIdBase(index: usize) u64 {
+    return grid_id_base + (@as(u64, index) << 40);
+}
+
 /// One text run's staging capacity — shared by the paint loop's scratch
 /// and the preflight's per-cell cap so measure and emission agree.
 /// Sized to the WHOLE display-list text store, so the paint tier is
@@ -259,12 +276,16 @@ pub const Session = struct {
 
     /// Clamp a proposed grid to the canvas budgets: the glyph budget
     /// bounds total cells, so very wide windows trade rows for columns
-    /// honestly instead of overflowing the frame.
-    pub fn clampGrid(proposed_cols: usize, proposed_rows: usize) Session.CellPos {
+    /// honestly instead of overflowing the frame. `cell_ceiling` is the
+    /// caller's share of `max_cells` — a single-grid window passes the
+    /// whole thing; a cockpit of N panes passes its per-pane slice, so
+    /// the panes together can never outgrow one view's budgets.
+    pub fn clampGrid(proposed_cols: usize, proposed_rows: usize, cell_ceiling: usize) Session.CellPos {
+        const cells = @max(4, @min(cell_ceiling, max_cells));
         var c = std.math.clamp(proposed_cols, 2, max_cols);
         var r = std.math.clamp(proposed_rows, 2, max_rows);
-        if (c * r > max_cells) r = @max(2, max_cells / c);
-        if (c * r > max_cells) c = @max(2, max_cells / r);
+        if (c * r > cells) r = @max(2, cells / c);
+        if (c * r > cells) c = @max(2, cells / r);
         return .{ .x = @intCast(c), .y = @intCast(r) };
     }
 
@@ -505,6 +526,12 @@ pub const PaintOptions = struct {
     /// whose new code points would cross it. 0 means unbounded (tests
     /// that size their own builder).
     glyph_budget: usize = 0,
+    /// The stable command-id namespace this paint emits into. One window
+    /// can hold several grids side by side (the cockpit's panes); each
+    /// needs its own band or their row ids would collide and the
+    /// retained diff would reject the frame. `grid.paneIdBase(i)` mints
+    /// them; the default is the single-grid base.
+    id_base: u64 = grid_id_base,
 };
 
 /// Distinct-code-point probe set backing `PaintOptions.glyph_budget`:
@@ -593,7 +620,7 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
     // (and under the titlebar band, when the window chrome is hidden -
     // one seamless surface with the traffic lights floating over it).
     try builder.fillRect(.{
-        .id = grid_id_base,
+        .id = options.id_base,
         .rect = options.background_frame orelse options.frame,
         .fill = .{ .color = palette.background },
     });
@@ -603,7 +630,7 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
     // resize lands via the journaled viewport Msg), and unclipped rows
     // or wide cells would paint over the status bar and past the right
     // edge. The clip makes the stale frame degrade to a cropped grid.
-    try builder.pushClip(.{ .id = grid_id_base + 0x4_0000_0000, .rect = options.frame });
+    try builder.pushClip(.{ .id = options.id_base + 0x4_0000_0000, .rect = options.frame });
 
     const origin_x = options.frame.x;
     const origin_y = options.frame.y;
@@ -612,13 +639,18 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
 
     // Worst case for one row, when no runs merge (every cell a distinct
     // style): a background run, a text run, AND an underline run per
-    // column, or a box-drawing cell's up-to-four segments — four
-    // commands each — plus one selection wash. Reserved for the ACTUAL
-    // grid width so the LAST painted row can never push the list past
-    // the budget; the cursor, scrollbar, and clip push/pop (+4) fit
-    // under the same reserve.
+    // column — or a box-drawing cell's segments, which cost up to EIGHT
+    // commands, not four: `box.paintSegment` emits TWO fillRects for a
+    // `.double` weight and `box.paint` threads up to four sides, so one
+    // `╬` costs 8. Reserving only four per column let a row of double
+    // box drawing overshoot `command_budget` — under `variable_prefix`
+    // that is a whole-frame `error.InvalidChromeCommandCount`, not a
+    // graceful row-wise degrade. Reserved for the ACTUAL grid width so
+    // the LAST painted row can never push the list past the budget; the
+    // cursor, scrollbar, and clip push/pop (+4) fit under the same
+    // reserve.
     const cols_actual: usize = if (rs.row_data.len > 0) rs.row_data.get(0).cells.len else max_cols;
-    const row_reserve: usize = cols_actual * 4 + 8;
+    const row_reserve: usize = cols_actual * 8 + 8;
     const row_ceiling: usize = if (options.command_budget > row_reserve)
         options.command_budget - row_reserve
     else
@@ -668,7 +700,11 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
         // the frame degrades to fewer rows instead of failing whole on
         // `GlyphAtlasListFull`.
         if (glyph_budget > 0) {
-            glyphs_counted += rowNewGlyphs(row, &glyph_seen);
+            // Each distinct code point costs FOUR atlas entries, not
+            // one: the renderer rasterizes a subpixel variant per
+            // horizontal phase. Charging 1 here would let a screen of
+            // distinct scalars pass a budget the atlas then fails.
+            glyphs_counted += rowNewGlyphs(row, &glyph_seen) * 4;
             if (glyphs_counted > glyph_budget) break;
         }
         const row_y = origin_y + @as(f32, @floatFromInt(row_index)) * cell_h;
@@ -676,7 +712,7 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
         // visible; a row straddling the edge still paints and the clip
         // crops it, so content reaches the very edge without spilling.
         if (row_y >= options.frame.y + options.frame.height) break;
-        const row_id = grid_id_base + (@as(u64, @intCast(row_index)) << 16);
+        const row_id = options.id_base + (@as(u64, @intCast(row_index)) << 16);
 
         // Background runs: contiguous cells sharing a non-default bg.
         var run_start: usize = 0;
@@ -845,7 +881,12 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
                     @as(f32, @floatFromInt(span)) * cell_w,
                     cell_h,
                 );
-                box.paint(builder, row_id + 0x6000 + @as(u64, @intCast(x)) * 4, rect, box_cp, fg, box_thickness) catch break;
+                // Stride EIGHT, matching `box.paint`'s worst case (a
+                // `.double` cross emits two rects per side): a stride of
+                // four let one cell's ids run into its neighbour's, and
+                // duplicate object ids hard-fail the retained diff.
+                // 0x6000 + 319*8 = 0x6A38, still inside the row's band.
+                box.paint(builder, row_id + 0x6000 + @as(u64, @intCast(x)) * 8, rect, box_cp, fg, box_thickness) catch break;
                 x += span - 1;
                 continue;
             }
@@ -892,13 +933,13 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
             };
             if (options.focused and options.running) {
                 try builder.fillRect(.{
-                    .id = cursor_command_id,
+                    .id = cursorCommandId(options.id_base),
                     .rect = rect,
                     .fill = .{ .color = cursor_color },
                 });
             } else {
                 try builder.strokeRect(.{
-                    .id = cursor_command_id,
+                    .id = cursorCommandId(options.id_base),
                     .rect = rect,
                     .stroke = .{ .fill = .{ .color = cursor_color }, .width = 1 },
                 });
@@ -911,7 +952,7 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
         const head_x = origin_x + @as(f32, @floatFromInt(session.select_head.x)) * cell_w;
         const head_y = origin_y + @as(f32, @floatFromInt(session.select_head.y)) * cell_h;
         try builder.strokeRect(.{
-            .id = grid_id_base + 0x2_0000_0000,
+            .id = options.id_base + 0x2_0000_0000,
             .rect = geometry.RectF.init(head_x, head_y, cell_w, cell_h),
             .stroke = .{ .fill = .{ .color = tokens.colors.focus_ring }, .width = 1 },
         });
@@ -930,7 +971,7 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
             const thumb_h = @max(24, track_h * (visible / total));
             const thumb_y = options.frame.y + (track_h - thumb_h) * (offset / @max(1, total - visible));
             try builder.fillRect(.{
-                .id = grid_id_base + 0x3_0000_0000,
+                .id = options.id_base + 0x3_0000_0000,
                 .rect = geometry.RectF.init(
                     options.frame.x + options.frame.width - 5,
                     thumb_y,
