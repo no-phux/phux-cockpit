@@ -1840,3 +1840,238 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     try testing.expectEqualStrings(recorded.screen[0..recorded.screen_len], screen[0..recorded.screen_len]);
     try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
 }
+
+// ------------------------------------------------------- cockpit: two panes
+
+const automation = native_sdk.automation;
+
+/// Distinct baseline rows among a display-list slice's text commands —
+/// how many grid rows a paint actually put on screen.
+fn distinctTextRows(commands: []const canvas.CanvasCommand) usize {
+    var rows: [128]f32 = undefined;
+    var count: usize = 0;
+    outer: for (commands) |command| {
+        switch (command) {
+            .draw_text => |text| {
+                for (rows[0..count]) |seen| {
+                    if (seen == text.origin.y) continue :outer;
+                }
+                if (count < rows.len) {
+                    rows[count] = text.origin.y;
+                    count += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    return count;
+}
+
+/// A pane's worst case for run merging: every cell its own style, so no
+/// two adjacent cells share a run.
+fn feedAdversarialRows(session: *grid.Session, cols: usize, rows: usize) void {
+    var line: [1024]u8 = undefined;
+    for (0..rows) |_| {
+        var w: usize = 0;
+        for (0..cols) |col| {
+            const code: u8 = if (col % 2 == 0) 31 else 32;
+            w += (std.fmt.bufPrint(line[w..], "\x1b[{d}mX", .{code}) catch break).len;
+        }
+        session.feed(line[0..w]);
+        session.feed("\r\n");
+    }
+}
+
+test "two panes paint into distinct id namespaces the diff accepts" {
+    const sessions = try createSessions(20, 6);
+    defer for (sessions) |each| each.destroy();
+    sessions[0].feed("PANEALPHA\r\n");
+    sessions[1].feed("PANEBRAVO\r\n");
+
+    var commands: [2048]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    for (sessions, 0..) |session, index| {
+        try grid.paint(session, &builder, .{
+            .frame = geometry.RectF.init(@as(f32, @floatFromInt(index)) * 200, 0, 190, 200),
+            .tokens = .{},
+            .running = true,
+            .selecting = false,
+            .id_base = grid.paneIdBase(index),
+        });
+    }
+    const list = builder.displayList();
+
+    // The retained diff is the real judge: it rejects a display list that
+    // repeats an object id, which is exactly what two panes sharing one
+    // id base would produce.
+    const changes = try testing.allocator.alloc(canvas.DiffChange, 4096);
+    defer testing.allocator.free(changes);
+    _ = try canvas.DisplayList.diff(.{}, list, changes);
+
+    const first = list.findCommandById(grid.cursorCommandId(grid.paneIdBase(0))) orelse
+        return error.TestExpectedCursor;
+    const second = list.findCommandById(grid.cursorCommandId(grid.paneIdBase(1))) orelse
+        return error.TestExpectedCursor;
+    try testing.expect(first.index != second.index);
+}
+
+test "the pane command floor holds: neither pane starves its neighbour" {
+    const sessions = try createSessions(40, 40);
+    defer for (sessions) |each| each.destroy();
+    for (sessions) |session| feedAdversarialRows(session, 40, 40);
+
+    var commands: [2048]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    var painted: [app.pane_count]usize = @splat(0);
+    for (sessions, 0..) |session, index| {
+        const before = builder.displayList().commands.len;
+        try grid.paint(session, &builder, .{
+            .frame = geometry.RectF.init(@as(f32, @floatFromInt(index)) * 480, 0, 470, 800),
+            .tokens = .{},
+            .running = true,
+            .selecting = false,
+            .command_budget = app.paneCommandBudget(index),
+            .text_reserve = app.pane_text_reserve,
+            .glyph_budget = app.pane_glyph_budget,
+            .id_base = grid.paneIdBase(index),
+        });
+        painted[index] = distinctTextRows(builder.displayList().commands[before..]);
+    }
+    // Pane 0 is capped at its floor and pane 1 inherits the slack, so a
+    // busy pane 0 cannot blank pane 1 and vice versa.
+    try testing.expect(painted[0] >= 5);
+    try testing.expect(painted[1] >= 5);
+    try testing.expect(builder.displayList().commands.len <= app.chrome_command_envelope);
+}
+
+test "a screen of double box drawing stays inside the pane command budget" {
+    // U+256C costs EIGHT commands (four double sides, two bars each). A
+    // four-per-column reserve let the last painted row overshoot the
+    // budget, and under `variable_prefix` an overshoot fails the WHOLE
+    // frame rather than dropping a row.
+    const session = try createSession(40, 24);
+    defer session.destroy();
+    for (0..24) |_| {
+        session.feed("\u{256C}" ** 40);
+        session.feed("\r\n");
+    }
+
+    var commands: [2048]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try grid.paint(session, &builder, .{
+        .frame = geometry.RectF.init(0, 0, 600, 600),
+        .tokens = .{},
+        .running = true,
+        .selecting = false,
+        .command_budget = app.paneCommandBudget(0),
+        .id_base = grid.paneIdBase(0),
+    });
+    try testing.expect(builder.displayList().commands.len <= app.paneCommandBudget(0));
+}
+
+/// The cockpit under the harness with both ptys live and distinct
+/// content on each: the shape tests (d), (e), and (f) all need.
+fn startTwoPaneCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
+    const app_state = try startFocusedTerminal(gpa, harness);
+    const app_iface = app_state.app();
+    try app_state.effects.feedPtyOutput(app.ptyKey(0), "PANEALPHA\r\n");
+    try app_state.effects.feedPtyOutput(app.ptyKey(1), "PANEBRAVO\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    return app_state;
+}
+
+test "each pane's text lands inside its own rect and outside its neighbour's" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+
+    const frames = app.paneFrames(&app_state.model, geometry.SizeF.init(980, 640));
+    const markers = [app.pane_count][]const u8{ "PANEALPHA", "PANEBRAVO" };
+    const list = harness.runtime.views[0].canvasDisplayList();
+    var found: [app.pane_count]bool = @splat(false);
+    for (list.commands) |command| {
+        switch (command) {
+            .draw_text => |text| {
+                for (markers, 0..) |marker, index| {
+                    if (std.mem.indexOf(u8, text.text, marker) == null) continue;
+                    found[index] = true;
+                    const own = frames[index];
+                    const other = frames[1 - index];
+                    try testing.expect(text.origin.x >= own.x);
+                    try testing.expect(text.origin.x < own.x + own.width);
+                    try testing.expect(text.origin.x < other.x or text.origin.x >= other.x + other.width);
+                }
+            },
+            else => {},
+        }
+    }
+    try testing.expect(found[0]);
+    try testing.expect(found[1]);
+}
+
+test "both panes reach the accessibility tree, so both are in the fingerprint" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+
+    const buffer = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("cockpit"), &writer);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEALPHA") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEBRAVO") != null);
+    try testing.expect(harness.runtime.sessionStateFingerprint() != 0);
+}
+
+// The eyes: the retained frame rendered offscreen through the
+// deterministic reference renderer and written as a PNG, so a human (or
+// an agent that can read images) can SEE two live panes side by side.
+// Skipped by default, never in CI:
+//
+//   COCKPIT_SHOTS=1 zig build test -Dplatform=null
+const cockpit_shot_path = "/Users/phall/workspace/phux-native-spike/cockpit/zig-out/cockpit-two-panes.png";
+
+test "cockpit two-pane proof shot (env-gated)" {
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, "terminal-canvas", null);
+    const pixels = try gpa.alloc(u8, pixel_size.byte_len);
+    defer gpa.free(pixels);
+    const scratch = try gpa.alloc(u8, pixel_size.byte_len);
+    defer gpa.free(scratch);
+    const shot = try harness.runtime.renderCanvasScreenshot(1, "terminal-canvas", null, pixels, scratch);
+
+    const encoded = try gpa.alloc(u8, try canvas.png.encodedRgba8ByteLen(shot.width, shot.height));
+    defer gpa.free(encoded);
+    var writer = std.Io.Writer.fixed(encoded);
+    try canvas.png.writeRgba8(&writer, shot.width, shot.height, shot.rgba8);
+    const first = writer.buffered();
+
+    // Deterministic: the same retained frame encodes byte-identically.
+    const again = try gpa.alloc(u8, encoded.len);
+    defer gpa.free(again);
+    var second_writer = std.Io.Writer.fixed(again);
+    try canvas.png.writeRgba8(&second_writer, shot.width, shot.height, shot.rgba8);
+    try testing.expectEqualSlices(u8, first, second_writer.buffered());
+
+    try std.Io.Dir.cwd().createDirPath(io, "/Users/phall/workspace/phux-native-spike/cockpit/zig-out");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cockpit_shot_path, .data = first });
+}

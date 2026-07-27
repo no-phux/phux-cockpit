@@ -61,3 +61,56 @@ fewer than 48 means something in the fork regressed rather than grew.
 ## Repo rules
 
 Local commits only. There is no remote and one must never be added.
+
+---
+
+## Slice 2 — two panes (commit after `b2741ed`)
+
+The fork is no longer verbatim. `src/main.zig`, `src/grid.zig`, `src/box.zig`,
+and `src/tests.zig` all diverge; `git diff b2741ed -- src/` is the whole story.
+
+### Budget policy (do not improvise; measure before tuning)
+
+One `gpu_surface`, one chrome prefix, `pane_count = 2` grids painted into it.
+The three per-view canvas budgets are accounted DIFFERENTLY by the painter, so
+each is partitioned differently:
+
+| Budget | Accounting | Partition | Value (N=2) |
+|---|---|---|---|
+| `command_budget` | CUMULATIVE — compared against the builder TOTAL, so it is an absolute high-water mark | floor-and-slack | pane 0: 896, pane 1: 1792 |
+| `text_reserve` | PER-PAINT LOCAL — the emitted-bytes counter resets each call, the 32 KiB store does not | mirrored | 18432 for both |
+| `glyph_budget` | PER-PAINT LOCAL and a SET, not a count | halved | 3840 for both |
+
+`chrome_command_envelope` is 1792 (2048 less a 256-command widget reserve) and
+is what `chrome.prefix_commands` now declares.
+
+### Measured
+
+- Combined chrome under the adversarial two-pane test (40x40, a distinct SGR
+  per cell, real ceilings): **1488 of 1792 commands**, pane 0 painting 15 rows
+  and pane 1 painting 22. Neither pane starved.
+- A 40-column screen of `╬` costs 8 commands per cell; with the corrected
+  `cols*8+8` row reserve one pane lands at 644 of its 896 budget. With the old
+  `cols*4+8` reserve the same screen reached 964 — a whole-frame
+  `error.InvalidChromeCommandCount` under `variable_prefix`. That regression is
+  pinned by `a screen of double box drawing stays inside the pane command budget`,
+  observed failing before the fix and passing after.
+
+### Test count
+
+54 (48 baseline + 6). The sixth is env-gated and skips unless `COCKPIT_SHOTS=1`:
+
+```sh
+cd /Users/phall/workspace/phux-native-spike/cockpit && \
+  COCKPIT_SHOTS=1 /nix/store/y6ihamhfl46ybmz49k7c5qs9navb6q1a-zig-0.16.0/bin/zig \
+  build test -Dplatform=null --summary all
+```
+
+It writes `zig-out/cockpit-two-panes.png` (980x640 RGBA) — a build artifact,
+gitignored twice over (`zig-out/` and `*.png`), so read it in-session.
+
+### Keyed-effect space
+
+One key space spans pty, clipboard, spawn, and fetch. Pane i owns pty key
+`1 + i`; the clipboard moved from key 2 to **key 100**. Leaving it at 2 would
+make every copy silently reject the moment pane 1 spawned.
