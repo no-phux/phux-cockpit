@@ -48,6 +48,13 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     const phux_host = phuxHostModule(b, app_module, phux_enabled);
     app_module.addImport("phux_host", phux_host);
+    if (phux_enabled and app_module.resolved_target.?.result.os.tag == .macos) {
+        app_module.addCSourceFile(.{
+            .file = b.path("src/phux_pointer_macos.m"),
+            .flags = &.{ "-fobjc-arc", "-fblocks" },
+        });
+        app_module.linkFramework("AppKit", .{});
+    }
     const ghostty = b.dependency("ghostty", .{
         .target = app_module.resolved_target.?,
         .optimize = app_module.optimize.?,

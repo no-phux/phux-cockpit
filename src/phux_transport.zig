@@ -56,7 +56,7 @@ pub const FrameQueue = struct {
         queue.frames.deinit(queue.gpa);
     }
 
-    /// Copy one complete frame out of ephemeral socket/FFI scratch.
+    /// Copy one complete frame out of ephemeral FFI scratch.
     pub fn stage(queue: *FrameQueue, frame: []const u8) bool {
         if (frame.len == 0 or frame.len > max_frame_bytes) {
             queue.markDisconnected(.oversized_frame);
@@ -66,6 +66,17 @@ pub const FrameQueue = struct {
             queue.markDisconnected(.queue_overflow);
             return false;
         };
+        return queue.stageOwned(owned);
+    }
+
+    /// Transfer one allocator-owned frame into the queue without copying.
+    /// Ownership transfers on every return path; failure frees `frame`.
+    pub fn stageOwned(queue: *FrameQueue, frame: []u8) bool {
+        if (frame.len == 0 or frame.len > max_frame_bytes) {
+            queue.gpa.free(frame);
+            queue.markDisconnected(.oversized_frame);
+            return false;
+        }
         queue.mutex.lock();
         defer queue.mutex.unlock();
         if (queue.disconnect != null or
@@ -73,12 +84,12 @@ pub const FrameQueue = struct {
             frame.len > max_queued_bytes - queue.pending_bytes)
         {
             queue.disconnect = .queue_overflow;
-            queue.gpa.free(owned);
+            queue.gpa.free(frame);
             return false;
         }
-        queue.frames.append(queue.gpa, owned) catch {
+        queue.frames.append(queue.gpa, frame) catch {
             queue.disconnect = .queue_overflow;
-            queue.gpa.free(owned);
+            queue.gpa.free(frame);
             return false;
         };
         queue.pending_bytes += frame.len;
@@ -191,6 +202,18 @@ test "explicit config and large-frame channel bypass" {
     const received = harness.bridge.incoming.take().?;
     defer harness.bridge.incoming.release(received);
     try testing.expectEqualSlices(u8, large, received);
+}
+
+test "owned inbound frame transfers without payload allocation" {
+    const testing = std.testing;
+    var queue = FrameQueue.init(testing.allocator);
+    defer queue.deinit();
+    const owned = try testing.allocator.dupe(u8, "\x00\x00\x00\x01x");
+    const original_ptr = owned.ptr;
+    try testing.expect(queue.stageOwned(owned));
+    const received = queue.take().?;
+    try testing.expectEqual(original_ptr, received.ptr);
+    queue.release(received);
 }
 
 test "queue retains high-water metadata capacity" {

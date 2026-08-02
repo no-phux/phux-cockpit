@@ -490,6 +490,10 @@ pub const Host = struct {
         return host.search_results.items;
     }
 
+    pub fn clearSearchResults(host: *Host) void {
+        host.search_results.items.len = 0;
+    }
+
     pub fn selectionText(host: *Host, pane_index: usize, gpa: std.mem.Allocator) ![]u8 {
         const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return error.InvalidState;
         const id = pane.id.asC();

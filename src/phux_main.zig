@@ -10,10 +10,12 @@ const grid_painter = @import("grid.zig");
 const host_mod = @import("phux_host");
 const transport = @import("phux_transport.zig");
 const extension = @import("phux_extension.zig");
+const pointer_monitor = @import("phux_pointer.zig");
 const c = host_mod.abi;
 
 const pane_count: usize = 2;
 const channel_key: u64 = 0x7068_7578;
+const search_capacity: usize = 256;
 const clipboard_key: u64 = 0x7068_7579;
 const canvas_label = "terminal-canvas";
 const window_width: f32 = 980;
@@ -193,10 +195,13 @@ pub const Model = struct {
     bridge: *transport.Bridge,
     host: *host_mod.Host,
     worker: ?*extension.Worker = null,
+    pointer: pointer_monitor.Monitor = .{},
+    pointer_capture: ?usize = null,
     endpoint: extension.Endpoint,
     config: AttachConfig,
     client_name: []const u8,
     projections: [pane_count]Projection,
+    search_buffer: canvas.TextBuffer(search_capacity) = .{},
     selections: [pane_count]Selection = [_]Selection{.{}} ** pane_count,
     focus: usize = 0,
     attached_requested: bool = false,
@@ -241,6 +246,7 @@ pub const Model = struct {
     }
 
     fn shutdown(model: *Model) void {
+        model.pointer.stop();
         if (model.worker) |worker| worker.stop();
         model.worker = null;
         model.host.destroy();
@@ -254,6 +260,7 @@ pub const Msg = union(enum) {
     channel: native_sdk.EffectChannelEvent,
     key: canvas.WidgetKeyboardEvent,
     text: canvas.WidgetKeyboardEvent,
+    search_edit: canvas.TextInputEvent,
     wheel: native_sdk.platform.WheelEvent,
     resize: struct { cols: u16, rows: u16, size: geometry.SizeF },
     focus_pane: u8,
@@ -382,6 +389,25 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .text => |event| {
             if (event.text.len == 0) return;
             sendKey(model, event, c.PHUX_KEY_PRESS, c.PHUX_KEY_UNIDENTIFIED, event.text);
+        },
+        .search_edit => |edit| {
+            model.search_buffer.apply(edit);
+            const query = model.search_buffer.text();
+            if (query.len == 0) {
+                model.host.clearSearchResults();
+                model.setStatus("search cleared");
+                return;
+            }
+            const matches = model.host.search(model.focus, query, false) catch {
+                model.failed = true;
+                model.setStatus("terminal search failed");
+                return;
+            };
+            const status = std.fmt.bufPrint(&model.status, "{d} search matches", .{matches.len}) catch {
+                model.setStatus("search complete");
+                return;
+            };
+            model.status_len = status.len;
         },
         .copy => {
             if (model.copy_inflight) return;
@@ -552,6 +578,13 @@ fn view(ui: *PhuxUi, model: *const Model) PhuxUi.Node {
     return ui.column(.{ .padding = grid_inset }, .{
         ui.row(.{ .height = header_height, .gap = pane_gutter, .cross = .center }, .{
             ui.text(.{ .style = .caption }, status),
+            ui.el(.text_field, .{
+                .width = 220,
+                .text = model.search_buffer.text(),
+                .placeholder = "Search terminal",
+                .on_input = PhuxUi.inputMsg(.search_edit),
+                .semantics = .{ .label = "Search terminal output" },
+            }, .{}),
             ui.spacer(1),
             ui.button(.{ .size = .sm, .on_press = .reconnect }, "Reconnect"),
         }),
@@ -624,12 +657,41 @@ fn paneAtPoint(model: *const Model, x: f32, y: f32) ?usize {
     return null;
 }
 
+fn onRawPointer(context: ?*anyopaque, sample: *const pointer_monitor.Event) callconv(.c) void {
+    const model: *Model = @ptrCast(@alignCast(context orelse return));
+    const pointed = paneAtPoint(model, @floatCast(sample.x), @floatCast(sample.y));
+    const index = if (sample.kind == c.PHUX_MOUSE_PRESS)
+        pointed orelse return
+    else
+        model.pointer_capture orelse pointed orelse return;
+    if (sample.kind == c.PHUX_MOUSE_PRESS) model.pointer_capture = index;
+    if (sample.kind == c.PHUX_MOUSE_RELEASE) model.pointer_capture = null;
+    const frame = paneFrames(model, model.surface_size)[index];
+    const button: u32 = if (sample.button == std.math.maxInt(u32))
+        c.PHUX_MOUSE_BUTTON_UNKNOWN
+    else
+        @min(sample.button + 1, c.PHUX_MOUSE_BUTTON_ELEVEN);
+    const event: c.PhuxMouseEvent = .{
+        .size = @sizeOf(c.PhuxMouseEvent),
+        .version = c.PHUX_CLIENT_ABI_VERSION,
+        .action = sample.kind,
+        .button = button,
+        .modifiers = sample.modifiers,
+        .x = sample.x - @as(f64, frame.x),
+        .y = sample.y - @as(f64, frame.y),
+    };
+    model.host.sendMouse(index, &event) catch {
+        model.failed = true;
+        model.setStatus("terminal mouse input failed");
+    };
+}
 fn appOptions() PhuxApp.Options {
     return .{
         .name = "phux-terminal",
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .init_fx = initFx,
+
         .update_fx = update,
         .view = view,
         .on_key = onKey,
@@ -693,6 +755,7 @@ pub fn main(init: std.process.Init) !void {
     app_state.* = PhuxApp.init(std.heap.page_allocator, model, appOptions());
     defer app_state.model.shutdown();
     defer app_state.deinit();
+    app_state.model.pointer = try pointer_monitor.Monitor.start(&app_state.model, onRawPointer);
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "phux",
         .window_title = "phux",

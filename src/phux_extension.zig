@@ -4,6 +4,7 @@
 //! Complete frames cross `Bridge`; only a one-byte wake crosses ChannelHandle.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
 const transport = @import("phux_transport.zig");
 const posix = std.posix;
@@ -51,6 +52,12 @@ pub const Worker = struct {
             worker.wake();
             return;
         };
+        configureSocket(fd) catch {
+            posix.close(fd);
+            worker.bridge.incoming.markDisconnected(.socket_lost);
+            worker.wake();
+            return;
+        };
         worker.fd.store(fd, .release);
         defer {
             _ = worker.fd.swap(-1, .acq_rel);
@@ -71,8 +78,10 @@ pub const Worker = struct {
             }};
             const ready = posix.poll(&poll_fds, 50) catch return;
             if (ready == 0) continue;
-            if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return;
-            if (poll_fds[0].revents & posix.POLL.IN == 0) continue;
+            if (poll_fds[0].revents & posix.POLL.IN == 0) {
+                if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return;
+                continue;
+            }
             if (!readExact(worker, fd, &header)) return;
             const len: usize = std.mem.readInt(u32, &header, .big);
             if (len == 0 or len > transport.max_frame_bytes - header.len) {
@@ -85,10 +94,12 @@ pub const Worker = struct {
                 worker.wake();
                 return;
             };
-            defer worker.gpa.free(frame);
             @memcpy(frame[0..header.len], &header);
-            if (!readExact(worker, fd, frame[header.len..])) return;
-            if (!worker.bridge.incoming.stage(frame)) {
+            if (!readExact(worker, fd, frame[header.len..])) {
+                worker.gpa.free(frame);
+                return;
+            }
+            if (!worker.bridge.incoming.stageOwned(frame)) {
                 worker.wake();
                 return;
             }
@@ -128,8 +139,10 @@ fn readExact(worker: *Worker, fd: posix.fd_t, output: []u8) bool {
         }};
         const ready = posix.poll(&poll_fds, 50) catch return false;
         if (ready == 0) continue;
-        if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
-        if (poll_fds[0].revents & posix.POLL.IN == 0) continue;
+        if (poll_fds[0].revents & posix.POLL.IN == 0) {
+            if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return false;
+            continue;
+        }
         const count = posix.read(fd, output[offset..]) catch return false;
         if (count == 0) return false;
         offset += count;
@@ -140,11 +153,25 @@ fn readExact(worker: *Worker, fd: posix.fd_t, output: []u8) bool {
 fn writeExact(fd: posix.fd_t, input: []const u8) bool {
     var offset: usize = 0;
     while (offset < input.len) {
-        const count = posix.write(fd, input[offset..]) catch return false;
-        if (count == 0) return false;
-        offset += count;
+        const flags: u32 = if (comptime @hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
+        const rc = std.c.send(fd, input[offset..].ptr, input.len - offset, flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return false;
+                offset += @intCast(rc);
+            },
+            .INTR => continue,
+            else => return false,
+        }
     }
     return true;
+}
+
+fn configureSocket(fd: posix.fd_t) !void {
+    if (comptime @hasDecl(posix.SO, "NOSIGPIPE")) {
+        const enabled: c_int = 1;
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&enabled));
+    }
 }
 
 fn connect(endpoint: Endpoint) !posix.fd_t {
@@ -168,4 +195,46 @@ fn connectUnix(path: []const u8) !posix.fd_t {
     errdefer posix.close(fd);
     try posix.connect(fd, &address.any, address.getOsSockLen());
     return fd;
+}
+
+fn socketPair() ![2]posix.fd_t {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    var sockets: [2]posix.fd_t = undefined;
+    if (std.c.socketpair(@intCast(posix.AF.UNIX), @intCast(posix.SOCK.STREAM), 0, &sockets) != 0)
+        return error.SocketPairFailed;
+    return sockets;
+}
+
+test "write after peer teardown reports failure without process signal" {
+    const sockets = try socketPair();
+    defer posix.close(sockets[0]);
+    posix.close(sockets[1]);
+    try configureSocket(sockets[0]);
+    try std.testing.expect(!writeExact(sockets[0], "terminal reply"));
+}
+
+test "final complete frame remains readable when peer has shut down" {
+    const sockets = try socketPair();
+    defer posix.close(sockets[0]);
+    defer posix.close(sockets[1]);
+    const frame = [_]u8{ 0, 0, 0, 1, 0x42 };
+    try std.testing.expect(writeExact(sockets[0], &frame));
+    try posix.shutdown(sockets[0], .send);
+
+    var poll_fds = [_]posix.pollfd{.{
+        .fd = sockets[1],
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    try std.testing.expectEqual(@as(usize, 1), try posix.poll(&poll_fds, 1000));
+    try std.testing.expect(poll_fds[0].revents & posix.POLL.IN != 0);
+
+    var received: [frame.len]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < received.len) {
+        const count = try posix.read(sockets[1], received[offset..]);
+        try std.testing.expect(count > 0);
+        offset += count;
+    }
+    try std.testing.expectEqualSlices(u8, &frame, &received);
 }
