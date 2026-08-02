@@ -18,6 +18,7 @@ const channel_key: u64 = 0x7068_7578;
 const search_capacity: usize = 256;
 const clipboard_key: u64 = 0x7068_7579;
 const paste_clipboard_key: u64 = 0x7068_757a;
+const terminal_search_case_sensitive = true;
 const display_command_budget: usize = 16 * 1024;
 const canvas_label = "terminal-canvas";
 const window_width: f32 = 980;
@@ -25,10 +26,12 @@ const window_height: f32 = 640;
 const grid_inset: f32 = 8;
 const header_height: f32 = 28;
 const pane_gutter: f32 = 8;
+const PixelSize = host_mod.PixelSize;
 const AttachConfig = struct {
     session: []const u8,
     cols: u16,
     rows: u16,
+    pixels: PixelSize,
 };
 
 const shell_views = [_]native_sdk.ShellView{.{
@@ -55,6 +58,7 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 const Selection = struct {
+    owner: ?host_mod.ReplicaOwner = null,
     active: bool = false,
     anchor: c.PhuxDocumentAnchor = std.mem.zeroes(c.PhuxDocumentAnchor),
     head: c.PhuxDocumentAnchor = std.mem.zeroes(c.PhuxDocumentAnchor),
@@ -68,6 +72,7 @@ const Projection = struct {
     rows: std.ArrayListUnmanaged(canvas.TerminalRow) = .empty,
     screen_text: std.ArrayListUnmanaged(u8) = .empty,
     generation: host_mod.Generation = .{},
+    owner: ?host_mod.ReplicaOwner = null,
     cursor: ?canvas.TerminalCursor = null,
     scrollbar: canvas.TerminalScrollbar = .{},
     running: bool = false,
@@ -152,6 +157,7 @@ const Projection = struct {
         }
 
         projection.generation = source.generation;
+        projection.owner = .{ .terminal_id = source.terminal_id, .generation = source.generation };
         projection.running = true;
         projection.cursor = if (source.cursor_visible) .{
             .x = source.cursor_col,
@@ -176,6 +182,7 @@ const Projection = struct {
         projection.cursor = null;
         projection.scrollbar = .{};
         projection.running = false;
+        projection.owner = null;
     }
 
     fn snapshot(projection: *const Projection, tokens: canvas.DesignTokens) canvas.TerminalGrid {
@@ -211,9 +218,12 @@ pub const Model = struct {
     attached_requested: bool = false,
     reconnect_requested: bool = false,
     channel_live: bool = false,
-    copy_inflight: bool = false,
+    copy_inflight: ?host_mod.ReplicaOwner = null,
+    paste_inflight: ?host_mod.ReplicaOwner = null,
+    focus_announced: bool = false,
     failed: bool = false,
     surface_size: geometry.SizeF = geometry.SizeF.init(window_width, window_height),
+    surface_scale: f32 = 1,
     status: [256]u8 = undefined,
     status_len: usize = 0,
 
@@ -228,18 +238,46 @@ pub const Model = struct {
     }
 
     fn refreshProjections(model: *Model) void {
-        for (0..@min(model.host.panes.items.len, pane_count)) |index| {
+        const generation_changed = for (model.projections, 0..) |projection, index| {
+            const published = projection.owner orelse continue;
+            const current = model.host.replicaOwner(index) orelse break true;
+            if (!published.eql(current)) break true;
+        } else false;
+        if (generation_changed) resetLocalState(model);
+        for (0..pane_count) |index| {
+            if (index >= model.host.panes.items.len) {
+                dropSelection(model, index, false);
+                model.projections[index].clear();
+                continue;
+            }
             const pane = &model.host.panes.items[index];
+            const owner = model.host.replicaOwner(index).?;
+            if (model.projections[index].owner) |published| {
+                if (!published.eql(owner)) {
+                    dropSelection(model, index, false);
+                    model.projections[index].clear();
+                }
+            }
+            if (model.selections[index].owner) |selection_owner| {
+                if (!selection_owner.eql(owner)) dropSelection(model, index, false);
+            }
             switch (pane.phase) {
                 .live => model.projections[index].refresh(&pane.grid) catch {
                     model.projections[index].clear();
                     model.failed = true;
                     model.setStatus("grid projection failed");
                 },
-                .tombstoned, .closed, .failed => model.projections[index].clear(),
-                .attaching, .reconnecting, .frozen => {},
+                .closed, .failed => model.projections[index].clear(),
+                .tombstoned, .attaching, .reconnecting, .frozen => {},
             }
         }
+        if (model.copy_inflight) |owner| {
+            if (!model.host.ownerIsCurrent(owner)) model.copy_inflight = null;
+        }
+        if (model.paste_inflight) |owner| {
+            if (!model.host.ownerIsCurrent(owner)) model.paste_inflight = null;
+        }
+        if (model.focus >= model.host.panes.items.len and model.host.panes.items.len > 0) model.focus = 0;
     }
 
     fn consumeNotices(model: *Model) void {
@@ -253,6 +291,7 @@ pub const Model = struct {
         model.pointer.stop();
         if (model.worker) |worker| worker.stop();
         model.worker = null;
+        resetLocalState(model);
         model.host.destroy();
         model.bridge.deinit();
         model.gpa.destroy(model.bridge);
@@ -266,7 +305,7 @@ pub const Msg = union(enum) {
     text: canvas.WidgetKeyboardEvent,
     search_edit: canvas.TextInputEvent,
     wheel: native_sdk.platform.WheelEvent,
-    resize: struct { cols: u16, rows: u16, size: geometry.SizeF },
+    resize: struct { cols: u16, rows: u16, size: geometry.SizeF, scale: f32, pixels: PixelSize },
     paste_clipboard: native_sdk.EffectClipboardResult,
     focus_pane: u8,
     focus_changed: bool,
@@ -308,6 +347,7 @@ fn restartTransport(model: *Model, fx: *Effects) void {
     model.reconnect_requested = false;
     model.bridge.incoming.reset();
     model.bridge.outgoing.reset();
+    resetLocalState(model);
     const replacement = host_mod.Host.create(model.gpa, model.bridge) catch {
         model.failed = true;
         model.setStatus("client restart failed");
@@ -336,7 +376,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     return;
                 };
                 if (!model.attached_requested and model.host.state() == c.PHUX_CLIENT_STATE_NEGOTIATED) {
-                    model.host.attach(model.config.session, model.config.cols, model.config.rows) catch {
+                    model.host.attach(model.config.session, model.config.cols, model.config.rows, model.config.pixels) catch {
                         model.failed = true;
                         model.setStatus("ATTACH queue failed");
                         return;
@@ -346,7 +386,13 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
                 model.refreshProjections();
                 model.consumeNotices();
-                if (model.host.state() == c.PHUX_CLIENT_STATE_ATTACHED) model.setStatus("attached");
+                if (model.host.state() == c.PHUX_CLIENT_STATE_ATTACHED) {
+                    if (!model.focus_announced and model.focus < model.host.panes.items.len) {
+                        model.host.sendFocus(model.focus, true) catch {};
+                        model.focus_announced = true;
+                    }
+                    model.setStatus("attached");
+                }
             },
             .closed, .rejected => {
                 model.channel_live = false;
@@ -369,7 +415,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .focus_pane => |pane| {
             const next = @min(@as(usize, pane), pane_count - 1);
-            if (next == model.focus) return;
+            if (next == model.focus or next >= model.host.panes.items.len) return;
             model.host.sendFocus(model.focus, false) catch {};
             model.focus = next;
             model.host.sendFocus(model.focus, true) catch {};
@@ -377,19 +423,16 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .focus_changed => |focused| model.host.sendFocus(model.focus, focused) catch {},
         .resize => |resize| {
             model.surface_size = resize.size;
+            model.surface_scale = resize.scale;
             model.config.cols = resize.cols;
             model.config.rows = resize.rows;
-            model.host.viewportResize(resize.cols, resize.rows, null) catch {
+            model.config.pixels = resize.pixels;
+            model.host.viewportResize(resize.cols, resize.rows, resize.pixels) catch {
                 model.failed = true;
                 model.setStatus("viewport resize rejected");
             };
         },
-        .wheel => |wheel| {
-            const pane = paneAtPoint(model, wheel.x, wheel.y) orelse model.focus;
-            const rows: i64 = @intFromFloat(@round(wheel.delta_y / 16));
-            if (rows != 0) model.host.scrollViewport(pane, c.PHUX_VIEWPORT_SCROLL_DELTA, -rows) catch {};
-            model.refreshProjections();
-        },
+        .wheel => |wheel| routeWheel(model, wheel),
         .key => |event| handleKey(model, event, fx),
         .text => |event| {
             if (event.text.len == 0) return;
@@ -403,7 +446,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.setStatus("search cleared");
                 return;
             }
-            const matches = model.host.search(model.focus, query, false) catch {
+            const matches = model.host.search(model.focus, query, terminal_search_case_sensitive) catch {
                 model.failed = true;
                 model.setStatus("terminal search failed");
                 return;
@@ -415,35 +458,48 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.status_len = status.len;
         },
         .copy => {
-            if (model.copy_inflight) return;
+            if (model.copy_inflight != null) return;
+            const owner = model.host.replicaOwner(model.focus) orelse {
+                model.setStatus("selection copy unavailable");
+                return;
+            };
             const text = model.host.selectionText(model.focus, model.gpa) catch {
                 model.setStatus("selection copy failed");
                 return;
             };
             defer model.gpa.free(text);
-            model.copy_inflight = true;
+            model.copy_inflight = owner;
             fx.writeClipboard(.{ .key = clipboard_key, .text = text, .on_result = Effects.clipboardMsg(.clipboard) });
         },
         .clipboard => |result| {
-            model.copy_inflight = false;
+            const owner = model.copy_inflight orelse return;
+            model.copy_inflight = null;
             if (result.outcome == .ok) {
-                clearSelection(model, model.focus);
+                clearSelectionOwner(model, owner);
                 model.refreshProjections();
                 model.setStatus("selection copied");
             } else model.setStatus("clipboard write failed; selection retained");
         },
         .paste_clipboard => |result| {
+            const owner = model.paste_inflight orelse return;
+            model.paste_inflight = null;
             if (result.outcome != .ok) {
                 model.setStatus("clipboard read failed");
                 return;
             }
             if (result.text.len == 0) return;
-            model.host.sendPaste(model.focus, result.text, false) catch {
+            model.host.sendPasteOwned(owner, result.text, false) catch {
                 model.failed = true;
                 model.setStatus("terminal paste rejected");
             };
         },
     }
+}
+
+fn paneShortcut(event: canvas.WidgetKeyboardEvent) ?u8 {
+    const primary = event.modifiers.control or event.modifiers.super;
+    if (!primary or event.key.len != 1 or event.key[0] < '1' or event.key[0] > '2') return null;
+    return event.key[0] - '1';
 }
 
 fn handleKey(model: *Model, event: canvas.WidgetKeyboardEvent, fx: *Effects) void {
@@ -452,15 +508,19 @@ fn handleKey(model: *Model, event: canvas.WidgetKeyboardEvent, fx: *Effects) voi
         update(model, .reconnect, fx);
         return;
     }
-    if (event.phase == .key_down and primary and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '2') {
-        model.focus = @intCast(event.key[0] - '1');
-        return;
+    if (event.phase == .key_down) {
+        if (paneShortcut(event)) |pane| {
+            update(model, .{ .focus_pane = pane }, fx);
+            return;
+        }
     }
     if (event.phase == .key_down and primary and keyIs(event.key, "c") and model.selections[model.focus].active) {
         update(model, .copy, fx);
         return;
     }
     if (event.phase == .key_down and primary and keyIs(event.key, "v")) {
+        if (model.paste_inflight != null) return;
+        model.paste_inflight = model.host.replicaOwner(model.focus) orelse return;
         fx.readClipboard(.{ .key = paste_clipboard_key, .on_result = Effects.clipboardMsg(.paste_clipboard) });
         return;
     }
@@ -481,10 +541,14 @@ fn handleKey(model: *Model, event: canvas.WidgetKeyboardEvent, fx: *Effects) voi
         if (moveSelection(model, event)) return;
     }
     const physical = physicalKey(event.key);
+    if (expectsTextCallback(event)) return;
     const action: u32 = if (event.phase == .key_up) c.PHUX_KEY_RELEASE else c.PHUX_KEY_PRESS;
-    const printable_unmodified = event.phase == .key_down and event.key.len == 1 and
-        !(event.modifiers.shift or event.modifiers.control or event.modifiers.alt or event.modifiers.super);
-    if (!printable_unmodified) sendKey(model, event, action, physical, "");
+    sendKey(model, event, action, physical, "");
+}
+
+fn expectsTextCallback(event: canvas.WidgetKeyboardEvent) bool {
+    if (event.modifiers.control or event.modifiers.super) return false;
+    return event.key.len == 1 or keyIs(event.key, "space");
 }
 
 fn sendKey(model: *Model, event: canvas.WidgetKeyboardEvent, action: u32, physical: u32, text: []const u8) void {
@@ -509,6 +573,7 @@ fn sendKey(model: *Model, event: canvas.WidgetKeyboardEvent, action: u32, physic
 
 fn beginSelection(model: *Model) void {
     if (model.focus >= model.host.panes.items.len) return;
+    const owner = model.host.replicaOwner(model.focus) orelse return;
     const grid = &model.host.panes.items[model.focus].grid;
     const point: c.PhuxDocumentPoint = .{
         .space = c.PHUX_DOCUMENT_VIEWPORT,
@@ -520,28 +585,69 @@ fn beginSelection(model: *Model) void {
         model.setStatus("selection anchor unavailable");
         return;
     };
-    model.selections[model.focus] = .{ .active = true, .anchor = anchor, .head = anchor, .head_point = point };
+    model.selections[model.focus] = .{
+        .owner = owner,
+        .active = true,
+        .anchor = anchor,
+        .head = anchor,
+        .head_point = point,
+    };
     model.host.setSelection(model.focus, anchor, anchor, false) catch {
-        model.host.releaseAnchor(model.focus, anchor);
+        model.host.releaseAnchorOwned(owner, anchor);
         model.selections[model.focus] = .{};
     };
     model.refreshProjections();
 }
 
 fn clearSelection(model: *Model, pane_index: usize) void {
+    dropSelection(model, pane_index, true);
+}
+
+fn dropSelection(model: *Model, pane_index: usize, clear_remote: bool) void {
     if (pane_index >= model.selections.len) return;
     const selection = &model.selections[pane_index];
-    model.host.clearSelection(pane_index) catch {};
-    if (selection.active) {
-        if (selection.head.opaque_id != selection.anchor.opaque_id)
-            model.host.releaseAnchor(pane_index, selection.head);
-        model.host.releaseAnchor(pane_index, selection.anchor);
-    }
+    const owner = selection.owner orelse {
+        selection.* = .{};
+        return;
+    };
+    if (clear_remote) model.host.clearSelectionOwned(owner) catch {};
+    if (selection.head.opaque_id != selection.anchor.opaque_id)
+        model.host.releaseAnchorOwned(owner, selection.head);
+    model.host.releaseAnchorOwned(owner, selection.anchor);
     selection.* = .{};
+}
+
+fn clearSelectionOwner(model: *Model, owner: host_mod.ReplicaOwner) void {
+    for (&model.selections, 0..) |selection, index| {
+        if (selection.owner) |candidate| {
+            if (candidate.eql(owner)) {
+                dropSelection(model, index, true);
+                return;
+            }
+        }
+    }
+}
+
+fn resetLocalState(model: *Model) void {
+    for (0..pane_count) |index| dropSelection(model, index, false);
+    model.host.clearSearchResults();
+    model.search_buffer = .{};
+    model.copy_inflight = null;
+    model.paste_inflight = null;
+    model.pointer_capture = null;
+    model.focus = 0;
+    model.focus_announced = false;
+    for (&model.projections) |*projection| projection.clear();
 }
 
 fn moveSelection(model: *Model, event: canvas.WidgetKeyboardEvent) bool {
     var selection = &model.selections[model.focus];
+    const owner = selection.owner orelse return false;
+    if (!model.host.ownerIsCurrent(owner)) {
+        dropSelection(model, model.focus, false);
+        model.setStatus("selection became stale");
+        return true;
+    }
     var next = selection.head_point;
     var moved = true;
     if (keyIs(event.key, "arrowleft")) {
@@ -551,18 +657,18 @@ fn moveSelection(model: *Model, event: canvas.WidgetKeyboardEvent) bool {
     } else if (keyIs(event.key, "arrowdown")) next.row +|= 1 else moved = false;
     if (!moved) return false;
     const next_head = model.host.createAnchor(model.focus, next) catch {
-        selection.active = false;
+        dropSelection(model, model.focus, false);
         model.setStatus("selection became stale");
         return true;
     };
     model.host.setSelection(model.focus, selection.anchor, next_head, false) catch {
-        model.host.releaseAnchor(model.focus, next_head);
-        selection.active = false;
+        model.host.releaseAnchorOwned(owner, next_head);
+        dropSelection(model, model.focus, false);
         model.setStatus("selection became stale");
         return true;
     };
     if (selection.head.opaque_id != selection.anchor.opaque_id)
-        model.host.releaseAnchor(model.focus, selection.head);
+        model.host.releaseAnchorOwned(owner, selection.head);
     selection.head = next_head;
     selection.head_point = next;
     model.refreshProjections();
@@ -639,8 +745,7 @@ fn view(ui: *PhuxUi, model: *const Model) PhuxUi.Node {
     });
 }
 
-fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometry.RectF {
-    _ = model;
+fn paneFrames(size: geometry.SizeF) [pane_count]geometry.RectF {
     const top = grid_inset + header_height;
     const usable = @max(0, size.width - grid_inset * 2);
     const width = @max(0, (usable - pane_gutter) / 2);
@@ -652,7 +757,7 @@ fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometry.Re
 }
 
 fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
-    const frames = paneFrames(model, size);
+    const frames = paneFrames(size);
     for (&model.projections, frames, 0..) |*projection, frame, index| {
         try grid_painter.paintTerminalGrid(projection.snapshot(tokens), builder, .{
             .frame = frame,
@@ -690,16 +795,81 @@ fn onLifecycle(event: native_sdk.LifecycleEvent) ?Msg {
 fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     if (frame.size.width <= 0 or frame.size.height <= 0) return null;
     const metrics = canvas.terminalCellMetrics(canvas.DesignTokens{});
-    const pane = paneFrames(model, frame.size)[model.focus];
+    const pane = paneFrames(frame.size)[model.focus];
     const cols: u16 = @intFromFloat(std.math.clamp(@floor(pane.width / @max(metrics.width, 1)), 2, 1000));
     const rows: u16 = @intFromFloat(std.math.clamp(@floor(pane.height / @max(metrics.height, 1)), 2, 1000));
+    const scale = if (std.math.isFinite(frame.scale_factor) and frame.scale_factor > 0) frame.scale_factor else 1;
+    const pixels = panePixelSize(pane, scale);
     if (cols == model.config.cols and rows == model.config.rows and
-        frame.size.width == model.surface_size.width and frame.size.height == model.surface_size.height) return null;
-    return .{ .resize = .{ .cols = cols, .rows = rows, .size = frame.size } };
+        pixels.width == model.config.pixels.width and pixels.height == model.config.pixels.height and
+        frame.size.width == model.surface_size.width and frame.size.height == model.surface_size.height and
+        scale == model.surface_scale) return null;
+    return .{ .resize = .{ .cols = cols, .rows = rows, .size = frame.size, .scale = scale, .pixels = pixels } };
+}
+
+fn panePixelSize(frame: geometry.RectF, scale: f32) PixelSize {
+    return .{
+        .width = scaledDimension(frame.width, scale),
+        .height = scaledDimension(frame.height, scale),
+    };
+}
+
+fn scaledDimension(points: f32, scale: f32) u16 {
+    const normalized_scale = if (std.math.isFinite(scale) and scale > 0) scale else 1;
+    const value = @round(@max(points, 0) * normalized_scale);
+    return @intFromFloat(std.math.clamp(value, 1, std.math.maxInt(u16)));
+}
+const PixelPoint = struct { x: f64, y: f64 };
+
+fn panePixelPoint(frame: geometry.RectF, x: f64, y: f64, scale: f32) PixelPoint {
+    const pixels = panePixelSize(frame, scale);
+    const local_x = (x - @as(f64, frame.x)) * scale;
+    const local_y = (y - @as(f64, frame.y)) * scale;
+    return .{
+        .x = std.math.clamp(local_x, 0, @as(f64, @floatFromInt(pixels.width - 1))),
+        .y = std.math.clamp(local_y, 0, @as(f64, @floatFromInt(pixels.height - 1))),
+    };
+}
+
+fn routeWheel(model: *Model, wheel: native_sdk.platform.WheelEvent) void {
+    const pane = paneAtPoint(model, wheel.x, wheel.y) orelse model.focus;
+    const rows: i64 = @intFromFloat(@round(wheel.delta_y / 16));
+    if (rows == 0) return;
+    if (model.host.mouseTracking(pane) catch false) {
+        const point = panePixelPoint(paneFrames(model.surface_size)[pane], wheel.x, wheel.y, model.surface_scale);
+        const event: c.PhuxMouseEvent = .{
+            .size = @sizeOf(c.PhuxMouseEvent),
+            .version = c.PHUX_CLIENT_ABI_VERSION,
+            .action = c.PHUX_MOUSE_PRESS,
+            .button = wheelButton(rows),
+            .modifiers = wheelModifierMask(wheel.modifiers),
+            .x = point.x,
+            .y = point.y,
+        };
+        model.host.sendMouse(pane, &event) catch {
+            model.setStatus("terminal wheel input failed");
+        };
+        return;
+    }
+    model.host.scrollViewport(pane, c.PHUX_VIEWPORT_SCROLL_DELTA, -rows) catch {};
+    model.refreshProjections();
+}
+
+fn wheelButton(rows: i64) u32 {
+    return if (rows > 0) c.PHUX_MOUSE_BUTTON_FOUR else c.PHUX_MOUSE_BUTTON_FIVE;
+}
+
+fn wheelModifierMask(mods: native_sdk.platform.ShortcutModifiers) u16 {
+    var result: u16 = 0;
+    if (mods.shift) result |= c.PHUX_MOD_SHIFT;
+    if (mods.control) result |= c.PHUX_MOD_CONTROL;
+    if (mods.option) result |= c.PHUX_MOD_ALT;
+    if (mods.command or mods.primary) result |= c.PHUX_MOD_SUPER;
+    return result;
 }
 
 fn paneAtPoint(model: *const Model, x: f32, y: f32) ?usize {
-    const frames = paneFrames(model, model.surface_size);
+    const frames = paneFrames(model.surface_size);
     for (frames, 0..) |frame, index| if (frame.normalized().containsPoint(geometry.PointF.init(x, y))) return index;
     return null;
 }
@@ -713,19 +883,20 @@ fn onRawPointer(context: ?*anyopaque, sample: *const pointer_monitor.Event) call
         model.pointer_capture orelse pointed orelse return;
     if (sample.kind == c.PHUX_MOUSE_PRESS) model.pointer_capture = index;
     if (sample.kind == c.PHUX_MOUSE_RELEASE) model.pointer_capture = null;
-    const frame = paneFrames(model, model.surface_size)[index];
+    const frame = paneFrames(model.surface_size)[index];
     const button: u32 = if (sample.button == std.math.maxInt(u32))
         c.PHUX_MOUSE_BUTTON_UNKNOWN
     else
         @min(sample.button + 1, c.PHUX_MOUSE_BUTTON_ELEVEN);
+    const point = panePixelPoint(frame, sample.x, sample.y, model.surface_scale);
     const event: c.PhuxMouseEvent = .{
         .size = @sizeOf(c.PhuxMouseEvent),
         .version = c.PHUX_CLIENT_ABI_VERSION,
         .action = sample.kind,
         .button = button,
         .modifiers = sample.modifiers,
-        .x = sample.x - @as(f64, frame.x),
-        .y = sample.y - @as(f64, frame.y),
+        .x = point.x,
+        .y = point.y,
     };
     model.host.sendMouse(index, &event) catch {
         model.failed = true;
@@ -773,7 +944,12 @@ fn initialModel(
         .bridge = bridge,
         .host = client,
         .endpoint = endpoint,
-        .config = .{ .session = session, .cols = 80, .rows = 24 },
+        .config = .{
+            .session = session,
+            .cols = 80,
+            .rows = 24,
+            .pixels = panePixelSize(paneFrames(geometry.SizeF.init(window_width, window_height))[0], 1),
+        },
         .client_name = user,
         .projections = .{ .init(gpa), .init(gpa) },
     };
@@ -813,4 +989,104 @@ pub fn main(init: std.process.Init) !void {
         .restore_state = false,
         .security = .{ .permissions = &.{}, .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } } },
     }, init);
+}
+
+test "shift and option printable keys wait for the text callback" {
+    try std.testing.expect(expectsTextCallback(.{
+        .phase = .key_down,
+        .key = "A",
+        .modifiers = .{ .shift = true },
+    }));
+    try std.testing.expect(expectsTextCallback(.{
+        .phase = .key_down,
+        .key = "e",
+        .modifiers = .{ .alt = true },
+    }));
+    try std.testing.expect(!expectsTextCallback(.{
+        .phase = .key_down,
+        .key = "c",
+        .modifiers = .{ .control = true },
+    }));
+}
+
+test "pane shortcuts route through the focus action" {
+    try std.testing.expectEqual(@as(?u8, 0), paneShortcut(.{
+        .phase = .key_down,
+        .key = "1",
+        .modifiers = .{ .super = true },
+    }));
+    try std.testing.expectEqual(@as(?u8, 1), paneShortcut(.{
+        .phase = .key_down,
+        .key = "2",
+        .modifiers = .{ .super = true },
+    }));
+    try std.testing.expectEqual(@as(?u8, null), paneShortcut(.{ .phase = .key_down, .key = "2" }));
+}
+
+test "pane pixels scale and captured pointer coordinates clamp" {
+    const frame = geometry.RectF.init(10, 20, 100, 50);
+    try std.testing.expectEqual(PixelSize{ .width = 200, .height = 100 }, panePixelSize(frame, 2));
+    try std.testing.expectEqual(PixelPoint{ .x = 10, .y = 10 }, panePixelPoint(frame, 15, 25, 2));
+    try std.testing.expectEqual(PixelPoint{ .x = 199, .y = 0 }, panePixelPoint(frame, 500, 0, 2));
+}
+
+test "wheel tracking maps vertical direction to DEC wheel buttons" {
+    try std.testing.expectEqual(@as(u32, c.PHUX_MOUSE_BUTTON_FOUR), wheelButton(1));
+    try std.testing.expectEqual(@as(u32, c.PHUX_MOUSE_BUTTON_FIVE), wheelButton(-1));
+}
+
+test "search and async owners are explicit generation-bound policy" {
+    try std.testing.expect(terminal_search_case_sensitive);
+    const first: host_mod.ReplicaOwner = .{
+        .terminal_id = .{ .id = 7 },
+        .generation = .{ .stream_id = 3, .bootstrap_id = 4 },
+    };
+    const same = first;
+    const replacement: host_mod.ReplicaOwner = .{
+        .terminal_id = .{ .id = 7 },
+        .generation = .{ .stream_id = 3, .bootstrap_id = 5 },
+    };
+    try std.testing.expect(first.eql(same));
+    try std.testing.expect(!first.eql(replacement));
+}
+
+test "production host creates with nonzero bounded history options" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try host_mod.Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+    try std.testing.expectEqual(@as(c.PhuxClientState, @intCast(c.PHUX_CLIENT_STATE_NEW)), host.state());
+}
+
+test "repeated damage projection retains grid allocation capacity" {
+    var grid = host_mod.Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var cells = [_]c.PhuxTerminalCell{std.mem.zeroes(c.PhuxTerminalCell)} ** 8;
+    const text = "damage";
+    var grid_view = std.mem.zeroes(c.PhuxTerminalGridView);
+    grid_view.cols = 4;
+    grid_view.rows = 2;
+    grid_view.cells = &cells;
+    grid_view.cell_count = cells.len;
+    grid_view.utf8 = .{ .data = text.ptr, .len = text.len };
+    try grid.copyBorrowed(&grid_view);
+    const cell_capacity = grid.cells.capacity;
+    const utf8_capacity = grid.utf8.capacity;
+    try grid.copyBorrowed(&grid_view);
+    try std.testing.expectEqual(cell_capacity, grid.cells.capacity);
+    try std.testing.expectEqual(utf8_capacity, grid.utf8.capacity);
+}
+
+test "connect cancellation is observed before entering poll" {
+    var sockets: [2]std.posix.fd_t = undefined;
+    if (std.c.socketpair(
+        @intCast(std.posix.AF.UNIX),
+        @intCast(std.posix.SOCK.STREAM),
+        0,
+        &sockets,
+    ) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+    const stopping = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, extension.waitConnected(sockets[0], &stopping));
 }

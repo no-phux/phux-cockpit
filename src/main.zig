@@ -1342,4 +1342,5 @@ test {
     _ = @import("adversarial_tests.zig");
     _ = @import("phux_transport");
     _ = phux_host.enabled;
+    if (phux_host.enabled) _ = @import("phux_main.zig");
 }

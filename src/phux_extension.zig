@@ -49,18 +49,22 @@ pub const Worker = struct {
     }
 
     fn run(worker: *Worker) void {
-        const fd = connect(worker.io, worker.endpoint) catch {
-            worker.bridge.incoming.markDisconnected(.socket_lost);
-            worker.wake();
+        const fd = connect(worker) catch {
+            if (!worker.stopping.load(.acquire)) {
+                worker.bridge.incoming.markDisconnected(.socket_lost);
+                worker.wake();
+            }
             return;
         };
         configureSocket(fd) catch {
+            _ = worker.fd.swap(-1, .acq_rel);
             _ = std.c.close(fd);
-            worker.bridge.incoming.markDisconnected(.socket_lost);
-            worker.wake();
+            if (!worker.stopping.load(.acquire)) {
+                worker.bridge.incoming.markDisconnected(.socket_lost);
+                worker.wake();
+            }
             return;
         };
-        worker.fd.store(fd, .release);
         defer {
             _ = worker.fd.swap(-1, .acq_rel);
             _ = std.c.close(fd);
@@ -176,23 +180,105 @@ fn configureSocket(fd: posix.fd_t) !void {
     }
 }
 
-fn connect(io: std.Io, endpoint: Endpoint) !posix.fd_t {
-    return switch (endpoint) {
-        .tcp => |tcp| connectTcp(io, tcp.host, tcp.port),
-        .unix => |path| connectUnix(io, path),
+fn connect(worker: *Worker) !posix.fd_t {
+    return switch (worker.endpoint) {
+        .tcp => |tcp| connectTcp(worker, tcp.host, tcp.port),
+        .unix => |path| connectUnix(worker, path),
     };
 }
 
-fn connectTcp(io: std.Io, host: []const u8, port: u16) !posix.fd_t {
-    const address = try std.Io.net.IpAddress.resolve(io, host, port);
-    const stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
-    return @intCast(stream.socket.handle);
+fn connectTcp(worker: *Worker, host: []const u8, port: u16) !posix.fd_t {
+    const address = try std.Io.net.IpAddress.parse(host, port);
+    return switch (address) {
+        .ip4 => |ip4| {
+            var socket_address: posix.sockaddr.in = .{
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+            };
+            return connectAddress(
+                worker,
+                @ptrCast(&socket_address),
+                @sizeOf(@TypeOf(socket_address)),
+                posix.AF.INET,
+            );
+        },
+        .ip6 => |ip6| {
+            var socket_address: posix.sockaddr.in6 = .{
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = ip6.flow,
+                .addr = ip6.bytes,
+                .scope_id = 0,
+            };
+            return connectAddress(
+                worker,
+                @ptrCast(&socket_address),
+                @sizeOf(@TypeOf(socket_address)),
+                posix.AF.INET6,
+            );
+        },
+    };
 }
 
-fn connectUnix(io: std.Io, path: []const u8) !posix.fd_t {
-    const address = try std.Io.net.UnixAddress.init(path);
-    const stream = try address.connect(io);
-    return @intCast(stream.socket.handle);
+fn connectUnix(worker: *Worker, path: []const u8) !posix.fd_t {
+    if (path.len == 0 or path.len >= @sizeOf(@FieldType(posix.sockaddr.un, "path"))) return error.InvalidUnixPath;
+    var socket_address = std.mem.zeroes(posix.sockaddr.un);
+    socket_address.len = @intCast(@offsetOf(posix.sockaddr.un, "path") + path.len + 1);
+    socket_address.family = posix.AF.UNIX;
+    @memcpy(socket_address.path[0..path.len], path);
+    return connectAddress(
+        worker,
+        @ptrCast(&socket_address),
+        socket_address.len,
+        posix.AF.UNIX,
+    );
+}
+
+fn connectAddress(
+    worker: *Worker,
+    address: *const posix.sockaddr,
+    address_len: posix.socklen_t,
+    family: posix.sa_family_t,
+) !posix.fd_t {
+    const fd = std.c.socket(@intCast(family), posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.SocketOpenFailed;
+    worker.fd.store(fd, .release);
+    errdefer {
+        _ = worker.fd.swap(-1, .acq_rel);
+        _ = std.c.close(fd);
+    }
+    try setNonblocking(fd, true);
+    const rc = std.c.connect(fd, address, address_len);
+    if (rc != 0 and posix.errno(rc) != .INPROGRESS) return error.ConnectFailed;
+    if (rc != 0) try waitConnected(fd, &worker.stopping);
+    try setNonblocking(fd, false);
+    return fd;
+}
+
+pub fn waitConnected(fd: posix.fd_t, stopping: *const std.atomic.Value(bool)) !void {
+    while (!stopping.load(.acquire)) {
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = fd,
+            .events = posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const ready = try posix.poll(&poll_fds, 50);
+        if (ready == 0) continue;
+        var socket_error: c_int = 0;
+        var error_len: posix.socklen_t = @sizeOf(c_int);
+        if (std.c.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, &socket_error, &error_len) != 0)
+            return error.ConnectFailed;
+        if (socket_error != 0) return error.ConnectFailed;
+        return;
+    }
+    return error.Canceled;
+}
+
+pub fn setNonblocking(fd: posix.fd_t, enabled: bool) !void {
+    const raw_flags = std.c.fcntl(fd, posix.F.GETFL);
+    if (raw_flags < 0) return error.FcntlFailed;
+    var flags: posix.O = @bitCast(@as(u32, @intCast(raw_flags)));
+    flags.NONBLOCK = enabled;
+    if (std.c.fcntl(fd, posix.F.SETFL, @as(c_int, @bitCast(flags))) < 0) return error.FcntlFailed;
 }
 
 fn socketPair() ![2]posix.fd_t {
@@ -206,8 +292,8 @@ fn socketPair() ![2]posix.fd_t {
 test "write after peer teardown reports failure without process signal" {
     const sockets = try socketPair();
     defer _ = std.c.close(sockets[0]);
-    _ = std.c.close(sockets[1]);
     try configureSocket(sockets[0]);
+    _ = std.c.close(sockets[1]);
     try std.testing.expect(!writeExact(sockets[0], "terminal reply"));
 }
 
@@ -235,4 +321,21 @@ test "final complete frame remains readable when peer has shut down" {
         offset += count;
     }
     try std.testing.expectEqualSlices(u8, &frame, &received);
+}
+
+test "connect wait observes cancellation without a blocking syscall" {
+    const sockets = try socketPair();
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+    const stopping = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, waitConnected(sockets[0], &stopping));
+}
+
+test "nonblocking connect mode can be restored for framed IO" {
+    const sockets = try socketPair();
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+    try setNonblocking(sockets[0], true);
+    try setNonblocking(sockets[0], false);
+    try std.testing.expect(writeExact(sockets[0], "frame"));
 }

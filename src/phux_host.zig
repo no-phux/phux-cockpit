@@ -16,6 +16,7 @@ pub const enabled = true;
 pub const max_panes: usize = 16;
 pub const max_satellite_host_bytes: usize = 255;
 
+pub const PixelSize = struct { width: u16, height: u16 };
 pub const Phase = enum { attaching, live, reconnecting, tombstoned, frozen, closed, failed };
 
 pub const TerminalId = struct {
@@ -34,7 +35,7 @@ pub const TerminalId = struct {
         return out;
     }
 
-    fn asC(id: *const TerminalId) c.PhuxTerminalId {
+    pub fn asC(id: *const TerminalId) c.PhuxTerminalId {
         return .{
             .kind = id.kind,
             .id = id.id,
@@ -45,7 +46,7 @@ pub const TerminalId = struct {
         };
     }
 
-    pub fn eql(a: *const TerminalId, b: *const TerminalId) bool {
+    pub fn eql(a: TerminalId, b: TerminalId) bool {
         return a.kind == b.kind and a.id == b.id and
             std.mem.eql(u8, a.host_storage[0..a.host_len], b.host_storage[0..b.host_len]);
     }
@@ -55,6 +56,19 @@ pub const Generation = struct {
     stream_id: u64 = 0,
     bootstrap_id: u64 = 0,
     last_seq: u64 = 0,
+
+    pub fn eql(a: Generation, b: Generation) bool {
+        return a.stream_id == b.stream_id and a.bootstrap_id == b.bootstrap_id;
+    }
+};
+
+pub const ReplicaOwner = struct {
+    terminal_id: TerminalId,
+    generation: Generation,
+
+    pub fn eql(a: ReplicaOwner, b: ReplicaOwner) bool {
+        return a.terminal_id.eql(b.terminal_id) and a.generation.eql(b.generation);
+    }
 };
 
 pub const Grid = struct {
@@ -77,18 +91,18 @@ pub const Grid = struct {
     history_pages_loaded: u64 = 0,
     history_bytes_loaded: u64 = 0,
     history_has_more: bool = false,
-    top_anchor: c.PhuxDocumentAnchor = std.mem.zeroes(c.PhuxDocumentAnchor),
+    // `top_anchor` is released immediately after every borrowed grid copy.
 
-    fn init(gpa: std.mem.Allocator) Grid {
+    pub fn init(gpa: std.mem.Allocator) Grid {
         return .{ .gpa = gpa };
     }
 
-    fn deinit(grid: *Grid) void {
+    pub fn deinit(grid: *Grid) void {
         grid.cells.deinit(grid.gpa);
         grid.utf8.deinit(grid.gpa);
     }
 
-    fn copyBorrowed(grid: *Grid, view: *const c.PhuxTerminalGridView) !void {
+    pub fn copyBorrowed(grid: *Grid, view: *const c.PhuxTerminalGridView) !void {
         try grid.cells.ensureTotalCapacity(grid.gpa, view.cell_count);
         grid.cells.items.len = view.cell_count;
         if (view.cell_count > 0) @memcpy(grid.cells.items, view.cells[0..view.cell_count]);
@@ -115,7 +129,7 @@ pub const Grid = struct {
         grid.history_has_more = view.history_has_more;
         grid.history_pages_loaded = view.history_pages_loaded;
         grid.history_bytes_loaded = view.history_bytes_loaded;
-        grid.top_anchor = view.top_anchor;
+        // The caller releases `view.top_anchor` after every complete copy.
     }
 };
 
@@ -123,6 +137,8 @@ pub const Pane = struct {
     id: TerminalId = .{},
     phase: Phase = .attaching,
     dirty: bool = false,
+    seen_in_attach: bool = false,
+    remove_at_barrier: bool = false,
     grid: Grid,
     title: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -165,9 +181,11 @@ pub const Host = struct {
     bridge: *transport.Bridge,
     panes: std.ArrayListUnmanaged(Pane) = .empty,
     search_results: std.ArrayListUnmanaged(c.PhuxSearchResult) = .empty,
+    search_owner: ?ReplicaOwner = null,
     notices: std.ArrayListUnmanaged(Notice) = .empty,
     focused: ?usize = null,
     failed: bool = false,
+    attach_barrier_seen: bool = false,
 
     pub fn create(gpa: std.mem.Allocator, bridge: *transport.Bridge) !*Host {
         const host = try gpa.create(Host);
@@ -178,6 +196,10 @@ pub const Host = struct {
             .version = c.PHUX_CLIENT_ABI_VERSION,
             .max_bootstrap_chunk_bytes = 256 * 1024,
             .max_history_page_bytes = 1024 * 1024,
+            .max_history_page_rows = 1024,
+            .max_history_cache_bytes = 8 * 1024 * 1024,
+            .max_history_materialized_rows = 8192,
+            .history_prefetch_rows = 256,
         };
         try resultError(c.phux_client_new(&options, &raw));
         host.* = .{ .gpa = gpa, .client = raw orelse return error.InvalidState, .bridge = bridge };
@@ -185,6 +207,7 @@ pub const Host = struct {
     }
 
     pub fn destroy(host: *Host) void {
+        host.clearSearchResults();
         for (host.panes.items) |*pane| pane.deinit(host.gpa);
         host.panes.deinit(host.gpa);
         for (host.notices.items) |notice| host.gpa.free(notice.bytes);
@@ -203,7 +226,13 @@ pub const Host = struct {
         try host.stageOutgoing();
     }
 
-    pub fn attach(host: *Host, session: []const u8, cols: u16, rows: u16) !void {
+    pub fn attach(
+        host: *Host,
+        session: []const u8,
+        cols: u16,
+        rows: u16,
+        pixels: ?PixelSize,
+    ) !void {
         const options: c.PhuxAttachOptions = .{
             .size = @sizeOf(c.PhuxAttachOptions),
             .version = c.PHUX_CLIENT_ABI_VERSION,
@@ -213,9 +242,9 @@ pub const Host = struct {
             .name = bytes(session),
             .cols = cols,
             .rows = rows,
-            .has_pixel_size = false,
-            .pixel_width = 0,
-            .pixel_height = 0,
+            .has_pixel_size = pixels != null,
+            .pixel_width = if (pixels) |p| p.width else 0,
+            .pixel_height = if (pixels) |p| p.height else 0,
             .request_scrollback = true,
             .scrollback_limit_lines = 5000,
         };
@@ -239,6 +268,10 @@ pub const Host = struct {
             host.freezePublished();
             return err;
         };
+        if (host.state() == c.PHUX_CLIENT_STATE_ATTACHED and !host.attach_barrier_seen) {
+            host.finishAttachBarrier();
+            host.attach_barrier_seen = true;
+        }
         host.stageOutgoing() catch |err| {
             host.failed = true;
             host.freezePublished();
@@ -248,7 +281,7 @@ pub const Host = struct {
 
     fn ensurePane(host: *Host, raw: c.PhuxTerminalId) !*Pane {
         const id = TerminalId.fromC(raw);
-        for (host.panes.items) |*pane| if (pane.id.eql(&id)) return pane;
+        for (host.panes.items) |*pane| if (pane.id.eql(id)) return pane;
         if (host.panes.items.len == max_panes) return error.OutOfMemory;
         try host.panes.append(host.gpa, .init(host.gpa, id));
         if (host.focused == null) host.focused = host.panes.items.len - 1;
@@ -256,7 +289,46 @@ pub const Host = struct {
     }
     fn findPane(host: *Host, raw: c.PhuxTerminalId) ?*Pane {
         const id = TerminalId.fromC(raw);
-        for (host.panes.items) |*pane| if (pane.id.eql(&id)) return pane;
+        for (host.panes.items) |*pane| if (pane.id.eql(id)) return pane;
+        return null;
+    }
+
+    fn finishAttachBarrier(host: *Host) void {
+        host.clearSearchResults();
+        var index = host.panes.items.len;
+        while (index > 0) {
+            index -= 1;
+            const pane = &host.panes.items[index];
+            if (!pane.seen_in_attach or pane.remove_at_barrier) {
+                pane.deinit(host.gpa);
+                _ = host.panes.orderedRemove(index);
+            }
+        }
+        host.focused = if (host.panes.items.len == 0)
+            null
+        else
+            @min(host.focused orelse 0, host.panes.items.len - 1);
+    }
+
+    pub fn replicaOwner(host: *const Host, pane_index: usize) ?ReplicaOwner {
+        if (pane_index >= host.panes.items.len) return null;
+        const pane = &host.panes.items[pane_index];
+        return .{ .terminal_id = pane.id, .generation = pane.grid.generation };
+    }
+
+    pub fn ownerIsCurrent(host: *const Host, owner: ReplicaOwner) bool {
+        for (host.panes.items) |pane| {
+            const current: ReplicaOwner = .{ .terminal_id = pane.id, .generation = pane.grid.generation };
+            if (current.eql(owner)) return true;
+        }
+        return false;
+    }
+
+    pub fn indexOfOwner(host: *const Host, owner: ReplicaOwner) ?usize {
+        for (host.panes.items, 0..) |pane, index| {
+            const current: ReplicaOwner = .{ .terminal_id = pane.id, .generation = pane.grid.generation };
+            if (current.eql(owner)) return index;
+        }
         return null;
     }
 
@@ -272,10 +344,15 @@ pub const Host = struct {
                 c.PHUX_CLIENT_EFFECT_DAMAGE => {
                     const pane = try host.ensurePane(effect.terminal_id);
                     switch (effect.detail) {
-                        c.PHUX_CLIENT_DAMAGE_REMOVED => pane.phase = .tombstoned,
+                        c.PHUX_CLIENT_DAMAGE_REMOVED => {
+                            pane.phase = .tombstoned;
+                            pane.remove_at_barrier = true;
+                        },
                         else => {
                             pane.dirty = true;
                             pane.phase = .live;
+                            pane.seen_in_attach = true;
+                            pane.remove_at_barrier = false;
                         },
                     }
                 },
@@ -295,7 +372,12 @@ pub const Host = struct {
                             }
                         },
                         c.PHUX_CLIENT_STATUS_DETACHED => {
-                            for (host.panes.items) |*pane| pane.phase = .reconnecting;
+                            host.attach_barrier_seen = false;
+                            for (host.panes.items) |*pane| {
+                                pane.phase = .reconnecting;
+                                pane.seen_in_attach = false;
+                                pane.remove_at_barrier = false;
+                            }
                         },
                         c.PHUX_CLIENT_STATUS_SERVER_ERROR => {
                             for (host.panes.items) |*pane| pane.phase = .failed;
@@ -349,7 +431,14 @@ pub const Host = struct {
                 continue;
             }
             try resultError(result);
-            try pane.grid.copyBorrowed(&view);
+            const top_anchor = view.top_anchor;
+            pane.grid.copyBorrowed(&view) catch |err| {
+                if (top_anchor.opaque_id != 0)
+                    _ = c.phux_client_anchor_release(host.client, &id, top_anchor);
+                return err;
+            };
+            if (top_anchor.opaque_id != 0)
+                _ = c.phux_client_anchor_release(host.client, &id, top_anchor);
             pane.dirty = false;
         }
     }
@@ -380,7 +469,7 @@ pub const Host = struct {
     }
 
     /// Local viewport projection only; never resizes the canonical PTY.
-    pub fn viewportResize(host: *Host, cols: u16, rows: u16, pixels: ?struct { width: u16, height: u16 }) !void {
+    pub fn viewportResize(host: *Host, cols: u16, rows: u16, pixels: ?PixelSize) !void {
         try resultError(c.phux_client_viewport_resize(
             host.client,
             cols,
@@ -414,6 +503,14 @@ pub const Host = struct {
         try host.stageOutgoing();
     }
 
+    pub fn mouseTracking(host: *const Host, pane_index: usize) !bool {
+        const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return error.InvalidState;
+        const id = pane.id.asC();
+        var tracking_enabled = false;
+        try resultError(c.phux_client_terminal_mouse_tracking(host.client, &id, &tracking_enabled));
+        return tracking_enabled;
+    }
+
     /// Transfer one copied status/job notification to the UI owner.
     pub fn takeNotice(host: *Host) ?Notice {
         if (host.notices.items.len == 0) return null;
@@ -438,6 +535,13 @@ pub const Host = struct {
         try host.stageOutgoing();
     }
 
+    pub fn sendPasteOwned(host: *Host, owner: ReplicaOwner, payload: []const u8, trusted: bool) !void {
+        if (!host.ownerIsCurrent(owner)) return error.InvalidState;
+        const id = owner.terminal_id.asC();
+        try resultError(c.phux_client_send_paste(host.client, &id, payload.ptr, payload.len, trusted));
+        try host.stageOutgoing();
+    }
+
     pub fn scrollViewport(host: *Host, pane_index: usize, kind: u32, value: i64) !void {
         const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return error.InvalidState;
         const id = pane.id.asC();
@@ -455,8 +559,12 @@ pub const Host = struct {
     }
 
     pub fn releaseAnchor(host: *Host, pane_index: usize, anchor: c.PhuxDocumentAnchor) void {
-        const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return;
-        const id = pane.id.asC();
+        const owner = host.replicaOwner(pane_index) orelse return;
+        host.releaseAnchorOwned(owner, anchor);
+    }
+
+    pub fn releaseAnchorOwned(host: *Host, owner: ReplicaOwner, anchor: c.PhuxDocumentAnchor) void {
+        const id = owner.terminal_id.asC();
         _ = c.phux_client_anchor_release(host.client, &id, anchor);
     }
 
@@ -482,6 +590,14 @@ pub const Host = struct {
         try host.stageOutgoing();
     }
 
+    pub fn clearSelectionOwned(host: *Host, owner: ReplicaOwner) !void {
+        if (!host.ownerIsCurrent(owner)) return error.InvalidState;
+        const id = owner.terminal_id.asC();
+        try resultError(c.phux_client_selection_clear(host.client, &id));
+        try host.captureEffects();
+        try host.stageOutgoing();
+    }
+
     pub fn search(
         host: *Host,
         pane_index: usize,
@@ -489,7 +605,9 @@ pub const Host = struct {
         case_sensitive: bool,
     ) ![]const c.PhuxSearchResult {
         const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return error.InvalidState;
+        const owner: ReplicaOwner = .{ .terminal_id = pane.id, .generation = pane.grid.generation };
         const id = pane.id.asC();
+        host.clearSearchResults();
         var borrowed: [*c]const c.PhuxSearchResult = null;
         var count: usize = 0;
         try resultError(c.phux_client_search(
@@ -500,16 +618,25 @@ pub const Host = struct {
             &borrowed,
             &count,
         ));
-        try host.search_results.ensureTotalCapacity(host.gpa, count);
+        host.search_results.ensureTotalCapacity(host.gpa, count) catch {
+            releaseSearchAnchors(host.client, &id, if (count == 0) &.{} else borrowed[0..count]);
+            return error.OutOfMemory;
+        };
         host.search_results.items.len = count;
         if (count > 0) @memcpy(host.search_results.items, borrowed[0..count]);
+        host.search_owner = owner;
         try host.captureEffects();
         try host.stageOutgoing();
         return host.search_results.items;
     }
 
     pub fn clearSearchResults(host: *Host) void {
+        if (host.search_owner) |owner| {
+            const id = owner.terminal_id.asC();
+            releaseSearchAnchors(host.client, &id, host.search_results.items);
+        }
         host.search_results.items.len = 0;
+        host.search_owner = null;
     }
 
     pub fn selectionText(host: *Host, pane_index: usize, gpa: std.mem.Allocator) ![]u8 {
@@ -524,4 +651,65 @@ pub const Host = struct {
 
 fn bytes(slice: []const u8) c.PhuxBytes {
     return .{ .data = if (slice.len == 0) null else slice.ptr, .len = slice.len };
+}
+
+fn releaseSearchAnchors(
+    client: *c.PhuxClient,
+    terminal_id: *const c.PhuxTerminalId,
+    results: []const c.PhuxSearchResult,
+) void {
+    for (results) |result| {
+        _ = c.phux_client_anchor_release(client, terminal_id, result.start);
+        if (result.end.opaque_id != result.start.opaque_id)
+            _ = c.phux_client_anchor_release(client, terminal_id, result.end);
+    }
+}
+
+test "runtime host creation accepts materialized history limits" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+    try std.testing.expectEqual(@as(c.PhuxClientState, @intCast(c.PHUX_CLIENT_STATE_NEW)), host.state());
+}
+
+test "repeated borrowed grid copies retain bounded capacity" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var cells = [_]c.PhuxTerminalCell{std.mem.zeroes(c.PhuxTerminalCell)} ** 8;
+    const text = "damage";
+    var grid_view = std.mem.zeroes(c.PhuxTerminalGridView);
+    grid_view.cols = 4;
+    grid_view.rows = 2;
+    grid_view.cells = &cells;
+    grid_view.cell_count = cells.len;
+    grid_view.utf8 = bytes(text);
+    try grid.copyBorrowed(&grid_view);
+    const cell_capacity = grid.cells.capacity;
+    const utf8_capacity = grid.utf8.capacity;
+    try grid.copyBorrowed(&grid_view);
+    try std.testing.expectEqual(cell_capacity, grid.cells.capacity);
+    try std.testing.expectEqual(utf8_capacity, grid.utf8.capacity);
+}
+
+test "absent and removed panes survive until the attach barrier" {
+    var host: Host = undefined;
+    host.gpa = std.testing.allocator;
+    host.panes = .empty;
+    host.search_results = .empty;
+    host.search_owner = null;
+    host.focused = 1;
+    try host.panes.append(std.testing.allocator, Pane.init(std.testing.allocator, .{ .id = 1 }));
+    try host.panes.append(std.testing.allocator, Pane.init(std.testing.allocator, .{ .id = 2 }));
+    host.panes.items[0].seen_in_attach = true;
+    host.panes.items[1].remove_at_barrier = true;
+    try std.testing.expectEqual(@as(usize, 2), host.panes.items.len);
+    host.finishAttachBarrier();
+    defer {
+        for (host.panes.items) |*pane| pane.deinit(std.testing.allocator);
+        host.panes.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), host.panes.items.len);
+    try std.testing.expectEqual(@as(u32, 1), host.panes.items[0].id.id);
+    try std.testing.expectEqual(@as(?usize, 0), host.focused);
 }
