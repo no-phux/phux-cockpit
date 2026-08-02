@@ -238,12 +238,15 @@ pub const Model = struct {
     }
 
     fn refreshProjections(model: *Model) void {
-        const generation_changed = for (model.projections, 0..) |projection, index| {
-            const published = projection.owner orelse continue;
-            const current = model.host.replicaOwner(index) orelse break true;
-            if (!published.eql(current)) break true;
-        } else false;
-        if (generation_changed) resetLocalState(model);
+        const state = model.host.state();
+        var published_owners: [pane_count]?host_mod.ReplicaOwner = @splat(null);
+        var current: [pane_count]?host_mod.ReplicaOwner = @splat(null);
+        for (model.projections, 0..) |projection, index| {
+            published_owners[index] = projection.owner;
+            current[index] = model.host.replicaOwner(index);
+        }
+        if (state != c.PHUX_CLIENT_STATE_ATTACHED) return;
+        if (publishedSetChanged(state, &published_owners, &current)) resetLocalState(model);
         for (0..pane_count) |index| {
             if (index >= model.host.panes.items.len) {
                 dropSelection(model, index, false);
@@ -347,7 +350,7 @@ fn restartTransport(model: *Model, fx: *Effects) void {
     model.reconnect_requested = false;
     model.bridge.incoming.reset();
     model.bridge.outgoing.reset();
-    resetLocalState(model);
+    resetClientState(model);
     const replacement = host_mod.Host.create(model.gpa, model.bridge) catch {
         model.failed = true;
         model.setStatus("client restart failed");
@@ -547,6 +550,7 @@ fn handleKey(model: *Model, event: canvas.WidgetKeyboardEvent, fx: *Effects) voi
 }
 
 fn expectsTextCallback(event: canvas.WidgetKeyboardEvent) bool {
+    if (event.phase != .key_down) return false;
     if (event.modifiers.control or event.modifiers.super) return false;
     return event.key.len == 1 or keyIs(event.key, "space");
 }
@@ -628,7 +632,7 @@ fn clearSelectionOwner(model: *Model, owner: host_mod.ReplicaOwner) void {
     }
 }
 
-fn resetLocalState(model: *Model) void {
+fn resetClientState(model: *Model) void {
     for (0..pane_count) |index| dropSelection(model, index, false);
     model.host.clearSearchResults();
     model.search_buffer = .{};
@@ -637,7 +641,25 @@ fn resetLocalState(model: *Model) void {
     model.pointer_capture = null;
     model.focus = 0;
     model.focus_announced = false;
+}
+
+fn resetLocalState(model: *Model) void {
+    resetClientState(model);
     for (&model.projections) |*projection| projection.clear();
+}
+
+fn publishedSetChanged(
+    state: c.PhuxClientState,
+    published: []const ?host_mod.ReplicaOwner,
+    current: []const ?host_mod.ReplicaOwner,
+) bool {
+    if (state != c.PHUX_CLIENT_STATE_ATTACHED) return false;
+    for (published, 0..) |published_owner, index| {
+        const old = published_owner orelse continue;
+        const replacement = if (index < current.len) current[index] else null;
+        if (replacement == null or !old.eql(replacement.?)) return true;
+    }
+    return false;
 }
 
 fn moveSelection(model: *Model, event: canvas.WidgetKeyboardEvent) bool {
@@ -1007,6 +1029,11 @@ test "shift and option printable keys wait for the text callback" {
         .key = "c",
         .modifiers = .{ .control = true },
     }));
+    try std.testing.expect(!expectsTextCallback(.{
+        .phase = .key_up,
+        .key = "A",
+        .modifiers = .{ .shift = true },
+    }));
 }
 
 test "pane shortcuts route through the focus action" {
@@ -1048,6 +1075,25 @@ test "search and async owners are explicit generation-bound policy" {
     };
     try std.testing.expect(first.eql(same));
     try std.testing.expect(!first.eql(replacement));
+}
+
+test "reconnect preserves two published panes until one-pane aggregate ready" {
+    const old_one: host_mod.ReplicaOwner = .{
+        .terminal_id = .{ .id = 1 },
+        .generation = .{ .stream_id = 10, .bootstrap_id = 20 },
+    };
+    const old_two: host_mod.ReplicaOwner = .{
+        .terminal_id = .{ .id = 2 },
+        .generation = .{ .stream_id = 11, .bootstrap_id = 21 },
+    };
+    const replacement: host_mod.ReplicaOwner = .{
+        .terminal_id = .{ .id = 1 },
+        .generation = .{ .stream_id = 12, .bootstrap_id = 22 },
+    };
+    const published = [_]?host_mod.ReplicaOwner{ old_one, old_two };
+    const staged = [_]?host_mod.ReplicaOwner{ replacement, null };
+    try std.testing.expect(!publishedSetChanged(c.PHUX_CLIENT_STATE_NEGOTIATED, &published, &staged));
+    try std.testing.expect(publishedSetChanged(c.PHUX_CLIENT_STATE_ATTACHED, &published, &staged));
 }
 
 test "production host creates with nonzero bounded history options" {

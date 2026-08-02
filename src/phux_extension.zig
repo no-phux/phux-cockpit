@@ -14,6 +14,26 @@ pub const Endpoint = union(enum) {
     unix: []const u8,
 };
 
+const max_resolved_addresses = 16;
+const ResolvedAddresses = struct {
+    items: [max_resolved_addresses]std.Io.net.IpAddress = undefined,
+    len: usize = 0,
+};
+
+const ResolveContext = struct {
+    host: [std.Io.net.HostName.max_len:0]u8 = @splat(0),
+    host_len: usize,
+    port: u16,
+    state: std.atomic.Value(u8) = .init(0),
+    result: ResolvedAddresses = .{},
+
+    fn run(context: *ResolveContext) void {
+        context.result = resolveBlocking(context.host[0..context.host_len :0], context.port);
+        const previous = context.state.cmpxchgStrong(0, 1, .release, .acquire);
+        if (previous == 2) std.heap.page_allocator.destroy(context);
+    }
+};
+
 pub const Worker = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -188,7 +208,23 @@ fn connect(worker: *Worker) !posix.fd_t {
 }
 
 fn connectTcp(worker: *Worker, host: []const u8, port: u16) !posix.fd_t {
-    const address = try std.Io.net.IpAddress.parse(host, port);
+    if (std.Io.net.IpAddress.parse(host, port)) |address| {
+        return connectIpAddress(worker, address);
+    } else |_| {}
+
+    const addresses = try resolveHost(worker, host, port);
+    var last_error: ?anyerror = null;
+    for (addresses.items[0..addresses.len]) |address| {
+        return connectIpAddress(worker, address) catch |err| {
+            if (worker.stopping.load(.acquire)) return error.Canceled;
+            last_error = err;
+            continue;
+        };
+    }
+    return last_error orelse error.UnknownHostName;
+}
+
+fn connectIpAddress(worker: *Worker, address: std.Io.net.IpAddress) !posix.fd_t {
     return switch (address) {
         .ip4 => |ip4| {
             var socket_address: posix.sockaddr.in = .{
@@ -207,7 +243,7 @@ fn connectTcp(worker: *Worker, host: []const u8, port: u16) !posix.fd_t {
                 .port = std.mem.nativeToBig(u16, ip6.port),
                 .flowinfo = ip6.flow,
                 .addr = ip6.bytes,
-                .scope_id = 0,
+                .scope_id = ip6.interface.index,
             };
             return connectAddress(
                 worker,
@@ -217,6 +253,63 @@ fn connectTcp(worker: *Worker, host: []const u8, port: u16) !posix.fd_t {
             );
         },
     };
+}
+
+fn resolveHost(worker: *Worker, host: []const u8, port: u16) !ResolvedAddresses {
+    _ = try std.Io.net.HostName.init(host);
+    const context = try std.heap.page_allocator.create(ResolveContext);
+    context.* = .{ .host_len = host.len, .port = port };
+    @memcpy(context.host[0..host.len], host);
+    const thread = std.Thread.spawn(.{}, ResolveContext.run, .{context}) catch |err| {
+        std.heap.page_allocator.destroy(context);
+        return err;
+    };
+    thread.detach();
+
+    while (true) {
+        if (context.state.load(.acquire) == 1) {
+            const result = context.result;
+            std.heap.page_allocator.destroy(context);
+            if (result.len == 0) return error.UnknownHostName;
+            return result;
+        }
+        if (worker.stopping.load(.acquire)) {
+            const previous = context.state.cmpxchgStrong(0, 2, .release, .acquire);
+            if (previous == 1) std.heap.page_allocator.destroy(context);
+            return error.Canceled;
+        }
+        std.Io.sleep(worker.io, std.Io.Duration.fromMilliseconds(10), .awake) catch {};
+    }
+}
+
+fn resolveBlocking(host: [:0]const u8, port: u16) ResolvedAddresses {
+    var output: ResolvedAddresses = .{};
+    var port_buffer: [8]u8 = undefined;
+    const port_z = std.fmt.bufPrintZ(&port_buffer, "{d}", .{port}) catch return output;
+    const hints: posix.addrinfo = .{
+        .flags = .{ .NUMERICSERV = true },
+        .family = posix.AF.UNSPEC,
+        .socktype = posix.SOCK.STREAM,
+        .protocol = posix.IPPROTO.TCP,
+        .canonname = null,
+        .addr = null,
+        .addrlen = 0,
+        .next = null,
+    };
+    var result: ?*posix.addrinfo = null;
+    if (posix.system.getaddrinfo(host.ptr, port_z.ptr, &hints, &result) != @as(posix.system.EAI, @enumFromInt(0)))
+        return output;
+    defer if (result) |head| posix.system.freeaddrinfo(head);
+    var cursor = result;
+    while (cursor) |info| : (cursor = info.next) {
+        if (output.len == output.items.len) break;
+        const address = info.addr orelse continue;
+        if (address.family != posix.AF.INET and address.family != posix.AF.INET6) continue;
+        const wrapped: *const std.Io.Threaded.PosixAddress = @alignCast(@fieldParentPtr("any", address));
+        output.items[output.len] = std.Io.Threaded.addressFromPosix(wrapped);
+        output.len += 1;
+    }
+    return output;
 }
 
 fn connectUnix(worker: *Worker, path: []const u8) !posix.fd_t {
@@ -338,4 +431,11 @@ test "nonblocking connect mode can be restored for framed IO" {
     try setNonblocking(sockets[0], true);
     try setNonblocking(sockets[0], false);
     try std.testing.expect(writeExact(sockets[0], "frame"));
+}
+
+test "localhost resolves without requiring a numeric TCP address" {
+    const addresses = resolveBlocking("localhost", 4321);
+    try std.testing.expect(addresses.len > 0);
+    for (addresses.items[0..addresses.len]) |address|
+        try std.testing.expectEqual(@as(u16, 4321), address.getPort());
 }

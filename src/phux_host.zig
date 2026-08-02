@@ -294,15 +294,22 @@ pub const Host = struct {
     }
 
     fn finishAttachBarrier(host: *Host) void {
+        host.pruneRemovedPanes(true);
+    }
+
+    fn pruneRemovedPanes(host: *Host, include_unseen: bool) void {
+        const removes_any = for (host.panes.items) |pane| {
+            if (pane.remove_at_barrier or (include_unseen and !pane.seen_in_attach)) break true;
+        } else false;
+        if (!removes_any) return;
         host.clearSearchResults();
         var index = host.panes.items.len;
         while (index > 0) {
             index -= 1;
             const pane = &host.panes.items[index];
-            if (!pane.seen_in_attach or pane.remove_at_barrier) {
-                pane.deinit(host.gpa);
-                _ = host.panes.orderedRemove(index);
-            }
+            if (!pane.remove_at_barrier and (!include_unseen or pane.seen_in_attach)) continue;
+            pane.deinit(host.gpa);
+            _ = host.panes.orderedRemove(index);
         }
         host.focused = if (host.panes.items.len == 0)
             null
@@ -421,6 +428,7 @@ pub const Host = struct {
             }
         }
         try resultError(c.phux_client_effect_clear(host.client));
+        if (host.attach_barrier_seen) host.pruneRemovedPanes(false);
         for (host.panes.items) |*pane| {
             if (!pane.dirty or pane.phase != .live) continue;
             const id = pane.id.asC();
@@ -712,4 +720,23 @@ test "absent and removed panes survive until the attach barrier" {
     try std.testing.expectEqual(@as(usize, 1), host.panes.items.len);
     try std.testing.expectEqual(@as(u32, 1), host.panes.items[0].id.id);
     try std.testing.expectEqual(@as(?usize, 0), host.focused);
+}
+
+test "live tombstone prunes immediately after the attach barrier" {
+    var host: Host = undefined;
+    host.gpa = std.testing.allocator;
+    host.panes = .empty;
+    host.search_results = .empty;
+    host.search_owner = null;
+    host.focused = 0;
+    try host.panes.append(std.testing.allocator, Pane.init(std.testing.allocator, .{ .id = 1 }));
+    try host.panes.append(std.testing.allocator, Pane.init(std.testing.allocator, .{ .id = 2 }));
+    host.panes.items[1].remove_at_barrier = true;
+    host.pruneRemovedPanes(false);
+    defer {
+        for (host.panes.items) |*pane| pane.deinit(std.testing.allocator);
+        host.panes.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), host.panes.items.len);
+    try std.testing.expectEqual(@as(u32, 1), host.panes.items[0].id.id);
 }
