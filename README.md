@@ -1,35 +1,131 @@
-# phux-cockpit
+# Phux Cockpit
 
-A spike, run 2026-07-27, answering one question: **can phux have a native GUI
-cockpit — several live terminal panes beside ordinary native widgets, in one GPU
-surface — without the native layer having to understand terminals?**
+Phux Cockpit is the macOS companion for
+[phux](https://github.com/phall1/phux). Version 0.1.0 is an intentionally
+interim, terminal-backed release: it puts the installed phux TUI and an
+ephemeral local shell side by side in one native Metal window.
 
-**Verdict: GO, with caveats.** Read [`FINDINGS.md`](FINDINGS.md) before the code.
-It records what was built, what broke, and what it cost, and it marks every claim
-by how it was established — two adversarial validators and the report agent died
-on transient API errors partway through, so the coverage is thinner than planned
-and the document says so where it matters.
+## Companion scope
 
-## What this is
+- **Workspace** runs the `phux` executable already installed on your Mac. It is
+  the same TUI and workspace state you get by running `phux` in a terminal.
+- **Local Shell** is owned by this app process. It is ephemeral:
+  closing or restarting the app ends that shell, and it is not a durable phux
+  session.
+- This release is **not** the future native `SessionKernel` client. It does not
+  embed `SessionKernel<NativeEngine>`, attach through a native protocol, or
+  replace phux's TUI. That integration waits for phux's versioned libghostty
+  checkpoint bootstrap and shared kernel layers.
 
-A fork of `native-sdk`'s `examples/terminal` (`a7509a7`), grown into a two-pane
-cockpit: two independent libghostty-vt panes rendering into one `gpu_surface`,
-laid out by the canvas alongside native widgets, with focus routing and a budget
-policy derived from the framework's own constants.
+Both panes are real PTYs backed by libghostty-vt and painted into one native-sdk
+Metal surface. The native layer owns terminal state and pixels; it does not
+parse phux application state.
 
-It has since been ported onto the framework's first-party `canvas.terminal_grid`
-painter, deleting the forked renderer entirely (`grid.zig` 1156 → 916 lines,
-`box.zig` gone). The old painter is still in history —
-`git show d4ccb84^:src/box.zig`.
+## Install
+
+Phux must be installed and available on `PATH`. Install the companion with
+Homebrew:
 
 ```sh
-zig build run                    # run the cockpit
-zig build test -Dplatform=null   # 70/72 pass, 2 env-gated skips
+brew install --cask phall1/tap/phux-cockpit
 ```
 
-## The finding that mattered
+The cask installs the `phux` formula from the same tap, then places **Phux
+Cockpit** in Applications. Version 0.1.0 is ad-hoc signed; the cask clears its
+quarantine attribute and reports that fact in its caveat.
 
-The seam to phux is one line, and it knows nothing about PTYs (`src/grid.zig`):
+## Keybindings
+
+| Key | Action |
+|---|---|
+| `cmd+1` | Focus Workspace |
+| `cmd+2` | Focus Local Shell |
+| `cmd+shift+space` | Enter or leave keyboard selection mode |
+| Arrow keys | Move the selection caret |
+| `shift` + arrow keys | Extend the selection |
+| `B` | Toggle block selection while selecting |
+| `enter` | Copy and leave selection mode |
+| `esc` | Cancel selection mode |
+| `cmd+C` | Copy the active selection |
+| `cmd+V` | Safely paste the system clipboard into the focused pane |
+| `cmd+arrow-up` / `cmd+arrow-down` | Scroll one history line (`shift` scrolls a page) |
+| `cmd+home` / `cmd+end` | Jump to the top or bottom of history |
+| `cmd+R` | Restart the focused pane after its process exits |
+
+Clicking a pane focuses it. Trackpad and mouse-wheel input scrolls the pane
+under the pointer.
+
+## Requirements
+
+- Apple silicon Mac running macOS 11 or later
+- `phux` installed and discoverable on `PATH` (the cask installs it)
+- Zig 0.16.0 and Xcode Command Line Tools for source builds
+- Internet access on the first source build to fetch pinned dependencies
+
+native-sdk is pinned to v0.7.1. libghostty-vt is pinned to Ghostty commit
+`7aa9591746ffa4d2eee458960c76554352832595`, the existing Zig 0.16-compatible
+checkpoint.
+
+## Build and test
+
+```sh
+zig build
+zig build run
+zig build test -Dplatform=null --summary all
+```
+
+The application is macOS-only. The null platform is used only for deterministic
+tests; it does not exercise Metal presentation.
+
+## Package
+
+Create an arm64 app, ZIP, DMG, and `SHA256SUMS` under `zig-out/release`:
+
+```sh
+./scripts/package-macos.sh
+```
+
+Local packaging ad-hoc signs the app. A release machine can provide a Developer
+ID identity and optional notarization credentials:
+
+```sh
+MACOS_SIGNING_IDENTITY="Developer ID Application: Example (TEAMID)" \
+APPLE_NOTARY_KEY_PATH="$HOME/private/AuthKey_KEYID.p8" \
+APPLE_NOTARY_KEY_ID="KEYID" \
+APPLE_NOTARY_ISSUER_ID="ISSUER-UUID" \
+./scripts/package-macos.sh
+```
+
+`MACOS_ENTITLEMENTS` may point to an entitlements plist when one is required.
+The packaging script validates the bundle identifier, display name, version,
+executable, arm64 architecture, and code signature before producing archives.
+
+## Limitations
+
+- Version 0.1.0 is an interim Companion, not a native phux session client.
+- Workspace depends on an independently installed `phux`; the app does not
+  bundle or update phux.
+- Local Shell is disposable and has no phux session semantics.
+- Window and shell state are not restored between launches.
+- Headless tests prove terminal and UI behavior but cannot prove live Metal
+  presentation.
+- The 0.1.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
+  performs the same explicit quarantine removal used by other apps in the tap.
+
+## Project background
+
+This repository began as a spike on 2026-07-27 asking whether phux could have
+several independent terminal panes beside ordinary native widgets in one GPU
+surface without making the native layer understand terminals.
+
+**Verdict: GO, with caveats.** [`FINDINGS.md`](FINDINGS.md) records what was
+built, what broke, what it cost, and how each claim was established. The spike
+forked native-sdk's `examples/terminal` at `a7509a7`, grew it into a two-pane
+cockpit, and was then ported to the framework's first-party
+`canvas.terminal_grid` painter. The old forked painter remains in history at
+`git show d4ccb84^:src/box.zig`.
+
+The rendering seam remains deliberately small (`src/grid.zig`):
 
 ```zig
 pub fn feed(session: *Session, bytes: []const u8) void {
@@ -37,46 +133,18 @@ pub fn feed(session: *Session, bytes: []const u8) void {
 }
 ```
 
-Swapping the byte source for phux `PANE_OUTPUT` frames is a change of *caller*,
-not of the terminal stack — ADR-0013's asymmetry landing on the FFI boundary as
-intended. Zig owns everything from VT bytes rightward, Rust owns everything
-leftward, and Rust never parses a byte.
+The rendering spike is complete. Steps 1-3 of `FINDINGS.md` section 8 landed on
+`port/first-party-terminal-grid`, and this repository remains the native host
+validation fixture.
 
-## Where it stands
+The section 7 `phux-client-ffi` sketch is historical, not the next API to
+implement. The current phux direction is a versioned libghostty checkpoint
+bootstrap and a shared `SessionKernel<NativeEngine>`; the eventual native host
+bridge should expose that kernel's effects, borrowed render views, and damage.
+Resume that integration here only after those protocol and kernel layers exist.
 
-Steps 1–3 of `FINDINGS.md` section 8 are done, on
-`port/first-party-terminal-grid`. The remaining work is **step 4:
-`phux-client-ffi`**, the C ABI, whose minimum shape is specified in section 7.
+## License
 
-Branches:
-
-- `main` — the spike as originally built, on the forked painter
-- `port/first-party-terminal-grid` — the port, and where the work continues
-
-Two sibling working copies sat beside this repo during the spike (`baseline/`,
-`cockpit-validator/`). Neither holds anything this history does not, and neither
-was published.
-
----
-
-## Upstream example README
-
-The text below is from `native-sdk`'s `examples/terminal`, which this forked.
-Some of it still describes how the terminal stack works; the keybindings are the
-example's and not necessarily this spike's.
-
-A recordable terminal: a real shell on a pty, rendered as real text on the canvas, and — the headline — sessions that replay byte-identical offline, with no shell present.
-
-- The pty effect vocabulary (`fx.ptySpawn` / `ptyWrite` / `ptyResize` / `ptyKill`) owns the transport.
-- [libghostty-vt](https://github.com/ghostty-org/ghostty) owns terminal state and damage (the `ghostty-vt` Zig module, pinned in `build.zig.zon`).
-- The canvas owns the pixels: damaged rows re-render as styled text runs, the ANSI-16 palette derives from the active theme tokens, and 256-color/truecolor pass through exactly.
-
-### Keyboard
-
-- `cmd+shift+space` — toggle keyboard selection mode (arrows move the caret, `shift`+arrows extend, `B` toggles block selection, `enter` copies, `esc` cancels)
-- `cmd+C` — copy the active selection
-- `cmd+arrow-up` / `cmd+arrow-down` — scroll history one line (`shift` for a page)
-- `cmd+home` / `cmd+end` — jump to the top / bottom of history
-- `cmd+R` — restart the shell after it exits
-
-Trackpad and mouse-wheel scrolling over the grid scrolls history directly.
+Apache-2.0. See [`LICENSE`](LICENSE). Bundled dependency licenses and notices
+are recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and shipped
+inside every application bundle.

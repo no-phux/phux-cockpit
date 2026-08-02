@@ -81,7 +81,7 @@ pub const Session = struct {
     /// lost, checkable by the app.
     response_buffer: []u8 = &.{},
     response_len: usize = 0,
-    responses_dropped: u32 = 0,
+    response_bytes_dropped: u64 = 0,
     /// Cached viewport plain text (see `refreshScreenText`): the grid's
     /// accessibility surface and the fingerprint's cell-state coverage.
     /// Heap-owned and EXACT — each refresh keeps the renderer's whole
@@ -118,7 +118,7 @@ pub const Session = struct {
     /// The growth ceiling — matched to the app's pending-outbound ring:
     /// retained replies past this could never be enqueued whole anyway,
     /// so growing further would only defer the same counted drop.
-    pub const response_capacity_max: usize = 256 * 1024;
+    pub const response_capacity_max: usize = 64 * 1024;
 
     /// The app feeds output in sub-slices no larger than this, draining
     /// answers after each, so a burst of pipelined query replies cannot
@@ -128,7 +128,7 @@ pub const Session = struct {
     /// down by a generous worst-case expansion factor: even an unbroken
     /// run of the shortest high-expansion query across a full slice
     /// produces fewer reply bytes than the buffer holds. That keeps the
-    /// write-back lossless; `responses_dropped` stays the honest fallback
+    /// write-back lossless; `response_bytes_dropped` stays the honest fallback
     /// count should a reply ever overflow anyway.
     pub const feed_slice_bytes: usize = response_capacity / 16;
 
@@ -375,7 +375,7 @@ pub const Session = struct {
         session.stream = .initAlloc(session.gpa, .init(&session.term));
         session.installStreamEffects();
         session.response_len = 0;
-        session.responses_dropped = 0;
+        session.response_bytes_dropped = 0;
         session.clearSelection();
         session.select_head = .{};
         session.select_block = false;
@@ -401,7 +401,7 @@ pub const Session = struct {
             // the ceiling — or under allocation failure — the reply
             // drops WHOLE and counted, never cut.
             if (needed > response_capacity_max) {
-                session.responses_dropped +|= 1;
+                session.response_bytes_dropped +|= bytes.len;
                 return;
             }
             var new_cap = @max(session.response_buffer.len * 2, response_capacity);
@@ -410,7 +410,7 @@ pub const Session = struct {
             if (session.gpa.realloc(session.response_buffer, new_cap)) |grown| {
                 session.response_buffer = grown;
             } else |_| {
-                session.responses_dropped +|= 1;
+                session.response_bytes_dropped +|= bytes.len;
                 return;
             }
         }
