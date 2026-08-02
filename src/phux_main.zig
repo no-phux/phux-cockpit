@@ -17,6 +17,7 @@ const pane_count: usize = 2;
 const channel_key: u64 = 0x7068_7578;
 const search_capacity: usize = 256;
 const clipboard_key: u64 = 0x7068_7579;
+const paste_clipboard_key: u64 = 0x7068_757a;
 const canvas_label = "terminal-canvas";
 const window_width: f32 = 980;
 const window_height: f32 = 640;
@@ -263,6 +264,7 @@ pub const Msg = union(enum) {
     search_edit: canvas.TextInputEvent,
     wheel: native_sdk.platform.WheelEvent,
     resize: struct { cols: u16, rows: u16, size: geometry.SizeF },
+    paste_clipboard: native_sdk.EffectClipboardResult,
     focus_pane: u8,
     focus_changed: bool,
     reconnect,
@@ -428,6 +430,17 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.setStatus("selection copied");
             } else model.setStatus("clipboard write failed; selection retained");
         },
+        .paste_clipboard => |result| {
+            if (result.outcome != .ok) {
+                model.setStatus("clipboard read failed");
+                return;
+            }
+            if (result.text.len == 0) return;
+            model.host.sendPaste(model.focus, result.text, false) catch {
+                model.failed = true;
+                model.setStatus("terminal paste rejected");
+            };
+        },
     }
 }
 
@@ -443,6 +456,10 @@ fn handleKey(model: *Model, event: canvas.WidgetKeyboardEvent, fx: *Effects) voi
     }
     if (event.phase == .key_down and primary and keyIs(event.key, "c") and model.selections[model.focus].active) {
         update(model, .copy, fx);
+        return;
+    }
+    if (event.phase == .key_down and primary and keyIs(event.key, "v")) {
+        fx.readClipboard(.{ .key = paste_clipboard_key, .on_result = Effects.clipboardMsg(.paste_clipboard) });
         return;
     }
     if (event.phase == .key_down and primary and event.modifiers.shift and keyIs(event.key, "space")) {
