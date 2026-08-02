@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,10 +17,22 @@ permissions:
 jobs:
   macos:
     name: Package arm64 macOS release
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
+
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
@@ -87,11 +105,9 @@ jobs:
 
       - name: Build, sign, verify, and package
         id: package
-        env:
-          VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          export VERSION="${VERSION#v}"
+          export VERSION="${RELEASE_TAG#v}"
           ./scripts/package-macos.sh
 
       - name: Publish release
@@ -114,12 +130,12 @@ jobs:
           Signing mode: ${SIGNING_MODE}.
           EOF
           fi
-          gh release create "${GITHUB_REF_NAME}" \
+          gh release create "${RELEASE_TAG}" \
             zig-out/release/*.zip \
             zig-out/release/*.dmg \
             zig-out/release/SHA256SUMS \
             --verify-tag \
-            --title "Phux Cockpit ${GITHUB_REF_NAME}" \
+            --title "Phux Cockpit ${RELEASE_TAG}" \
             --notes-file "${notes}"
 
       - name: Require Homebrew tap deploy key
@@ -139,10 +155,10 @@ jobs:
 
       - name: Update Homebrew tap
         env:
-          TAG: ${{ github.ref_name }}
           NOTARIZED: ${{ steps.package.outputs.notarized }}
         run: |
           set -euo pipefail
+          TAG="$RELEASE_TAG"
           [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
           version="${BASH_REMATCH[1]}"
           archive="phux-cockpit-$version-macos-arm64.zip"
