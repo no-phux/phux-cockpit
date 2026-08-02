@@ -1,25 +1,30 @@
 # Phux Cockpit
 
-Phux Cockpit is the macOS companion for
-[phux](https://github.com/phall1/phux). Version 0.1.0 is an intentionally
-interim, terminal-backed release: it puts the installed phux TUI and an
-ephemeral local shell side by side in one native Metal window.
+Phux Cockpit is a native macOS workbench around
+[phux](https://github.com/phall1/phux). Version 0.2.0 introduces a stable Work
+rail over three real execution surfaces: the installed phux TUI, an ephemeral
+local scratch shell, and a focused system-WebKit research surface.
 
 ## Companion scope
 
-- **Workspace** runs the `phux` executable already installed on your Mac. It is
-  the same TUI and workspace state you get by running `phux` in a terminal.
-- **Local Shell** is owned by this app process. It is ephemeral:
+- **Workspace** runs the installed `phux` executable. It is the same durable
+  TUI and workspace state you get by running `phux` in a terminal.
+- **Scratch** is owned by this app process. It is ephemeral:
   closing or restarting the app ends that shell, and it is not a durable phux
   session.
+- **Web** is a native WebKit surface for the explicitly allowed GitHub,
+  Superlogical, and Mitchell Hashimoto top-level origins. It keeps its page
+  process alive while another Work is selected. Native bridge commands are
+  disabled; WebKit subframes and page resources remain ordinary web content.
 - This release is **not** the future native `SessionKernel` client. It does not
   embed `SessionKernel<NativeEngine>`, attach through a native protocol, or
   replace phux's TUI. That integration waits for phux's versioned libghostty
   checkpoint bootstrap and shared kernel layers.
 
-Both panes are real PTYs backed by libghostty-vt and painted into one native-sdk
-Metal surface. The native layer owns terminal state and pixels; it does not
-parse phux application state.
+Both terminal executions stay live while hidden. The selected terminal is
+backed by libghostty-vt and painted into a native-sdk Metal surface; Web is a
+real platform webview layered into the same window. The native layer does not
+parse or fabricate phux application state.
 
 ## Install
 
@@ -31,15 +36,16 @@ brew install --cask phall1/tap/phux-cockpit
 ```
 
 The cask installs the `phux` formula from the same tap, then places **Phux
-Cockpit** in Applications. Version 0.1.0 is ad-hoc signed; the cask clears its
+Cockpit** in Applications. Version 0.2.0 is ad-hoc signed; the cask clears its
 quarantine attribute and reports that fact in its caveat.
 
 ## Keybindings
 
 | Key | Action |
 |---|---|
-| `cmd+1` | Focus Workspace |
-| `cmd+2` | Focus Local Shell |
+| `cmd+1` | Select Workspace |
+| `cmd+2` | Select Scratch |
+| `cmd+3` | Select Web |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |
 | `shift` + arrow keys | Extend the selection |
@@ -47,13 +53,14 @@ quarantine attribute and reports that fact in its caveat.
 | `enter` | Copy and leave selection mode |
 | `esc` | Cancel selection mode |
 | `cmd+C` | Copy the active selection |
-| `cmd+V` | Safely paste the system clipboard into the focused pane |
+| `cmd+V` | Safely paste the system clipboard into the selected terminal |
 | `cmd+arrow-up` / `cmd+arrow-down` | Scroll one history line (`shift` scrolls a page) |
 | `cmd+home` / `cmd+end` | Jump to the top or bottom of history |
-| `cmd+R` | Restart the focused pane after its process exits |
+| `cmd+R` | Restart the selected terminal after its process exits |
 
-Clicking a pane focuses it. Trackpad and mouse-wheel input scrolls the pane
-under the pointer.
+Clicking a Work row switches surfaces without stopping hidden work. Trackpad
+and mouse-wheel input scrolls only inside the selected terminal; wheel input
+over the rail never leaks into a hidden execution.
 
 ## Requirements
 
@@ -105,14 +112,20 @@ scheduled updater independently repairs a missed release update.
 
 ## Limitations
 
-- Version 0.1.0 is an interim Companion, not a native phux session client.
+- Version 0.2.0 is an early product slice, not a native phux session client.
 - Workspace depends on an independently installed `phux`; the app does not
   bundle or update phux.
-- Local Shell is disposable and has no phux session semantics.
+- Scratch is disposable and has no phux session semantics.
+- Web allowlists top-level navigation; it is not a content firewall for
+  subframes or page resources. native-sdk v0.7.1 does not expose page title,
+  committed-navigation, load-state, or native back/forward events to Zig, so
+  Cockpit does not pretend to own general browser history.
+- The initial Work records are fixed; user-created durable Work and promotion
+  in place require the next persistence/session integration slice.
 - Window and shell state are not restored between launches.
 - Headless tests prove terminal and UI behavior but cannot prove live Metal
   presentation.
-- The 0.1.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
+- The 0.2.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
   performs the same explicit quarantine removal used by other apps in the tap.
 
 ## Project background

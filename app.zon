@@ -2,14 +2,14 @@
     .id = "dev.phux.cockpit",
     .name = "phux-cockpit",
     .display_name = "Phux Cockpit",
-    .description = "An interim native companion for the installed phux TUI, with an ephemeral local shell.",
-    .version = "0.1.0",
+    .description = "A native work cockpit for phux, local scratch, and focused web research.",
+    .version = "0.2.0",
     .theme = "geist",
     .theme_accent = "#bef264",
     .icons = .{"assets/icon.svg"},
     .platforms = .{"macos"},
     .permissions = .{ "view", "command" },
-    .capabilities = .{ "native_views", "gpu_surfaces" },
+    .capabilities = .{ "native_views", "gpu_surfaces", "webview" },
     .shell = .{
         .windows = .{
             .{
@@ -24,16 +24,17 @@
                 .titlebar = "hidden_inset_tall",
                 .views = .{
                     .{ .label = "phux-cockpit-canvas", .kind = "gpu_surface", .fill = true, .role = "Phux Cockpit canvas", .accessibility_label = "Phux Cockpit", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                    .{ .label = "phux-cockpit-web", .kind = "webview", .parent = "phux-cockpit-canvas", .url = "https://github.com/phall1", .x = 0, .y = 0, .width = 1, .height = 1, .layer = 20 },
                 },
             },
         },
     },
     .security = .{
         .navigation = .{
-            .allowed_origins = .{ "zero://app", "zero://inline" },
+            .allowed_origins = .{ "zero://app", "zero://inline", "https://github.com", "https://www.superlogical.com", "https://mitchellh.com" },
             .external_links = .{ .action = "deny" },
         },
     },
     .web_engine = "system",
-    .webview_layer = "exclude",
+    .webview_layer = "auto",
 }

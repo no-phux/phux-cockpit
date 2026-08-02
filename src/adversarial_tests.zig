@@ -28,6 +28,8 @@ fn destroyModelSessions(model: *app.Model) void {
 
 fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.shortcuts = &app.work_shortcuts;
     const sessions = try createSessions(80, 24);
     const app_state = try gpa.create(TerminalApp);
     app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
@@ -165,13 +167,9 @@ fn expectNoDuplicateIds(gpa: std.mem.Allocator, commands: []const canvas.CanvasC
     }
 }
 
-test "ADVERSARIAL: no two commands in a hostile two-pane frame share an id" {
-    // The recon flagged `grid_id_base` / `cursor_command_id` as a real
-    // collision risk. This drives BOTH panes into every id-emitting path
-    // at once — background, clip, row backgrounds, text runs, underlines,
-    // strikethroughs, box geometry, selection wash, the cursor, and the
-    // scrollbar thumb — at the widest grid the clamp allows, and scans
-    // the WHOLE list rather than probing two known ids.
+test "ADVERSARIAL: hostile terminal Work switches retain collision-free ids" {
+    // Each selected terminal drives every id-emitting path, then the
+    // retained diff switches between their disjoint id namespaces.
     const gpa = testing.allocator;
     const sessions = try createSessions(120, 40);
     defer for (sessions) |each| each.destroy();
@@ -195,32 +193,33 @@ test "ADVERSARIAL: no two commands in a hostile two-pane frame share an id" {
         session.moveSelection(20, 3, true);
     }
 
-    const commands = try gpa.alloc(canvas.CanvasCommand, 64 * 1024);
-    defer gpa.free(commands);
-    var builder = canvas.Builder.init(commands);
+    var storage: [app.pane_count][]canvas.CanvasCommand = undefined;
+    var allocated: usize = 0;
+    defer for (storage[0..allocated]) |commands| gpa.free(commands);
+    var lists: [app.pane_count]canvas.DisplayList = undefined;
     for (sessions, 0..) |session, index| {
+        storage[index] = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
+        allocated += 1;
+        var builder = canvas.Builder.init(storage[index]);
         try grid.paint(session, &builder, .{
-            .frame = geometry.RectF.init(@as(f32, @floatFromInt(index)) * 490, 36, 480, 600),
-            .background_frame = if (index == 0) geometry.RectF.init(0, 0, 980, 640) else null,
+            .frame = geometry.RectF.init(226, 60, 746, 572),
+            .background_frame = geometry.RectF.init(0, 0, 980, 640),
             .tokens = .{},
             .running = true,
-            .focused = index == 0,
+            .focused = true,
             .selecting = true,
-            // NOTE: unbounded on purpose. A budget would truncate the
-            // rows before the high row ids could ever collide, which
-            // would make this probe vacuous.
             .id_base = grid.paneIdBase(index),
         });
+        lists[index] = builder.displayList();
+        try testing.expect(lists[index].commands.len > 2000);
+        try expectNoDuplicateIds(gpa, lists[index].commands);
     }
-    const list = builder.displayList();
-    try testing.expect(list.commands.len > 2000); // the probe is not empty
-    try expectNoDuplicateIds(gpa, list.commands);
+    const changes = try gpa.alloc(canvas.DiffChange, 64 * 1024);
+    defer gpa.free(changes);
+    _ = try canvas.DisplayList.diff(lists[0], lists[1], changes);
 }
 
-test "ADVERSARIAL: the live frame's ids are unique across grids AND widgets" {
-    // The unit probe above paints grids only. This one takes the REAL
-    // retained display list the runtime holds — chrome prefix plus the
-    // widget header and badges — and scans all of it.
+test "ADVERSARIAL: each selected terminal frame has unique ids and no hidden grid band" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -241,26 +240,28 @@ test "ADVERSARIAL: the live frame's ids are unique across grids AND widgets" {
     }
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
-    const list = harness.runtime.views[0].canvasDisplayList();
-    try testing.expect(list.commands.len > 100);
-    try expectNoDuplicateIds(gpa, list.commands);
-
-    // And the grids' bands really are disjoint from each other. Under the
-    // first-party painter the emitted band for caller id `n` is
-    // `paintIdBase(n) + [0, 2^24)` — the painter applies the stride, so a
-    // band check must apply it too.
     const stride: u64 = 1 << 24;
     const base0 = canvas.terminal_grid.paintIdBase(grid.paneIdBase(0));
     const base1 = canvas.terminal_grid.paintIdBase(grid.paneIdBase(1));
-    var pane0: usize = 0;
-    var pane1: usize = 0;
-    for (list.commands) |command| {
-        const id = command.objectId() orelse continue;
-        if (id >= base0 and id < base0 + stride) pane0 += 1;
-        if (id >= base1 and id < base1 + stride) pane1 += 1;
+    for ([_]struct { key: []const u8, selected_base: u64, hidden_base: u64 }{
+        .{ .key = "1", .selected_base = base0, .hidden_base = base1 },
+        .{ .key = "2", .selected_base = base1, .hidden_base = base0 },
+    }) |case| {
+        try pressKey(harness, app_iface, case.key, .{ .primary = true });
+        try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+        const list = harness.runtime.views[0].canvasDisplayList();
+        try testing.expect(list.commands.len > 100);
+        try expectNoDuplicateIds(gpa, list.commands);
+        var selected_commands: usize = 0;
+        var hidden_commands: usize = 0;
+        for (list.commands) |command| {
+            const id = command.objectId() orelse continue;
+            if (id >= case.selected_base and id < case.selected_base + stride) selected_commands += 1;
+            if (id >= case.hidden_base and id < case.hidden_base + stride) hidden_commands += 1;
+        }
+        try testing.expect(selected_commands > 20);
+        try testing.expectEqual(@as(usize, 0), hidden_commands);
     }
-    try testing.expect(pane0 > 20);
-    try testing.expect(pane1 > 20);
 }
 
 // --------------------------------------------------- A3/A4: budget reality
@@ -297,7 +298,7 @@ fn feedHostileRows(session: *grid.Session, cols: usize, rows: usize) void {
     }
 }
 
-test "ADVERSARIAL: the command budget genuinely binds - it is not 0" {
+test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
     // A budget that was secretly 0 (unbounded) would still pass a test
     // that only asserts `len <= budget` on a quiet screen. This compares
     // the SAME hostile screen painted bounded vs unbounded: if the bound
@@ -328,79 +329,64 @@ test "ADVERSARIAL: the command budget genuinely binds - it is not 0" {
         .tokens = .{},
         .running = true,
         .selecting = false,
-        .command_budget = app.paneCommandBudget(0),
-        .text_reserve = app.pane_text_reserve,
-        .glyph_budget = app.pane_glyph_budget,
+        .command_budget = app.chrome_command_envelope,
+        .text_reserve = canvas.terminal_grid.widget_text_reserve,
+        .glyph_budget = canvas.terminal_grid.widget_glyph_budget,
         .id_base = grid.paneIdBase(0),
     });
     const bounded_len = bounded.displayList().commands.len;
 
     std.debug.print(
         "\nMEASURED budget bind: unbounded={d} bounded={d} budget={d}\n",
-        .{ unbounded_len, bounded_len, app.paneCommandBudget(0) },
+        .{ unbounded_len, bounded_len, app.chrome_command_envelope },
     );
-    try testing.expect(app.paneCommandBudget(0) > 0);
-    try testing.expect(unbounded_len > app.paneCommandBudget(0)); // the screen CAN overflow
+    try testing.expect(app.chrome_command_envelope > 0);
+    try testing.expect(unbounded_len > app.chrome_command_envelope); // the screen CAN overflow
     try testing.expect(bounded_len < unbounded_len); // the bound truncated it
-    try testing.expect(bounded_len <= app.paneCommandBudget(0));
+    try testing.expect(bounded_len <= app.chrome_command_envelope);
 }
 
-test "ADVERSARIAL: identical hostile content, and the two panes are NOT equal" {
-    // MEASUREMENT, not a repair. The policy calls itself "floor and
-    // slack" and claims neither pane can starve the other. It is a
-    // CUMULATIVE high-water mark, so pane 0 stops at 896 total while
-    // pane 1 stops at 1792 total, and each pane also gives back its own
-    // `cols*8+8` row reserve. Feed BOTH panes byte-identical content at
-    // the app's real pane geometry and the two do not paint the same
-    // number of rows: position in the paint order decides how much of
-    // your terminal you can see.
+test "ADVERSARIAL: either selected terminal gets the same full hostile-content budget" {
     const gpa = testing.allocator;
     const sessions = try createSessions(58, 40);
     defer for (sessions) |each| each.destroy();
     for (sessions) |session| feedHostileRows(session, 58, 40);
 
-    // The real rects the app would use at its default window size.
     var model = app.initialModel(sessions);
-    const frames = app.paneFrames(&model, geometry.SizeF.init(980, 640));
-
-    const storage = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
-    defer gpa.free(storage);
-    var builder = canvas.Builder.init(storage);
     var painted: [app.pane_count]usize = @splat(0);
     var used: [app.pane_count]usize = @splat(0);
-    for (sessions, frames, 0..) |session, frame, index| {
-        const before = builder.displayList().commands.len;
+    for (sessions, 0..) |session, index| {
+        model.selected_work = if (index == 0) .workspace else .scratch;
+        const frames = app.paneFrames(&model, geometry.SizeF.init(980, 640));
+        try testing.expect(frames[index].width > 0);
+        try testing.expectEqual(@as(f32, 0), frames[1 - index].width);
+
+        const storage = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
+        defer gpa.free(storage);
+        var builder = canvas.Builder.init(storage);
         try grid.paint(session, &builder, .{
-            .frame = frame,
-            .background_frame = if (index == 0) geometry.RectF.init(0, 0, 980, 640) else null,
+            .frame = frames[index],
+            .background_frame = geometry.RectF.init(0, 0, 980, 640),
             .tokens = .{},
             .running = true,
-            .focused = index == 0,
+            .focused = true,
             .selecting = false,
-            .command_budget = app.paneCommandBudget(index),
-            .text_reserve = app.pane_text_reserve,
-            .glyph_budget = app.pane_glyph_budget,
+            .command_budget = app.chrome_command_envelope,
+            .text_reserve = canvas.terminal_grid.widget_text_reserve,
+            .glyph_budget = canvas.terminal_grid.widget_glyph_budget,
             .id_base = grid.paneIdBase(index),
         });
-        const after = builder.displayList().commands.len;
-        used[index] = after - before;
-        painted[index] = paintedRows(builder.displayList().commands[before..after]);
+        used[index] = builder.displayList().commands.len;
+        painted[index] = paintedRows(builder.displayList().commands);
+        try testing.expect(used[index] <= app.chrome_command_envelope);
     }
     std.debug.print(
-        "\nMEASURED symmetry: rows={{ {d}, {d} }} commands={{ {d}, {d} }} budgets={{ {d}, {d} }} envelope={d}\n",
-        .{ painted[0], painted[1], used[0], used[1], app.paneCommandBudget(0), app.paneCommandBudget(1), app.chrome_command_envelope },
+        "\nMEASURED selected symmetry: rows={{ {d}, {d} }} commands={{ {d}, {d} }} envelope={d}\n",
+        .{ painted[0], painted[1], used[0], used[1], app.chrome_command_envelope },
     );
-
-    // The envelope holds — that part of the claim is true.
-    try testing.expect(builder.displayList().commands.len <= app.chrome_command_envelope);
-    // Both panes show something — no total starvation.
-    try testing.expect(painted[0] > 0);
-    try testing.expect(painted[1] > 0);
-    // But the split is NOT even. Pinned as the honest description of
-    // the policy: pane 1 gets strictly more of the frame than pane 0
-    // for byte-identical content. If a later change makes them equal,
-    // this test fails and the comment above should be deleted.
-    try testing.expect(painted[1] > painted[0]);
+    try testing.expect(painted[0] >= 5);
+    try testing.expectEqual(painted[0], painted[1]);
+    try testing.expectEqual(used[0], used[1]);
 }
 
 // ------------------------------------------------------- A5/A6: input paths
@@ -475,10 +461,7 @@ test "ADVERSARIAL: the focus chord itself never leaks a byte to either child" {
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-test "ADVERSARIAL: a wheel over the UNFOCUSED pane scrolls that one, not the focused one" {
-    // Named by the build agent as implemented-but-unpinned. It is also
-    // the sharpest shared-state probe available: one scrollback offset
-    // behind two panes would move both.
+test "ADVERSARIAL: a wheel over the Work rail reaches neither terminal" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -496,11 +479,6 @@ test "ADVERSARIAL: a wheel over the UNFOCUSED pane scrolls that one, not the foc
         model.panes[0].session.feed(bytes);
         model.panes[1].session.feed(bytes);
     }
-    // `Model.surface_size` is only written by the `.viewport` Msg, and
-    // `onFrame` emits at most ONE of those per surface frame. Until the
-    // surface has been measured, `paneFrames` returns zero-width rects
-    // and the hit test cannot resolve anything — so pump real frames
-    // first, exactly as a live window does at ~60 Hz.
     for (2..8) |frame_index| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
             .label = app.canvas_label,
@@ -515,48 +493,27 @@ test "ADVERSARIAL: a wheel over the UNFOCUSED pane scrolls that one, not the foc
     const bottom0 = model.panes[0].session.scrollbar().offset;
     const bottom1 = model.panes[1].session.scrollbar().offset;
     try testing.expect(bottom0 > 0 and bottom1 > 0);
-    try testing.expectEqual(@as(u8, 0), model.focus);
-
-    // Point at the CENTRE of pane 1 while pane 0 holds keyboard focus.
-    const frames = app.paneFrames(model, size);
-    const target = frames[1];
-    const cell_h = model.panes[1].session.cell_height;
+    try testing.expectEqual(app.WorkId.workspace, model.selected_work);
+    const cell_h = model.panes[0].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
             .label = app.canvas_label,
             .kind = .scroll,
-            .x = target.x + target.width / 2,
-            .y = target.y + target.height / 2,
+            .x = app.work_rail_width / 2,
+            .y = 300,
             .delta_y = cell_h,
         } });
     }
     std.debug.print(
-        "\nMEASURED wheel routing (surface measured): pane0 {d}->{d}  pane1 {d}->{d}\n",
+        "\nMEASURED rail wheel isolation: pane0 {d}->{d}  pane1 {d}->{d}\n",
         .{ bottom0, model.panes[0].session.scrollbar().offset, bottom1, model.panes[1].session.scrollbar().offset },
     );
-    // Pane 1 scrolled into history...
-    try testing.expect(model.panes[1].session.scrollbar().offset < bottom1);
-    // ...and the FOCUSED pane 0 did not move at all. Two scrollback
-    // offsets, independently addressable by pointer position.
     try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
+    try testing.expectEqual(bottom1, model.panes[1].session.scrollbar().offset);
 }
 
-test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" {
-    // The defect this probe originally found, now repaired and inverted.
-    //
-    // `Model.surface_size` used to start at {0,0} and was only written by
-    // the `.viewport` Msg. Until `onFrame` emitted one, `paneFrames`
-    // returned zero-width rects, `paneAtPoint` could never contain a
-    // point, and EVERY wheel — including one plainly over pane 1 — fell
-    // back silently to the focused pane. The build agents' suite never
-    // reached the measured state, so their "a wheel scrolls the pane it
-    // is OVER" claim went unexercised.
-    //
-    // The fix seeds `surface_size` from the window's CONFIGURED size,
-    // which `app.zon` pins with `restore_state = false` and
-    // `center_on_primary`. This test holds the fix in place by asserting
-    // the routing works with NO frame dispatched at all.
+test "REGRESSION: the selected Scratch frame receives wheel input before the first frame" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(1100, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -571,6 +528,9 @@ test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" 
     // The mirror is live before any frame, and the rects it yields are real.
     try testing.expectEqual(size.width, model.surface_size.width);
     try testing.expectEqual(size.height, model.surface_size.height);
+    try pressKey(harness, app_iface, "2", .{ .primary = true });
+    try testing.expectEqual(app.WorkId.scratch, model.selected_work);
+    try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[0].width);
     try testing.expect(app.paneFrames(model, model.surface_size)[1].width > 0);
 
     var line: [32]u8 = undefined;
@@ -582,9 +542,8 @@ test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" 
     const bottom0 = model.panes[0].session.scrollbar().offset;
     const bottom1 = model.panes[1].session.scrollbar().offset;
 
-    // Pane 0 holds focus; aim squarely at pane 1. The wheel must follow
-    // the POINTER, not the focus.
-    try testing.expectEqual(@as(u8, 0), model.focus);
+    // Aim squarely at the selected Scratch terminal.
+    try testing.expectEqual(@as(u8, 1), model.focus);
     const target = app.paneFrames(model, model.surface_size)[1];
     const cell_h = model.panes[1].session.cell_height;
     for (0..6) |_| {
@@ -597,21 +556,16 @@ test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" 
             .delta_y = cell_h,
         } });
     }
-    // Pane 1 scrolled; the focused pane 0 did NOT.
+    // Scratch scrolled; hidden Workspace did not.
     try testing.expect(model.panes[1].session.scrollbar().offset < bottom1);
     try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
 }
 
 // -------------------------------------------------- A7: the validator's eyes
 
-const validator_shot_path = "zig-out/validator-two-panes.png";
+const validator_shot_path = "zig-out/validator-selected-work.png";
 
-test "ADVERSARIAL: proof shot with SUBSTANTIAL distinct content in both panes (env-gated)" {
-    // The builders' shot showed one word per pane. If the panes shared a
-    // terminal, one word each is exactly what a fluke could still look
-    // right for. This drives many rows of clearly-labelled, differently
-    // styled content into each pty and renders the retained frame the
-    // GPU would present.
+test "ADVERSARIAL: selected-Work proof shot preserves substantial hidden content (env-gated)" {
     if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
     if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -654,14 +608,18 @@ test "ADVERSARIAL: proof shot with SUBSTANTIAL distinct content in both panes (e
     }
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
-    // Both streams landed on their own emulator, and neither saw the
-    // other's marker.
+    // Both streams landed on their own emulator while only one surface
+    // was visible, and neither saw the other's marker.
     const left = app_state.model.panes[0].session.screenText();
     const right = app_state.model.panes[1].session.screenText();
     try testing.expect(std.mem.indexOf(u8, left, "build step 14/14") != null);
     try testing.expect(std.mem.indexOf(u8, left, "RIGHT") == null);
     try testing.expect(std.mem.indexOf(u8, right, "Tue Jul 27") != null);
     try testing.expect(std.mem.indexOf(u8, right, "LEFT") == null);
+
+    // Capture Scratch selected; Workspace remains live but unpainted.
+    try pressKey(harness, app_iface, "2", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, null);
     const pixels = try gpa.alloc(u8, pixel_size.byte_len);

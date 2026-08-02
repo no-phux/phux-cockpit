@@ -1,4 +1,4 @@
-//! Companion: a recordable two-pane terminal cockpit. The pty
+//! Native Work cockpit over terminal and web surfaces. The pty
 //! effect vocabulary owns the transport (`fx.ptySpawn` and friends),
 //! libghostty-vt owns cell state, damage, scrollback, and selection, and
 //! the canvas paints the viewport as real text — theme-mapped ANSI-16,
@@ -27,6 +27,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 pub const canvas_label = "phux-cockpit-canvas";
+pub const webview_label = "phux-cockpit-web";
+pub const webview_anchor = "phux-cockpit-web-pane";
 pub const app_name = "Phux Cockpit";
 pub const bundle_id = "dev.phux.cockpit";
 const window_width: f32 = 1100;
@@ -42,11 +44,14 @@ const grid_inset: f32 = 8;
 /// chrome prefix never paints under the widget tree.
 pub const header_height: f32 = 52;
 
-/// The cockpit paints SEVERAL terminal panes into one gpu_surface.
-pub const pane_count: usize = 2;
+/// Stable navigation lives outside any one execution surface. The first
+/// product cut keeps the rail deliberately compact so a terminal remains
+/// useful at the minimum window width.
+pub const work_rail_width: f32 = 208;
+pub const work_rail_gutter: f32 = 10;
 
-/// The horizontal gap between two panes, in canvas points.
-pub const pane_gutter: f32 = 8;
+/// Two terminal executions remain live; one selected Work paints at a time.
+pub const pane_count: usize = 2;
 
 /// One keyed-effect space spans pty, clipboard, spawn, and fetch
 /// (`effects.keyOccupiedUntilDelivery`), so pane, copy, and paste keys
@@ -59,51 +64,10 @@ pub fn ptyKey(index: usize) u64 {
 pub const clipboard_key: u64 = 100;
 pub const paste_clipboard_key: u64 = 101;
 
-/// THE BUDGET POLICY. The three per-view canvas budgets are accounted
-/// DIFFERENTLY by the painter, so each is partitioned differently.
-///
-/// COMMANDS are CUMULATIVE: the painter compares the BUILDER TOTAL
-/// against its ceiling, so `command_budget` is an absolute high-water
-/// mark, not a per-paint allowance. Partitioned floor-and-slack: pane 0
-/// may reach 896 and no further, pane 1 may reach the whole 1792 — so
-/// pane 1 inherits every command pane 0 left unspent while still being
-/// guaranteed its own 896. Neither pane can starve its neighbour.
-/// The widgets' share now comes from the first-party painter's own
-/// constants rather than a local copy: the port's whole point is to stop
-/// hand-maintaining numbers the framework publishes and will keep in
-/// step with its own emission.
+/// The selected terminal owns the complete retained-chrome envelope. Hidden
+/// terminals ingest bytes but emit no display-list commands.
 const widget_command_reserve: usize = canvas.terminal_grid.widget_command_reserve;
 pub const chrome_command_envelope: usize = native_sdk.runtime.max_canvas_commands_per_view - widget_command_reserve;
-pub fn paneCommandBudget(index: usize) usize {
-    return chrome_command_envelope - (pane_count - 1 - index) * (chrome_command_envelope / pane_count);
-}
-
-/// TEXT is PER-PAINT LOCAL: the painter's emitted-bytes counter resets
-/// every call while the 32 KiB text store is shared. Partitioned by a
-/// MIRRORED reserve — both panes get the same one, each capping its own
-/// local counter, so the pair can never exceed the store less the
-/// widgets' share.
-pub const pane_text_reserve: usize = canvas.max_display_list_text_bytes -
-    (canvas.max_display_list_text_bytes - canvas.terminal_grid.widget_text_reserve) / pane_count;
-
-/// GLYPHS are PER-PAINT LOCAL and a SET, not a running count. Halved
-/// per pane. The four-atlas-variants-per-code-point charge that the fork
-/// had to add by hand is now the painter's own
-/// (`atlas_variants_per_glyph`), so this is a plain division again.
-pub const pane_glyph_budget: usize = canvas.terminal_grid.widget_glyph_budget / pane_count;
-
-/// PATHS are PER-PAINT LOCAL, and new to the first-party painter: box
-/// drawing renders as GEOMETRY at exact cell bounds rather than font
-/// glyphs, so box-heavy content competes for path elements. The fork had
-/// no path tier at all — it widened its per-column command reserve
-/// instead, which is exactly the hand-maintained accounting this port
-/// deletes.
-pub const pane_path_reserve: usize = native_sdk.runtime.max_canvas_path_elements_per_view -
-    (native_sdk.runtime.max_canvas_path_elements_per_view - canvas.terminal_grid.widget_path_reserve) / pane_count;
-
-/// Each pane's share of the module-wide cell ceiling, so two panes
-/// together can never outgrow one view's budgets.
-pub const pane_cell_ceiling: usize = grid.max_cells / pane_count;
 
 /// The per-pane pending-outbound ring. 64 KiB matches the pty's stdin
 /// FIFO exactly; at two panes that is 128 KiB of model, HALF the single
@@ -152,9 +116,64 @@ pub fn paneArgv(index: usize) []const []const u8 {
     return if (index == 0) workspace_argv else control_argv;
 }
 
+pub const BrowserPage = enum {
+    github,
+    superlogical,
+    article,
+
+    pub fn url(page: BrowserPage) []const u8 {
+        return switch (page) {
+            .github => "https://github.com/phall1",
+            .superlogical => "https://www.superlogical.com/",
+            .article => "https://mitchellh.com/writing/superlogical",
+        };
+    }
+};
+
+pub const WorkId = enum(u8) {
+    workspace,
+    scratch,
+    web,
+};
+
+pub const Work = struct {
+    id: WorkId,
+    title: []const u8,
+    context: []const u8,
+    surface: union(enum) {
+        terminal: u8,
+        web: void,
+    },
+};
+
+pub const works = [_]Work{
+    .{ .id = .workspace, .title = "Workspace", .context = "phux / durable work", .surface = .{ .terminal = 0 } },
+    .{ .id = .scratch, .title = "Scratch", .context = "local / ephemeral", .surface = .{ .terminal = 1 } },
+    .{ .id = .web, .title = "Web", .context = "native WebKit", .surface = .{ .web = {} } },
+};
+
+pub fn workById(id: WorkId) *const Work {
+    return &works[@intFromEnum(id)];
+}
+
+pub const web_origins = [_][]const u8{
+    "zero://inline",
+    "zero://app",
+    "https://github.com",
+    "https://www.superlogical.com",
+    "https://mitchellh.com",
+};
+
+pub const work_shortcuts = [_]native_sdk.Shortcut{
+    .{ .id = "work.workspace", .key = "1", .modifiers = .{ .primary = true } },
+    .{ .id = "work.scratch", .key = "2", .modifiers = .{ .primary = true } },
+    .{ .id = "work.web", .key = "3", .modifiers = .{ .primary = true } },
+};
+
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Phux Cockpit canvas", .accessibility_label = "Phux Cockpit", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
+    .{ .label = webview_label, .kind = .webview, .parent = canvas_label, .url = BrowserPage.github.url(), .x = 0, .y = 0, .width = 1, .height = 1, .layer = 20 },
 };
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
@@ -248,6 +267,13 @@ pub const Pane = struct {
 
 pub const Model = struct {
     panes: [pane_count]Pane,
+    /// Product selection is independent from terminal focus. A Work may
+    /// present a terminal, a native webview, or future non-terminal surface.
+    selected_work: WorkId = .workspace,
+    browser_page: BrowserPage = .github,
+    /// Forces an app-owned root navigation even when the chosen root did not
+    /// change while WebKit navigated internally.
+    browser_navigation_token: u64 = 0,
     /// Which pane keyboard input reaches. Window activation is global,
     /// pane focus is not: exactly one pane is the keyboard target and
     /// only that one paints a filled cursor.
@@ -285,18 +311,15 @@ pub const Model = struct {
     chrome_top: f32 = 0,
     /// The last surface size the frame pump reported, carried on the
     /// `.viewport` message. `update` has no view size of its own, and
-    /// the wheel hit test needs one to resolve which pane the pointer
-    /// stands over — `on_wheel` cannot do it (no model access) and
+    /// the wheel hit test needs one to resolve whether the pointer stands
+    /// over the selected terminal — `on_wheel` cannot do it (no model access) and
     /// `on_frame` cannot mutate. A size change too small to move any
     /// pane's grid never lands here, so the resolved midpoint can lag
-    /// by up to one cell: correct for a which-half question, and the
-    /// hit test falls back to the focused pane when the point lands in
-    /// no rect at all.
+    /// by up to one cell. Points outside the selected frame are rejected.
     ///
     /// SEEDED with the window's CONFIGURED size rather than left zero.
-    /// Zero made every pre-first-frame wheel miss both rects and fall
-    /// back to the focused pane — so a wheel aimed squarely at pane 1
-    /// scrolled pane 0, which the adversarial suite caught and pinned.
+    /// Zero made every pre-first-frame wheel miss the terminal frame,
+    /// which the adversarial suite caught and pinned.
     /// `app.zon` declares `restore_state = false` with
     /// `center_on_primary`, so the window always opens at exactly this
     /// size: the seed is not a guess about the first frame, it is the
@@ -307,6 +330,13 @@ pub const Model = struct {
 
     pub fn focusedPane(model: *Model) *Pane {
         return &model.panes[@min(model.focus, pane_count - 1)];
+    }
+
+    pub fn selectedTerminalIndex(model: *const Model) ?u8 {
+        return switch (workById(model.selected_work).surface) {
+            .terminal => |index| index,
+            .web => null,
+        };
     }
 };
 
@@ -333,6 +363,9 @@ pub const Msg = union(enum) {
     paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
     restart,
+    select_work: WorkId,
+    shortcut_work: WorkId,
+    browser_page: BrowserPage,
     /// Move keyboard focus to a pane (cmd+1/cmd+2, or a press on the
     /// pane's own stack). Out-of-range indices are ignored.
     focus_pane: u8,
@@ -352,6 +385,81 @@ pub const Msg = union(enum) {
 
 const TerminalApp = native_sdk.UiApp(Model, Msg);
 const Fx = TerminalApp.Effects;
+
+/// UiApp owns the deterministic model/view/effects loop. This host adds the
+/// one imperative operation native surface switching requires: moving the OS
+/// first responder after a global Work shortcut. Without it, a parked WebKit
+/// view can keep consuming text after the model has returned to a terminal.
+pub const CockpitHost = struct {
+    inner: TerminalApp = undefined,
+    inner_app: native_sdk.App = undefined,
+
+    pub fn init(self: *CockpitHost, allocator: std.mem.Allocator, model: Model, options: TerminalApp.Options) void {
+        self.inner = TerminalApp.init(allocator, model, options);
+        self.inner_app = self.inner.app();
+    }
+
+    pub fn deinit(self: *CockpitHost) void {
+        self.inner.deinit();
+    }
+
+    pub fn app(self: *CockpitHost) native_sdk.App {
+        return .{
+            .context = self,
+            .name = self.inner_app.name,
+            .source = self.inner_app.source,
+            .source_fn = if (self.inner_app.source_fn != null) source else null,
+            .scene_fn = if (self.inner_app.scene_fn != null) scene else null,
+            .start_fn = if (self.inner_app.start_fn != null) start else null,
+            .event_fn = if (self.inner_app.event_fn != null) event else null,
+            .stop_fn = if (self.inner_app.stop_fn != null) stop else null,
+            .replay_fn = if (self.inner_app.replay_fn != null) replay else null,
+        };
+    }
+
+    fn source(context: *anyopaque) anyerror!native_sdk.platform.WebViewSource {
+        const self: *CockpitHost = @ptrCast(@alignCast(context));
+        return self.inner_app.webViewSource();
+    }
+
+    fn scene(context: *anyopaque) anyerror!native_sdk.ShellConfig {
+        const self: *CockpitHost = @ptrCast(@alignCast(context));
+        return (try self.inner_app.scene()) orelse return error.SceneUnavailable;
+    }
+
+    fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const self: *CockpitHost = @ptrCast(@alignCast(context));
+        try self.inner_app.start(runtime);
+    }
+
+    fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
+        const self: *CockpitHost = @ptrCast(@alignCast(context));
+        try self.inner_app.event(runtime, event_value);
+        switch (event_value) {
+            .shortcut => |shortcut| {
+                const target = if (std.mem.eql(u8, shortcut.id, "work.web"))
+                    webview_label
+                else if (std.mem.eql(u8, shortcut.id, "work.workspace") or
+                    std.mem.eql(u8, shortcut.id, "work.scratch"))
+                    canvas_label
+                else
+                    return;
+                try runtime.focusView(shortcut.window_id, target);
+            },
+            else => {},
+        }
+    }
+
+    fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const self: *CockpitHost = @ptrCast(@alignCast(context));
+        try self.inner_app.stop(runtime);
+    }
+
+    fn replay(context: *anyopaque, control: native_sdk.runtime.ReplayControl) anyerror!void {
+        const self: *CockpitHost = @ptrCast(@alignCast(context));
+        try self.inner_app.replayControl(control);
+    }
+};
 
 fn initFx(model: *Model, fx: *Fx) void {
     for (&model.panes) |*pane| spawnPane(pane, fx);
@@ -470,6 +578,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .key => |event| handleKey(model, fx, event),
         .text => |event| {
+            if (model.selectedTerminalIndex() == null) return;
             const pane = model.focusedPane();
             if (pane.selecting or !pane.acceptsInput()) return;
             if (event.text.len == 0) return;
@@ -513,16 +622,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             }
         },
         .wheel => |wheel| {
+            if (model.selectedTerminalIndex() == null) return;
             // Natural direction, like every terminal: swiping the
             // content down (positive delta on hosts with natural
             // scrolling) reveals history. Inert while a selection is
             // armed - the caret and the emulator's absolute range must
             // not desynchronize (the scroll-chord rule).
             //
-            // A wheel scrolls the pane it is OVER, not the focused one:
-            // that is what every tiling terminal does and it is why the
-            // pointer position rides on the message.
-            const pane = paneAtPoint(model, wheel.x, wheel.y) orelse model.focusedPane();
+            // The rail and native surfaces never fall back to hidden work.
+            // Pointer position rides on the message to enforce that boundary.
+            const pane = paneAtPoint(model, wheel.x, wheel.y) orelse return;
             if (pane.selecting) return;
             pane.wheel_accum += wheel.delta;
             const cell_h = @max(1, pane.session.cell_height);
@@ -532,7 +641,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 pane.session.scrollLines(-@as(isize, @intFromFloat(rows)));
             }
         },
-        .copy_selection => copySelection(model, fx),
+        .copy_selection => {
+            if (model.selectedTerminalIndex() == null) return;
+            copySelection(model, fx);
+        },
         .clipboard => |result| {
             if (!model.copy_inflight) return;
             model.copy_inflight = false;
@@ -578,6 +690,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             pasteClipboardText(model, pane, fx, result.text);
         },
         .restart => {
+            if (model.selectedTerminalIndex() == null) return;
             // Restart ONLY a genuinely finished session. During
             // `.starting` (spawned, no output yet) or `.live` the pty
             // still holds the key, so respawning would collide on the
@@ -606,6 +719,27 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // would strand and swallow a later matching release.
             model.panes[@min(model.focus, pane_count - 1)].macos_natural_keys_held = 0;
             model.focus = next;
+            model.selected_work = if (next == 0) .workspace else .scratch;
+        },
+        .select_work => |work| {
+            if (work == model.selected_work) return;
+            model.panes[@min(model.focus, pane_count - 1)].macos_natural_keys_held = 0;
+            model.selected_work = work;
+            if (model.selectedTerminalIndex()) |index| model.focus = index;
+        },
+        .shortcut_work => |work| {
+            const key: []const u8 = switch (work) {
+                .workspace => "1",
+                .scratch => "2",
+                .web => "3",
+            };
+            latchAppShortcut(model, key);
+            update(model, .{ .select_work = work }, fx);
+        },
+        .browser_page => |page| {
+            model.browser_page = page;
+            model.browser_navigation_token +%= 1;
+            model.selected_work = .web;
         },
     }
 }
@@ -613,11 +747,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
 /// The pane whose rect contains a view point, or null when the point
 /// stands over the header band, a gutter, or outside the panes.
 fn paneAtPoint(model: *Model, x: f32, y: f32) ?*Pane {
+    const selected = model.selectedTerminalIndex() orelse return null;
     const frames = paneFrames(model, model.surface_size);
-    for (&model.panes, frames) |*pane, frame| {
-        if (x >= frame.x and x < frame.x + frame.width and
-            y >= frame.y and y < frame.y + frame.height) return pane;
-    }
+    const frame = frames[selected];
+    if (x >= frame.x and x < frame.x + frame.width and
+        y >= frame.y and y < frame.y + frame.height) return &model.panes[selected];
     return null;
 }
 
@@ -871,10 +1005,6 @@ fn onLifecycle(event: native_sdk.LifecycleEvent) ?Msg {
 fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     const mods = event.modifiers;
     const primary = mods.hasCommandModifier();
-    // Keyboard input belongs to the FOCUSED pane; window-level copy,
-    // paste, focus, and restart chords still route through the model.
-    const pane = model.focusedPane();
-    const session = pane.session;
 
     // A consumed app-shortcut press owns its release too. The latch is
     // window-level because a focus shortcut changes panes before its
@@ -885,6 +1015,8 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
             model.consumed_shortcut_keys_held &= ~shortcut_mask;
             return;
         }
+        if (model.selectedTerminalIndex() == null) return;
+        const pane = model.focusedPane();
         if (pane.selecting or !pane.acceptsInput()) return;
         encodeKeyEvent(pane, fx, event, .release);
         return;
@@ -895,16 +1027,30 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // the bit; otherwise the terminal receives a balanced press/release pair.
     model.consumed_shortcut_keys_held &= ~appShortcutKeyMask(event.key);
 
+    // Work selection is global and remains available while native WebKit
+    // owns the content surface. Releases are latched by physical key above.
+    if (primary and !mods.shift and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '3') {
+        latchAppShortcut(model, event.key);
+        const work: WorkId = switch (event.key[0]) {
+            '1' => .workspace,
+            '2' => .scratch,
+            else => .web,
+        };
+        update(model, .{ .select_work = work }, fx);
+        return;
+    }
+
+    // A webview is a real native input surface. Unclaimed canvas events
+    // must never leak into whichever terminal happened to be focused last.
+    if (model.selectedTerminalIndex() == null) return;
+
+    // Keyboard input belongs to the selected terminal Work.
+    const pane = model.focusedPane();
+    const session = pane.session;
+
     // App chords first: pane focus, selection mode, copy/paste,
     // scrollback, restart.
     //
-    // Only Cmd+1 and Cmd+2 are pane shortcuts. Higher digits remain
-    // terminal input and must never clamp/alias to Local Shell.
-    if (primary and !mods.shift and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '2') {
-        latchAppShortcut(model, event.key);
-        update(model, .{ .focus_pane = event.key[0] - '1' }, fx);
-        return;
-    }
     if (primary and mods.shift and keyIs(event.key, "space")) {
         latchAppShortcut(model, event.key);
         if (pane.selecting) {
@@ -1000,6 +1146,7 @@ fn latchAppShortcut(model: *Model, key: []const u8) void {
 fn appShortcutKeyMask(key: []const u8) u16 {
     if (keyIs(key, "1")) return 1 << 0;
     if (keyIs(key, "2")) return 1 << 1;
+    if (keyIs(key, "3")) return 1 << 12;
     if (keyIs(key, "space")) return 1 << 2;
     if (keyIs(key, "c")) return 1 << 3;
     if (keyIs(key, "r")) return 1 << 4;
@@ -1304,106 +1451,149 @@ fn paneRoleName(index: usize) []const u8 {
     };
 }
 
-pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
-    // The cockpit is panes plus an honest, non-focusable status header.
-    //
-    // The stacks paint NOTHING (a panel would draw its surface over the
-    // grid) — they exist to put both panes' viewport text in the
-    // accessibility tree and to be press targets that move focus.
-    // Because `.stack` is not focusable (`defaultFocusable`), a press on
-    // one releases widget focus back to the app's `on_key`.
-    var badges: [pane_count]TerminalUi.Node = undefined;
-    for (&badges, &model.panes, 0..) |*node, *pane, index| {
-        const phux_missing = index == 0 and pane.phase == .ended and
-            pane.exit_reason == .exited and pane.exit_code == 127;
-        const phase = if (phux_missing)
-            "PHUX NOT FOUND"
-        else switch (pane.phase) {
-            .starting, .live => "RUNNING",
-            .ended => switch (pane.exit_reason) {
-                .exited => ui.fmt("EXIT {d}", .{pane.exit_code}),
-                .signaled => ui.fmt("SIGNAL {d}", .{pane.exit_signal}),
-                .cancelled => "CANCELLED",
-                else => "ENDED",
-            },
-            .failed => "FAILED",
-        };
-        const title = if (index == 0) "1 WORKSPACE" else "2 LOCAL SHELL";
-        const phase_failed = pane.phase == .failed or
-            (pane.phase == .ended and (pane.exit_reason != .exited or pane.exit_code != 0));
-        const io_loss = pane.outbound_dropped > 0 or pane.session.response_bytes_dropped > 0 or pane.dropped_writes > 0;
-        const paste_failed = model.paste_owner == index and model.paste_failed;
-        const failed = pane.copy_failed or paste_failed or
-            io_loss or phase_failed;
-        const status = if (phux_missing)
-            "1 WORKSPACE / PHUX NOT FOUND / CMD+R RETRY"
-        else if (phase_failed)
-            ui.fmt("{s} / {s} / CMD+R RETRY", .{ title, phase })
-        else if (io_loss)
-            ui.fmt("{s} / I/O LOSS", .{title})
-        else if (paste_failed)
-            ui.fmt("{s} / PASTE FAILED", .{title})
-        else if (pane.copy_failed)
-            ui.fmt("{s} / COPY FAILED", .{title})
-        else if (pane.selecting)
-            ui.fmt("{s} / SELECTING", .{title})
-        else if (model.paste_owner == index and model.paste_inflight)
-            ui.fmt("{s} / PASTING", .{title})
-        else if (model.copy_inflight and model.copy_owner == index)
-            ui.fmt("{s} / COPYING", .{title})
-        else if (pane.copied_bytes > 0)
-            ui.fmt("{s} / COPIED {d}B", .{ title, pane.copied_bytes })
-        else if (index == model.focus)
-            ui.fmt("{s} / FOCUSED / {s}", .{ title, phase })
-        else
-            ui.fmt("{s} / {s}", .{ title, phase });
-        const detail = ui.fmt(
+fn paneStatus(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Node {
+    const pane = &model.panes[index];
+    const phux_missing = index == 0 and pane.phase == .ended and
+        pane.exit_reason == .exited and pane.exit_code == 127;
+    const phase = if (phux_missing)
+        "PHUX NOT FOUND"
+    else switch (pane.phase) {
+        .starting, .live => "RUNNING",
+        .ended => switch (pane.exit_reason) {
+            .exited => ui.fmt("EXIT {d}", .{pane.exit_code}),
+            .signaled => ui.fmt("SIGNAL {d}", .{pane.exit_signal}),
+            .cancelled => "CANCELLED",
+            else => "ENDED",
+        },
+        .failed => "FAILED",
+    };
+    const title = if (index == 0) "WORKSPACE" else "SCRATCH";
+    const phase_failed = pane.phase == .failed or
+        (pane.phase == .ended and (pane.exit_reason != .exited or pane.exit_code != 0));
+    const io_loss = pane.outbound_dropped > 0 or pane.session.response_bytes_dropped > 0 or pane.dropped_writes > 0;
+    const paste_failed = model.paste_owner == index and model.paste_failed;
+    const failed = pane.copy_failed or paste_failed or io_loss or phase_failed;
+    const status = if (phux_missing)
+        "PHUX NOT FOUND / CMD+R RETRY"
+    else if (phase_failed)
+        ui.fmt("{s} / {s} / CMD+R RETRY", .{ title, phase })
+    else if (io_loss)
+        ui.fmt("{s} / I/O LOSS", .{title})
+    else if (paste_failed)
+        ui.fmt("{s} / PASTE FAILED", .{title})
+    else if (pane.copy_failed)
+        ui.fmt("{s} / COPY FAILED", .{title})
+    else if (pane.selecting)
+        ui.fmt("{s} / SELECTING", .{title})
+    else if (model.paste_owner == index and model.paste_inflight)
+        ui.fmt("{s} / PASTING", .{title})
+    else if (model.copy_inflight and model.copy_owner == index)
+        ui.fmt("{s} / COPYING", .{title})
+    else if (pane.copied_bytes > 0)
+        ui.fmt("{s} / COPIED {d}B", .{ title, pane.copied_bytes })
+    else
+        ui.fmt("{s} / {s}", .{ title, phase });
+    return ui.el(.badge, .{
+        .size = .sm,
+        .variant = if (failed) .destructive else .primary,
+        .text = status,
+        .semantics = .{ .label = ui.fmt(
             "{s}; outbound loss {d} bytes; reply loss {d} bytes; refused writes {d}",
             .{ status, pane.outbound_dropped, pane.session.response_bytes_dropped, pane.dropped_writes },
-        );
-        const variant: canvas.WidgetVariant = if (failed)
-            .destructive
-        else if (index == model.focus)
-            .primary
-        else if (pane.acceptsInput())
-            .outline
-        else
-            .secondary;
-        node.* = ui.el(.badge, .{
-            .key = .{ .index = index },
-            .size = .sm,
-            .grow = if (index == 0) 65 else 35,
-            .variant = variant,
-            .text = status,
-            .semantics = .{ .label = detail },
-        }, .{});
-    }
+        ) },
+    }, .{});
+}
 
-    const focused_pane = &model.panes[@min(model.focus, pane_count - 1)];
-    const help = if (focused_pane.selecting)
-        "Arrows move | Shift+Arrows extend | Enter copy | Esc cancel"
-    else
-        "Cmd+1/2 focus | Cmd+Shift+Space select | Cmd+C copy | Cmd+V paste | Cmd+R restart exited";
-    const header_top = [_]TerminalUi.Node{
-        ui.text(.{ .cross = .center }, "Phux Cockpit"),
-        ui.el(.badge, .{ .size = .sm, .text = "COMPANION" }, .{}),
+fn workRow(ui: *TerminalUi, model: *const Model, work: Work, shortcut: []const u8) TerminalUi.Node {
+    const selected = model.selected_work == work.id;
+    return ui.el(.panel, .{
+        .key = .{ .index = @intFromEnum(work.id) },
+        .height = 54,
+        .padding = 9,
+        .on_press = .{ .select_work = work.id },
+        .style_tokens = if (selected)
+            .{ .background = .surface_pressed, .radius = .md, .border_color = .accent }
+        else
+            .{ .background = .surface_subtle, .radius = .md },
+        .semantics = .{
+            .role = .button,
+            .label = ui.fmt("{s}, {s}, shortcut {s}{s}", .{
+                work.title,
+                work.context,
+                shortcut,
+                if (selected) ", selected" else "",
+            }),
+        },
+    }, ui.column(.{ .gap = 3 }, .{
+        ui.row(.{ .cross = .center, .gap = 6 }, .{
+            ui.text(.{}, work.title),
+            ui.spacer(1),
+            ui.text(.{ .style_tokens = .{ .foreground = if (selected) .accent else .text_muted } }, shortcut),
+        }),
+        ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, work.context),
+    }));
+}
+
+pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+    var rows: [works.len]TerminalUi.Node = undefined;
+    const shortcuts = [_][]const u8{ "CMD+1", "CMD+2", "CMD+3" };
+    for (&rows, works, shortcuts) |*node, work, shortcut| node.* = workRow(ui, model, work, shortcut);
+
+    const rail = ui.column(.{
+        .width = work_rail_width,
+        .padding = 10,
+        .gap = 8,
+        .style_tokens = .{ .background = .surface, .radius = .lg },
+        .semantics = .{ .role = .list, .label = "Work" },
+    }, .{
+        ui.row(.{ .height = 22, .cross = .center }, .{
+            ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, "WORK"),
+            ui.spacer(1),
+            ui.el(.badge, .{ .size = .sm, .text = "3" }, .{}),
+        }),
+        rows[0],
+        rows[1],
+        rows[2],
         ui.spacer(1),
-        ui.text(.{ .cross = .center }, help),
-    };
-    const header_top_nodes: []const TerminalUi.Node = &header_top;
-    const status_nodes: []const TerminalUi.Node = &badges;
-    const header = ui.column(.{ .height = header_height }, .{
-        ui.row(.{ .height = 24, .gap = pane_gutter, .cross = .center }, header_top_nodes),
-        ui.row(.{ .height = 28, .gap = pane_gutter, .cross = .center }, status_nodes),
+        ui.text(.{ .wrap = true, .style_tokens = .{ .foreground = .text_muted } }, "Switch views without stopping hidden work."),
     });
 
-    var panes: [pane_count]TerminalUi.Node = undefined;
-    for (&panes, &model.panes, 0..) |*node, *pane, index| {
+    const selected = workById(model.selected_work);
+    const terminal_index = model.selectedTerminalIndex();
+    const help = if (terminal_index) |index| blk: {
+        const pane = &model.panes[index];
+        break :blk if (pane.selecting)
+            "Arrows move | Shift extends | Enter copies | Esc cancels"
+        else
+            "Cmd+1/2/3 switch work | Cmd+Shift+Space select | Cmd+C/V copy/paste";
+    } else "Native WebKit | top-level navigation allowlisted | native commands disabled";
+    const header_top = ui.row(.{ .height = 24, .gap = 8, .cross = .center }, .{
+        ui.text(.{}, selected.title),
+        ui.el(.badge, .{ .size = .sm, .text = switch (model.selected_work) {
+            .workspace => "DURABLE",
+            .scratch => "SCRATCH",
+            .web => "NATIVE WEB",
+        } }, .{}),
+        ui.spacer(1),
+        ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, help),
+    });
+
+    const header_bottom = if (terminal_index) |index|
+        ui.row(.{ .height = 28, .cross = .center }, .{paneStatus(ui, model, index)})
+    else
+        ui.row(.{ .height = 28, .gap = 6, .cross = .center }, .{
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .{ .browser_page = .github } }, "Open GitHub"),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .{ .browser_page = .superlogical } }, "Open Superlogical"),
+            ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .{ .browser_page = .article } }, "Open Mitchell's note"),
+        });
+    const header = ui.column(.{ .height = header_height }, .{ header_top, header_bottom });
+
+    const content = if (terminal_index) |index| blk: {
+        const pane = &model.panes[index];
         const screen = pane.session.screenText();
-        node.* = ui.el(.stack, .{
-            .key = .{ .index = index },
-            .grow = if (index == 0) 65 else 35,
-            .on_press = .{ .focus_pane = @intCast(index) },
+        const terminal = ui.el(.stack, .{
+            .grow = 1,
+            .on_press = .{ .focus_pane = index },
             .semantics = .{
                 .role = .group,
                 .label = if (screen.len > 0)
@@ -1412,18 +1602,25 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
                     paneRoleName(index),
             },
         }, .{});
-    }
+        // Parking the webview at a one-point anchor preserves its native
+        // page state without allowing it to cover or receive input over a
+        // terminal Work. v0.7.1 has no non-destructive visibility patch.
+        break :blk ui.el(.stack, .{ .grow = 1 }, .{
+            terminal,
+            ui.panel(.{ .width = 1, .height = 1, .opacity = 0, .semantics = .{ .label = webview_anchor, .hidden = true } }, .{}),
+        });
+    } else ui.panel(.{
+        .grow = 1,
+        .semantics = .{ .label = webview_anchor },
+    }, .{});
 
-    const pane_nodes: []const TerminalUi.Node = &panes;
-    // The column's uniform padding IS `grid_inset`, and the leading
-    // spacer is the hidden-inset titlebar band: together they reproduce
-    // `paneFrames`' top edge exactly, which the layout-agreement test
-    // pins to a quarter of a point.
     const titlebar_band = @max(0, @max(grid_inset, model.chrome_top + 4) - grid_inset);
     return ui.column(.{ .padding = grid_inset }, .{
         ui.el(.stack, .{ .height = titlebar_band }, .{}),
-        header,
-        ui.row(.{ .grow = 1, .gap = pane_gutter }, pane_nodes),
+        ui.row(.{ .grow = 1, .gap = work_rail_gutter }, .{
+            rail,
+            ui.column(.{ .grow = 1 }, .{ header, content }),
+        }),
     });
 }
 
@@ -1435,33 +1632,27 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
 /// commands floor-and-slack (cumulative), text mirrored (per-paint
 /// local), glyphs halved (per-paint local).
 fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
+    const selected = model.selectedTerminalIndex() orelse return;
     const frames = paneFrames(model, size);
-    for (&model.panes, frames, 0..) |*pane, frame, index| {
-        try grid.paint(pane.session, builder, .{
-            .frame = frame,
-            // Pane 0 lays the full-bleed terminal background over the
-            // WHOLE window (under the hidden-inset titlebar band too, so
-            // the window reads as one surface); the others fill only
-            // their own rect over it.
-            .background_frame = if (index == 0) geometry.RectF.init(0, 0, size.width, size.height) else null,
-            .tokens = tokens,
-            .running = pane.phase == .live or pane.phase == .starting,
-            // Window activation is global, pane focus is not: only the
-            // focused pane of an active window paints a filled cursor.
-            .focused = model.focused and index == model.focus,
-            .selecting = pane.selecting,
-            .command_budget = paneCommandBudget(index),
-            .text_reserve = pane_text_reserve,
-            .glyph_budget = pane_glyph_budget,
-            .path_reserve = pane_path_reserve,
-            .id_base = grid.paneIdBase(index),
-        });
-    }
+    const pane = &model.panes[selected];
+    try grid.paint(pane.session, builder, .{
+        .frame = frames[selected],
+        .background_frame = geometry.RectF.init(0, 0, size.width, size.height),
+        .tokens = tokens,
+        .running = pane.phase == .live or pane.phase == .starting,
+        .focused = model.focused,
+        .selecting = pane.selecting,
+        .command_budget = chrome_command_envelope,
+        .text_reserve = canvas.terminal_grid.widget_text_reserve,
+        .glyph_budget = canvas.terminal_grid.widget_glyph_budget,
+        .path_reserve = canvas.terminal_grid.widget_path_reserve,
+        .id_base = grid.paneIdBase(selected),
+    });
 }
 
-/// Where each pane's grid lives, in canvas points: below the
-/// hidden-inset titlebar band AND below the widget header row, width
-/// split 65/35 with `pane_gutter` between.
+/// Where the selected terminal grid lives, beside the Work rail and below
+/// the hidden-inset titlebar band plus surface header. The hidden terminal
+/// and Web selection receive zero terminal frames.
 ///
 /// This is the SECOND derivation of these rectangles — `view()` is the
 /// first, and the layout engine owns that one. `ChromeOptions.build`
@@ -1469,36 +1660,35 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
 /// the layout-agreement test is what keeps them honest.
 pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometry.RectF {
     const top = @max(grid_inset, model.chrome_top + 4) + header_height;
-    const usable = @max(0, size.width - grid_inset * 2);
-    const gutters = pane_gutter * @as(f32, @floatFromInt(pane_count - 1));
-    const pane_usable = @max(0, usable - gutters);
-    const widths = [pane_count]f32{ pane_usable * 0.65, pane_usable * 0.35 };
+    const x = grid_inset + work_rail_width + work_rail_gutter;
+    const width = @max(0, size.width - x - grid_inset);
     const height = @max(0, size.height - top - grid_inset);
-    var frames: [pane_count]geometry.RectF = undefined;
-    var x = grid_inset;
-    for (&frames, 0..) |*frame, index| {
-        frame.* = geometry.RectF.init(x, top, widths[index], height);
-        x += widths[index] + pane_gutter;
+    var frames = [_]geometry.RectF{.{}} ** pane_count;
+    if (model.selectedTerminalIndex()) |selected| {
+        frames[selected] = geometry.RectF.init(x, top, width, height);
     }
     return frames;
 }
 
-/// Frame pump: derive the grid each pane's rect fits and dispatch a
-/// resize Msg exactly when one changes (journaled, so replay resizes
-/// identically). At most ONE Msg per frame, so a window resize that
-/// moves both panes sequences across consecutive frames — safe, because
-/// the painter clips every pane to its (possibly stale) frame.
+/// Frame pump: derive the selected terminal's grid and dispatch a resize Msg
+/// exactly when it changes. Hidden terminals retain their last geometry and
+/// continue processing output until selected again.
 fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     if (frame.size.width <= 0 or frame.size.height <= 0) return null;
     const frames = paneFrames(model, frame.size);
     var pending = false;
-    for (&model.panes, frames, 0..) |*pane, inner, index| {
+    for (&model.panes) |*pane| {
+        if (pane.outbound_len > 0 or pane.session.response_len > 0) pending = true;
+    }
+    if (model.selectedTerminalIndex()) |index| {
+        const pane = &model.panes[index];
+        const inner = frames[index];
         const session = pane.session;
-        if (session.cell_width <= 0 or session.cell_height <= 0) continue;
+        if (session.cell_width <= 0 or session.cell_height <= 0) return if (pending) .flush_outbound else null;
         const proposed = grid.Session.clampGrid(
             @intFromFloat(@max(2, inner.width / session.cell_width)),
             @intFromFloat(@max(2, inner.height / session.cell_height)),
-            pane_cell_ceiling,
+            grid.max_cells,
         );
         if (proposed.x != pane.cols or proposed.y != pane.rows) {
             return .{ .viewport = .{
@@ -1508,14 +1698,25 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
                 .size = frame.size,
             } };
         }
-        // No resize for this pane: if bytes are still queued (a large
-        // paste draining, or a child that read without echoing), or a
-        // query reply sits retained in the emulator's buffer behind a
-        // full ring, nudge the update loop to push more now that the
-        // FIFO may have freed.
-        if (pane.outbound_len > 0 or session.response_len > 0) pending = true;
     }
     if (pending) return .flush_outbound;
+    return null;
+}
+
+pub fn webPanes(model: *const Model, out: []TerminalApp.WebViewPane) usize {
+    out[0] = .{
+        .label = webview_label,
+        .anchor = webview_anchor,
+        .url = model.browser_page.url(),
+        .reload_token = model.browser_navigation_token,
+    };
+    return 1;
+}
+
+pub fn onCommand(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, "work.workspace")) return .{ .shortcut_work = .workspace };
+    if (std.mem.eql(u8, name, "work.scratch")) return .{ .shortcut_work = .scratch };
+    if (std.mem.eql(u8, name, "work.web")) return .{ .shortcut_work = .web };
     return null;
 }
 
@@ -1539,6 +1740,8 @@ pub fn appOptions() TerminalApp.Options {
         .on_chrome = onChrome,
         .on_lifecycle = onLifecycle,
         .on_frame = onFrame,
+        .web_panes = webPanes,
+        .on_command = onCommand,
         .chrome = .{
             .prefix_commands = chrome_command_envelope,
             .variable_prefix = true,
@@ -1557,9 +1760,9 @@ pub fn main(init: std.process.Init) !void {
     while (created < pane_count) : (created += 1) {
         sessions[created] = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
     }
-    const app_state = try std.heap.page_allocator.create(TerminalApp);
+    const app_state = try std.heap.page_allocator.create(CockpitHost);
     defer std.heap.page_allocator.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, initialModel(sessions), appOptions());
+    app_state.init(std.heap.page_allocator, initialModel(sessions), appOptions());
     defer app_state.deinit();
     try runner.runWithOptions(app_state.app(), .{
         .app_name = app_name,
@@ -1568,9 +1771,13 @@ pub fn main(init: std.process.Init) !void {
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .restore_state = false,
         .js_window_api = false,
+        .shortcuts = &work_shortcuts,
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } },
+            .navigation = .{
+                .allowed_origins = &web_origins,
+                .external_links = .{ .action = .deny },
+            },
         },
     }, init);
 }

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${VERSION:-0.1.0}"
+VERSION="${VERSION:-0.2.0}"
 TARGET="${TARGET:-aarch64-macos}"
 OPTIMIZE="${OPTIMIZE:-ReleaseSafe}"
 OUT_DIR="${OUTPUT_DIR:-${ROOT}/zig-out/release}"
