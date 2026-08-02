@@ -6,7 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
-const transport = @import("phux_transport.zig");
+const transport = @import("phux_transport");
 const posix = std.posix;
 
 pub const Endpoint = union(enum) {
@@ -16,6 +16,7 @@ pub const Endpoint = union(enum) {
 
 pub const Worker = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     bridge: *transport.Bridge,
     handle: native_sdk.ChannelHandle,
     endpoint: Endpoint,
@@ -24,6 +25,7 @@ pub const Worker = struct {
     fd: std.atomic.Value(posix.fd_t) = std.atomic.Value(posix.fd_t).init(-1),
 
     pub fn start(
+        io: std.Io,
         gpa: std.mem.Allocator,
         bridge: *transport.Bridge,
         handle: native_sdk.ChannelHandle,
@@ -31,7 +33,7 @@ pub const Worker = struct {
     ) !*Worker {
         const worker = try gpa.create(Worker);
         errdefer gpa.destroy(worker);
-        worker.* = .{ .gpa = gpa, .bridge = bridge, .handle = handle, .endpoint = endpoint };
+        worker.* = .{ .gpa = gpa, .io = io, .bridge = bridge, .handle = handle, .endpoint = endpoint };
         worker.thread = try std.Thread.spawn(.{}, run, .{worker});
         return worker;
     }
@@ -41,19 +43,19 @@ pub const Worker = struct {
     pub fn stop(worker: *Worker) void {
         worker.stopping.store(true, .release);
         const fd = worker.fd.load(.acquire);
-        if (fd >= 0) posix.shutdown(fd, .both) catch {};
+        if (fd >= 0) _ = std.c.shutdown(fd, std.c.SHUT.RDWR);
         if (worker.thread) |thread| thread.join();
         worker.gpa.destroy(worker);
     }
 
     fn run(worker: *Worker) void {
-        const fd = connect(worker.endpoint) catch {
+        const fd = connect(worker.io, worker.endpoint) catch {
             worker.bridge.incoming.markDisconnected(.socket_lost);
             worker.wake();
             return;
         };
         configureSocket(fd) catch {
-            posix.close(fd);
+            _ = std.c.close(fd);
             worker.bridge.incoming.markDisconnected(.socket_lost);
             worker.wake();
             return;
@@ -61,7 +63,7 @@ pub const Worker = struct {
         worker.fd.store(fd, .release);
         defer {
             _ = worker.fd.swap(-1, .acq_rel);
-            posix.close(fd);
+            _ = std.c.close(fd);
             if (!worker.stopping.load(.acquire)) {
                 worker.bridge.incoming.markDisconnected(.socket_lost);
                 worker.wake();
@@ -174,27 +176,23 @@ fn configureSocket(fd: posix.fd_t) !void {
     }
 }
 
-fn connect(endpoint: Endpoint) !posix.fd_t {
+fn connect(io: std.Io, endpoint: Endpoint) !posix.fd_t {
     return switch (endpoint) {
-        .tcp => |tcp| connectTcp(tcp.host, tcp.port),
-        .unix => |path| connectUnix(path),
+        .tcp => |tcp| connectTcp(io, tcp.host, tcp.port),
+        .unix => |path| connectUnix(io, path),
     };
 }
 
-fn connectTcp(host: []const u8, port: u16) !posix.fd_t {
-    const address = try std.net.Address.resolveIp(host, port);
-    const fd = try posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &address.any, address.getOsSockLen());
-    return fd;
+fn connectTcp(io: std.Io, host: []const u8, port: u16) !posix.fd_t {
+    const address = try std.Io.net.IpAddress.resolve(io, host, port);
+    const stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    return @intCast(stream.socket.handle);
 }
 
-fn connectUnix(path: []const u8) !posix.fd_t {
-    const address = try std.net.Address.initUnix(path);
-    const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    errdefer posix.close(fd);
-    try posix.connect(fd, &address.any, address.getOsSockLen());
-    return fd;
+fn connectUnix(io: std.Io, path: []const u8) !posix.fd_t {
+    const address = try std.Io.net.UnixAddress.init(path);
+    const stream = try address.connect(io);
+    return @intCast(stream.socket.handle);
 }
 
 fn socketPair() ![2]posix.fd_t {
@@ -207,19 +205,19 @@ fn socketPair() ![2]posix.fd_t {
 
 test "write after peer teardown reports failure without process signal" {
     const sockets = try socketPair();
-    defer posix.close(sockets[0]);
-    posix.close(sockets[1]);
+    defer _ = std.c.close(sockets[0]);
+    _ = std.c.close(sockets[1]);
     try configureSocket(sockets[0]);
     try std.testing.expect(!writeExact(sockets[0], "terminal reply"));
 }
 
 test "final complete frame remains readable when peer has shut down" {
     const sockets = try socketPair();
-    defer posix.close(sockets[0]);
-    defer posix.close(sockets[1]);
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
     const frame = [_]u8{ 0, 0, 0, 1, 0x42 };
     try std.testing.expect(writeExact(sockets[0], &frame));
-    try posix.shutdown(sockets[0], .send);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(sockets[0], std.c.SHUT.WR));
 
     var poll_fds = [_]posix.pollfd{.{
         .fd = sockets[1],

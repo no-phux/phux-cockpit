@@ -36,10 +36,22 @@ pub const Config = struct {
     }
 };
 
+const SpinMutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(mutex: *SpinMutex) void {
+        while (!mutex.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(mutex: *SpinMutex) void {
+        mutex.inner.unlock();
+    }
+};
+
 /// Owned frame queue crossing between the socket extension and UI owner.
 pub const FrameQueue = struct {
     gpa: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: SpinMutex = .{},
     pending_bytes: usize = 0,
     disconnect: ?DisconnectReason = null,
     frames: std.ArrayListUnmanaged([]u8) = .empty,

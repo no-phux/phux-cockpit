@@ -335,8 +335,9 @@ estimate for everything after it. It should happen before the ABI work, not afte
 
 ## 9. The port, executed (2026-07-27)
 
-Branch `port/first-party-terminal-grid`, three commits. Steps 1-3 of section 8 are
-done; step 4 (`phux-client-ffi`) is the remaining work.
+Branch `port/first-party-terminal-grid`. All four steps from section 8 are now
+integrated: the first-party painter, routing/budget work, and the production
+`phux-client-ffi` host.
 
 ### What landed
 
@@ -373,6 +374,25 @@ it widened its per-column command reserve instead.
 - The adversarial id-uniqueness test needed its band arithmetic repointed at the new
   scheme. Instrumented before changing it, to confirm the duplicate-id check itself
   still passed: no duplicates across 616 commands, both pane bands symmetric at 302.
+
+### Production host integration (2026-08-02)
+
+`src/phux_host.zig` now owns the panic-contained C ABI client on the UI thread.
+`src/phux_extension.zig` owns only the TCP/Unix socket worker; complete,
+length-prefixed frames cross bounded reusable queues, and a one-byte
+native-sdk channel wake asks the UI owner to drain them. Borrowed FFI grids are
+copied into reusable projection buffers before the next mutable client call.
+Input and local policy paths cover keyboard/IME, paste, focus, pointer,
+viewport resize/scroll, opaque document-anchor selection, clipboard, and
+search. Reconnect freezes published panes until the replacement attach
+publishes.
+
+The production build is selected explicitly with `-Dphux-enabled=true` and
+requires the generated header plus the `ffi-release` static-library directory.
+With Zig 0.16, both the production build and
+`zig build test -Dplatform=null -Dphux-enabled=true` exited 0 against
+`target/ffi-release/libphux_client_ffi.a`. The test runner still prints its
+known `failed command: ... --listen=-` line while the build graph exits 0.
 
 ### The glyph budget: measured, and the answer is split
 

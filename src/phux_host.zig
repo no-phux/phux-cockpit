@@ -6,7 +6,7 @@
 //! borrowed presentation grid into reusable buffers, and stages outgoing bytes.
 
 const std = @import("std");
-const transport = @import("phux_transport.zig");
+const transport = @import("phux_transport");
 const c = @cImport({
     @cInclude("phux/client.h");
 });
@@ -294,8 +294,12 @@ pub const Host = struct {
                                 for (host.panes.items) |*pane| pane.phase = .frozen;
                             }
                         },
-                        c.PHUX_CLIENT_STATUS_DETACHED => for (host.panes.items) |*pane| pane.phase = .reconnecting,
-                        c.PHUX_CLIENT_STATUS_SERVER_ERROR => for (host.panes.items) |*pane| pane.phase = .failed,
+                        c.PHUX_CLIENT_STATUS_DETACHED => {
+                            for (host.panes.items) |*pane| pane.phase = .reconnecting;
+                        },
+                        c.PHUX_CLIENT_STATUS_SERVER_ERROR => {
+                            for (host.panes.items) |*pane| pane.phase = .failed;
+                        },
                         else => {},
                     }
                     const payload = host.gpa.dupe(u8, effect_bytes) catch return error.OutOfMemory;
@@ -442,16 +446,30 @@ pub const Host = struct {
         try host.stageOutgoing();
     }
 
+    pub fn createAnchor(host: *Host, pane_index: usize, point: c.PhuxDocumentPoint) !c.PhuxDocumentAnchor {
+        const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return error.InvalidState;
+        const id = pane.id.asC();
+        var anchor: c.PhuxDocumentAnchor = undefined;
+        try resultError(c.phux_client_anchor_create(host.client, &id, point, &anchor));
+        return anchor;
+    }
+
+    pub fn releaseAnchor(host: *Host, pane_index: usize, anchor: c.PhuxDocumentAnchor) void {
+        const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return;
+        const id = pane.id.asC();
+        _ = c.phux_client_anchor_release(host.client, &id, anchor);
+    }
+
     pub fn setSelection(
         host: *Host,
         pane_index: usize,
-        start: c.PhuxDocumentAnchor,
-        end: c.PhuxDocumentAnchor,
+        selection_start: c.PhuxDocumentAnchor,
+        selection_end: c.PhuxDocumentAnchor,
         rectangle: bool,
     ) !void {
         const pane = if (pane_index < host.panes.items.len) &host.panes.items[pane_index] else return error.InvalidState;
         const id = pane.id.asC();
-        try resultError(c.phux_client_selection_set(host.client, &id, start, end, rectangle));
+        try resultError(c.phux_client_selection_set(host.client, &id, selection_start, selection_end, rectangle));
         try host.captureEffects();
         try host.stageOutgoing();
     }

@@ -7,6 +7,7 @@ const native_sdk = @import("native_sdk");
 fn phuxHostModule(
     b: *std.Build,
     app_module: *std.Build.Module,
+    transport_module: *std.Build.Module,
     phux_enabled: bool,
 ) *std.Build.Module {
     if (!phux_enabled) {
@@ -32,6 +33,7 @@ fn phuxHostModule(
         .target = app_module.resolved_target.?,
         .optimize = app_module.optimize.?,
     });
+    module.addImport("phux_transport", transport_module);
     module.addIncludePath(.{ .cwd_relative = include_dir });
     module.addObjectFile(.{ .cwd_relative = archive });
     module.linkSystemLibrary("c", .{});
@@ -46,7 +48,13 @@ pub fn build(b: *std.Build) void {
         "phux-enabled",
         "Build the real phux client host instead of the local spike fixture",
     ) orelse false;
-    const phux_host = phuxHostModule(b, app_module, phux_enabled);
+    const transport_module = b.createModule(.{
+        .root_source_file = b.path("src/phux_transport.zig"),
+        .target = app_module.resolved_target.?,
+        .optimize = app_module.optimize.?,
+    });
+    const phux_host = phuxHostModule(b, app_module, transport_module, phux_enabled);
+    app_module.addImport("phux_transport", transport_module);
     app_module.addImport("phux_host", phux_host);
     if (phux_enabled and app_module.resolved_target.?.result.os.tag == .macos) {
         app_module.addCSourceFile(.{
@@ -74,5 +82,6 @@ pub fn build(b: *std.Build) void {
     if (artifacts.tests.root_module != app_module) {
         artifacts.tests.root_module.addImport("ghostty-vt", vt);
         artifacts.tests.root_module.addImport("phux_host", phux_host);
+        artifacts.tests.root_module.addImport("phux_transport", transport_module);
     }
 }

@@ -12,10 +12,12 @@ and the document says so where it matters.
 
 ## What this is
 
-A fork of `native-sdk`'s `examples/terminal` (`a7509a7`), grown into a two-pane
-cockpit: two independent libghostty-vt panes rendering into one `gpu_surface`,
-laid out by the canvas alongside native widgets, with focus routing and a budget
-policy derived from the framework's own constants.
+The default build remains a fork of `native-sdk`'s `examples/terminal`
+(`a7509a7`) for deterministic painter tests. The production
+`-Dphux-enabled=true` build replaces that fixture with the real
+`phux-client-ffi`: protocol 0.7 frames cross a bounded TCP/Unix socket bridge,
+the owning UI thread drains the synchronous client, and two client-owned grid
+views render beside ordinary native widgets in one GPU surface.
 
 It has since been ported onto the framework's first-party `canvas.terminal_grid`
 painter, deleting the forked renderer entirely (`grid.zig` 1156 → 916 lines,
@@ -23,30 +25,35 @@ painter, deleting the forked renderer entirely (`grid.zig` 1156 → 916 lines,
 `git show d4ccb84^:src/box.zig`.
 
 ```sh
-zig build run                    # run the cockpit
-zig build test -Dplatform=null   # 70/72 pass, 2 env-gated skips
+zig build run
+zig build test -Dplatform=null
+
+# Production host against the panic-contained Rust static library:
+zig build -Dphux-enabled=true \
+  -Dphux-client-ffi-include-dir=../../phux-codec-bindings/crates/phux-client-ffi/include \
+  -Dphux-client-ffi-lib-dir=../../phux-codec-bindings/target/ffi-release
+zig build test -Dplatform=null -Dphux-enabled=true \
+  -Dphux-client-ffi-include-dir=../../phux-codec-bindings/crates/phux-client-ffi/include \
+  -Dphux-client-ffi-lib-dir=../../phux-codec-bindings/target/ffi-release
 ```
 
 ## The finding that mattered
 
-The seam to phux is one line, and it knows nothing about PTYs (`src/grid.zig`):
 
-```zig
-pub fn feed(session: *Session, bytes: []const u8) void {
-    session.stream.nextSlice(bytes);
-}
-```
-
-Swapping the byte source for phux `PANE_OUTPUT` frames is a change of *caller*,
-not of the terminal stack — ADR-0013's asymmetry landing on the FFI boundary as
-intended. Zig owns everything from VT bytes rightward, Rust owns everything
-leftward, and Rust never parses a byte.
+The integrated seam is `src/phux_host.zig`: it owns one `PhuxClient`, copies
+borrowed published grids into reusable Zig projection buffers, drains typed
+status/damage/job effects, and stages exact outbound protocol frames. Socket
+I/O remains in `src/phux_extension.zig`; `PhuxClient` never leaves the UI
+thread. Keyboard, IME text, paste, focus, pointer, viewport, selection,
+clipboard, and search paths all call the C ABI rather than interpreting
+terminal bytes in Zig.
 
 ## Where it stands
 
-Steps 1–3 of `FINDINGS.md` section 8 are done, on
-`port/first-party-terminal-grid`. The remaining work is **step 4:
-`phux-client-ffi`**, the C ABI, whose minimum shape is specified in section 7.
+Steps 1–4 of `FINDINGS.md` section 8 are integrated on
+`port/first-party-terminal-grid`. With Zig 0.16, the production build and the
+`platform=null` suite both exit 0 against
+`target/ffi-release/libphux_client_ffi.a`.
 
 Branches:
 

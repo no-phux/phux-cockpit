@@ -8,7 +8,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 const grid_painter = @import("grid.zig");
 const host_mod = @import("phux_host");
-const transport = @import("phux_transport.zig");
+const transport = @import("phux_transport");
 const extension = @import("phux_extension.zig");
 const pointer_monitor = @import("phux_pointer.zig");
 const c = host_mod.abi;
@@ -18,6 +18,7 @@ const channel_key: u64 = 0x7068_7578;
 const search_capacity: usize = 256;
 const clipboard_key: u64 = 0x7068_7579;
 const paste_clipboard_key: u64 = 0x7068_757a;
+const display_command_budget: usize = 16 * 1024;
 const canvas_label = "terminal-canvas";
 const window_width: f32 = 980;
 const window_height: f32 = 640;
@@ -38,7 +39,7 @@ const shell_views = [_]native_sdk.ShellView{.{
     .accessibility_label = "phux terminal",
     .gpu_backend = .metal,
     .gpu_pixel_format = .bgra8_unorm,
-    .gpu_present_mode = .on_demand,
+    .gpu_present_mode = .timer,
     .gpu_alpha_mode = .@"opaque",
     .gpu_color_space = .srgb,
     .gpu_vsync = true,
@@ -57,6 +58,7 @@ const Selection = struct {
     active: bool = false,
     anchor: c.PhuxDocumentAnchor = std.mem.zeroes(c.PhuxDocumentAnchor),
     head: c.PhuxDocumentAnchor = std.mem.zeroes(c.PhuxDocumentAnchor),
+    head_point: c.PhuxDocumentPoint = std.mem.zeroes(c.PhuxDocumentPoint),
 };
 
 const Projection = struct {
@@ -192,6 +194,7 @@ const Projection = struct {
 };
 
 pub const Model = struct {
+    io: std.Io,
     gpa: std.mem.Allocator,
     bridge: *transport.Bridge,
     host: *host_mod.Host,
@@ -234,7 +237,7 @@ pub const Model = struct {
                     model.setStatus("grid projection failed");
                 },
                 .tombstoned, .closed, .failed => model.projections[index].clear(),
-                .attaching => {},
+                .attaching, .reconnecting, .frozen => {},
             }
         }
     }
@@ -283,7 +286,7 @@ fn openTransport(model: *Model, fx: *Effects) void {
         model.setStatus("transport channel unavailable");
         return;
     }
-    model.worker = extension.Worker.start(model.gpa, model.bridge, handle, model.endpoint) catch {
+    model.worker = extension.Worker.start(model.io, model.gpa, model.bridge, handle, model.endpoint) catch {
         fx.closeChannel(channel_key);
         model.failed = true;
         model.setStatus("socket worker failed to start");
@@ -424,8 +427,7 @@ fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .clipboard => |result| {
             model.copy_inflight = false;
             if (result.outcome == .ok) {
-                model.host.clearSelection(model.focus) catch {};
-                model.selections[model.focus].active = false;
+                clearSelection(model, model.focus);
                 model.refreshProjections();
                 model.setStatus("selection copied");
             } else model.setStatus("clipboard write failed; selection retained");
@@ -468,8 +470,7 @@ fn handleKey(model: *Model, event: canvas.WidgetKeyboardEvent, fx: *Effects) voi
     }
     if (model.selections[model.focus].active and event.phase == .key_down) {
         if (keyIs(event.key, "escape")) {
-            model.host.clearSelection(model.focus) catch {};
-            model.selections[model.focus].active = false;
+            clearSelection(model, model.focus);
             model.refreshProjections();
             return;
         }
@@ -509,32 +510,61 @@ fn sendKey(model: *Model, event: canvas.WidgetKeyboardEvent, action: u32, physic
 fn beginSelection(model: *Model) void {
     if (model.focus >= model.host.panes.items.len) return;
     const grid = &model.host.panes.items[model.focus].grid;
-    const anchor: c.PhuxDocumentAnchor = .{
-        .document_revision = grid.document_revision,
-        .row = grid.top_anchor.row + grid.cursor_row,
+    const point: c.PhuxDocumentPoint = .{
+        .space = c.PHUX_DOCUMENT_VIEWPORT,
+        .row = grid.cursor_row,
         .column = grid.cursor_col,
         .reserved = 0,
     };
-    model.selections[model.focus] = .{ .active = true, .anchor = anchor, .head = anchor };
+    const anchor = model.host.createAnchor(model.focus, point) catch {
+        model.setStatus("selection anchor unavailable");
+        return;
+    };
+    model.selections[model.focus] = .{ .active = true, .anchor = anchor, .head = anchor, .head_point = point };
     model.host.setSelection(model.focus, anchor, anchor, false) catch {
-        model.selections[model.focus].active = false;
+        model.host.releaseAnchor(model.focus, anchor);
+        model.selections[model.focus] = .{};
     };
     model.refreshProjections();
 }
 
+fn clearSelection(model: *Model, pane_index: usize) void {
+    if (pane_index >= model.selections.len) return;
+    const selection = &model.selections[pane_index];
+    model.host.clearSelection(pane_index) catch {};
+    if (selection.active) {
+        if (selection.head.opaque_id != selection.anchor.opaque_id)
+            model.host.releaseAnchor(pane_index, selection.head);
+        model.host.releaseAnchor(pane_index, selection.anchor);
+    }
+    selection.* = .{};
+}
+
 fn moveSelection(model: *Model, event: canvas.WidgetKeyboardEvent) bool {
     var selection = &model.selections[model.focus];
+    var next = selection.head_point;
     var moved = true;
     if (keyIs(event.key, "arrowleft")) {
-        if (selection.head.column > 0) selection.head.column -= 1;
-    } else if (keyIs(event.key, "arrowright")) selection.head.column +|= 1 else if (keyIs(event.key, "arrowup")) {
-        if (selection.head.row > 0) selection.head.row -= 1;
-    } else if (keyIs(event.key, "arrowdown")) selection.head.row +|= 1 else moved = false;
+        if (next.column > 0) next.column -= 1;
+    } else if (keyIs(event.key, "arrowright")) next.column +|= 1 else if (keyIs(event.key, "arrowup")) {
+        if (next.row > 0) next.row -= 1;
+    } else if (keyIs(event.key, "arrowdown")) next.row +|= 1 else moved = false;
     if (!moved) return false;
-    model.host.setSelection(model.focus, selection.anchor, selection.head, false) catch {
+    const next_head = model.host.createAnchor(model.focus, next) catch {
         selection.active = false;
         model.setStatus("selection became stale");
+        return true;
     };
+    model.host.setSelection(model.focus, selection.anchor, next_head, false) catch {
+        model.host.releaseAnchor(model.focus, next_head);
+        selection.active = false;
+        model.setStatus("selection became stale");
+        return true;
+    };
+    if (selection.head.opaque_id != selection.anchor.opaque_id)
+        model.host.releaseAnchor(model.focus, selection.head);
+    selection.head = next_head;
+    selection.head_point = next;
     model.refreshProjections();
     return true;
 }
@@ -562,12 +592,12 @@ fn physicalKey(key: []const u8) u32 {
     for (names) |entry| if (keyIs(key, entry.name)) return entry.value;
     if (key.len == 1) {
         const ch = std.ascii.toLower(key[0]);
-        if (ch >= 'a' and ch <= 'z') return c.PHUX_KEY_A + ch - 'a';
-        if (ch >= '0' and ch <= '9') return c.PHUX_KEY_DIGIT0 + ch - '0';
+        if (ch >= 'a' and ch <= 'z') return @as(u32, @intCast(c.PHUX_KEY_A)) + ch - 'a';
+        if (ch >= '0' and ch <= '9') return @as(u32, @intCast(c.PHUX_KEY_DIGIT0)) + ch - '0';
     }
     if (key.len >= 2 and (key[0] == 'f' or key[0] == 'F')) {
         const number = std.fmt.parseInt(u8, key[1..], 10) catch 0;
-        if (number >= 1 and number <= 24) return c.PHUX_KEY_F1 + number - 1;
+        if (number >= 1 and number <= 24) return @as(u32, @intCast(c.PHUX_KEY_F1)) + number - 1;
     }
     return c.PHUX_KEY_UNIDENTIFIED;
 }
@@ -594,7 +624,7 @@ fn view(ui: *PhuxUi, model: *const Model) PhuxUi.Node {
     }
     return ui.column(.{ .padding = grid_inset }, .{
         ui.row(.{ .height = header_height, .gap = pane_gutter, .cross = .center }, .{
-            ui.text(.{ .style = .caption }, status),
+            ui.text(.{ .style_tokens = .{ .foreground = .text_muted } }, status),
             ui.el(.text_field, .{
                 .width = 220,
                 .text = model.search_buffer.text(),
@@ -605,7 +635,7 @@ fn view(ui: *PhuxUi, model: *const Model) PhuxUi.Node {
             ui.spacer(1),
             ui.button(.{ .size = .sm, .on_press = .reconnect }, "Reconnect"),
         }),
-        ui.row(.{ .grow = 1, .gap = pane_gutter }, pane_nodes),
+        ui.row(.{ .grow = 1, .gap = pane_gutter }, @as([]PhuxUi.Node, &pane_nodes)),
     });
 }
 
@@ -631,7 +661,7 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
             .running = projection.running,
             .focused = index == model.focus,
             .selecting = model.selections[index].active,
-            .command_budget = canvas.max_display_list_commands / pane_count - 32,
+            .command_budget = display_command_budget / pane_count - 32,
             .text_reserve = 512,
             .glyph_budget = 3500,
             .path_reserve = 128,
@@ -649,10 +679,10 @@ fn onText(event: canvas.WidgetKeyboardEvent) ?Msg {
 fn onWheel(event: native_sdk.platform.WheelEvent) ?Msg {
     return .{ .wheel = event };
 }
-fn onLifecycle(event: native_sdk.platform.LifecycleEvent) ?Msg {
+fn onLifecycle(event: native_sdk.LifecycleEvent) ?Msg {
     return switch (event) {
-        .focused => .{ .focus_changed = true },
-        .unfocused => .{ .focus_changed = false },
+        .activate => .{ .focus_changed = true },
+        .deactivate => .{ .focus_changed = false },
         else => null,
     };
 }
@@ -718,7 +748,7 @@ fn appOptions() PhuxApp.Options {
         .on_lifecycle = onLifecycle,
         .on_frame = onFrame,
         .chrome = .{
-            .prefix_commands = canvas.max_display_list_commands - 256,
+            .prefix_commands = display_command_budget - 256,
             .variable_prefix = true,
             .build = buildChrome,
         },
@@ -726,6 +756,7 @@ fn appOptions() PhuxApp.Options {
 }
 fn initialModel(
     gpa: std.mem.Allocator,
+    io: std.Io,
     endpoint: extension.Endpoint,
     session: []const u8,
     user: []const u8,
@@ -738,6 +769,7 @@ fn initialModel(
     errdefer client.destroy();
     return .{
         .gpa = gpa,
+        .io = io,
         .bridge = bridge,
         .host = client,
         .endpoint = endpoint,
@@ -763,7 +795,7 @@ pub fn main(init: std.process.Init) !void {
         break :tcp .{ .tcp = .{ .host = address[0..split], .port = port } };
     };
 
-    var model = try initialModel(std.heap.page_allocator, endpoint, session, user);
+    var model = try initialModel(std.heap.page_allocator, init.io, endpoint, session, user);
     const app_state = std.heap.page_allocator.create(PhuxApp) catch |err| {
         model.shutdown();
         return err;
@@ -778,11 +810,7 @@ pub fn main(init: std.process.Init) !void {
         .window_title = "phux",
         .bundle_id = "dev.phux.native",
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
-        .restore_frame = false,
-        .min_width = 640,
-        .min_height = 420,
-        .metal_gpu_surfaces = true,
-        .chrome = .{ .titlebar = .hidden_inset, .variable_prefix = true },
+        .restore_state = false,
         .security = .{ .permissions = &.{}, .navigation = .{ .allowed_origins = &.{ "zero://inline", "zero://app" } } },
     }, init);
 }
