@@ -122,6 +122,39 @@ jobs:
             --title "Phux Cockpit ${GITHUB_REF_NAME}" \
             --notes-file "${notes}"
 
+      - name: Require Homebrew tap deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [[ -z "$DEPLOY_KEY" ]]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY must target phall1/homebrew-tap with write access."
+            exit 1
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: phall1/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Update Homebrew tap
+        env:
+          TAG: ${{ github.ref_name }}
+          NOTARIZED: ${{ steps.package.outputs.notarized }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          version="${BASH_REMATCH[1]}"
+          archive="phux-cockpit-$version-macos-arm64.zip"
+          expected="$(awk -v file="$archive" '$2 == file { print $1 }' zig-out/release/SHA256SUMS)"
+          actual="$(shasum -a 256 "zig-out/release/$archive" | cut -d ' ' -f 1)"
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$actual" == "$expected" ]]
+          cd tap
+          bash .github/scripts/gen-phux-cockpit-cask.sh "$TAG" "$actual" "$NOTARIZED" Casks/phux-cockpit.rb
+          ruby -c Casks/phux-cockpit.rb
+          bash .github/scripts/commit-update.sh Casks/phux-cockpit.rb "Brew cask update for Phux Cockpit $TAG"
+
       - name: Remove temporary signing keychain
         if: always()
         run: |
