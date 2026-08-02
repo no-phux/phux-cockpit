@@ -99,6 +99,9 @@ APPLE_NOTARY_ISSUER_ID="ISSUER-UUID" \
 `MACOS_ENTITLEMENTS` may point to an entitlements plist when one is required.
 The packaging script validates the bundle identifier, display name, version,
 executable, arm64 architecture, and code signature before producing archives.
+Tagged releases also regenerate `Casks/phux-cockpit.rb` in
+[`phall1/homebrew-tap`](https://github.com/phall1/homebrew-tap); the tap's
+scheduled updater independently repairs a missed release update.
 
 ## Limitations
 
