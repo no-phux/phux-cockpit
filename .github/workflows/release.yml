@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: Package arm64 macOS release
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Configure Developer ID signing when available
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          supplied=0
+          [[ -n "${MACOS_CERTIFICATE}" ]] && supplied=$((supplied + 1))
+          [[ -n "${MACOS_CERTIFICATE_PASSWORD}" ]] && supplied=$((supplied + 1))
+          [[ -n "${SIGNING_IDENTITY}" ]] && supplied=$((supplied + 1))
+          if [[ "${supplied}" -eq 0 ]]; then
+            echo "No Developer ID secrets configured; the release will be ad-hoc signed."
+            exit 0
+          fi
+          if [[ "${supplied}" -ne 3 ]]; then
+            echo "Developer ID secrets are incomplete; the release will be ad-hoc signed." >&2
+            exit 0
+          fi
+
+          certificate_path="${RUNNER_TEMP}/developer-id.p12"
+          keychain_path="${RUNNER_TEMP}/phux-cockpit-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          printf '%s' "${MACOS_CERTIFICATE}" | base64 -D > "${certificate_path}"
+          security create-keychain -p "${keychain_password}" "${keychain_path}"
+          security set-keychain-settings -lut 21600 "${keychain_path}"
+          security unlock-keychain -p "${keychain_password}" "${keychain_path}"
+          security import "${certificate_path}" -P "${MACOS_CERTIFICATE_PASSWORD}" -A -t cert -f pkcs12 -k "${keychain_path}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain_path}"
+          security list-keychains -d user -s "${keychain_path}"
+          {
+            echo "MACOS_SIGNING_IDENTITY=${SIGNING_IDENTITY}"
+            echo "SIGNING_KEYCHAIN=${keychain_path}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Configure notarization when available
+        env:
+          NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          supplied=0
+          [[ -n "${NOTARY_KEY}" ]] && supplied=$((supplied + 1))
+          [[ -n "${NOTARY_KEY_ID}" ]] && supplied=$((supplied + 1))
+          [[ -n "${NOTARY_ISSUER_ID}" ]] && supplied=$((supplied + 1))
+          if [[ "${supplied}" -eq 0 ]]; then
+            echo "No notarization secrets configured; the release will be marked unnotarized."
+            exit 0
+          fi
+          if [[ "${supplied}" -ne 3 ]]; then
+            echo "Notarization secrets are incomplete; the release will be marked unnotarized." >&2
+            exit 0
+          fi
+
+          key_path="${RUNNER_TEMP}/AuthKey_${NOTARY_KEY_ID}.p8"
+          printf '%s' "${NOTARY_KEY}" | base64 -D > "${key_path}"
+          {
+            echo "APPLE_NOTARY_KEY_PATH=${key_path}"
+            echo "APPLE_NOTARY_KEY_ID=${NOTARY_KEY_ID}"
+            echo "APPLE_NOTARY_ISSUER_ID=${NOTARY_ISSUER_ID}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Test
+        run: zig build test -Dplatform=null --summary all
+
+      - name: Build, sign, verify, and package
+        id: package
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          export VERSION="${VERSION#v}"
+          ./scripts/package-macos.sh
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNING_MODE: ${{ steps.package.outputs.signing }}
+          NOTARIZED: ${{ steps.package.outputs.notarized }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          if [[ "${NOTARIZED}" == "true" ]]; then
+            cat > "${notes}" <<EOF
+          This release is Developer ID signed and Apple-notarized.
+          EOF
+          else
+            cat > "${notes}" <<EOF
+          This release is ad-hoc signed because Developer ID and notarization
+          credentials are not configured. The Homebrew cask clears the app's
+          quarantine attribute and reports this in its installation caveat.
+          Signing mode: ${SIGNING_MODE}.
+          EOF
+          fi
+          gh release create "${GITHUB_REF_NAME}" \
+            zig-out/release/*.zip \
+            zig-out/release/*.dmg \
+            zig-out/release/SHA256SUMS \
+            --verify-tag \
+            --title "Phux Cockpit ${GITHUB_REF_NAME}" \
+            --notes-file "${notes}"
+
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
+            security delete-keychain "${SIGNING_KEYCHAIN}" || true
+          fi

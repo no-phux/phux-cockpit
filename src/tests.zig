@@ -30,6 +30,35 @@ fn destroyModelSessions(model: *app.Model) void {
     for (&model.panes) |*pane| pane.session.destroy();
 }
 
+test "Phux Cockpit identity and macOS pane commands are exact" {
+    try testing.expectEqualStrings("Phux Cockpit", app.app_name);
+    try testing.expectEqualStrings("dev.phux.cockpit", app.bundle_id);
+    try testing.expectEqualStrings("phux-cockpit-canvas", app.canvas_label);
+    try testing.expectEqualStrings(app.app_name, app.shell_scene.windows[0].title.?);
+    try testing.expectEqualStrings(app.canvas_label, app.shell_scene.windows[0].views[0].label);
+    try testing.expectEqualStrings(app.app_name, app.appOptions().name);
+    try testing.expectEqualStrings(app.canvas_label, app.appOptions().canvas_label);
+
+    if (comptime builtin.os.tag != .macos) return;
+    try testing.expectEqualSlices([]const u8, &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\"; if command -v phux >/dev/null 2>&1; then exec phux; fi; printf '\nPhux CLI was not found.\nInstall it with:\n  brew install phall1/tap/phux\nThen press Cmd+R to retry.\n'; exit 127" }, app.paneArgv(0));
+    try testing.expectEqualSlices([]const u8, &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -l -i" }, app.paneArgv(1));
+}
+
+test "Phux Cockpit owns its dark graphite and lime visual register" {
+    const sessions = try createSessions(80, 24);
+    defer for (sessions) |session| session.destroy();
+    const model = app.initialModel(sessions);
+    const tokens = app.cockpitTokens(&model);
+    try testing.expectEqual(canvas.Color.rgb8(9, 11, 15), tokens.colors.background);
+    try testing.expectEqual(canvas.Color.rgb8(17, 20, 27), tokens.colors.surface);
+    try testing.expectEqual(canvas.Color.rgb8(244, 247, 251), tokens.colors.text);
+    try testing.expectEqual(canvas.Color.rgb8(190, 242, 100), tokens.colors.accent);
+}
+
+test "retained response capacity matches the outbound ring" {
+    try testing.expectEqual(app.outbound_buffer_bytes, grid.Session.response_capacity_max);
+}
+
 test "the emulator round-trips output into real cell state" {
     const session = try createSession(40, 6);
     defer session.destroy();
@@ -493,7 +522,7 @@ fn recordTerminalSession(
     defer std.heap.page_allocator.destroy(recorder);
     recorder.* = native_sdk.runtime.SessionRecorder.init(buffer.sink());
     recorder.blob_sink = store.sink();
-    recorder.begin(.{ .platform_name = "test", .app_name = "terminal", .window_width = 980, .window_height = 640 });
+    recorder.begin(.{ .platform_name = "test", .app_name = app.app_name, .window_width = 980, .window_height = 640 });
 
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -512,7 +541,7 @@ fn recordTerminalSession(
 
     try harness.start(app_iface);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .size = geometry.SizeF.init(980, 640),
         .scale_factor = 2,
         .frame_index = 1,
@@ -534,14 +563,14 @@ fn recordTerminalSession(
     // target-less text.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .pointer_down,
         .x = 200,
         .y = 200,
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "ls",
     } });
@@ -586,7 +615,7 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
 
     try harness.start(app_iface);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .size = geometry.SizeF.init(980, 640),
         .scale_factor = 2,
         .frame_index = 1,
@@ -599,14 +628,14 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
     try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .pointer_down,
         .x = 200,
         .y = 200,
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "whoami",
     } });
@@ -622,7 +651,7 @@ fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp 
     const app_iface = app_state.app();
     try harness.start(app_iface);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .size = geometry.SizeF.init(980, 640),
         .scale_factor = 2,
         .frame_index = 1,
@@ -632,7 +661,7 @@ fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp 
     // Focus the surface with a click.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .pointer_down,
         .x = 200,
         .y = 200,
@@ -676,7 +705,7 @@ test "IME: a preedit is provisional; only the commit reaches the pty" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .{
         .gpu_surface_input = .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .ime_set_composition,
             .text = "\xe3\x81\x8b", // か
         },
@@ -687,7 +716,7 @@ test "IME: a preedit is provisional; only the commit reaches the pty" {
     // composed bytes come from the buffered preedit and reach the pty.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .ime_commit_composition,
         .text = "",
     } });
@@ -711,19 +740,19 @@ test "IME: composition keys never encode into the pty - and the commit releases 
     // the half-composed command.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .ime_set_composition,
         .text = "\xe3\x81\x8b",
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "arrowdown",
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "enter",
     } });
@@ -735,14 +764,14 @@ test "IME: composition keys never encode into the pty - and the commit releases 
     // encodes CR.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .ime_commit_composition,
         .text = "",
     } });
     try testing.expectEqualStrings("\xe3\x81\x8b", app_state.effects.ptyWrittenBytes(1));
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "enter",
     } });
@@ -766,7 +795,7 @@ test "a command-chorded text event never types a literal character into the pty"
     // never the chord plus a stray character.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .key = "c",
         .text = "c",
@@ -777,7 +806,7 @@ test "a command-chorded text event never types a literal character into the pty"
     // Unmodified typing still flows.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "c",
     } });
@@ -799,7 +828,7 @@ test "typing carried on the key event reaches the pty - the no-separate-text-eve
     // carry it to the pty or typing is silently lost there.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "j",
         .text = "j",
@@ -821,7 +850,7 @@ test "kitty report-all encodes committed text as CSI-u, and legacy passes it raw
     // byte, exactly as before the encoder routing.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "a",
     } });
@@ -833,7 +862,7 @@ test "kitty report-all encodes committed text as CSI-u, and legacy passes it raw
     app_state.model.panes[0].session.feed("\x1b[>8u");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "a",
     } });
@@ -854,7 +883,7 @@ test "kitty event reporting hears key releases; legacy modes never do" {
     // Legacy: a release encodes nothing.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_up,
         .key = "enter",
     } });
@@ -866,19 +895,317 @@ test "kitty event reporting hears key releases; legacy modes never do" {
     app_state.model.panes[0].session.feed("\x1b[>11u");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "a",
         .text = "a",
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_up,
         .key = "a",
     } });
     const written = app_state.effects.ptyWrittenBytes(1);
     try testing.expect(std.mem.indexOf(u8, written, ":3u") != null);
+}
+
+test "consumed app shortcut releases never leak under kitty reporting" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    // Both children request key-release reports. Releases deliberately
+    // omit Command to model the modifier coming up before the key.
+    for (&app_state.model.panes) |*pane| pane.session.feed("\x1b[>11u");
+
+    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true, .command = true });
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
+    try releaseCanvasKey(harness, app_iface, "2", .{});
+    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+
+    // Toggle selection on and back off. The second release arrives while
+    // selection is no longer armed, so only the app-level latch can stop it.
+    for (0..2) |_| {
+        try pressCanvasKey(harness, app_iface, "space", .{ .primary = true, .command = true, .shift = true });
+        try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
+        try releaseCanvasKey(harness, app_iface, "space", .{});
+        try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    }
+    try testing.expect(!app_state.model.panes[1].selecting);
+
+    // An emulator selection can be copied without keyboard-selection mode.
+    // That keeps the release path otherwise open and proves copy is latched.
+    app_state.model.panes[1].session.feed("copy");
+    app_state.model.panes[1].session.beginSelection(false);
+    try pressCanvasKey(harness, app_iface, "c", .{ .primary = true, .command = true });
+    try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
+    try releaseCanvasKey(harness, app_iface, "c", .{});
+    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+
+    try pressCanvasKey(harness, app_iface, "arrowup", .{ .primary = true, .command = true });
+    try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
+    try releaseCanvasKey(harness, app_iface, "arrowup", .{});
+    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+
+    // Escape turns selection off immediately, and Enter may turn it off
+    // before key-up when clipboard completion is fast. Both releases still
+    // belong to the app action rather than the kitty-reporting child.
+    app_state.model.panes[1].session.feed("select me");
+    app_state.model.panes[1].selecting = true;
+    app_state.model.panes[1].session.beginSelection(false);
+    try pressCanvasKey(harness, app_iface, "escape", .{});
+    try testing.expect(!app_state.model.panes[1].selecting);
+    try releaseCanvasKey(harness, app_iface, "escape", .{});
+
+    app_state.model.panes[1].selecting = true;
+    app_state.model.panes[1].session.beginSelection(false);
+    app_state.model.panes[1].session.moveSelection(-1, 0, true);
+    try pressCanvasKey(harness, app_iface, "enter", .{});
+    try app_state.effects.feedClipboardResult(app.clipboard_key, .ok, "");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expect(!app_state.model.panes[1].selecting);
+    try releaseCanvasKey(harness, app_iface, "enter", .{});
+
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
+    try testing.expectEqual(app.Phase.starting, app_state.model.panes[1].phase);
+    try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
+    try releaseCanvasKey(harness, app_iface, "r", .{});
+    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+}
+
+test "a non-shortcut re-press supersedes a stranded app shortcut latch" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    app_state.model.panes[0].session.feed("\x1b[>11u");
+    try pressCanvasKey(harness, app_iface, "arrowup", .{ .primary = true, .command = true });
+    try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
+
+    // The key repeats after Command came up. This is now terminal input,
+    // so the old app latch must not swallow its eventual release.
+    try pressCanvasKey(harness, app_iface, "arrowup", .{});
+    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    const before_release = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
+    try releaseCanvasKey(harness, app_iface, "arrowup", .{});
+    try testing.expect(app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len > before_release);
+}
+
+test "Cmd+V reads the clipboard and normalizes plain-paste newlines" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    for (0..120) |index| {
+        var line: [24]u8 = undefined;
+        app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{index}) catch unreachable);
+    }
+    app_state.model.panes[0].session.scrollToTop();
+    const history_offset = app_state.model.panes[0].session.scrollbar().offset;
+
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try testing.expect(app_state.model.paste_inflight);
+    try testing.expectEqual(@as(u8, 0), app_state.model.paste_owner);
+    try testing.expect(app.paste_clipboard_key != app.clipboard_key);
+    const request = app_state.effects.pendingClipboardAt(0) orelse return error.TestExpectedClipboardRead;
+    try testing.expectEqual(app.paste_clipboard_key, request.key);
+    try testing.expectEqual(native_sdk.EffectClipboardOp.read, request.op);
+
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "alpha\nbeta\r\ngamma");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expectEqualStrings("alpha\rbeta\r\rgamma", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expect(!app_state.model.paste_inflight);
+    try testing.expect(!app_state.model.paste_failed);
+    try testing.expect(app_state.model.panes[0].session.scrollbar().offset > history_offset);
+}
+
+test "Cmd+V uses bracketed paste framing and preserves newlines" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    app_state.model.panes[0].session.feed("\x1b[?2004h");
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "alpha\nbeta");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+
+    try testing.expectEqualStrings(
+        "\x1b[200~alpha\nbeta\x1b[201~",
+        app_state.effects.ptyWrittenBytes(app.ptyKey(0)),
+    );
+}
+
+test "Cmd+V replaces dangerous control bytes before writing" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "one\x03two\x1bthree\x00");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expectEqualStrings("one two three ", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+}
+
+test "clipboard paste stays with its requesting pane when focus changes" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true, .command = true });
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "original owner");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+
+    try testing.expectEqualStrings("original owner", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+}
+
+test "clipboard read failure is visible on the requesting pane" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .failed, "");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expect(app_state.model.paste_failed);
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+
+    const buffer = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("paste-failed"), &writer);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "1 WORKSPACE / PASTE FAILED") != null);
+}
+
+test "clipboard result after pane exit is a visible paste failure" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "too late");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+
+    try testing.expect(app_state.model.paste_failed);
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqual(@as(usize, 0), app_state.model.panes[0].outbound_len);
+}
+
+test "Cmd+V release never leaks under kitty reporting" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    app_state.model.panes[0].session.feed("\x1b[>11u");
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "paste");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    // Hosts commonly omit Command when the key comes up after the
+    // modifier. The app-level latch still owns this physical release.
+    try releaseCanvasKey(harness, app_iface, "v", .{});
+    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    try testing.expectEqualStrings("paste", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+}
+
+test "paste follows retained replies and atomic admission refuses every byte" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+    const pane = &app_state.model.panes[0];
+
+    // A terminal query reply predates the paste. It must reach stdin
+    // first even though its ring admission was initially blocked.
+    pane.session.feed("\x1b[6n");
+    const reply = try gpa.dupe(u8, pane.session.pendingResponses());
+    defer gpa.free(reply);
+    app_state.effects.fake_pty_write_full = true;
+    pane.outbound_len = pane.outbound_buffer.len;
+    app.moveResponsesToOutbound(pane, &app_state.effects);
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    app_state.effects.fake_pty_write_full = false;
+    pane.outbound_len = 0;
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "after");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    const ordered = app_state.effects.ptyWrittenBytes(app.ptyKey(0));
+    try testing.expect(std.mem.startsWith(u8, ordered, reply));
+    try testing.expect(std.mem.endsWith(u8, ordered, "after"));
+
+    // In bracketed mode, less free ring space than the complete framed
+    // paste refuses it whole: no opening fence can be queued by itself.
+    pane.session.feed("\x1b[?2004h");
+    app_state.effects.fake_pty_write_full = true;
+    pane.outbound_head = 0;
+    pane.outbound_len = pane.outbound_buffer.len - 4;
+    const before_len = pane.outbound_len;
+    const before_loss = pane.outbound_dropped;
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "body");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expectEqual(before_len, pane.outbound_len);
+    try testing.expectEqual(before_loss + "\x1b[200~body\x1b[201~".len, pane.outbound_dropped);
+    try testing.expect(app_state.model.paste_failed);
 }
 
 test "a second copy while the write is in flight is a no-op, never a false failure" {
@@ -894,14 +1221,14 @@ test "a second copy while the write is in flight is a no-op, never a false failu
     app_state.model.panes[0].session.feed("copy me");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "arrowleft",
         .modifiers = .{ .shift = true },
@@ -911,13 +1238,13 @@ test "a second copy while the write is in flight is a no-op, never a false failu
     // the first copy's success.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "enter",
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "enter",
     } });
@@ -944,7 +1271,7 @@ test "chorded punctuation and function keys encode their control sequences" {
     // the FS control byte (0x1C).
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "\\",
         .modifiers = .{ .control = true },
@@ -956,7 +1283,7 @@ test "chorded punctuation and function keys encode their control sequences" {
     // bytes the emulator's own terminal sends for this chord.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "[",
         .modifiers = .{ .control = true },
@@ -967,7 +1294,7 @@ test "chorded punctuation and function keys encode their control sequences" {
     // no text, so the encoder is their only road to the child.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "f1",
     } });
@@ -991,7 +1318,7 @@ test "a primary-aliased Ctrl chord still encodes its C0 byte" {
     // never treats as an interrupt.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "c",
         .modifiers = .{ .control = true, .primary = true },
@@ -1018,66 +1345,66 @@ test "macOS natural text arrow gestures use shell editing bindings" {
     const events = [_]native_sdk.platform.GpuSurfaceInputEvent{
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_down,
             .key = "arrowleft",
             .modifiers = .{ .option = true },
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_up,
             .key = "arrowleft",
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_down,
             .key = "arrowright",
             .modifiers = .{ .option = true },
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_up,
             .key = "arrowright",
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_down,
             .key = "arrowleft",
             .modifiers = .{ .primary = true, .command = true },
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_up,
             .key = "arrowleft",
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_down,
             .key = "arrowright",
             .modifiers = .{ .primary = true, .command = true },
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_up,
             .key = "arrowright",
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_down,
             .key = "backspace",
             .modifiers = .{ .primary = true, .command = true },
         },
         .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .key_up,
             .key = "backspace",
         },
@@ -1112,7 +1439,7 @@ test "stdin order holds: a retained reply reaches the child before newer typing"
     // the keystroke drops counted, the reply stays first in line.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "y",
     } });
@@ -1126,7 +1453,7 @@ test "stdin order holds: a retained reply reaches the child before newer typing"
     app_state.model.panes[0].outbound_len = 0;
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "x",
     } });
@@ -1156,7 +1483,7 @@ test "retained replies keep accumulating while further output feeds - the buffer
     const burst = "\x1b[6n" ** 6000; // ~36 KiB of replies, > 16 KiB initial
     session.feed(burst);
     app.moveResponsesToOutbound(&app_state.model.panes[0], &app_state.effects);
-    try testing.expectEqual(@as(u32, 0), session.responses_dropped);
+    try testing.expectEqual(@as(u64, 0), session.response_bytes_dropped);
     try testing.expect(session.pendingResponses().len > grid.Session.response_capacity);
 
     // The ring drains; the whole accumulated batch moves and clears.
@@ -1242,7 +1569,7 @@ test "a payload the outbound ring cannot hold whole is dropped whole, never torn
     @memset(oversized, 'z');
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = oversized,
     } });
@@ -1252,7 +1579,7 @@ test "a payload the outbound ring cannot hold whole is dropped whole, never torn
     // The stream is intact past the drop: the next keystroke flows.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "ok",
     } });
@@ -1323,7 +1650,7 @@ test "restart during starting is a no-op - the original session is not duplicate
     try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "r",
         .modifiers = .{ .primary = true },
@@ -1332,7 +1659,7 @@ test "restart during starting is a no-op - the original session is not duplicate
     try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
 }
 
-test "a restarted shell starts its refused-write tally at zero" {
+test "restart resets every per-session counter and exit field" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -1346,22 +1673,118 @@ test "a restarted shell starts its refused-write tally at zero" {
     // carries them into the model, where the status tally renders them.
     try app_state.effects.feedPtyOutput(1, "demo$ ");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try app_state.effects.feedPtyExit(1, 0, 0, .exited, 3);
+    try app_state.effects.feedPtyExit(1, 0, 9, .signaled, 3);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
     try testing.expectEqual(@as(u32, 3), app_state.model.panes[0].dropped_writes);
+    const pane = &app_state.model.panes[0];
+    const previous_generation = pane.session_generation;
+    pane.selecting = true;
+    pane.copied_bytes = 12;
+    pane.copy_failed = true;
+    pane.macos_natural_keys_held = 7;
+    pane.wheel_accum = 4.5;
+    pane.outbound_head = 9;
+    pane.outbound_len = 11;
+    pane.outbound_dropped = 13;
+    pane.session.response_bytes_dropped = 2;
+    app_state.model.paste_owner = 0;
+    app_state.model.paste_failed = true;
+    try testing.expect(pane.output_batches > 0);
+    try testing.expect(pane.output_bytes > 0);
+    try testing.expectEqual(@as(i32, -1), pane.exit_code);
+    try testing.expectEqual(@as(i32, 9), pane.exit_signal);
 
     // Cmd+R: the new shell's tally is its own — zero, not the dead
     // session's drops.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "r",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
-    try testing.expectEqual(@as(u32, 0), app_state.model.panes[0].dropped_writes);
+    try testing.expectEqual(app.Phase.starting, pane.phase);
+    try testing.expectEqual(@as(i32, 0), pane.exit_code);
+    try testing.expectEqual(@as(i32, 0), pane.exit_signal);
+    try testing.expectEqual(native_sdk.EffectExitReason.exited, pane.exit_reason);
+    try testing.expect(!pane.selecting);
+    try testing.expectEqual(@as(u64, 0), pane.copied_bytes);
+    try testing.expect(!pane.copy_failed);
+    try testing.expectEqual(@as(u8, 0), pane.macos_natural_keys_held);
+    try testing.expectEqual(@as(f32, 0), pane.wheel_accum);
+    try testing.expectEqual(@as(u64, 0), pane.output_batches);
+    try testing.expectEqual(@as(u64, 0), pane.output_bytes);
+    try testing.expectEqual(@as(u32, 0), pane.dropped_writes);
+    try testing.expectEqual(@as(usize, 0), pane.outbound_head);
+    try testing.expectEqual(@as(usize, 0), pane.outbound_len);
+    try testing.expectEqual(@as(u64, 0), pane.outbound_dropped);
+    try testing.expectEqual(@as(u64, 0), pane.session.response_bytes_dropped);
+    try testing.expect(pane.session_generation != previous_generation);
+    try testing.expect(!app_state.model.paste_failed);
+}
+
+test "restart cancels an owned clipboard read and ignores its stale result" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
+    const old_generation = app_state.model.panes[0].session_generation;
+    try testing.expect(app_state.model.paste_inflight);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
+    try testing.expect(app_state.model.panes[0].session_generation != old_generation);
+    try testing.expect(app_state.model.paste_inflight);
+
+    // The cancellation terminal is delivered after the replacement
+    // shell exists. Generation pinning makes it state-only cleanup: no
+    // bytes and no failure are attributed to the new session.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expect(!app_state.model.paste_inflight);
+    try testing.expect(!app_state.model.paste_failed);
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+}
+
+test "restart cancels an owned clipboard write and ignores its stale result" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+    const pane = &app_state.model.panes[0];
+
+    pane.session.feed("copy me");
+    pane.selecting = true;
+    pane.session.beginSelection(false);
+    pane.session.moveSelection(-1, 0, true);
+    try pressCanvasKey(harness, app_iface, "enter", .{});
+    const old_generation = pane.session_generation;
+    try testing.expect(app_state.model.copy_inflight);
+
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
+    try testing.expect(pane.session_generation != old_generation);
+    try testing.expect(app_state.model.copy_inflight);
+
+    // Cancellation arrives after reset and cannot clear or fail a selection
+    // belonging to the replacement shell.
+    pane.selecting = true;
+    pane.session.beginSelection(false);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expect(!app_state.model.copy_inflight);
+    try testing.expect(pane.selecting);
+    try testing.expect(!pane.copy_failed);
 }
 
 test "scrolling into history refreshes the semantic viewport text" {
@@ -1432,7 +1855,7 @@ test "wheel scrolling over the grid scrolls history" {
     for (0..4) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .scroll,
             .delta_y = cell_h,
         } });
@@ -1442,7 +1865,7 @@ test "wheel scrolling over the grid scrolls history" {
     // Typing returns the viewport to the live screen.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = "x",
     } });
@@ -1509,7 +1932,7 @@ test "scrollback chords pause while a selection is armed" {
     }
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
@@ -1522,7 +1945,7 @@ test "scrollback chords pause while a selection is armed" {
     const before = app_state.model.panes[0].session.scrollbar().offset;
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "home",
         .modifiers = .{ .primary = true },
@@ -1532,13 +1955,13 @@ test "scrollback chords pause while a selection is armed" {
     // Selection dismissed, the same chord scrolls again.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "escape",
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "home",
         .modifiers = .{ .primary = true },
@@ -1559,21 +1982,21 @@ test "a selection outlives the copy until the clipboard confirms" {
     app_state.model.panes[0].session.feed("copy me");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "arrowleft",
         .modifiers = .{ .shift = true },
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "enter",
     } });
@@ -1590,7 +2013,7 @@ test "a selection outlives the copy until the clipboard confirms" {
     try testing.expect(app_state.model.panes[0].session.selectionActive());
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "enter",
     } });
@@ -1656,7 +2079,7 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
     app_state.model.panes[0].session.feed("some text\r\n");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
@@ -1669,7 +2092,7 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
     app_state.model.panes[0].session.term.screens.active.clearSelection();
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = "c",
         .modifiers = .{ .primary = true },
@@ -1724,7 +2147,7 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     defer gpa.free(text_layout_lines);
     const changes = try gpa.alloc(canvas.DiffChange, 4096);
     defer gpa.free(changes);
-    _ = try harness.runtime.presentNextCanvasFramePixels(1, "terminal-canvas", .{
+    _ = try harness.runtime.presentNextCanvasFramePixels(1, app.canvas_label, .{
         .frame_index = 2,
         .surface_size = geometry.SizeF.init(@floatFromInt(width), @floatFromInt(height)),
         .scale = 1,
@@ -1747,9 +2170,9 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     const session = app_state.model.panes[0].session;
     const cell_w: usize = @intFromFloat(@max(1, session.cell_width));
     const cell_h: usize = @intFromFloat(@max(1, session.cell_height));
-    // The window is titlebar + grid: the grid starts at its inset.
-    const grid_x: usize = 8;
-    const grid_y: usize = 8;
+    const pane_frame = app.paneFrames(&app_state.model, geometry.SizeF.init(@floatFromInt(width), @floatFromInt(height)))[0];
+    const grid_x: usize = @intFromFloat(pane_frame.x);
+    const grid_y: usize = @intFromFloat(pane_frame.y);
     var band_colors = std.AutoHashMap(u32, void).init(gpa);
     defer band_colors.deinit();
     var y: usize = grid_y;
@@ -1769,11 +2192,11 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     // (ii) The caret cell paints distinguishably: the cursor sits right
     // after "demo$ " (column 6) and its wash differs from both the
     // background and the row's empty cells.
-    const caret_x: usize = @intFromFloat(8.0 + 6.5 * session.cell_width);
+    const caret_x: usize = @intFromFloat(pane_frame.x + 6.5 * session.cell_width);
     const caret_y = grid_y + cell_h / 2;
     const caret_offset = (caret_y * width + caret_x) * 4;
     const caret_value = std.mem.readInt(u32, pixels[caret_offset..][0..4], .little);
-    const empty_x: usize = @intFromFloat(8.0 + 40.0 * session.cell_width);
+    const empty_x: usize = @intFromFloat(pane_frame.x + 40.0 * session.cell_width);
     const empty_offset = (caret_y * width + empty_x) * 4;
     const empty_value = std.mem.readInt(u32, pixels[empty_offset..][0..4], .little);
     try testing.expect(caret_value != empty_value);
@@ -2023,7 +2446,7 @@ test "each pane's text lands inside its own rect and outside its neighbour's" {
     try testing.expect(found[1]);
 }
 
-test "both panes reach the accessibility tree, so both are in the fingerprint" {
+test "idle pane badges stay concise and use focus variants" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2032,13 +2455,101 @@ test "both panes reach the accessibility tree, so both are in the fingerprint" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
 
+    var saw_workspace = false;
+    var saw_control = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
+        if (std.mem.eql(u8, layout.widget.text, "1 WORKSPACE / FOCUSED / RUNNING")) {
+            saw_workspace = true;
+            try testing.expectEqual(canvas.WidgetVariant.primary, layout.widget.variant);
+        }
+        if (std.mem.eql(u8, layout.widget.text, "2 LOCAL SHELL / RUNNING")) {
+            saw_control = true;
+            try testing.expectEqual(canvas.WidgetVariant.outline, layout.widget.variant);
+        }
+    }
+    try testing.expect(saw_workspace);
+    try testing.expect(saw_control);
+}
+
+test "missing phux and selection mode are actionable in native chrome" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 127, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    var saw_missing = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
+        if (std.mem.eql(u8, layout.widget.text, "1 WORKSPACE / PHUX NOT FOUND / CMD+R RETRY")) {
+            saw_missing = true;
+            try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
+        }
+    }
+    try testing.expect(saw_missing);
+
+    // Local Shell remains usable and teaches selection in context.
+    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
+    try pressCanvasKey(harness, app_iface, "space", .{ .primary = true, .shift = true });
+    var saw_selecting = false;
+    var saw_help = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
+        if (std.mem.eql(u8, layout.widget.text, "2 LOCAL SHELL / SELECTING")) saw_selecting = true;
+        if (std.mem.eql(u8, layout.widget.text, "Arrows move | Shift+Arrows extend | Enter copy | Esc cancel")) saw_help = true;
+    }
+    try testing.expect(saw_selecting);
+    try testing.expect(saw_help);
+}
+
+test "status and stable pane roles reach accessibility with both screens" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+
+    app_state.model.panes[0].copy_failed = true;
+    app_state.model.panes[0].outbound_dropped = 7;
+    app_state.model.panes[0].session.response_bytes_dropped = 2;
+    app_state.model.panes[1].copied_bytes = 9;
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .app_deactivated);
+
     const buffer = try gpa.alloc(u8, 128 * 1024);
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("cockpit"), &writer);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Phux Cockpit") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "COMPANION") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "1 WORKSPACE / I/O LOSS") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "outbound loss 7 bytes; reply loss 2 bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "2 LOCAL SHELL / COPIED 9B") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "COPIED 9B") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Workspace terminal") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Local shell terminal") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEALPHA") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEBRAVO") != null);
     try testing.expect(harness.runtime.sessionStateFingerprint() != 0);
+
+    var saw_workspace = false;
+    var saw_control = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
+        if (std.mem.startsWith(u8, layout.widget.text, "1 WORKSPACE")) {
+            saw_workspace = true;
+            try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
+        }
+        if (std.mem.startsWith(u8, layout.widget.text, "2 LOCAL SHELL")) {
+            saw_control = true;
+            try testing.expectEqual(canvas.WidgetVariant.outline, layout.widget.variant);
+        }
+    }
+    try testing.expect(saw_workspace);
+    try testing.expect(saw_control);
 }
 
 // The eyes: the retained frame rendered offscreen through the
@@ -2047,7 +2558,7 @@ test "both panes reach the accessibility tree, so both are in the fingerprint" {
 // Skipped by default, never in CI:
 //
 //   COCKPIT_SHOTS=1 zig build test -Dplatform=null
-const cockpit_shot_path = "/Users/phall/workspace/phux-native-spike/cockpit/zig-out/cockpit-two-panes.png";
+const cockpit_shot_path = "zig-out/cockpit-two-panes.png";
 
 test "cockpit two-pane proof shot (env-gated)" {
     if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
@@ -2061,12 +2572,12 @@ test "cockpit two-pane proof shot (env-gated)" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
 
-    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, "terminal-canvas", null);
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, null);
     const pixels = try gpa.alloc(u8, pixel_size.byte_len);
     defer gpa.free(pixels);
     const scratch = try gpa.alloc(u8, pixel_size.byte_len);
     defer gpa.free(scratch);
-    const shot = try harness.runtime.renderCanvasScreenshot(1, "terminal-canvas", null, pixels, scratch);
+    const shot = try harness.runtime.renderCanvasScreenshot(1, app.canvas_label, null, pixels, scratch);
 
     const encoded = try gpa.alloc(u8, try canvas.png.encodedRgba8ByteLen(shot.width, shot.height));
     defer gpa.free(encoded);
@@ -2081,7 +2592,7 @@ test "cockpit two-pane proof shot (env-gated)" {
     try canvas.png.writeRgba8(&second_writer, shot.width, shot.height, shot.rgba8);
     try testing.expectEqualSlices(u8, first, second_writer.buffered());
 
-    try std.Io.Dir.cwd().createDirPath(io, "/Users/phall/workspace/phux-native-spike/cockpit/zig-out");
+    try std.Io.Dir.cwd().createDirPath(io, "zig-out");
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cockpit_shot_path, .data = first });
 }
 
@@ -2095,14 +2606,14 @@ test "cockpit two-pane proof shot (env-gated)" {
 fn clickCanvas(harness: anytype, app_iface: anytype, x: f32, y: f32) !void {
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .pointer_down,
         .x = x,
         .y = y,
     } });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .pointer_up,
         .x = x,
         .y = y,
@@ -2112,7 +2623,7 @@ fn clickCanvas(harness: anytype, app_iface: anytype, x: f32, y: f32) !void {
 fn typeCanvasText(harness: anytype, app_iface: anytype, text: []const u8) !void {
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .text_input,
         .text = text,
     } });
@@ -2121,8 +2632,18 @@ fn typeCanvasText(harness: anytype, app_iface: anytype, text: []const u8) !void 
 fn pressCanvasKey(harness: anytype, app_iface: anytype, key: []const u8, modifiers: native_sdk.platform.ShortcutModifiers) !void {
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
+        .key = key,
+        .modifiers = modifiers,
+    } });
+}
+
+fn releaseCanvasKey(harness: anytype, app_iface: anytype, key: []const u8, modifiers: native_sdk.platform.ShortcutModifiers) !void {
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .key_up,
         .key = key,
         .modifiers = modifiers,
     } });
@@ -2141,16 +2662,19 @@ fn paneStackFrame(harness: anytype, marker: []const u8) ?geometry.RectF {
     return null;
 }
 
-fn headerButtonFrame(harness: anytype) ?geometry.RectF {
-    const layout = harness.runtime.views[0].widgetLayoutTree();
-    for (layout.nodes) |node| {
-        if (node.widget.kind == .button) return node.frame;
-    }
-    return null;
-}
-
 fn rectCenter(rect: geometry.RectF) geometry.PointF {
     return geometry.PointF.init(rect.x + rect.width / 2, rect.y + rect.height / 2);
+}
+
+test "paneFrames uses the product 65/35 split" {
+    const sessions = try createSessions(80, 24);
+    defer for (sessions) |session| session.destroy();
+    const model = app.initialModel(sessions);
+    const frames = app.paneFrames(&model, geometry.SizeF.init(1100, 640));
+    const pane_width = frames[0].width + frames[1].width;
+    try testing.expectApproxEqAbs(@as(f32, 0.65), frames[0].width / pane_width, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.35), frames[1].width / pane_width, 0.0001);
+    try testing.expect(frames[0].width > frames[1].width);
 }
 
 test "the widget tree's pane stacks land exactly where paneFrames paints" {
@@ -2181,9 +2705,11 @@ test "the widget tree's pane stacks land exactly where paneFrames paints" {
         try testing.expectApproxEqAbs(expected.height, laid_out.height, 0.25);
     }
 
-    // The header band is real chrome above them, not a gap.
-    const button = headerButtonFrame(harness) orelse return error.TestExpectedButton;
-    try testing.expect(button.y + button.height <= frames[0].y + 0.25);
+    // The header is real chrome above them and contains no focusable
+    // control that can steal terminal keystrokes.
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        try testing.expect(node.widget.kind != .button);
+    }
 }
 
 test "typed keys reach the FOCUSED pane's pty and only that one" {
@@ -2218,6 +2744,13 @@ test "typed keys reach the FOCUSED pane's pty and only that one" {
     try typeCanvasText(harness, app_iface, "!");
     try testing.expectEqualStrings("alpha!", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+
+    // Only 1 and 2 are app focus shortcuts. Cmd+3 remains terminal input
+    // (or may encode to nothing in a legacy mode), but never aliases to
+    // the last pane.
+    try pressCanvasKey(harness, app_iface, "3", .{ .primary = true });
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
 test "clicking a pane moves focus to it with no chord" {
@@ -2243,14 +2776,9 @@ test "clicking a pane moves focus to it with no chord" {
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
 }
 
-test "the focusable button swallows Enter while it holds focus, and a pane click gives it back" {
-    // THE HAZARD, PINNED RATHER THAN DESIGNED AROUND. A real
-    // focusable widget on the same surface as a terminal means
-    // activation keys belong to whoever holds focus. This is the
-    // documented constraint; the recovery is one click on a pane.
+test "the header has no focusable button hazard and Enter stays terminal input" {
     const gpa = testing.allocator;
-    const size = geometry.SizeF.init(980, 640);
-    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
     const app_state = try startTwoPaneCockpit(gpa, harness);
     defer gpa.destroy(app_state);
@@ -2258,27 +2786,15 @@ test "the focusable button swallows Enter while it holds focus, and a pane click
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    // Baseline: Enter reaches the focused pane.
-    try pressCanvasKey(harness, app_iface, "enter", .{});
-    try testing.expectEqualStrings("\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
-
-    const button = rectCenter(headerButtonFrame(harness) orelse return error.TestExpectedButton);
-    try clickCanvas(harness, app_iface, button.x, button.y);
-    try testing.expect(harness.runtime.views[0].canvas_widget_focused_id != 0);
-
-    // The button owns the keyboard now: Enter activates IT (a no-op
-    // restart on a live pane) and never reaches the shell.
-    try pressCanvasKey(harness, app_iface, "enter", .{});
-    try testing.expectEqualStrings("\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
-    try testing.expectEqual(app.Phase.live, app_state.model.panes[0].phase);
-
-    // Clicking a pane stack is the recovery path: a non-focusable press
-    // target resolves widget focus to nothing, so keys reach `on_key`.
-    const pane0 = rectCenter(app.paneFrames(&app_state.model, size)[0]);
-    try clickCanvas(harness, app_iface, pane0.x, pane0.y);
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        try testing.expect(node.widget.kind != .button);
+    }
+    for (harness.runtime.views[0].widgetSemantics()) |node| {
+        try testing.expect(!node.focusable);
+    }
     try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
     try pressCanvasKey(harness, app_iface, "enter", .{});
-    try testing.expectEqualStrings("\r\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
 }
 
 test "only the focused pane paints a filled cursor, and deactivation hollows both" {

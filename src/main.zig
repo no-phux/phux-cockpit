@@ -1,4 +1,4 @@
-//! terminal: a recordable terminal embed at the example tier. The pty
+//! Companion: a recordable two-pane terminal cockpit. The pty
 //! effect vocabulary owns the transport (`fx.ptySpawn` and friends),
 //! libghostty-vt owns cell state, damage, scrollback, and selection, and
 //! the canvas paints the viewport as real text — theme-mapped ANSI-16,
@@ -10,8 +10,9 @@
 //! the IME-correct text channel; chords and specials through the
 //! emulator's key encoder, so application cursor-key modes hold).
 //! cmd/ctrl+shift+space arms cell selection (arrows move, shift+arrows
-//! extend, B toggles block/line, cmd/ctrl+C copies, escape clears);
-//! cmd/ctrl+arrows page the scrollback.
+//! extend, B toggles block/line, cmd/ctrl+C copies, escape clears),
+//! cmd/ctrl+V safely pastes the system clipboard into the pane that
+//! requested it, and cmd/ctrl+arrows page the scrollback.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,20 +26,21 @@ pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
-const canvas_label = "terminal-canvas";
-const window_width: f32 = 980;
+pub const canvas_label = "phux-cockpit-canvas";
+pub const app_name = "Phux Cockpit";
+pub const bundle_id = "dev.phux.cockpit";
+const window_width: f32 = 1100;
 const window_height: f32 = 640;
-pub const window_min_width: f32 = 640;
+pub const window_min_width: f32 = 900;
 pub const window_min_height: f32 = 420;
 
 /// The grid's padding inside the window.
 const grid_inset: f32 = 8;
 
-/// The band the ORDINARY WIDGETS occupy above the grids: the cockpit's
-/// label, one status badge per pane, and a real focusable button. The
-/// pane rects start below it (`paneFrames`), so the chrome prefix never
-/// paints under the widget row.
-pub const header_height: f32 = 28;
+/// The two-line native header: identity and keyboard help above the pane
+/// status row. The pane rects start below it (`paneFrames`), so the
+/// chrome prefix never paints under the widget tree.
+pub const header_height: f32 = 52;
 
 /// The cockpit paints SEVERAL terminal panes into one gpu_surface.
 pub const pane_count: usize = 2;
@@ -47,15 +49,15 @@ pub const pane_count: usize = 2;
 pub const pane_gutter: f32 = 8;
 
 /// One keyed-effect space spans pty, clipboard, spawn, and fetch
-/// (`effects.keyOccupiedUntilDelivery`), so the pane keys and the
-/// clipboard key must not collide. Pane i owns key 1+i; the clipboard
-/// sits far clear of them — at key 2 (the single-pane original) every
-/// copy would be silently rejected the moment pane 1 spawned, surfacing
-/// only as `copy_failed`.
+/// (`effects.keyOccupiedUntilDelivery`), so pane, copy, and paste keys
+/// must not collide. Pane i owns key 1+i; clipboard effects sit far clear
+/// of them. Copy and paste use distinct keys so one direction can be in
+/// flight without rejecting the other.
 pub fn ptyKey(index: usize) u64 {
     return 1 + index;
 }
 pub const clipboard_key: u64 = 100;
+pub const paste_clipboard_key: u64 = 101;
 
 /// THE BUDGET POLICY. The three per-view canvas budgets are accounted
 /// DIFFERENTLY by the painter, so each is partitioned differently.
@@ -108,7 +110,7 @@ pub const pane_cell_ceiling: usize = grid.max_cells / pane_count;
 /// pane's former 256 KiB. Only a paste or reply burst larger than the
 /// whole ring, into a child that never reads, reaches the drop path —
 /// and even then the drop is counted and shown, never silent.
-const outbound_buffer_bytes: usize = 64 * 1024;
+pub const outbound_buffer_bytes: usize = 64 * 1024;
 
 /// The default interactive shell per platform — a deterministic pick so
 /// a replayed update issues the identical spawn (reading $SHELL here
@@ -133,26 +135,30 @@ const default_shell_argv: []const []const u8 = if (builtin.os.tag == .windows)
 else
     &.{ default_shell, "-i" };
 
-/// The second pane's content. Two panes only prove the cockpit thesis if
-/// they show DIFFERENT things, so pane 1 runs a self-driving clock: it
-/// produces output on its own, which also exercises two concurrent live
-/// ptys feeding one surface without any typing.
-const ticker_argv: []const []const u8 = if (builtin.os.tag == .windows)
-    &.{ default_shell, "/c", "for /l %i in (1,0,2) do @(echo %date% %time%& timeout /t 1 >nul)" }
+/// Product commands. On macOS the Workspace enters HOME and replaces the
+/// login shell with phux; Local Shell enters HOME and replaces it with a
+/// login-configured interactive zsh. Other hosts retain a practical
+/// interactive-shell fallback so null-platform tests remain portable.
+const workspace_argv: []const []const u8 = if (builtin.os.tag == .macos)
+    &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\"; if command -v phux >/dev/null 2>&1; then exec phux; fi; printf '\nPhux CLI was not found.\nInstall it with:\n  brew install phall1/tap/phux\nThen press Cmd+R to retry.\n'; exit 127" }
 else
-    &.{ default_shell, "-c", "while :; do date; sleep 1; done" };
+    default_shell_argv;
+const control_argv: []const []const u8 = if (builtin.os.tag == .macos)
+    &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -l -i" }
+else
+    default_shell_argv;
 
-fn paneArgv(index: usize) []const []const u8 {
-    return if (index == 0) default_shell_argv else ticker_argv;
+pub fn paneArgv(index: usize) []const []const u8 {
+    return if (index == 0) workspace_argv else control_argv;
 }
 
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
 const shell_views = [_]native_sdk.ShellView{
-    .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Terminal canvas", .accessibility_label = "Terminal", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
+    .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Phux Cockpit canvas", .accessibility_label = "Phux Cockpit", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
-    .title = "Terminal",
+    .title = app_name,
     .width = window_width,
     .height = window_height,
     .min_width = window_min_width,
@@ -181,6 +187,9 @@ pub const Pane = struct {
     /// The spawn argv for this pane's child (and its restart).
     argv: []const []const u8 = default_shell_argv,
     phase: Phase = .starting,
+    /// Incremented for every spawn so an asynchronous clipboard read
+    /// from a restarted session cannot paste into its replacement.
+    session_generation: u64 = 0,
     exit_code: i32 = 0,
     exit_signal: i32 = 0,
     exit_reason: native_sdk.EffectExitReason = .exited,
@@ -247,6 +256,10 @@ pub const Model = struct {
     /// the application is active. Lifecycle messages rebuild the custom
     /// chrome so the cursor fills on focus and hollows on blur.
     focused: bool = true,
+    /// Physical keys whose presses were consumed as app shortcuts. A
+    /// matching release must also be consumed when a child enabled kitty
+    /// release reporting, even if modifiers or pane focus changed first.
+    consumed_shortcut_keys_held: u16 = 0,
     /// A clipboard write is IN FLIGHT: further copies are no-ops until
     /// its result lands, or the fixed-key re-request would be rejected
     /// as a duplicate and overwrite the first copy's outcome. There is
@@ -255,6 +268,16 @@ pub const Model = struct {
     /// so the result clears the right pane's highlight.
     copy_inflight: bool = false,
     copy_owner: u8 = 0,
+    copy_owner_generation: u64 = 0,
+    /// One clipboard read may be in flight for the window. The owner and
+    /// its spawn generation pin delivery to the pane/session that asked,
+    /// even if keyboard focus moves before the result arrives.
+    paste_inflight: bool = false,
+    paste_owner: u8 = 0,
+    paste_owner_generation: u64 = 0,
+    /// The last paste read or atomic queue admission failed. This is
+    /// window-level feedback displayed on `paste_owner`'s badge.
+    paste_failed: bool = false,
     /// The OS titlebar band height (hidden-inset chrome): the grid's
     /// text starts below it while the terminal background runs under
     /// it, so the window reads as one seamless surface with only the
@@ -307,16 +330,12 @@ pub const Msg = union(enum) {
     text: canvas.WidgetKeyboardEvent,
     viewport: struct { pane: u8, cols: u16, rows: u16, size: geometry.SizeF },
     clipboard: native_sdk.EffectClipboardResult,
+    paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
     restart,
-    /// Move keyboard focus to a pane (cmd+digit, or a press on the
-    /// pane's own stack). Out-of-range indices clamp rather than trap:
-    /// the chord generalizes to nine panes and the app has two.
+    /// Move keyboard focus to a pane (cmd+1/cmd+2, or a press on the
+    /// pane's own stack). Out-of-range indices are ignored.
     focus_pane: u8,
-    /// The header button's action: restart the FOCUSED pane's shell.
-    /// A distinct variant from `.restart` so the journal records which
-    /// surface asked — the chord or the widget.
-    restart_pane,
     /// The frame pump asks the update loop (which holds `fx`) to push
     /// more pending outbound bytes now that a frame elapsed — the child
     /// may have read and freed FIFO space without producing output to
@@ -340,7 +359,12 @@ fn initFx(model: *Model, fx: *Fx) void {
 
 fn spawnPane(pane: *Pane, fx: *Fx) void {
     const model = pane;
+    model.session_generation +%= 1;
+    if (model.session_generation == 0) model.session_generation = 1;
     model.phase = .starting;
+    model.exit_code = 0;
+    model.exit_signal = 0;
+    model.exit_reason = .exited;
     // Leave selection mode: reset() clears the emulator's selection, so
     // a lingering `selecting` flag would show a caret over no selection
     // AND make the new shell reject all typed text until Escape.
@@ -350,6 +374,9 @@ fn spawnPane(pane: *Pane, fx: *Fx) void {
     model.copied_bytes = 0;
     model.copy_failed = false;
     model.macos_natural_keys_held = 0;
+    model.wheel_accum = 0;
+    model.output_batches = 0;
+    model.output_bytes = 0;
     // Drop any bytes still queued for the session that just ended — a
     // restarted shell must not receive the dead one's unsent keystrokes.
     model.outbound_head = 0;
@@ -482,6 +509,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // only the focused one's.
             if (!focused) {
                 for (&model.panes) |*pane| pane.macos_natural_keys_held = 0;
+                model.consumed_shortcut_keys_held = 0;
             }
         },
         .wheel => |wheel| {
@@ -506,10 +534,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .copy_selection => copySelection(model, fx),
         .clipboard => |result| {
+            if (!model.copy_inflight) return;
             model.copy_inflight = false;
             // The result belongs to the pane whose selection was copied,
             // which may no longer be the focused one.
             const pane = &model.panes[@min(model.copy_owner, pane_count - 1)];
+            // A restart invalidates the request. Its cancelled (or raced
+            // successful) result must not mutate the replacement session.
+            if (pane.session_generation != model.copy_owner_generation) return;
             if (result.outcome == .ok) {
                 // Confirmed on the clipboard: the selection's job is
                 // done, and only NOW does it clear — a failed write
@@ -525,6 +557,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 pane.copy_failed = true;
             }
         },
+        .paste_clipboard => |result| {
+            if (!model.paste_inflight) return;
+            model.paste_inflight = false;
+            const pane = &model.panes[@min(model.paste_owner, pane_count - 1)];
+            // A restart invalidates the request. Its cancelled (or raced
+            // successful) terminal result must not touch the new shell.
+            if (pane.session_generation != model.paste_owner_generation) return;
+            if (result.outcome != .ok) {
+                model.paste_failed = true;
+                return;
+            }
+            // The child may have exited while the clipboard read was in
+            // flight. A successful read cannot make a dead pty writable.
+            if (!pane.acceptsInput()) {
+                model.paste_failed = true;
+                return;
+            }
+            model.paste_failed = false;
+            pasteClipboardText(model, pane, fx, result.text);
+        },
         .restart => {
             // Restart ONLY a genuinely finished session. During
             // `.starting` (spawned, no output yet) or `.live` the pty
@@ -533,13 +585,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // original with no input.
             const pane = model.focusedPane();
             if (pane.phase != .ended and pane.phase != .failed) return;
-            // The restarting pane's copy can never confirm now.
-            if (model.copy_inflight and model.copy_owner == model.focus) model.copy_inflight = false;
+            // Keep the clipboard key occupied until cancellation delivers;
+            // the generation check above discards the stale result.
+            if (model.copy_inflight and model.copy_owner == model.focus) fx.cancel(clipboard_key);
+            // Keep the read latched until its cancellation terminal
+            // arrives, preventing key reuse while the old effect still
+            // owns it. The generation check above discards that result.
+            if (model.paste_owner == model.focus) {
+                model.paste_failed = false;
+                if (model.paste_inflight) fx.cancel(paste_clipboard_key);
+            }
             spawnPane(pane, fx);
         },
-        .restart_pane => update(model, .restart, fx),
         .focus_pane => |requested| {
-            const next: u8 = @intCast(@min(requested, pane_count - 1));
+            if (requested >= pane_count) return;
+            const next = requested;
             if (next == model.focus) return;
             // The pane losing focus may never see the releases of keys
             // still physically down, so its natural-editing latches
@@ -712,6 +772,7 @@ fn copySelection(model: *Model, fx: *Fx) void {
     // Remember whose selection is riding the clipboard: the result may
     // land after focus moved to the other pane.
     model.copy_owner = model.focus;
+    model.copy_owner_generation = pane.session_generation;
     fx.writeClipboard(.{
         .key = clipboard_key,
         .text = text,
@@ -721,6 +782,63 @@ fn copySelection(model: *Model, fx: *Fx) void {
     // it now would leave a failed write nothing to retry — the promised
     // keep-on-failure needs the selection still standing when the
     // result lands (the `.clipboard` arm clears it on success).
+}
+
+fn requestPaste(model: *Model, fx: *Fx) void {
+    // One read in flight: the fixed paste key remains occupied until its
+    // result is delivered. A repeated Cmd+V is consumed but cannot issue
+    // a duplicate request that would only be rejected.
+    if (model.paste_inflight) return;
+    const pane = model.focusedPane();
+    model.paste_owner = model.focus;
+    model.paste_owner_generation = pane.session_generation;
+    model.paste_failed = false;
+    if (!pane.acceptsInput()) {
+        model.paste_failed = true;
+        return;
+    }
+    model.paste_inflight = true;
+    fx.readClipboard(.{
+        .key = paste_clipboard_key,
+        .on_result = Fx.clipboardMsg(.paste_clipboard),
+    });
+}
+
+/// Encode a clipboard result exactly as this terminal expects, then
+/// admit the complete framing and body as one outbound payload. The
+/// clipboard result is dispatch scratch, so the mutable staging buffer
+/// also gives `encodePaste` room to normalize newlines and replace unsafe
+/// control bytes before the result returns.
+fn pasteClipboardText(model: *Model, pane: *Pane, fx: *Fx, text: []const u8) void {
+    const fence_bytes = "\x1b[200~".len;
+    const staging = pane.session.gpa.alloc(u8, text.len + fence_bytes * 2) catch {
+        model.paste_failed = true;
+        return;
+    };
+    defer pane.session.gpa.free(staging);
+
+    const body = staging[fence_bytes .. fence_bytes + text.len];
+    @memcpy(body, text);
+    const parts = vt.input.encodePaste(body, .fromTerminal(&pane.session.term));
+    const start = fence_bytes - parts[0].len;
+    @memcpy(staging[start..fence_bytes], parts[0]);
+    @memcpy(staging[fence_bytes + text.len .. fence_bytes + text.len + parts[2].len], parts[2]);
+    const encoded = staging[start .. fence_bytes + text.len + parts[2].len];
+
+    pane.session.scrollToBottom();
+    // Retained terminal replies predate this user input and must enter
+    // the shared stream first. If they still cannot move, refusing the
+    // whole paste is the only ordering-safe outcome.
+    moveResponsesToOutbound(pane, fx);
+    if (pane.session.response_len > 0 or encoded.len > pane.outbound_buffer.len) {
+        pane.outbound_dropped += encoded.len;
+        model.paste_failed = true;
+        return;
+    }
+    if (!enqueueOutbound(pane, fx, encoded)) {
+        pane.outbound_dropped += encoded.len;
+        model.paste_failed = true;
+    }
 }
 
 // ------------------------------------------------------------- keyboard
@@ -753,33 +871,42 @@ fn onLifecycle(event: native_sdk.LifecycleEvent) ?Msg {
 fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     const mods = event.modifiers;
     const primary = mods.hasCommandModifier();
-    // Keyboard input belongs to the FOCUSED pane; the window-level
-    // clipboard and restart chords still route through the model.
+    // Keyboard input belongs to the FOCUSED pane; window-level copy,
+    // paste, focus, and restart chords still route through the model.
     const pane = model.focusedPane();
     const session = pane.session;
 
-    // Releases are terminal input only — app chords and selection act
-    // on presses. The encoder decides whether the child hears them
-    // (kitty event reporting; silent under legacy modes).
+    // A consumed app-shortcut press owns its release too. The latch is
+    // window-level because a focus shortcut changes panes before its
+    // release arrives.
     if (event.phase == .key_up) {
+        const shortcut_mask = appShortcutKeyMask(event.key);
+        if (shortcut_mask != 0 and (model.consumed_shortcut_keys_held & shortcut_mask) != 0) {
+            model.consumed_shortcut_keys_held &= ~shortcut_mask;
+            return;
+        }
         if (pane.selecting or !pane.acceptsInput()) return;
         encodeKeyEvent(pane, fx, event, .release);
         return;
     }
 
-    // App chords first: pane focus, selection mode, copy, scrollback,
-    // restart.
+    // A fresh press of the same physical key supersedes a stranded shortcut
+    // latch. If this press is another app shortcut, its branch below re-arms
+    // the bit; otherwise the terminal receives a balanced press/release pair.
+    model.consumed_shortcut_keys_held &= ~appShortcutKeyMask(event.key);
+
+    // App chords first: pane focus, selection mode, copy/paste,
+    // scrollback, restart.
     //
-    // cmd/ctrl+digit is the conventional tab chord and nothing else
-    // binds it, so it generalizes to N panes without stealing terminal
-    // input a shell would otherwise see. It runs BEFORE the selection
-    // and terminal paths because a focus move is a window action, not
-    // something the focused child should hear.
-    if (primary and !mods.shift and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '9') {
+    // Only Cmd+1 and Cmd+2 are pane shortcuts. Higher digits remain
+    // terminal input and must never clamp/alias to Local Shell.
+    if (primary and !mods.shift and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '2') {
+        latchAppShortcut(model, event.key);
         update(model, .{ .focus_pane = event.key[0] - '1' }, fx);
         return;
     }
     if (primary and mods.shift and keyIs(event.key, "space")) {
+        latchAppShortcut(model, event.key);
         if (pane.selecting) {
             pane.selecting = false;
             session.clearSelection();
@@ -790,10 +917,17 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         return;
     }
     if (primary and keyIs(event.key, "c") and (pane.selecting or session.selectionActive())) {
+        latchAppShortcut(model, event.key);
         copySelection(model, fx);
         return;
     }
+    if (primary and keyIs(event.key, "v")) {
+        latchAppShortcut(model, event.key);
+        requestPaste(model, fx);
+        return;
+    }
     if (primary and keyIs(event.key, "r") and (pane.phase == .ended or pane.phase == .failed)) {
+        latchAppShortcut(model, event.key);
         update(model, .restart, fx);
         return;
     }
@@ -805,18 +939,22 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // selection block below, where primary+arrows are simply inert.)
     if (!pane.selecting) {
         if (primary and keyIs(event.key, "arrowup")) {
+            latchAppShortcut(model, event.key);
             session.scrollLines(-if (mods.shift) @as(isize, pane.rows) else 1);
             return;
         }
         if (primary and keyIs(event.key, "arrowdown")) {
+            latchAppShortcut(model, event.key);
             session.scrollLines(if (mods.shift) @as(isize, pane.rows) else 1);
             return;
         }
         if (primary and keyIs(event.key, "home")) {
+            latchAppShortcut(model, event.key);
             session.scrollToTop();
             return;
         }
         if (primary and keyIs(event.key, "end")) {
+            latchAppShortcut(model, event.key);
             session.scrollToBottom();
             return;
         }
@@ -824,6 +962,7 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
 
     if (pane.selecting) {
         if (keyIs(event.key, "escape")) {
+            latchAppShortcut(model, event.key);
             pane.selecting = false;
             session.clearSelection();
             return;
@@ -833,6 +972,7 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
             return;
         }
         if (keyIs(event.key, "enter")) {
+            latchAppShortcut(model, event.key);
             copySelection(model, fx);
             return;
         }
@@ -851,6 +991,26 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // protocol, and modifier encodings all honored); plain printable
     // presses arrive through `.text` instead and are ignored here.
     encodeKeyEvent(pane, fx, event, .press);
+}
+
+fn latchAppShortcut(model: *Model, key: []const u8) void {
+    model.consumed_shortcut_keys_held |= appShortcutKeyMask(key);
+}
+
+fn appShortcutKeyMask(key: []const u8) u16 {
+    if (keyIs(key, "1")) return 1 << 0;
+    if (keyIs(key, "2")) return 1 << 1;
+    if (keyIs(key, "space")) return 1 << 2;
+    if (keyIs(key, "c")) return 1 << 3;
+    if (keyIs(key, "r")) return 1 << 4;
+    if (keyIs(key, "arrowup")) return 1 << 5;
+    if (keyIs(key, "arrowdown")) return 1 << 6;
+    if (keyIs(key, "home")) return 1 << 7;
+    if (keyIs(key, "end")) return 1 << 8;
+    if (keyIs(key, "v")) return 1 << 9;
+    if (keyIs(key, "escape")) return 1 << 10;
+    if (keyIs(key, "enter")) return 1 << 11;
+    return 0;
 }
 
 /// Encode one key transition and push the bytes toward the child. macOS
@@ -1113,66 +1273,147 @@ fn mapKey(event: canvas.WidgetKeyboardEvent) ?MappedKey {
 
 const TerminalUi = TerminalApp.Ui;
 
-/// A pane's fallback accessibility label before its shell has produced
-/// a screen. Stable per index so the layout test can find the stack.
-fn paneFallbackLabel(index: usize) []const u8 {
+/// Phux has one visual register regardless of the system appearance: deep
+/// graphite surfaces, porcelain text, and lime reserved for focus/action.
+/// The built-in Geist dark controls keep their accessibility behavior while
+/// the color register aligns the terminal and native chrome with phux.
+pub fn cockpitTokens(_: *const Model) canvas.DesignTokens {
+    var tokens = canvas.DesignTokens.themeWithOverrides(
+        .{ .color_scheme = .dark, .pack = .geist },
+        canvas.accentOverrides(canvas.Color.rgb8(190, 242, 100), .dark),
+    );
+    tokens.colors.background = canvas.Color.rgb8(9, 11, 15);
+    tokens.colors.surface = canvas.Color.rgb8(17, 20, 27);
+    tokens.colors.surface_subtle = canvas.Color.rgb8(23, 27, 35);
+    tokens.colors.surface_pressed = canvas.Color.rgb8(35, 41, 52);
+    tokens.colors.text = canvas.Color.rgb8(244, 247, 251);
+    tokens.colors.text_muted = canvas.Color.rgb8(154, 164, 178);
+    tokens.colors.border = canvas.Color.rgb8(52, 58, 70);
+    tokens.colors.accent = canvas.Color.rgb8(190, 242, 100);
+    tokens.colors.accent_text = canvas.Color.rgb8(9, 11, 15);
+    tokens.colors.warning = canvas.Color.rgb8(253, 224, 71);
+    tokens.colors.destructive = canvas.Color.rgb8(248, 113, 113);
+    return tokens;
+}
+
+/// Stable pane names prefix the dynamic screen text in accessibility.
+fn paneRoleName(index: usize) []const u8 {
     return switch (index) {
-        0 => "Terminal grid 1",
-        else => "Terminal grid 2",
+        0 => "Workspace terminal",
+        else => "Local shell terminal",
     };
 }
 
 pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
-    // The cockpit is panes PLUS ordinary widgets: a header row of real
-    // native chrome above a row of pane stacks.
+    // The cockpit is panes plus an honest, non-focusable status header.
     //
     // The stacks paint NOTHING (a panel would draw its surface over the
     // grid) — they exist to put both panes' viewport text in the
-    // accessibility tree, and now to be press targets that move focus.
+    // accessibility tree and to be press targets that move focus.
     // Because `.stack` is not focusable (`defaultFocusable`), a press on
-    // one RELEASES keyboard focus back to the app's `on_key`, which is
-    // exactly the recovery path that makes the focusable button below
-    // safe to ship: click the button and Enter goes to the button;
-    // click a pane and the terminal has the keyboard again.
+    // one releases widget focus back to the app's `on_key`.
     var badges: [pane_count]TerminalUi.Node = undefined;
     for (&badges, &model.panes, 0..) |*node, *pane, index| {
+        const phux_missing = index == 0 and pane.phase == .ended and
+            pane.exit_reason == .exited and pane.exit_code == 127;
+        const phase = if (phux_missing)
+            "PHUX NOT FOUND"
+        else switch (pane.phase) {
+            .starting, .live => "RUNNING",
+            .ended => switch (pane.exit_reason) {
+                .exited => ui.fmt("EXIT {d}", .{pane.exit_code}),
+                .signaled => ui.fmt("SIGNAL {d}", .{pane.exit_signal}),
+                .cancelled => "CANCELLED",
+                else => "ENDED",
+            },
+            .failed => "FAILED",
+        };
+        const title = if (index == 0) "1 WORKSPACE" else "2 LOCAL SHELL";
+        const phase_failed = pane.phase == .failed or
+            (pane.phase == .ended and (pane.exit_reason != .exited or pane.exit_code != 0));
+        const io_loss = pane.outbound_dropped > 0 or pane.session.response_bytes_dropped > 0 or pane.dropped_writes > 0;
+        const paste_failed = model.paste_owner == index and model.paste_failed;
+        const failed = pane.copy_failed or paste_failed or
+            io_loss or phase_failed;
+        const status = if (phux_missing)
+            "1 WORKSPACE / PHUX NOT FOUND / CMD+R RETRY"
+        else if (phase_failed)
+            ui.fmt("{s} / {s} / CMD+R RETRY", .{ title, phase })
+        else if (io_loss)
+            ui.fmt("{s} / I/O LOSS", .{title})
+        else if (paste_failed)
+            ui.fmt("{s} / PASTE FAILED", .{title})
+        else if (pane.copy_failed)
+            ui.fmt("{s} / COPY FAILED", .{title})
+        else if (pane.selecting)
+            ui.fmt("{s} / SELECTING", .{title})
+        else if (model.paste_owner == index and model.paste_inflight)
+            ui.fmt("{s} / PASTING", .{title})
+        else if (model.copy_inflight and model.copy_owner == index)
+            ui.fmt("{s} / COPYING", .{title})
+        else if (pane.copied_bytes > 0)
+            ui.fmt("{s} / COPIED {d}B", .{ title, pane.copied_bytes })
+        else if (index == model.focus)
+            ui.fmt("{s} / FOCUSED / {s}", .{ title, phase })
+        else
+            ui.fmt("{s} / {s}", .{ title, phase });
+        const detail = ui.fmt(
+            "{s}; outbound loss {d} bytes; reply loss {d} bytes; refused writes {d}",
+            .{ status, pane.outbound_dropped, pane.session.response_bytes_dropped, pane.dropped_writes },
+        );
+        const variant: canvas.WidgetVariant = if (failed)
+            .destructive
+        else if (index == model.focus)
+            .primary
+        else if (pane.acceptsInput())
+            .outline
+        else
+            .secondary;
         node.* = ui.el(.badge, .{
             .key = .{ .index = index },
             .size = .sm,
-            .text = ui.fmt("{d}{s} {s} {d}B", .{
-                index + 1,
-                if (index == model.focus) "*" else "",
-                @tagName(pane.phase),
-                pane.output_bytes,
-            }),
+            .grow = if (index == 0) 65 else 35,
+            .variant = variant,
+            .text = status,
+            .semantics = .{ .label = detail },
         }, .{});
     }
 
-    const header = [_]TerminalUi.Node{
-        ui.text(.{ .cross = .center }, "COCKPIT"),
-        badges[0],
-        badges[1],
+    const focused_pane = &model.panes[@min(model.focus, pane_count - 1)];
+    const help = if (focused_pane.selecting)
+        "Arrows move | Shift+Arrows extend | Enter copy | Esc cancel"
+    else
+        "Cmd+1/2 focus | Cmd+Shift+Space select | Cmd+C copy | Cmd+V paste | Cmd+R restart exited";
+    const header_top = [_]TerminalUi.Node{
+        ui.text(.{ .cross = .center }, "Phux Cockpit"),
+        ui.el(.badge, .{ .size = .sm, .text = "COMPANION" }, .{}),
         ui.spacer(1),
-        // A REAL focusable control, not decoration: it is the honest
-        // demonstration that panes and native widgets share one surface,
-        // and it is the one interaction hazard worth pinning — while it
-        // holds focus, Enter and Space activate the button instead of
-        // reaching the shell.
-        ui.button(.{ .size = .sm, .on_press = .restart_pane }, "Restart"),
+        ui.text(.{ .cross = .center }, help),
     };
+    const header_top_nodes: []const TerminalUi.Node = &header_top;
+    const status_nodes: []const TerminalUi.Node = &badges;
+    const header = ui.column(.{ .height = header_height }, .{
+        ui.row(.{ .height = 24, .gap = pane_gutter, .cross = .center }, header_top_nodes),
+        ui.row(.{ .height = 28, .gap = pane_gutter, .cross = .center }, status_nodes),
+    });
 
     var panes: [pane_count]TerminalUi.Node = undefined;
     for (&panes, &model.panes, 0..) |*node, *pane, index| {
         const screen = pane.session.screenText();
         node.* = ui.el(.stack, .{
             .key = .{ .index = index },
-            .grow = 1,
+            .grow = if (index == 0) 65 else 35,
             .on_press = .{ .focus_pane = @intCast(index) },
-            .semantics = .{ .label = if (screen.len > 0) screen else paneFallbackLabel(index) },
+            .semantics = .{
+                .role = .group,
+                .label = if (screen.len > 0)
+                    ui.fmt("{s}\n{s}", .{ paneRoleName(index), screen })
+                else
+                    paneRoleName(index),
+            },
         }, .{});
     }
 
-    const header_nodes: []const TerminalUi.Node = &header;
     const pane_nodes: []const TerminalUi.Node = &panes;
     // The column's uniform padding IS `grid_inset`, and the leading
     // spacer is the hidden-inset titlebar band: together they reproduce
@@ -1181,7 +1422,7 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     const titlebar_band = @max(0, @max(grid_inset, model.chrome_top + 4) - grid_inset);
     return ui.column(.{ .padding = grid_inset }, .{
         ui.el(.stack, .{ .height = titlebar_band }, .{}),
-        ui.row(.{ .height = header_height, .gap = pane_gutter, .cross = .center }, header_nodes),
+        header,
         ui.row(.{ .grow = 1, .gap = pane_gutter }, pane_nodes),
     });
 }
@@ -1220,7 +1461,7 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
 
 /// Where each pane's grid lives, in canvas points: below the
 /// hidden-inset titlebar band AND below the widget header row, width
-/// split evenly with `pane_gutter` between.
+/// split 65/35 with `pane_gutter` between.
 ///
 /// This is the SECOND derivation of these rectangles — `view()` is the
 /// first, and the layout engine owns that one. `ChromeOptions.build`
@@ -1230,16 +1471,14 @@ pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometr
     const top = @max(grid_inset, model.chrome_top + 4) + header_height;
     const usable = @max(0, size.width - grid_inset * 2);
     const gutters = pane_gutter * @as(f32, @floatFromInt(pane_count - 1));
-    const width = @max(0, (usable - gutters) / @as(f32, @floatFromInt(pane_count)));
+    const pane_usable = @max(0, usable - gutters);
+    const widths = [pane_count]f32{ pane_usable * 0.65, pane_usable * 0.35 };
     const height = @max(0, size.height - top - grid_inset);
     var frames: [pane_count]geometry.RectF = undefined;
+    var x = grid_inset;
     for (&frames, 0..) |*frame, index| {
-        frame.* = geometry.RectF.init(
-            grid_inset + @as(f32, @floatFromInt(index)) * (width + pane_gutter),
-            top,
-            width,
-            height,
-        );
+        frame.* = geometry.RectF.init(x, top, widths[index], height);
+        x += widths[index] + pane_gutter;
     }
     return frames;
 }
@@ -1284,9 +1523,10 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
 
 pub fn appOptions() TerminalApp.Options {
     return .{
-        .name = "terminal",
+        .name = app_name,
         .scene = shell_scene,
         .canvas_label = canvas_label,
+        .tokens_fn = cockpitTokens,
         .init_fx = initFx,
         .update_fx = update,
         .view = view,
@@ -1322,9 +1562,9 @@ pub fn main(init: std.process.Init) !void {
     app_state.* = TerminalApp.init(std.heap.page_allocator, initialModel(sessions), appOptions());
     defer app_state.deinit();
     try runner.runWithOptions(app_state.app(), .{
-        .app_name = "terminal",
-        .window_title = "Terminal",
-        .bundle_id = "dev.native_sdk.terminal",
+        .app_name = app_name,
+        .window_title = app_name,
+        .bundle_id = bundle_id,
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .restore_state = false,
         .js_window_api = false,

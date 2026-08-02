@@ -35,7 +35,7 @@ fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     const app_iface = app_state.app();
     try harness.start(app_iface);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .size = geometry.SizeF.init(980, 640),
         .scale_factor = 2,
         .frame_index = 1,
@@ -44,7 +44,7 @@ fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .pointer_down,
         .x = 200,
         .y = 200,
@@ -220,7 +220,7 @@ test "ADVERSARIAL: no two commands in a hostile two-pane frame share an id" {
 test "ADVERSARIAL: the live frame's ids are unique across grids AND widgets" {
     // The unit probe above paints grids only. This one takes the REAL
     // retained display list the runtime holds — chrome prefix plus the
-    // widget header, the badges, and the button — and scans all of it.
+    // widget header and badges — and scans all of it.
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -408,7 +408,7 @@ test "ADVERSARIAL: identical hostile content, and the two panes are NOT equal" {
 fn pressKey(harness: anytype, app_iface: anytype, key: []const u8, modifiers: native_sdk.platform.ShortcutModifiers) !void {
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_down,
         .key = key,
         .modifiers = modifiers,
@@ -455,16 +455,17 @@ test "ADVERSARIAL: the focus chord itself never leaks a byte to either child" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    // Press AND release, which is where the build agent flagged an
-    // asymmetry: the chord is swallowed on press, but the release path
-    // sits above the chord block.
+    // Press AND release under kitty release reporting. The release omits
+    // Command to model the modifier coming up first; the model-level
+    // physical-key latch must still recognize and swallow it.
+    for (&app_state.model.panes) |*pane| pane.session.feed("\x1b[>11u");
     try pressKey(harness, app_iface, "2", .{ .primary = true });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
-        .label = "terminal-canvas",
+        .label = app.canvas_label,
         .kind = .key_up,
         .key = "2",
-        .modifiers = .{ .primary = true },
+        .modifiers = .{},
     } });
     std.debug.print(
         "\nMEASURED chord leak: pane0={d} bytes pane1={d} bytes\n",
@@ -502,7 +503,7 @@ test "ADVERSARIAL: a wheel over the UNFOCUSED pane scrolls that one, not the foc
     // first, exactly as a live window does at ~60 Hz.
     for (2..8) |frame_index| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .size = size,
             .scale_factor = 2,
             .frame_index = @intCast(frame_index),
@@ -523,7 +524,7 @@ test "ADVERSARIAL: a wheel over the UNFOCUSED pane scrolls that one, not the foc
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .scroll,
             .x = target.x + target.width / 2,
             .y = target.y + target.height / 2,
@@ -557,7 +558,7 @@ test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" 
     // `center_on_primary`. This test holds the fix in place by asserting
     // the routing works with NO frame dispatched at all.
     const gpa = testing.allocator;
-    const size = geometry.SizeF.init(980, 640);
+    const size = geometry.SizeF.init(1100, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
     defer harness.destroy(gpa);
     const app_state = try startCockpit(gpa, harness);
@@ -589,7 +590,7 @@ test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" 
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .kind = .scroll,
             .x = target.x + target.width / 2,
             .y = target.y + target.height / 2,
@@ -603,7 +604,7 @@ test "REGRESSION: a wheel routes to the pane it is over BEFORE the first frame" 
 
 // -------------------------------------------------- A7: the validator's eyes
 
-const validator_shot_path = "/Users/phall/workspace/phux-native-spike/cockpit/zig-out/validator-two-panes.png";
+const validator_shot_path = "zig-out/validator-two-panes.png";
 
 test "ADVERSARIAL: proof shot with SUBSTANTIAL distinct content in both panes (env-gated)" {
     // The builders' shot showed one word per pane. If the panes shared a
@@ -628,7 +629,7 @@ test "ADVERSARIAL: proof shot with SUBSTANTIAL distinct content in both panes (e
     // real grids.
     for (2..8) |frame_index| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
-            .label = "terminal-canvas",
+            .label = app.canvas_label,
             .size = size,
             .scale_factor = 2,
             .frame_index = @intCast(frame_index),
@@ -662,16 +663,16 @@ test "ADVERSARIAL: proof shot with SUBSTANTIAL distinct content in both panes (e
     try testing.expect(std.mem.indexOf(u8, right, "Tue Jul 27") != null);
     try testing.expect(std.mem.indexOf(u8, right, "LEFT") == null);
 
-    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, "terminal-canvas", null);
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, null);
     const pixels = try gpa.alloc(u8, pixel_size.byte_len);
     defer gpa.free(pixels);
     const scratch = try gpa.alloc(u8, pixel_size.byte_len);
     defer gpa.free(scratch);
-    const shot = try harness.runtime.renderCanvasScreenshot(1, "terminal-canvas", null, pixels, scratch);
+    const shot = try harness.runtime.renderCanvasScreenshot(1, app.canvas_label, null, pixels, scratch);
     const encoded = try gpa.alloc(u8, try canvas.png.encodedRgba8ByteLen(shot.width, shot.height));
     defer gpa.free(encoded);
     var writer = std.Io.Writer.fixed(encoded);
     try canvas.png.writeRgba8(&writer, shot.width, shot.height, shot.rgba8);
-    try std.Io.Dir.cwd().createDirPath(io, "/Users/phall/workspace/phux-native-spike/cockpit/zig-out");
+    try std.Io.Dir.cwd().createDirPath(io, "zig-out");
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = validator_shot_path, .data = writer.buffered() });
 }

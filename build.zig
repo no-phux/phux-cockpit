@@ -5,8 +5,11 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 
 pub fn build(b: *std.Build) void {
-    const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{ .name = "terminal" });
+    const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{ .name = "phux-cockpit" });
     const app_module = artifacts.exe.root_module;
+    if (app_module.resolved_target.?.result.os.tag != .macos) {
+        @panic("phux-cockpit supports macOS only");
+    }
     const ghostty = b.dependency("ghostty", .{
         .target = app_module.resolved_target.?,
         .optimize = app_module.optimize.?,
