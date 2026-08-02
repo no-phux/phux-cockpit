@@ -527,6 +527,7 @@ fn recordTerminalSession(
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
     harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.session_recorder = recorder;
 
     const sessions = try createSessions(80, 24);
@@ -603,6 +604,7 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
     harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
 
     const sessions = try createSessions(80, 24);
     defer for (sessions) |each| each.destroy();
@@ -644,6 +646,8 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
 
 fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.shortcuts = &app.work_shortcuts;
     const sessions = try createSessions(80, 24);
     const app_state = try gpa.create(TerminalApp);
     app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
@@ -1078,7 +1082,7 @@ test "Cmd+V replaces dangerous control bytes before writing" {
     try testing.expectEqualStrings("one two three ", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
 }
 
-test "clipboard paste stays with its requesting pane when focus changes" {
+test "clipboard paste stays with its requesting terminal while Web is selected" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -1089,8 +1093,9 @@ test "clipboard paste stays with its requesting pane when focus changes" {
     const app_iface = app_state.app();
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
-    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true, .command = true });
-    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try pressCanvasKey(harness, app_iface, "3", .{ .primary = true, .command = true });
+    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "original owner");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
 
@@ -1118,7 +1123,7 @@ test "clipboard read failure is visible on the requesting pane" {
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("paste-failed"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "1 WORKSPACE / PASTE FAILED") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "WORKSPACE / PASTE FAILED") != null);
 }
 
 test "clipboard result after pane exit is a visible paste failure" {
@@ -1849,14 +1854,28 @@ test "wheel scrolling over the grid scrolls history" {
     const bottom_offset = app_state.model.panes[0].session.scrollbar().offset;
     try testing.expect(bottom_offset > 0);
 
+    // The persistent Work rail is outside every terminal hit target.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .scroll,
+        .x = app.work_rail_width / 2,
+        .y = 300,
+        .delta_y = app_state.model.panes[0].session.cell_height * 4,
+    } });
+    try testing.expectEqual(bottom_offset, app_state.model.panes[0].session.scrollbar().offset);
+
     // A trackpad swipe (several fractional deltas accumulating past one
     // cell) scrolls into history, like every terminal.
     const cell_h = app_state.model.panes[0].session.cell_height;
+    const frame = app.paneFrames(&app_state.model, app_state.model.surface_size)[0];
     for (0..4) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
             .label = app.canvas_label,
             .kind = .scroll,
+            .x = frame.x + frame.width / 2,
+            .y = frame.y + frame.height / 2,
             .delta_y = cell_h,
         } });
     }
@@ -2117,53 +2136,19 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
-    // Render the retained frame HEADLESS through the same machinery the
-    // damage oracles use, at scale 1 so a pixel is a point.
-    const width: usize = 980;
-    const height: usize = 640;
-    const pixels = try gpa.alloc(u8, width * height * 4);
+    // Render a full retained-scene screenshot. A damage-only present into
+    // fresh pixels is no longer a valid oracle once Work/Web transitions
+    // can add independent frame transactions.
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, 1);
+    const pixels = try gpa.alloc(u8, pixel_size.byte_len);
     defer gpa.free(pixels);
-    const scratch = try gpa.alloc(u8, width * height * 4);
+    const scratch = try gpa.alloc(u8, pixel_size.byte_len);
     defer gpa.free(scratch);
-    const render_commands = try gpa.alloc(canvas.RenderCommand, 4096);
-    defer gpa.free(render_commands);
-    const render_batches = try gpa.alloc(canvas.RenderBatch, 512);
-    defer gpa.free(render_batches);
-    const resources = try gpa.alloc(canvas.RenderResource, 1024);
-    defer gpa.free(resources);
-    const resource_cache_entries = try gpa.alloc(canvas.RenderResourceCacheEntry, 1024);
-    defer gpa.free(resource_cache_entries);
-    const resource_cache_actions = try gpa.alloc(canvas.RenderResourceCacheAction, 2048);
-    defer gpa.free(resource_cache_actions);
-    const glyphs = try gpa.alloc(canvas.GlyphAtlasEntry, 8192);
-    defer gpa.free(glyphs);
-    const glyph_cache_entries = try gpa.alloc(canvas.GlyphAtlasCacheEntry, 8192);
-    defer gpa.free(glyph_cache_entries);
-    const glyph_cache_actions = try gpa.alloc(canvas.GlyphAtlasCacheAction, 16384);
-    defer gpa.free(glyph_cache_actions);
-    const text_layout_plans = try gpa.alloc(canvas.TextLayoutPlan, 2048);
-    defer gpa.free(text_layout_plans);
-    const text_layout_lines = try gpa.alloc(canvas.TextLine, 4096);
-    defer gpa.free(text_layout_lines);
-    const changes = try gpa.alloc(canvas.DiffChange, 4096);
-    defer gpa.free(changes);
-    _ = try harness.runtime.presentNextCanvasFramePixels(1, app.canvas_label, .{
-        .frame_index = 2,
-        .surface_size = geometry.SizeF.init(@floatFromInt(width), @floatFromInt(height)),
-        .scale = 1,
-    }, .{
-        .render_commands = render_commands,
-        .render_batches = render_batches,
-        .resources = resources,
-        .resource_cache_entries = resource_cache_entries,
-        .resource_cache_actions = resource_cache_actions,
-        .glyph_atlas_entries = glyphs,
-        .glyph_atlas_cache_entries = glyph_cache_entries,
-        .glyph_atlas_cache_actions = glyph_cache_actions,
-        .text_layout_plans = text_layout_plans,
-        .text_layout_lines = text_layout_lines,
-        .changes = changes,
-    }, pixels, scratch, canvas.Color.rgb8(0, 0, 0));
+    const shot = try harness.runtime.renderCanvasScreenshot(1, app.canvas_label, 1, pixels, scratch);
+    const width: usize = shot.width;
+    const height: usize = shot.height;
+    try testing.expectEqual(@as(usize, 980), width);
+    try testing.expectEqual(@as(usize, 640), height);
     // (i) The prompt's cell band holds INK: pixels that differ from the
     // grid background. The first text row starts at the grid origin;
     // sample generously across the first cell row.
@@ -2180,10 +2165,18 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
         var x: usize = grid_x;
         while (x < grid_x + cell_w * 8) : (x += 1) {
             const offset = (y * width + x) * 4;
-            const value = std.mem.readInt(u32, pixels[offset..][0..4], .little);
+            const value = std.mem.readInt(u32, shot.rgba8[offset..][0..4], .little);
             try band_colors.put(value, {});
         }
     }
+    var retained_prompt = false;
+    for (harness.runtime.views[0].canvasDisplayList().commands) |command| switch (command) {
+        .draw_text => |text| if (std.mem.indexOf(u8, text.text, "demo$") != null) {
+            retained_prompt = true;
+        },
+        else => {},
+    };
+    try testing.expect(retained_prompt);
     // Background alone is one color; ink adds more (glyph coverage is
     // antialiased, so ink contributes MANY distinct values — demand a
     // handful so a single stray pixel cannot pass).
@@ -2195,10 +2188,10 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     const caret_x: usize = @intFromFloat(pane_frame.x + 6.5 * session.cell_width);
     const caret_y = grid_y + cell_h / 2;
     const caret_offset = (caret_y * width + caret_x) * 4;
-    const caret_value = std.mem.readInt(u32, pixels[caret_offset..][0..4], .little);
+    const caret_value = std.mem.readInt(u32, shot.rgba8[caret_offset..][0..4], .little);
     const empty_x: usize = @intFromFloat(pane_frame.x + 40.0 * session.cell_width);
     const empty_offset = (caret_y * width + empty_x) * 4;
-    const empty_value = std.mem.readInt(u32, pixels[empty_offset..][0..4], .little);
+    const empty_value = std.mem.readInt(u32, shot.rgba8[empty_offset..][0..4], .little);
     try testing.expect(caret_value != empty_value);
 }
 
@@ -2244,6 +2237,7 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
     harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     const sessions = try createSessions(80, 24);
     const session = sessions[0];
     defer for (sessions) |each| each.destroy();
@@ -2273,7 +2267,7 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
 }
 
-// ------------------------------------------------------- cockpit: two panes
+// ---------------------------------------------------- cockpit: Work surfaces
 
 const automation = native_sdk.automation;
 
@@ -2314,69 +2308,65 @@ fn feedAdversarialRows(session: *grid.Session, cols: usize, rows: usize) void {
     }
 }
 
-test "two panes paint into distinct id namespaces the diff accepts" {
+test "switching terminal Works retains distinct id namespaces the diff accepts" {
     const sessions = try createSessions(20, 6);
     defer for (sessions) |each| each.destroy();
     sessions[0].feed("PANEALPHA\r\n");
     sessions[1].feed("PANEBRAVO\r\n");
 
-    var commands: [2048]canvas.CanvasCommand = undefined;
-    var builder = canvas.Builder.init(&commands);
+    var command_storage: [app.pane_count][1024]canvas.CanvasCommand = undefined;
+    var lists: [app.pane_count]canvas.DisplayList = undefined;
     for (sessions, 0..) |session, index| {
+        var builder = canvas.Builder.init(&command_storage[index]);
         try grid.paint(session, &builder, .{
-            .frame = geometry.RectF.init(@as(f32, @floatFromInt(index)) * 200, 0, 190, 200),
+            .frame = geometry.RectF.init(226, 60, 746, 572),
             .tokens = .{},
             .running = true,
             .selecting = false,
             .id_base = grid.paneIdBase(index),
         });
+        lists[index] = builder.displayList();
     }
-    const list = builder.displayList();
 
-    // The retained diff is the real judge: it rejects a display list that
-    // repeats an object id, which is exactly what two panes sharing one
-    // id base would produce.
+    // A Work switch diffs one selected terminal frame into the other.
     const changes = try testing.allocator.alloc(canvas.DiffChange, 4096);
     defer testing.allocator.free(changes);
-    _ = try canvas.DisplayList.diff(.{}, list, changes);
+    _ = try canvas.DisplayList.diff(lists[0], lists[1], changes);
 
-    const first = list.findCommandById(grid.cursorCommandId(grid.paneIdBase(0))) orelse
+    const first = lists[0].findCommandById(grid.cursorCommandId(grid.paneIdBase(0))) orelse
         return error.TestExpectedCursor;
-    const second = list.findCommandById(grid.cursorCommandId(grid.paneIdBase(1))) orelse
+    const second = lists[1].findCommandById(grid.cursorCommandId(grid.paneIdBase(1))) orelse
         return error.TestExpectedCursor;
-    try testing.expect(first.index != second.index);
+    try testing.expect(first.command.objectId().? != second.command.objectId().?);
 }
 
-test "the pane command floor holds: neither pane starves its neighbour" {
+test "each selected terminal receives the full chrome command envelope" {
     const sessions = try createSessions(40, 40);
     defer for (sessions) |each| each.destroy();
     for (sessions) |session| feedAdversarialRows(session, 40, 40);
 
-    var commands: [2048]canvas.CanvasCommand = undefined;
-    var builder = canvas.Builder.init(&commands);
     var painted: [app.pane_count]usize = @splat(0);
     for (sessions, 0..) |session, index| {
-        const before = builder.displayList().commands.len;
+        var commands: [2048]canvas.CanvasCommand = undefined;
+        var builder = canvas.Builder.init(&commands);
         try grid.paint(session, &builder, .{
-            .frame = geometry.RectF.init(@as(f32, @floatFromInt(index)) * 480, 0, 470, 800),
+            .frame = geometry.RectF.init(0, 0, 746, 580),
             .tokens = .{},
             .running = true,
             .selecting = false,
-            .command_budget = app.paneCommandBudget(index),
-            .text_reserve = app.pane_text_reserve,
-            .glyph_budget = app.pane_glyph_budget,
+            .command_budget = app.chrome_command_envelope,
+            .text_reserve = canvas.terminal_grid.widget_text_reserve,
+            .glyph_budget = canvas.terminal_grid.widget_glyph_budget,
             .id_base = grid.paneIdBase(index),
         });
-        painted[index] = distinctTextRows(builder.displayList().commands[before..]);
+        painted[index] = distinctTextRows(builder.displayList().commands);
+        try testing.expect(builder.displayList().commands.len <= app.chrome_command_envelope);
     }
-    // Pane 0 is capped at its floor and pane 1 inherits the slack, so a
-    // busy pane 0 cannot blank pane 1 and vice versa.
     try testing.expect(painted[0] >= 5);
-    try testing.expect(painted[1] >= 5);
-    try testing.expect(builder.displayList().commands.len <= app.chrome_command_envelope);
+    try testing.expectEqual(painted[0], painted[1]);
 }
 
-test "a screen of double box drawing stays inside the pane command budget" {
+test "a screen of double box drawing stays inside the selected terminal budget" {
     // U+256C costs EIGHT commands (four double sides, two bars each). A
     // four-per-column reserve let the last painted row overshoot the
     // budget, and under `variable_prefix` an overshoot fails the WHOLE
@@ -2395,14 +2385,14 @@ test "a screen of double box drawing stays inside the pane command budget" {
         .tokens = .{},
         .running = true,
         .selecting = false,
-        .command_budget = app.paneCommandBudget(0),
+        .command_budget = app.chrome_command_envelope,
         .id_base = grid.paneIdBase(0),
     });
-    try testing.expect(builder.displayList().commands.len <= app.paneCommandBudget(0));
+    try testing.expect(builder.displayList().commands.len <= app.chrome_command_envelope);
 }
 
-/// The cockpit under the harness with both ptys live and distinct
-/// content on each: the shape tests (d), (e), and (f) all need.
+/// The cockpit under the harness with both ptys live and distinct, even
+/// though only the selected Work is presented.
 fn startTwoPaneCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     const app_state = try startFocusedTerminal(gpa, harness);
     const app_iface = app_state.app();
@@ -2413,7 +2403,30 @@ fn startTwoPaneCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     return app_state;
 }
 
-test "each pane's text lands inside its own rect and outside its neighbour's" {
+fn expectDisplayListMarker(display_list: anytype, marker: []const u8, frame: geometry.RectF) !void {
+    for (display_list.commands) |command| {
+        switch (command) {
+            .draw_text => |text| if (std.mem.indexOf(u8, text.text, marker) != null) {
+                try testing.expect(text.origin.x >= frame.x);
+                try testing.expect(text.origin.x < frame.x + frame.width);
+                return;
+            },
+            else => {},
+        }
+    }
+    return error.TestExpectedMarker;
+}
+
+fn expectDisplayListMissingMarker(display_list: anytype, marker: []const u8) !void {
+    for (display_list.commands) |command| {
+        switch (command) {
+            .draw_text => |text| try testing.expect(std.mem.indexOf(u8, text.text, marker) == null),
+            else => {},
+        }
+    }
+}
+
+test "only the selected terminal paints and hidden terminal state remains live" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2422,31 +2435,30 @@ test "each pane's text lands inside its own rect and outside its neighbour's" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
 
-    const frames = app.paneFrames(&app_state.model, geometry.SizeF.init(980, 640));
-    const markers = [app.pane_count][]const u8{ "PANEALPHA", "PANEBRAVO" };
-    const list = harness.runtime.views[0].canvasDisplayList();
-    var found: [app.pane_count]bool = @splat(false);
-    for (list.commands) |command| {
-        switch (command) {
-            .draw_text => |text| {
-                for (markers, 0..) |marker, index| {
-                    if (std.mem.indexOf(u8, text.text, marker) == null) continue;
-                    found[index] = true;
-                    const own = frames[index];
-                    const other = frames[1 - index];
-                    try testing.expect(text.origin.x >= own.x);
-                    try testing.expect(text.origin.x < own.x + own.width);
-                    try testing.expect(text.origin.x < other.x or text.origin.x >= other.x + other.width);
-                }
-            },
-            else => {},
-        }
-    }
-    try testing.expect(found[0]);
-    try testing.expect(found[1]);
+    const size = geometry.SizeF.init(980, 640);
+    var frames = app.paneFrames(&app_state.model, size);
+    try testing.expect(frames[0].width > 0);
+    try testing.expectEqual(@as(f32, 0), frames[1].width);
+    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEALPHA", frames[0]);
+    try expectDisplayListMissingMarker(harness.runtime.views[0].canvasDisplayList(), "PANEBRAVO");
+
+    // Pane 1 accepted output while hidden. Selecting Scratch reveals its
+    // existing emulator rather than creating or resetting a surface.
+    try app_state.effects.feedPtyOutput(app.ptyKey(1), "HIDDEN STATE\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
+    const hidden_bytes = app_state.model.panes[1].output_bytes;
+    try pressCanvasKey(harness, app_state.app(), "2", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(app_state.app(), .frame_requested);
+    frames = app.paneFrames(&app_state.model, size);
+    try testing.expectEqual(@as(f32, 0), frames[0].width);
+    try testing.expect(frames[1].width > 0);
+    try testing.expectEqual(hidden_bytes, app_state.model.panes[1].output_bytes);
+    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEBRAVO", frames[1]);
+    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "HIDDEN STATE", frames[1]);
+    try expectDisplayListMissingMarker(harness.runtime.views[0].canvasDisplayList(), "PANEALPHA");
 }
 
-test "idle pane badges stay concise and use focus variants" {
+test "selected terminal status is concise and the hidden status is absent" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2456,19 +2468,16 @@ test "idle pane badges stay concise and use focus variants" {
     defer app_state.deinit();
 
     var saw_workspace = false;
-    var saw_control = false;
+    var saw_scratch = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "1 WORKSPACE / FOCUSED / RUNNING")) {
+        if (std.mem.eql(u8, layout.widget.text, "WORKSPACE / RUNNING")) {
             saw_workspace = true;
             try testing.expectEqual(canvas.WidgetVariant.primary, layout.widget.variant);
         }
-        if (std.mem.eql(u8, layout.widget.text, "2 LOCAL SHELL / RUNNING")) {
-            saw_control = true;
-            try testing.expectEqual(canvas.WidgetVariant.outline, layout.widget.variant);
-        }
+        if (std.mem.eql(u8, layout.widget.text, "SCRATCH / RUNNING")) saw_scratch = true;
     }
     try testing.expect(saw_workspace);
-    try testing.expect(saw_control);
+    try testing.expect(!saw_scratch);
 }
 
 test "missing phux and selection mode are actionable in native chrome" {
@@ -2485,27 +2494,27 @@ test "missing phux and selection mode are actionable in native chrome" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     var saw_missing = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "1 WORKSPACE / PHUX NOT FOUND / CMD+R RETRY")) {
+        if (std.mem.eql(u8, layout.widget.text, "PHUX NOT FOUND / CMD+R RETRY")) {
             saw_missing = true;
             try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
         }
     }
     try testing.expect(saw_missing);
 
-    // Local Shell remains usable and teaches selection in context.
+    // Scratch remains usable and teaches selection in context.
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
     try pressCanvasKey(harness, app_iface, "space", .{ .primary = true, .shift = true });
     var saw_selecting = false;
     var saw_help = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "2 LOCAL SHELL / SELECTING")) saw_selecting = true;
-        if (std.mem.eql(u8, layout.widget.text, "Arrows move | Shift+Arrows extend | Enter copy | Esc cancel")) saw_help = true;
+        if (std.mem.eql(u8, layout.widget.text, "SCRATCH / SELECTING")) saw_selecting = true;
+        if (std.mem.eql(u8, layout.widget.text, "Arrows move | Shift extends | Enter copies | Esc cancels")) saw_help = true;
     }
     try testing.expect(saw_selecting);
     try testing.expect(saw_help);
 }
 
-test "status and stable pane roles reach accessibility with both screens" {
+test "Work rows and only the selected terminal surface reach accessibility" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2517,50 +2526,42 @@ test "status and stable pane roles reach accessibility with both screens" {
     app_state.model.panes[0].copy_failed = true;
     app_state.model.panes[0].outbound_dropped = 7;
     app_state.model.panes[0].session.response_bytes_dropped = 2;
-    app_state.model.panes[1].copied_bytes = 9;
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .app_deactivated);
 
     const buffer = try gpa.alloc(u8, 128 * 1024);
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("cockpit"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Phux Cockpit") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "COMPANION") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "1 WORKSPACE / I/O LOSS") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Work") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Workspace, phux / durable work, shortcut") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Scratch, local / ephemeral, shortcut") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, native WebKit, shortcut") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "WORKSPACE / I/O LOSS") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "outbound loss 7 bytes; reply loss 2 bytes") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "2 LOCAL SHELL / COPIED 9B") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "COPIED 9B") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Workspace terminal") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Local shell terminal") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEALPHA") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEBRAVO") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEBRAVO") == null);
     try testing.expect(harness.runtime.sessionStateFingerprint() != 0);
 
     var saw_workspace = false;
-    var saw_control = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.startsWith(u8, layout.widget.text, "1 WORKSPACE")) {
+        if (std.mem.startsWith(u8, layout.widget.text, "WORKSPACE")) {
             saw_workspace = true;
             try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
         }
-        if (std.mem.startsWith(u8, layout.widget.text, "2 LOCAL SHELL")) {
-            saw_control = true;
-            try testing.expectEqual(canvas.WidgetVariant.outline, layout.widget.variant);
-        }
     }
     try testing.expect(saw_workspace);
-    try testing.expect(saw_control);
 }
 
 // The eyes: the retained frame rendered offscreen through the
 // deterministic reference renderer and written as a PNG, so a human (or
-// an agent that can read images) can SEE two live panes side by side.
+// an agent that can read images) can inspect the selected Work and rail.
 // Skipped by default, never in CI:
 //
 //   COCKPIT_SHOTS=1 zig build test -Dplatform=null
-const cockpit_shot_path = "zig-out/cockpit-two-panes.png";
+const cockpit_shot_path = "zig-out/cockpit-selected-work.png";
 
-test "cockpit two-pane proof shot (env-gated)" {
+test "cockpit selected-Work proof shot (env-gated)" {
     if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
     if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -2666,24 +2667,33 @@ fn rectCenter(rect: geometry.RectF) geometry.PointF {
     return geometry.PointF.init(rect.x + rect.width / 2, rect.y + rect.height / 2);
 }
 
-test "paneFrames uses the product 65/35 split" {
+test "selected Work defaults to Workspace and paneFrames has one full content frame" {
     const sessions = try createSessions(80, 24);
     defer for (sessions) |session| session.destroy();
-    const model = app.initialModel(sessions);
-    const frames = app.paneFrames(&model, geometry.SizeF.init(1100, 640));
-    const pane_width = frames[0].width + frames[1].width;
-    try testing.expectApproxEqAbs(@as(f32, 0.65), frames[0].width / pane_width, 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 0.35), frames[1].width / pane_width, 0.0001);
-    try testing.expect(frames[0].width > frames[1].width);
+    var model = app.initialModel(sessions);
+    try testing.expectEqual(app.WorkId.workspace, model.selected_work);
+    try testing.expectEqual(@as(?u8, 0), model.selectedTerminalIndex());
+
+    const size = geometry.SizeF.init(1100, 640);
+    var frames = app.paneFrames(&model, size);
+    try testing.expectEqual(app.work_rail_width, @as(f32, 208));
+    try testing.expectApproxEqAbs(@as(f32, 226), frames[0].x, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 866), frames[0].width, 0.0001);
+    try testing.expect(frames[0].height > 0);
+    try testing.expectEqual(geometry.RectF{}, frames[1]);
+
+    model.selected_work = .scratch;
+    frames = app.paneFrames(&model, size);
+    try testing.expectEqual(geometry.RectF{}, frames[0]);
+    try testing.expect(frames[1].width > 0);
+
+    model.selected_work = .web;
+    frames = app.paneFrames(&model, size);
+    try testing.expectEqual(geometry.RectF{}, frames[0]);
+    try testing.expectEqual(geometry.RectF{}, frames[1]);
 }
 
-test "the widget tree's pane stacks land exactly where paneFrames paints" {
-    // THE LOAD-BEARING ONE. `ChromeOptions.build` never receives the
-    // laid-out tree, so `paneFrames()` (which places the grids) and
-    // `view()` (which places the hit targets) are two independent
-    // derivations of the same rectangles. Nothing but this test keeps
-    // them from drifting — and a drift means clicks land on the wrong
-    // pane while the picture still looks right.
+test "the selected terminal stack lands exactly where paneFrames paints" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -2693,26 +2703,20 @@ test "the widget tree's pane stacks land exactly where paneFrames paints" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
 
-    const frames = app.paneFrames(&app_state.model, size);
-    const markers = [app.pane_count][]const u8{ "PANEALPHA", "PANEBRAVO" };
-    for (frames, markers) |expected, marker| {
+    for ([_][]const u8{ "1", "2" }, [_][]const u8{ "PANEALPHA", "PANEBRAVO" }) |key, marker| {
+        try pressCanvasKey(harness, app_state.app(), key, .{ .primary = true });
+        try harness.runtime.dispatchPlatformEvent(app_state.app(), .frame_requested);
+        const index: usize = app_state.model.focus;
+        const expected = app.paneFrames(&app_state.model, size)[index];
         const laid_out = paneStackFrame(harness, marker) orelse return error.TestExpectedPaneStack;
-        // A quarter point. If this fails, reconcile padding/gap/header
-        // height — do NOT widen the epsilon.
         try testing.expectApproxEqAbs(expected.x, laid_out.x, 0.25);
         try testing.expectApproxEqAbs(expected.y, laid_out.y, 0.25);
         try testing.expectApproxEqAbs(expected.width, laid_out.width, 0.25);
         try testing.expectApproxEqAbs(expected.height, laid_out.height, 0.25);
     }
-
-    // The header is real chrome above them and contains no focusable
-    // control that can steal terminal keystrokes.
-    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        try testing.expect(node.widget.kind != .button);
-    }
 }
 
-test "typed keys reach the FOCUSED pane's pty and only that one" {
+test "Cmd+1 and Cmd+2 select terminal Works and route text only to that Work" {
     // THE ACCEPTANCE GATE for the whole spike: mis-routed input shows
     // up as bytes on the wrong pty, not as a subtle rendering
     // difference.
@@ -2726,6 +2730,7 @@ test "typed keys reach the FOCUSED pane's pty and only that one" {
     const app_iface = app_state.app();
 
     try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
     try typeCanvasText(harness, app_iface, "alpha");
     try testing.expectEqualStrings("alpha", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
@@ -2733,6 +2738,7 @@ test "typed keys reach the FOCUSED pane's pty and only that one" {
     // cmd+2 moves the keyboard to pane 1.
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
     try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
     try typeCanvasText(harness, app_iface, "bravo");
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
     // Pane 0's stream is untouched: the chord itself never reached it.
@@ -2741,19 +2747,207 @@ test "typed keys reach the FOCUSED pane's pty and only that one" {
     // ...and back.
     try pressCanvasKey(harness, app_iface, "1", .{ .primary = true });
     try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
     try typeCanvasText(harness, app_iface, "!");
     try testing.expectEqualStrings("alpha!", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
-
-    // Only 1 and 2 are app focus shortcuts. Cmd+3 remains terminal input
-    // (or may encode to nothing in a legacy mode), but never aliases to
-    // the last pane.
-    try pressCanvasKey(harness, app_iface, "3", .{ .primary = true });
-    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
-    try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-test "clicking a pane moves focus to it with no chord" {
+test "Work IDs and browser messages make focused model transitions" {
+    const sessions = try createSessions(80, 24);
+    defer for (sessions) |session| session.destroy();
+    var app_state = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    defer app_state.deinit();
+    app_state.effects.executor = .fake;
+
+    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
+    try testing.expectEqual(app.BrowserPage.github, app_state.model.browser_page);
+    try testing.expectEqual(@as(?u8, 0), app_state.model.selectedTerminalIndex());
+
+    app.update(&app_state.model, .{ .select_work = .scratch }, &app_state.effects);
+    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try testing.expectEqual(@as(?u8, 1), app_state.model.selectedTerminalIndex());
+
+    app.update(&app_state.model, .{ .browser_page = .article }, &app_state.effects);
+    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
+    try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+
+    try testing.expectEqual(@as(u64, 1), app_state.model.browser_navigation_token);
+    app.update(&app_state.model, .{ .select_work = .workspace }, &app_state.effects);
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
+}
+
+test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal input" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    var line: [24]u8 = undefined;
+    for (0..80) |index| app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{index}) catch unreachable);
+    const bottom = app_state.model.panes[0].session.scrollbar().offset;
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+
+    try pressCanvasKey(harness, app_iface, "3", .{ .primary = true });
+    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
+    try testing.expectEqual(@as(usize, 0), app_state.effects.pendingClipboardCount());
+
+    const before0 = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
+    const before1 = app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len;
+    try pressCanvasKey(harness, app_iface, "arrowup", .{});
+    try typeCanvasText(harness, app_iface, "blocked");
+    try pressCanvasKey(harness, app_iface, "v", .{ .primary = true });
+    try pressCanvasKey(harness, app_iface, "r", .{ .primary = true });
+    for ([_]f32{ 100, 500 }) |x| {
+        try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = app.canvas_label,
+            .kind = .scroll,
+            .x = x,
+            .y = 300,
+            .delta_y = app_state.model.panes[0].session.cell_height * 4,
+        } });
+    }
+    try testing.expectEqual(before0, app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len);
+    try testing.expectEqual(before1, app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len);
+    try testing.expectEqual(@as(usize, 0), app_state.effects.pendingClipboardCount());
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+    try testing.expectEqual(bottom, app_state.model.panes[0].session.scrollbar().offset);
+
+    const buffer = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("web"), &writer);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, native WebKit") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), app.webview_anchor) != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "GitHub") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Open GitHub") != null);
+
+    // The platform shortcut path, not a synthetic canvas key, escapes native
+    // WebKit focus. Its later physical release is latched and cannot leak to
+    // a terminal using kitty key-release reporting.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "work.scratch",
+        .key = "2",
+        .window_id = 1,
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
+    const scratch_before_release = app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len;
+    try releaseCanvasKey(harness, app_iface, "2", .{});
+    try testing.expectEqual(scratch_before_release, app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len);
+}
+
+test "web pane root-navigation bindings are exact" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+
+    try testing.expectEqualStrings("https://github.com/phall1", app.BrowserPage.github.url());
+    try testing.expectEqualStrings("https://www.superlogical.com/", app.BrowserPage.superlogical.url());
+    try testing.expectEqualStrings("https://mitchellh.com/writing/superlogical", app.BrowserPage.article.url());
+
+    var panes: [1]TerminalApp.WebViewPane = undefined;
+    try testing.expectEqual(@as(usize, 1), app.webPanes(&app_state.model, &panes));
+    try testing.expectEqualStrings(app.webview_label, panes[0].label);
+    try testing.expectEqualStrings(app.webview_anchor, panes[0].anchor.?);
+    try testing.expectEqualStrings(app.BrowserPage.github.url(), panes[0].url);
+    try testing.expectEqual(@as(u64, 0), panes[0].reload_token);
+
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.webview_count);
+    try testing.expectEqualStrings(app.webview_label, harness.null_platform.webviews[0].label);
+    try testing.expect(harness.null_platform.webviews[0].frame.width <= 1);
+    try testing.expect(harness.null_platform.webviews[0].frame.height <= 1);
+    const navigations = harness.null_platform.webview_navigate_count;
+    try app_state.dispatch(&harness.runtime, 1, .{ .browser_page = .superlogical });
+    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqualStrings(app.BrowserPage.superlogical.url(), harness.null_platform.webviews[0].url);
+    try testing.expectEqual(navigations + 1, harness.null_platform.webview_navigate_count);
+    try testing.expectEqual(@as(u64, 1), app_state.model.browser_navigation_token);
+    const web_frame = harness.null_platform.webviews[0].frame;
+    try testing.expect(web_frame.x >= app.work_rail_width);
+    try testing.expect(web_frame.y >= app.header_height);
+    try testing.expect(web_frame.width > 500);
+    try testing.expect(web_frame.height > 300);
+
+    // Reopening the same root forces a fresh app-owned navigation even if
+    // WebKit followed links without a committed-navigation callback.
+    try app_state.dispatch(&harness.runtime, 1, .{ .browser_page = .superlogical });
+    try testing.expectEqualStrings(app.BrowserPage.superlogical.url(), harness.null_platform.webviews[0].url);
+    try testing.expectEqual(navigations + 2, harness.null_platform.webview_navigate_count);
+    try testing.expectEqual(@as(u64, 2), app_state.model.browser_navigation_token);
+}
+
+test "native Work shortcuts transfer first responder between canvas and WebKit" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.shortcuts = &app.work_shortcuts;
+
+    const sessions = try createSessions(80, 24);
+    const host = try gpa.create(app.CockpitHost);
+    defer gpa.destroy(host);
+    host.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    host.inner.effects.executor = .fake;
+    const app_iface = host.app();
+    try harness.start(app_iface);
+
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "work.web",
+        .key = "3",
+        .window_id = 1,
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.WorkId.web, host.inner.model.selected_work);
+    var views_buffer: [4]native_sdk.ViewInfo = undefined;
+    var views = harness.runtime.listViews(1, &views_buffer);
+    var canvas_focused = false;
+    var web_focused = false;
+    for (views) |item| {
+        if (std.mem.eql(u8, item.label, app.canvas_label)) canvas_focused = item.focused;
+        if (std.mem.eql(u8, item.label, app.webview_label)) web_focused = item.focused;
+    }
+    try testing.expect(!canvas_focused);
+    try testing.expect(web_focused);
+
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "work.scratch",
+        .key = "2",
+        .window_id = 1,
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.WorkId.scratch, host.inner.model.selected_work);
+    views = harness.runtime.listViews(1, &views_buffer);
+    canvas_focused = false;
+    web_focused = false;
+    for (views) |item| {
+        if (std.mem.eql(u8, item.label, app.canvas_label)) canvas_focused = item.focused;
+        if (std.mem.eql(u8, item.label, app.webview_label)) web_focused = item.focused;
+    }
+    try testing.expect(canvas_focused);
+    try testing.expect(!web_focused);
+}
+
+test "clicking a Work row selects Scratch and routes typing to it" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -2764,10 +2958,15 @@ test "clicking a pane moves focus to it with no chord" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
-    const target = rectCenter(app.paneFrames(&app_state.model, size)[1]);
+    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
+    var scratch_frame: ?geometry.RectF = null;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.indexOf(u8, node.widget.semantics.label, "Scratch, local / ephemeral") != null) scratch_frame = node.frame;
+    }
+    const target = rectCenter(scratch_frame orelse return error.TestExpectedWorkRow);
     try clickCanvas(harness, app_iface, target.x, target.y);
     try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
 
     // A stack is not focusable, so the press RELEASED widget focus and
     // typing goes straight back to the terminal — pane 1's now.
@@ -2797,7 +2996,7 @@ test "the header has no focusable button hazard and Enter stays terminal input" 
     try testing.expectEqualStrings("\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
 }
 
-test "only the focused pane paints a filled cursor, and deactivation hollows both" {
+test "only the selected terminal has a cursor command and deactivation hollows it" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -2809,18 +3008,16 @@ test "only the focused pane paints a filled cursor, and deactivation hollows bot
     const app_iface = app_state.app();
 
     try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .filled);
-    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .hollow);
+    try testing.expect(harness.runtime.views[0].canvasDisplayList().findCommandById(grid.cursorCommandId(grid.paneIdBase(1))) == null);
 
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
-    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .hollow);
+    try testing.expect(harness.runtime.views[0].canvasDisplayList().findCommandById(grid.cursorCommandId(grid.paneIdBase(0))) == null);
     try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .filled);
 
-    // Window activation is global: a blurred window hollows EVERY pane,
-    // not only the unfocused one.
     try harness.runtime.dispatchPlatformEvent(app_iface, .app_deactivated);
-    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .hollow);
     try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .hollow);
+    try testing.expect(harness.runtime.views[0].canvasDisplayList().findCommandById(grid.cursorCommandId(grid.paneIdBase(0))) == null);
 }
 
 // ------------------------------------------- the first-party-painter port
