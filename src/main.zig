@@ -19,6 +19,7 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const vt = @import("ghostty-vt");
 const grid = @import("grid.zig");
+const phux_host = @import("phux_host");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -1308,6 +1309,7 @@ pub fn appOptions() TerminalApp.Options {
 }
 
 pub fn main(init: std.process.Init) !void {
+    if (comptime phux_host.enabled) return @import("phux_main.zig").main(init);
     var sessions: [pane_count]*grid.Session = undefined;
     var created: usize = 0;
     // The deferred expression runs at scope exit and reads `created`
@@ -1338,4 +1340,6 @@ pub fn main(init: std.process.Init) !void {
 test {
     _ = @import("tests.zig");
     _ = @import("adversarial_tests.zig");
+    _ = @import("phux_transport.zig");
+    _ = phux_host.enabled;
 }

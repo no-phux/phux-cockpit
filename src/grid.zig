@@ -739,7 +739,22 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
     session.cell_height = metrics.height;
 
     const snap = try session.snapshot(options.tokens, options.running, options.selecting);
-    try canvas.terminal_grid.paint(snap, builder, .{
+    try paintTerminalGrid(snap, builder, options);
+}
+
+/// Paint one already-borrowed frontend-neutral grid through the same
+/// first-party painter and per-pane identity policy as a local fixture.
+///
+/// The grid and every nested slice need remain valid only for this call.
+/// This is the production seam used by the phux client FFI; it neither owns
+/// terminal state nor copies frame payloads through the native-sdk event
+/// channel.
+pub fn paintTerminalGrid(
+    snapshot: canvas.TerminalGrid,
+    builder: *canvas.Builder,
+    options: PaintOptions,
+) !void {
+    try canvas.terminal_grid.paint(snapshot, builder, .{
         .frame = options.frame,
         .tokens = options.tokens,
         .focused = options.focused,

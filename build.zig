@@ -4,9 +4,50 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 
+fn phuxHostModule(
+    b: *std.Build,
+    app_module: *std.Build.Module,
+    phux_enabled: bool,
+) *std.Build.Module {
+    if (!phux_enabled) {
+        return b.createModule(.{
+            .root_source_file = b.path("src/phux_host_disabled.zig"),
+            .target = app_module.resolved_target.?,
+            .optimize = app_module.optimize.?,
+        });
+    }
+    const include_dir = b.option(
+        []const u8,
+        "phux-client-ffi-include-dir",
+        "Directory containing phux/client.h (required with -Dphux-enabled=true)",
+    ) orelse @panic("-Dphux-enabled=true requires -Dphux-client-ffi-include-dir=<dir>");
+    const lib_dir = b.option(
+        []const u8,
+        "phux-client-ffi-lib-dir",
+        "Directory containing libphux_client_ffi.a (required with -Dphux-enabled=true)",
+    ) orelse @panic("-Dphux-enabled=true requires -Dphux-client-ffi-lib-dir=<dir>");
+    const archive = b.pathJoin(&.{ lib_dir, "libphux_client_ffi.a" });
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/phux_host.zig"),
+        .target = app_module.resolved_target.?,
+        .optimize = app_module.optimize.?,
+    });
+    module.addIncludePath(.{ .cwd_relative = include_dir });
+    module.addObjectFile(.{ .cwd_relative = archive });
+    module.linkSystemLibrary("c", .{});
+    return module;
+}
+
 pub fn build(b: *std.Build) void {
     const artifacts = native_sdk.addAppArtifacts(b, b.dependency("native_sdk", .{}), .{ .name = "terminal" });
     const app_module = artifacts.exe.root_module;
+    const phux_enabled = b.option(
+        bool,
+        "phux-enabled",
+        "Build the real phux client host instead of the local spike fixture",
+    ) orelse false;
+    const phux_host = phuxHostModule(b, app_module, phux_enabled);
+    app_module.addImport("phux_host", phux_host);
     const ghostty = b.dependency("ghostty", .{
         .target = app_module.resolved_target.?,
         .optimize = app_module.optimize.?,
@@ -25,5 +66,6 @@ pub fn build(b: *std.Build) void {
     app_module.addImport("ghostty-vt", vt);
     if (artifacts.tests.root_module != app_module) {
         artifacts.tests.root_module.addImport("ghostty-vt", vt);
+        artifacts.tests.root_module.addImport("phux_host", phux_host);
     }
 }
