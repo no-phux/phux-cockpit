@@ -29,7 +29,7 @@ fn destroyModelSessions(model: *app.Model) void {
 fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
-    harness.runtime.options.shortcuts = &app.work_shortcuts;
+    harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
     const sessions = try createSessions(80, 24);
     const app_state = try gpa.create(TerminalApp);
     app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
@@ -167,7 +167,7 @@ fn expectNoDuplicateIds(gpa: std.mem.Allocator, commands: []const canvas.CanvasC
     }
 }
 
-test "ADVERSARIAL: hostile terminal Work switches retain collision-free ids" {
+test "ADVERSARIAL: hostile terminal tab switches retain collision-free ids" {
     // Each selected terminal drives every id-emitting path, then the
     // retained diff switches between their disjoint id namespaces.
     const gpa = testing.allocator;
@@ -264,6 +264,40 @@ test "ADVERSARIAL: each selected terminal frame has unique ids and no hidden gri
     }
 }
 
+test "ADVERSARIAL: split paints both hostile terminals inside one collision-free envelope" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(1100, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    feedHostileRows(app_state.model.panes[0].session, 58, 40);
+    for (0..40) |_| {
+        app_state.model.panes[1].session.feed("\u{256C}" ** 58);
+        app_state.model.panes[1].session.feed("\r\n");
+    }
+    try pressKey(harness, app_iface, "d", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    const list = harness.runtime.views[0].canvasDisplayList();
+    try expectNoDuplicateIds(gpa, list.commands);
+    try testing.expect(list.commands.len <= native_sdk.runtime.max_canvas_commands_per_view);
+
+    const stride: u64 = 1 << 24;
+    var per_pane: [app.pane_count]usize = @splat(0);
+    for (list.commands) |command| {
+        const id = command.objectId() orelse continue;
+        for (&per_pane, 0..) |*count, index| {
+            const base = canvas.terminal_grid.paintIdBase(grid.paneIdBase(index));
+            if (id >= base and id < base + stride) count.* += 1;
+        }
+    }
+    try testing.expect(per_pane[0] > 20);
+    try testing.expect(per_pane[1] > 20);
+}
+
 // --------------------------------------------------- A3/A4: budget reality
 
 /// Rows the pane actually put on screen this paint.
@@ -356,7 +390,7 @@ test "ADVERSARIAL: either selected terminal gets the same full hostile-content b
     var painted: [app.pane_count]usize = @splat(0);
     var used: [app.pane_count]usize = @splat(0);
     for (sessions, 0..) |session, index| {
-        model.selected_work = if (index == 0) .workspace else .scratch;
+        model.selected_tab = if (index == 0) .terminal_1 else .terminal_2;
         const frames = app.paneFrames(&model, geometry.SizeF.init(980, 640));
         try testing.expect(frames[index].width > 0);
         try testing.expectEqual(@as(f32, 0), frames[1 - index].width);
@@ -461,7 +495,7 @@ test "ADVERSARIAL: the focus chord itself never leaks a byte to either child" {
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-test "ADVERSARIAL: a wheel over the Work rail reaches neither terminal" {
+test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -493,15 +527,15 @@ test "ADVERSARIAL: a wheel over the Work rail reaches neither terminal" {
     const bottom0 = model.panes[0].session.scrollbar().offset;
     const bottom1 = model.panes[1].session.scrollbar().offset;
     try testing.expect(bottom0 > 0 and bottom1 > 0);
-    try testing.expectEqual(app.WorkId.workspace, model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_1, model.selected_tab);
     const cell_h = model.panes[0].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
             .label = app.canvas_label,
             .kind = .scroll,
-            .x = app.work_rail_width / 2,
-            .y = 300,
+            .x = 100,
+            .y = 30,
             .delta_y = cell_h,
         } });
     }
@@ -513,7 +547,52 @@ test "ADVERSARIAL: a wheel over the Work rail reaches neither terminal" {
     try testing.expectEqual(bottom1, model.panes[1].session.scrollbar().offset);
 }
 
-test "REGRESSION: the selected Scratch frame receives wheel input before the first frame" {
+test "ADVERSARIAL: split wheel routing scrolls only the pane under the pointer" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+    const model = &app_state.model;
+
+    for (&model.panes) |*pane| {
+        var line: [32]u8 = undefined;
+        for (0..200) |i| pane.session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{i}) catch unreachable);
+    }
+    try pressKey(harness, app_iface, "d", .{ .primary = true });
+    for (2..8) |frame_index| {
+        try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+            .label = app.canvas_label,
+            .size = size,
+            .scale_factor = 2,
+            .frame_index = @intCast(frame_index),
+            .timestamp_ns = @as(u64, frame_index) * 1_000_000,
+        } });
+    }
+    const frames = app.paneFrames(model, size);
+    const bottom0 = model.panes[0].session.scrollbar().offset;
+    const bottom1 = model.panes[1].session.scrollbar().offset;
+    try testing.expect(bottom0 > 0 and bottom1 > 0);
+
+    for (0..4) |_| {
+        try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = app.canvas_label,
+            .kind = .scroll,
+            .x = frames[1].x + frames[1].width / 2,
+            .y = frames[1].y + frames[1].height / 2,
+            .delta_y = model.panes[1].session.cell_height,
+        } });
+    }
+    try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
+    try testing.expect(model.panes[1].session.scrollbar().offset < bottom1);
+}
+
+test "REGRESSION: the selected Terminal 2 frame receives wheel input before the first frame" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(1100, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -529,7 +608,7 @@ test "REGRESSION: the selected Scratch frame receives wheel input before the fir
     try testing.expectEqual(size.width, model.surface_size.width);
     try testing.expectEqual(size.height, model.surface_size.height);
     try pressKey(harness, app_iface, "2", .{ .primary = true });
-    try testing.expectEqual(app.WorkId.scratch, model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_2, model.selected_tab);
     try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[0].width);
     try testing.expect(app.paneFrames(model, model.surface_size)[1].width > 0);
 
@@ -542,7 +621,7 @@ test "REGRESSION: the selected Scratch frame receives wheel input before the fir
     const bottom0 = model.panes[0].session.scrollbar().offset;
     const bottom1 = model.panes[1].session.scrollbar().offset;
 
-    // Aim squarely at the selected Scratch terminal.
+    // Aim squarely at the selected Terminal 2 surface.
     try testing.expectEqual(@as(u8, 1), model.focus);
     const target = app.paneFrames(model, model.surface_size)[1];
     const cell_h = model.panes[1].session.cell_height;
@@ -556,16 +635,16 @@ test "REGRESSION: the selected Scratch frame receives wheel input before the fir
             .delta_y = cell_h,
         } });
     }
-    // Scratch scrolled; hidden Workspace did not.
+    // Terminal 2 scrolled; hidden Terminal 1 did not.
     try testing.expect(model.panes[1].session.scrollbar().offset < bottom1);
     try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
 }
 
 // -------------------------------------------------- A7: the validator's eyes
 
-const validator_shot_path = "zig-out/validator-selected-work.png";
+const validator_shot_path = "zig-out/validator-native-split.png";
 
-test "ADVERSARIAL: selected-Work proof shot preserves substantial hidden content (env-gated)" {
+test "ADVERSARIAL: native-split proof shot preserves both independent terminals (env-gated)" {
     if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
     if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -617,8 +696,8 @@ test "ADVERSARIAL: selected-Work proof shot preserves substantial hidden content
     try testing.expect(std.mem.indexOf(u8, right, "Tue Jul 27") != null);
     try testing.expect(std.mem.indexOf(u8, right, "LEFT") == null);
 
-    // Capture Scratch selected; Workspace remains live but unpainted.
-    try pressKey(harness, app_iface, "2", .{ .primary = true });
+    // Capture both sessions through the real split substrate.
+    try pressKey(harness, app_iface, "d", .{ .primary = true });
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, null);
