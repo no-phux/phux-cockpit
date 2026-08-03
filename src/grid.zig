@@ -11,11 +11,11 @@
 //!
 //! It used to emit canvas commands itself — run merging, per-row ids,
 //! glyph and text accounting, box-drawing geometry, roughly 375 lines of
-//! it. All of that is the framework's now. What stays here is what the
-//! framework cannot do for us: own a libghostty session whose bytes come
-//! from wherever we choose. The framework's own session store
-//! (`runtime/terminal_session.zig`) is capped at four ptys and has no
-//! inbound byte-injection path, so a phux-fed fleet needs this layer.
+//! it. All of that is the framework's now. What stays here is the local
+//! provider's libghostty session and its byte-injection path. The framework's
+//! own session store (`runtime/terminal_session.zig`) is capped at four ptys and
+//! has no inbound byte-injection path. Other providers project their
+//! authoritative model straight into the shared painter below.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -189,13 +189,11 @@ pub const Session = struct {
     /// — the resolved, allocation-free snapshot the first-party painter
     /// consumes (`canvas.terminal_grid.paint`).
     ///
-    /// This is the whole reason the cockpit keeps its own `Session`
-    /// rather than the framework's terminal widget: the framework's
-    /// session store is capped at `effects.max_effect_ptys` (4) and has
-    /// no inbound byte-injection API, so a phux-fed fleet cannot use it.
-    /// The PAINTER, by contrast, is pure — it takes cells, not a
-    /// terminal — so a phux-fed pane and a local-pty pane project
-    /// identically through here.
+    /// The local provider keeps its own `Session` rather than using the
+    /// framework terminal widget because the latter has no inbound
+    /// byte-injection API. A provider with its own authoritative terminal model
+    /// instead supplies `canvas.TerminalGrid` directly to
+    /// `paintTerminalGrid`; it never creates a `Session` or second emulator.
     ///
     /// Every returned slice points into this session's own buffers and
     /// stays valid until the next `snapshot` call, which satisfies the
@@ -904,7 +902,16 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
     session.cell_height = metrics.height;
 
     const snap = try session.snapshot(options.tokens, options.running, options.selecting);
-    try canvas.terminal_grid.paint(snap, builder, .{
+    try paintTerminalGrid(snap, builder, options);
+}
+
+/// Paint an already-projected terminal grid through the same retained canvas
+/// path as a local `Session`. Providers that own their own terminal model use
+/// this seam directly; no second emulator or placement-derived identity is
+/// introduced. `PaintOptions` is intentionally shared so command, text, path,
+/// glyph, background, pixel, and retained-ID behavior remain identical.
+pub fn paintTerminalGrid(terminal_grid: canvas.TerminalGrid, builder: *canvas.Builder, options: PaintOptions) !void {
+    try canvas.terminal_grid.paint(terminal_grid, builder, .{
         .frame = options.frame,
         .tokens = options.tokens,
         .focused = options.focused,

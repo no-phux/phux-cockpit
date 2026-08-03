@@ -9,6 +9,7 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const app = @import("main.zig");
 const grid = @import("grid.zig");
+const vt = @import("ghostty-vt");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -115,6 +116,59 @@ test "ADVERSARIAL: a torrent into pane 0 leaves pane 1's emulator bit-identical"
     try testing.expect(std.mem.indexOf(u8, after_text, "PANEBRAVO") != null);
     // ...and pane 0 never learned pane 1's content either.
     try testing.expect(std.mem.indexOf(u8, alpha, "PANEBRAVO") == null);
+}
+
+test "ADVERSARIAL: scrollback search and selection remain terminal-local" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+    const model = &app_state.model;
+
+    for (0..48) |index| {
+        var line_buffer: [64]u8 = undefined;
+        const alpha = try std.fmt.bufPrint(&line_buffer, "alpha-history-{d}\r\n", .{index});
+        try app_state.effects.feedPtyOutput(app.ptyKey(0), alpha);
+        const bravo = try std.fmt.bufPrint(&line_buffer, "bravo-history-{d}\r\n", .{index});
+        try app_state.effects.feedPtyOutput(app.ptyKey(1), bravo);
+        try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    }
+    try app_state.effects.feedPtyOutput(app.ptyKey(0), "ONLY_ALPHA_NEEDLE\r\n");
+    try app_state.effects.feedPtyOutput(app.ptyKey(1), "ONLY_BRAVO_NEEDLE\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+
+    const bravo_offset = model.panes[1].session.scrollbar().offset;
+    model.panes[0].session.scrollLines(-6);
+    try testing.expect(model.panes[0].session.scrollbar().offset < bravo_offset);
+    try testing.expectEqual(bravo_offset, model.panes[1].session.scrollbar().offset);
+
+    model.panes[0].session.beginSelection(false);
+    model.panes[0].session.moveSelection(-4, 0, true);
+    try testing.expect(model.panes[0].session.selectionActive());
+    try testing.expect(!model.panes[1].session.selectionActive());
+
+    var alpha_in_alpha = try vt.search.Active.init(gpa, "ONLY_ALPHA_NEEDLE");
+    defer alpha_in_alpha.deinit();
+    _ = try alpha_in_alpha.update(&model.panes[0].session.term.screens.active.pages);
+    try testing.expect(alpha_in_alpha.next() != null);
+
+    var alpha_in_bravo = try vt.search.Active.init(gpa, "ONLY_ALPHA_NEEDLE");
+    defer alpha_in_bravo.deinit();
+    _ = try alpha_in_bravo.update(&model.panes[1].session.term.screens.active.pages);
+    try testing.expect(alpha_in_bravo.next() == null);
+
+    var bravo_in_bravo = try vt.search.Active.init(gpa, "ONLY_BRAVO_NEEDLE");
+    defer bravo_in_bravo.deinit();
+    _ = try bravo_in_bravo.update(&model.panes[1].session.term.screens.active.pages);
+    try testing.expect(bravo_in_bravo.next() != null);
+
+    model.panes[0].session.clearSelection();
+    try testing.expect(!model.panes[0].session.selectionActive());
+    try testing.expect(!model.panes[1].session.selectionActive());
 }
 
 test "ADVERSARIAL: a hard reset of pane 0 does not reset pane 1" {
@@ -390,7 +444,7 @@ test "ADVERSARIAL: either selected terminal gets the same full hostile-content b
     var painted: [app.pane_count]usize = @splat(0);
     var used: [app.pane_count]usize = @splat(0);
     for (sessions, 0..) |session, index| {
-        model.selected_surface = .{ .terminal = if (index == 0) .terminal_1 else .terminal_2 };
+        model.selected_surface = .{ .terminal = app.initialTerminalRef(index) };
         const frames = app.paneFrames(&model, geometry.SizeF.init(980, 640));
         try testing.expect(frames[index].width > 0);
         try testing.expectEqual(@as(f32, 0), frames[1 - index].width);
@@ -527,7 +581,7 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
     const bottom0 = model.panes[0].session.scrollbar().offset;
     const bottom1 = model.panes[1].session.scrollbar().offset;
     try testing.expect(bottom0 > 0 and bottom1 > 0);
-    try testing.expectEqual(app.TerminalId.terminal_1, model.selectedTerminalId().?);
+    try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     const cell_h = model.panes[0].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -608,7 +662,7 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
     try testing.expectEqual(size.width, model.surface_size.width);
     try testing.expectEqual(size.height, model.surface_size.height);
     try pressKey(harness, app_iface, "2", .{ .primary = true });
-    try testing.expectEqual(app.TerminalId.terminal_2, model.selectedTerminalId().?);
+    try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[0].width);
     try testing.expect(app.paneFrames(model, model.surface_size)[1].width > 0);
 

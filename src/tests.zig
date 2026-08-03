@@ -465,7 +465,7 @@ test "typed terminal attachments reject duplicates and preserve provider-owned s
     var model = app.initialModel(sessions);
     defer app.deinitModel(&model);
 
-    const id = app.TerminalId.terminal_1;
+    const id = app.initialTerminalRef(0);
     const terminal = model.provider.terminal(id) orelse return error.TestExpectedTerminal;
     terminal.session.feed("durable state");
     try testing.expectError(error.TerminalAlreadyAttached, model.attach(.secondary, id));
@@ -481,6 +481,106 @@ test "typed terminal attachments reject duplicates and preserve provider-owned s
     try model.attach(.secondary, id);
     try testing.expectEqual(id, model.attachments[app.Placement.secondary.index()].?);
     try testing.expect(model.terminalAt(.secondary) == terminal);
+}
+
+fn remoteTerminalRef(id: u32) !app.TerminalRef {
+    return .{
+        .provider_id = .phux,
+        .terminal_id = .{ .phux = try app.RemoteTerminalId.fromPhux(0, id, "local") },
+    };
+}
+
+test "local and remote terminal identities never collide" {
+    const local = app.initialTerminalRef(0);
+    const remote = try remoteTerminalRef(@truncate(@intFromEnum(app.initialTerminalId(0))));
+    try testing.expect(!local.eql(remote));
+    try testing.expectEqual(app.ProviderKind.local, app.providerKind(local));
+    try testing.expectEqual(app.ProviderKind.phux, app.providerKind(remote));
+}
+
+test "discovering a remote terminal never evicts a live local placement" {
+    // Discovery is not intent. A Phux terminal that appears becomes a tab; it
+    // takes a pane only when the operator selects it. Reconciliation must
+    // leave both live local placements exactly where they were.
+    const first = try remoteTerminalRef(11);
+    const second = try remoteTerminalRef(12);
+    var attachments: [app.pane_count]?app.TerminalRef = .{
+        app.initialTerminalRef(0),
+        app.initialTerminalRef(1),
+    };
+    app.reconcileRemoteRefs(&attachments, &.{ first, second });
+    try testing.expect(attachments[0].?.eql(app.initialTerminalRef(0)));
+    try testing.expect(attachments[1].?.eql(app.initialTerminalRef(1)));
+}
+
+test "remote enumeration reorder retains stable placement identity" {
+    const first = try remoteTerminalRef(21);
+    const second = try remoteTerminalRef(22);
+    // A remote terminal that WAS selected into a placement keeps it, and the
+    // order the provider enumerates in never reshuffles the panes.
+    var attachments: [app.pane_count]?app.TerminalRef = .{ first, second };
+    const before = attachments;
+    app.reconcileRemoteRefs(&attachments, &.{ second, first });
+    try testing.expect(attachments[0].?.eql(before[0].?));
+    try testing.expect(attachments[1].?.eql(before[1].?));
+}
+
+test "a remote terminal that disappears leaves the placement it held" {
+    const first = try remoteTerminalRef(31);
+    const second = try remoteTerminalRef(32);
+    var attachments: [app.pane_count]?app.TerminalRef = .{ first, second };
+    app.reconcileRemoteRefs(&attachments, &.{first});
+    try testing.expect(attachments[0].?.eql(first));
+    try testing.expectEqual(@as(?app.TerminalRef, null), attachments[1]);
+}
+
+test "pruning a remote placement never disturbs a local one" {
+    const remote = try remoteTerminalRef(41);
+    var attachments: [app.pane_count]?app.TerminalRef = .{
+        app.initialTerminalRef(0),
+        remote,
+    };
+    app.reconcileRemoteRefs(&attachments, &.{});
+    try testing.expect(attachments[0].?.eql(app.initialTerminalRef(0)));
+    try testing.expectEqual(@as(?app.TerminalRef, null), attachments[1]);
+}
+
+test "provider dispatch refuses a provider-qualified remote identity at the local backend" {
+    const sessions = try createSessions(80, 24);
+    var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
+
+    const local = app.initialTerminalRef(0);
+    const remote = try remoteTerminalRef(1);
+    try testing.expect(model.containsTerminal(local));
+    try testing.expect(!model.containsTerminal(remote));
+    try testing.expect(model.terminalOwner(local) != null);
+    try testing.expect(model.terminalOwner(remote) == null);
+    _ = model.detach(.primary);
+    try testing.expectError(error.UnknownTerminal, model.attach(.primary, remote));
+}
+
+test "local terminals keep scrollback and selection state independent" {
+    const sessions = try createSessions(20, 4);
+    var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
+    const first = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+    const second = model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
+
+    for (0..20) |index| {
+        var line: [24]u8 = undefined;
+        first.session.feed(std.fmt.bufPrint(&line, "first {d}\r\n", .{index}) catch unreachable);
+        second.session.feed(std.fmt.bufPrint(&line, "second {d}\r\n", .{index}) catch unreachable);
+    }
+    const second_offset = second.session.scrollbar().offset;
+    first.session.scrollLines(-3);
+    try testing.expect(first.session.scrollbar().offset != second_offset);
+    try testing.expectEqual(second_offset, second.session.scrollbar().offset);
+
+    first.session.beginSelection(false);
+    first.session.moveSelection(1, -1, true);
+    try testing.expect(first.session.selectionActive());
+    try testing.expect(!second.session.selectionActive());
 }
 
 // ------------------------------------------------- record/replay pinned
@@ -1075,7 +1175,9 @@ test "Cmd+V reads the clipboard and normalizes plain-paste newlines" {
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.paste_inflight);
-    try testing.expectEqual(app.TerminalId.terminal_1, app_state.model.paste_owner);
+    try testing.expect(app_state.model.paste_owner.eql(
+        app_state.model.provider.owner(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminalOwner,
+    ));
     try testing.expect(app.paste_clipboard_key != app.clipboard_key);
     const request = app_state.effects.pendingClipboardAt(0) orelse return error.TestExpectedClipboardRead;
     try testing.expectEqual(app.paste_clipboard_key, request.key);
@@ -1774,7 +1876,7 @@ test "restart resets every per-session counter and exit field" {
     pane.outbound_len = 11;
     pane.outbound_dropped = 13;
     pane.session.response_bytes_dropped = 2;
-    app_state.model.paste_owner = .terminal_1;
+    app_state.model.paste_owner = app_state.model.provider.owner(pane.id) orelse return error.TestExpectedTerminalOwner;
     app_state.model.paste_failed = true;
     try testing.expect(pane.output_batches > 0);
     try testing.expect(pane.output_bytes > 0);
@@ -2499,30 +2601,30 @@ test "detached terminal stays live and moved input and resize follow identity" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const model = &app_state.model;
-    const terminal = model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const terminal = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const original_session = terminal.session;
 
     app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
-    try testing.expectEqual(@as(?app.TerminalId, null), model.attachments[app.Placement.primary.index()]);
+    try testing.expectEqual(@as(?app.TerminalRef, null), model.attachments[app.Placement.primary.index()]);
     try app_state.effects.feedPtyOutput(app.ptyKey(0), "DETACHED LIVE\r\n");
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
     try testing.expectEqual(app.Phase.live, terminal.phase);
     try testing.expect(std.mem.indexOf(u8, terminal.session.screenText(), "DETACHED LIVE") != null);
 
     app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_id = .terminal_1 } }, &app_state.effects);
-    app.update(model, .{ .select_surface = .{ .terminal = .terminal_1 } }, &app_state.effects);
+    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
+    app.update(model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } }, &app_state.effects);
     try testing.expect(model.terminalAt(.secondary).?.session == original_session);
 
     try typeCanvasText(harness, app_state.app(), "moved");
     try testing.expect(std.mem.endsWith(u8, app_state.effects.ptyWrittenBytes(app.ptyKey(0)), "moved"));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 
-    const other = model.provider.terminal(.terminal_2) orelse return error.TestExpectedTerminal;
+    const other = model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
     const other_cols = other.cols;
     const other_rows = other.rows;
     app.update(model, .{ .viewport = .{
-        .terminal_id = .terminal_1,
+        .terminal_ref = app.initialTerminalRef(0),
         .cols = 61,
         .rows = 17,
         .size = geometry.SizeF.init(701, 411),
@@ -2544,11 +2646,13 @@ test "clipboard completion follows terminal identity across attachment moves" {
     const model = &app_state.model;
 
     try pressCanvasKey(harness, app_state.app(), "v", .{ .primary = true, .command = true });
-    try testing.expectEqual(app.TerminalId.terminal_1, model.paste_owner);
+    try testing.expect(model.paste_owner.eql(
+        model.provider.owner(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminalOwner,
+    ));
     app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
     app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_id = .terminal_1 } }, &app_state.effects);
-    app.update(model, .{ .select_surface = .{ .terminal = .terminal_1 } }, &app_state.effects);
+    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
+    app.update(model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } }, &app_state.effects);
 
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "identity paste");
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
@@ -2567,11 +2671,11 @@ test "attachment changes keep selected and focused placements routable" {
     const model = &app_state.model;
 
     app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
-    try testing.expectEqual(app.TerminalId.terminal_2, model.selectedTerminalId().?);
+    try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqual(app.Placement.secondary, model.focus_placement);
 
     app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    try testing.expectEqual(@as(?app.TerminalId, null), model.focusedTerminalId());
+    try testing.expectEqual(@as(?app.TerminalRef, null), model.focusedTerminalRef());
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
     try releaseCanvasKey(harness, app_state.app(), "f1", .{});
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
@@ -2590,8 +2694,8 @@ test "attachment changes keep selected and focused placements routable" {
     try testing.expect(saw_detached_semantics);
     try testing.expect(saw_disabled_split);
 
-    app.update(model, .{ .attach_terminal = .{ .placement = .primary, .terminal_id = .terminal_1 } }, &app_state.effects);
-    try testing.expectEqual(app.TerminalId.terminal_1, model.selectedTerminalId().?);
+    app.update(model, .{ .attach_terminal = .{ .placement = .primary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
+    try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try testing.expectEqual(app.Placement.primary, model.focus_placement);
     try typeCanvasText(harness, app_state.app(), "reattached");
     try testing.expectEqualStrings("reattached", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
@@ -2606,7 +2710,7 @@ test "terminal key release follows its press across attachment focus changes" {
     defer gpa.destroy(app_state);
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
-    const pane = app_state.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = app_state.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.feed("\x1b[>11u");
 
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
@@ -2628,7 +2732,7 @@ test "terminal key release from an ended generation cannot reach its replacement
     defer gpa.destroy(app_state);
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
-    const pane = app_state.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = app_state.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.feed("\x1b[>11u");
 
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
@@ -2751,7 +2855,7 @@ test "hidden terminal spawn failures mark tabs and distinguish failure reasons" 
 
     try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.TerminalId.terminal_1, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
 
     var saw_hidden_marker = false;
     var saw_hidden_reason = false;
@@ -2904,7 +3008,7 @@ test "native tabs and only the selected terminal surface reach accessibility" {
     try testing.expect(harness.runtime.sessionStateFingerprint() != 0);
 
     var terminal_nodes: usize = 0;
-    const terminal_id = canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) });
+    const terminal_id = canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.LocalTerminalId.terminal_1)) });
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
         if (layout.widget.id != terminal_id) continue;
         terminal_nodes += 1;
@@ -3051,7 +3155,7 @@ test "selected terminal defaults to the first tab and paneFrames has one full co
     const sessions = try createSessions(80, 24);
     var model = app.initialModel(sessions);
     defer app.deinitModel(&model);
-    try testing.expectEqual(app.TerminalId.terminal_1, model.selectedTerminalId().?);
+    try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try testing.expectEqual(@as(?u8, 0), model.selectedTerminalIndex());
 
     const size = geometry.SizeF.init(980, 640);
@@ -3061,7 +3165,7 @@ test "selected terminal defaults to the first tab and paneFrames has one full co
     try testing.expect(frames[0].height > 0);
     try testing.expectEqual(geometry.RectF{}, frames[1]);
 
-    model.selected_surface = .{ .terminal = .terminal_2 };
+    model.selected_surface = .{ .terminal = app.initialTerminalRef(1) };
     frames = app.paneFrames(&model, size);
     try testing.expectEqual(geometry.RectF{}, frames[0]);
     try testing.expect(frames[1].width > 0);
@@ -3071,7 +3175,7 @@ test "selected terminal defaults to the first tab and paneFrames has one full co
     try testing.expectEqual(geometry.RectF{}, frames[0]);
     try testing.expectEqual(geometry.RectF{}, frames[1]);
 
-    model.selected_surface = .{ .terminal = .terminal_1 };
+    model.selected_surface = .{ .terminal = app.initialTerminalRef(0) };
     model.layout = .split;
     model.split_fraction = 0.01;
     frames = app.paneFrames(&model, size);
@@ -3148,13 +3252,13 @@ test "Cmd+D projects both live terminals without respawning and collapse keeps t
     const right_target = rectCenter(frames[1]);
     try clickCanvas(harness, app_iface, right_target.x, right_target.y);
     try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
-    try testing.expectEqual(app.TerminalId.terminal_2, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
 
     try pressCanvasKey(harness, app_iface, "arrowleft", .{ .primary = true, .option = true });
     try testing.expectEqual(app.Placement.primary, app_state.model.focus_placement);
     try pressCanvasKey(harness, app_iface, "arrowright", .{ .primary = true, .option = true });
     try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
-    try testing.expectEqual(app.TerminalId.terminal_2, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try typeCanvasText(harness, app_iface, "right");
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("right", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
@@ -3323,13 +3427,13 @@ test "tab cycling crosses terminal and Web surfaces without sending terminal byt
     const app_iface = app_state.app();
 
     try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true });
-    try testing.expectEqual(app.TerminalId.terminal_2, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try releaseCanvasKey(harness, app_iface, "]", .{});
     try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true });
     try testing.expect(app_state.model.selected_surface.eql(.web));
     try releaseCanvasKey(harness, app_iface, "]", .{});
     try pressCanvasKey(harness, app_iface, "[", .{ .primary = true, .shift = true });
-    try testing.expectEqual(app.TerminalId.terminal_2, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
@@ -3345,7 +3449,7 @@ test "extra modifiers bypass exact spatial shortcuts and reach the terminal" {
     const app_iface = app_state.app();
 
     try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true, .control = true });
-    try testing.expectEqual(app.TerminalId.terminal_1, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     const after_bracket = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
     try testing.expect(after_bracket > 0);
 
@@ -3478,7 +3582,7 @@ test "Cmd+1 and Cmd+2 select terminal tabs and route text only to that tab" {
     const app_iface = app_state.app();
 
     try testing.expectEqual(app.Placement.primary, app_state.model.focus_placement);
-    try testing.expectEqual(app.TerminalId.terminal_1, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try typeCanvasText(harness, app_iface, "alpha");
     try testing.expectEqualStrings("alpha", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
@@ -3486,7 +3590,7 @@ test "Cmd+1 and Cmd+2 select terminal tabs and route text only to that tab" {
     // cmd+2 moves the keyboard to pane 1.
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
     try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
-    try testing.expectEqual(app.TerminalId.terminal_2, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try typeCanvasText(harness, app_iface, "bravo");
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
     // Pane 0's stream is untouched: the chord itself never reached it.
@@ -3495,7 +3599,7 @@ test "Cmd+1 and Cmd+2 select terminal tabs and route text only to that tab" {
     // ...and back.
     try pressCanvasKey(harness, app_iface, "1", .{ .primary = true });
     try testing.expectEqual(app.Placement.primary, app_state.model.focus_placement);
-    try testing.expectEqual(app.TerminalId.terminal_1, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try typeCanvasText(harness, app_iface, "!");
     try testing.expectEqualStrings("alpha!", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
@@ -3508,12 +3612,12 @@ test "stable surface IDs and browser messages make focused model transitions" {
     defer app_state.deinit();
     app_state.effects.executor = .fake;
 
-    try testing.expectEqual(app.TerminalId.terminal_1, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try testing.expectEqual(app.BrowserPage.github, app_state.model.browser_page);
     try testing.expectEqual(@as(?u8, 0), app_state.model.selectedTerminalIndex());
 
-    app.update(&app_state.model, .{ .select_surface = .{ .terminal = .terminal_2 } }, &app_state.effects);
-    try testing.expectEqual(app.TerminalId.terminal_2, app_state.model.selectedTerminalId().?);
+    app.update(&app_state.model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(1) } }, &app_state.effects);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
     try testing.expectEqual(@as(?u8, 1), app_state.model.selectedTerminalIndex());
 
@@ -3524,7 +3628,7 @@ test "stable surface IDs and browser messages make focused model transitions" {
     try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
 
     try testing.expectEqual(@as(u64, 1), app_state.model.browser_navigation_token);
-    app.update(&app_state.model, .{ .select_surface = .{ .terminal = .terminal_1 } }, &app_state.effects);
+    app.update(&app_state.model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } }, &app_state.effects);
     try testing.expectEqual(app.Placement.primary, app_state.model.focus_placement);
     try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
 }
@@ -3591,7 +3695,7 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.TerminalId.terminal_2, app_state.model.selectedTerminalId().?);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     const scratch_before_release = app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len;
     try releaseCanvasKey(harness, app_iface, "2", .{});
     try testing.expectEqual(scratch_before_release, app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len);
@@ -3683,7 +3787,7 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.TerminalId.terminal_2, host.inner.model.selectedTerminalId().?);
+    try testing.expect(host.inner.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     views = harness.runtime.listViews(1, &views_buffer);
     canvas_focused = false;
     web_focused = false;
@@ -3708,7 +3812,7 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.TerminalId.terminal_2, host.inner.model.selectedTerminalId().?);
+    try testing.expect(host.inner.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
 }
 
 test "pointer tab actions return focus to terminal content and hand off WebKit" {
@@ -3761,7 +3865,7 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
     target = rectCenter(terminal_2_frame orelse return error.TestExpectedTab);
     try clickCanvas(harness, app_iface, target.x, target.y);
     try testing.expectEqual(app.Placement.secondary, host.inner.model.focus_placement);
-    try testing.expectEqual(app.TerminalId.terminal_2, host.inner.model.selectedTerminalId().?);
+    try testing.expect(host.inner.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
 
     try pressCanvasKey(harness, app_iface, "enter", .{});
@@ -3783,7 +3887,7 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
     // terminal back and clear the tab control's own widget focus atomically.
     target = rectCenter(terminal_2_frame.?);
     try clickCanvas(harness, app_iface, target.x, target.y);
-    try testing.expectEqual(app.TerminalId.terminal_2, host.inner.model.selectedTerminalId().?);
+    try testing.expect(host.inner.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
     views = harness.runtime.listViews(1, &views_buffer);
     for (views) |item| {
@@ -3803,7 +3907,7 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
         .id = terminal_1_id orelse return error.TestExpectedTab,
         .action = .press,
     });
-    try testing.expectEqual(app.TerminalId.terminal_1, host.inner.model.selectedTerminalId().?);
+    try testing.expect(host.inner.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     views = harness.runtime.listViews(1, &views_buffer);
     for (views) |item| if (std.mem.eql(u8, item.label, app.canvas_label)) try testing.expect(item.focused);
 }
@@ -3827,7 +3931,7 @@ test "native tabs are keyboard focusable without stealing initial terminal input
     }
     try testing.expectEqual(@as(usize, 3), tab_count);
     try testing.expectEqual(
-        canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }),
+        canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.LocalTerminalId.terminal_1)) }),
         harness.runtime.views[0].canvas_widget_focused_id,
     );
     try pressCanvasKey(harness, app_iface, "enter", .{});
@@ -3949,12 +4053,12 @@ test "terminal overlays are stable identity-keyed and isolate chrome divider and
     var divider: geometry.RectF = .{};
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (node.widget.kind == .terminal and
-            (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }) or
-                node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_2)) })))
+            (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.LocalTerminalId.terminal_1)) }) or
+                node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.LocalTerminalId.terminal_2)) })))
         {
-            const id: usize = if (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }))
+            const id: usize = if (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.LocalTerminalId.terminal_1)) }))
                 0
-            else if (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_2)) }))
+            else if (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.LocalTerminalId.terminal_2)) }))
                 1
             else
                 return error.UnexpectedTerminalOverlay;
@@ -3994,7 +4098,7 @@ test "pointer drag selects Ghostty cells and Shift overrides TUI mouse reporting
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const app_iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(pane.pty_key, "alpha beta\r\n\x1b[?1003h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
@@ -4025,7 +4129,7 @@ test "TUI mouse reports exact SGR press motion release and wheel cells" {
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const app_iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(pane.pty_key, "mouse\r\n\x1b[?1003h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
@@ -4057,8 +4161,8 @@ test "pointer ownership survives focus and reorder but never crosses close gener
     defer host.deinit();
     const app_iface = host.app();
     try host.inner.dispatch(&harness.runtime, 1, .toggle_split);
-    const first = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
-    const second = host.inner.model.provider.terminal(.terminal_2) orelse return error.TestExpectedTerminal;
+    const first = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+    const second = host.inner.model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(first.pty_key, "\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
@@ -4067,7 +4171,7 @@ test "pointer ownership survives focus and reorder but never crosses close gener
     const across = rectCenter(frames[1]);
 
     try pointerInput(harness, app_iface, .pointer_down, start, 0, .{}, 0);
-    try testing.expectEqual(app.TerminalId.terminal_1, activePointerCapture(&host.inner.model, 7).?.terminal_id);
+    try testing.expectEqual(app.LocalTerminalId.terminal_1, activePointerCapture(&host.inner.model, 7).?.terminal_id);
     try host.inner.dispatch(&harness.runtime, 1, .{ .focus_pane = .secondary });
     try host.inner.dispatch(&harness.runtime, 1, .{ .move_terminal = -1 });
     try pointerInput(harness, app_iface, .pointer_drag, across, 0, .{}, 0);
@@ -4097,7 +4201,7 @@ test "Ghostty pointer selection keeps single word line gestures distinct from ke
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.reset();
     try host.inner.effects.feedPtyOutput(pane.pty_key, "alpha beta gamma\r\nsecond line");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
@@ -4153,7 +4257,7 @@ test "mouse protocols cover X10 UTF-8 SGR URXVT modes modifiers and both wheel a
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     for (2..6) |frame_index| try harness.runtime.dispatchPlatformEvent(iface, .{ .gpu_surface_frame = .{
         .label = app.canvas_label,
         .size = size,
@@ -4224,7 +4328,7 @@ test "SGR Pixels follows frame scale at one one-and-a-half and two" {
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1000h\x1b[?1016h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     const frame = app.paneFrames(&host.inner.model, size)[0];
@@ -4261,7 +4365,7 @@ test "pointer lifecycle matrix releases live owners once and fences restart gene
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(pane.pty_key, "MATRIX\r\n\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
@@ -4289,7 +4393,7 @@ test "pointer lifecycle matrix releases live owners once and fences restart gene
     try host.inner.dispatch(&harness.runtime, 1, .{ .detach_terminal = .primary });
     after_fence = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
     try testing.expect(after_fence > before_fence);
-    try host.inner.dispatch(&harness.runtime, 1, .{ .attach_terminal = .{ .placement = .primary, .terminal_id = pane.id } });
+    try host.inner.dispatch(&harness.runtime, 1, .{ .attach_terminal = .{ .placement = .primary, .terminal_ref = pane.id } });
     try host.inner.dispatch(&harness.runtime, 1, .{ .select_surface = .{ .terminal = pane.id } });
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     frame = terminalInteractionFrame(harness, "MATRIX") orelse return error.TestExpectedTerminalInteractionSurface;
@@ -4352,8 +4456,8 @@ test "multiple pointer captures are isolated and hostile wheel values stay bound
     defer host.deinit();
     const iface = host.app();
     try host.inner.dispatch(&harness.runtime, 1, .toggle_split);
-    const left = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
-    const right = host.inner.model.provider.terminal(.terminal_2) orelse return error.TestExpectedTerminal;
+    const left = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+    const right = host.inner.model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(left.pty_key, "\x1b[?1002h\x1b[?1006h");
     try host.inner.effects.feedPtyOutput(right.pty_key, "\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
@@ -4402,7 +4506,7 @@ test "mouse protocol transitions reset motion dedupe and wheel residue" {
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const frame = app.paneFrames(&host.inner.model, size)[0];
     const point = terminalCellPoint(pane, frame, 3, 3);
     try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1003h\x1b[?1006h");
@@ -4440,7 +4544,7 @@ test "terminal interaction exposes I-beam text value and native Copy Paste" {
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.reset();
     try host.inner.effects.feedPtyOutput(pane.pty_key, "copy this");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
@@ -4501,7 +4605,7 @@ test "terminal interaction exposes I-beam text value and native Copy Paste" {
         .item_id = 2,
     } });
     try testing.expect(host.inner.model.paste_inflight);
-    try testing.expectEqual(pane.id, host.inner.model.paste_owner);
+    try testing.expect(host.inner.model.paste_owner.terminal_ref.eql(pane.id));
 }
 
 test "secondary click ownership transitions between TUI reports and native menu" {
@@ -4514,7 +4618,7 @@ test "secondary click ownership transitions between TUI reports and native menu"
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.reset();
     try host.inner.effects.feedPtyOutput(pane.pty_key, "alpha beta\r\n\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
@@ -4605,7 +4709,7 @@ test "secondary report gesture survives protocol disable without menu takeover" 
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.reset();
     try host.inner.effects.feedPtyOutput(pane.pty_key, "transition\r\n\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
@@ -4649,7 +4753,7 @@ test "secondary report gesture survives process exit cancel without menu takeove
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.reset();
     try host.inner.effects.feedPtyOutput(pane.pty_key, "exiting\r\n\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
@@ -4698,7 +4802,7 @@ test "selection edge drag autoscrolls one Ghostty row per timer tick" {
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.reset();
     var lines: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&lines);
@@ -4734,7 +4838,7 @@ test "wheel reporting is axis-fair and does not consume local residue" {
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const frame = app.paneFrames(&host.inner.model, size)[0];
     const point = terminalCellPoint(pane, frame, 2, 2);
     try pointerInputAdvanced(harness, iface, .scroll, point, .{ .delta_y = pane.session.cell_height / 2 });
@@ -4766,7 +4870,7 @@ test "mouse capture is fenced by its press protocol fingerprint" {
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     const frame = app.paneFrames(&host.inner.model, size)[0];

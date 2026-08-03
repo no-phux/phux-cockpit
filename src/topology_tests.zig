@@ -80,23 +80,23 @@ test "production launch owns exactly one terminal and New spawns the second chil
     try testing.expectEqual(@as(usize, 1), state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 1), state.model.provider.occupiedCount());
     try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
-    try testing.expectEqual(app.TerminalId.terminal_1, state.model.terminal_order[0]);
-    try testing.expectEqual(app.TerminalId.terminal_1, state.model.selectedTerminalId().?);
-    try testing.expectEqual(app.TerminalId.terminal_1, state.model.attachments[0].?);
-    try testing.expectEqual(@as(?app.TerminalId, null), state.model.attachments[1]);
-    try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(.terminal_1).?.pty_key);
-    try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(.terminal_1).?.session_generation);
+    try testing.expect(state.model.terminal_order[0].eql(app.initialTerminalRef(0)));
+    try testing.expect(state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
+    try testing.expect(state.model.attachments[0].?.eql(app.initialTerminalRef(0)));
+    try testing.expectEqual(@as(?app.TerminalRef, null), state.model.attachments[1]);
+    try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(app.initialTerminalRef(0)).?.pty_key);
+    try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(app.initialTerminalRef(0)).?.session_generation);
 
     const initial_snapshot = try state.model.topologySnapshot();
     try initial_snapshot.validate();
     try testing.expectEqual(@as(u8, 1), initial_snapshot.terminal_count);
-    try testing.expectEqualDeep([app.pane_count]?app.TerminalId{ .terminal_1, null }, initial_snapshot.attachments);
+    try testing.expectEqualDeep([app.pane_count]?app.LocalTerminalId{ .terminal_1, null }, initial_snapshot.attachments);
 
     try state.dispatch(&harness.runtime, 1, .new_terminal);
     try testing.expectEqual(@as(usize, 2), state.model.terminal_count);
     try testing.expectEqual(@as(usize, 2), state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 2), state.effects.pendingPtyCount());
-    const second = state.model.provider.terminal(.terminal_2) orelse return error.TestExpectedTerminal;
+    const second = state.model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
     try testing.expectEqual(@as(u64, 2), second.pty_key);
     try testing.expectEqual(@as(u64, 1), second.session_generation);
 }
@@ -229,7 +229,7 @@ test "topology registry creates four unique terminals and refuses a fifth" {
         const pane = state.model.provider.terminal(id) orelse return error.TestExpectedTerminal;
         try testing.expectEqual(@as(u64, index + 1), pane.pty_key);
         try testing.expectEqualSlices([]const u8, app.paneArgv(0), pane.argv);
-        for (state.model.terminal_order[0..index]) |prior| try testing.expect(prior != id);
+        for (state.model.terminal_order[0..index]) |prior| try testing.expect(!prior.eql(id));
     }
 
     app.update(&state.model, .new_terminal, &state.effects);
@@ -267,7 +267,7 @@ test "close tombstones one PTY and stale events cannot reach its replacement" {
     var survivor_keys: [app.max_terminal_count - 1]u64 = undefined;
     var survivor_count: usize = 0;
     for (state.model.terminal_order[0..state.model.terminal_count]) |id| {
-        if (id == closed_id) continue;
+        if (id.eql(closed_id)) continue;
         survivor_keys[survivor_count] = state.model.provider.terminal(id).?.pty_key;
         survivor_count += 1;
     }
@@ -301,7 +301,7 @@ test "close tombstones one PTY and stale events cannot reach its replacement" {
     try testing.expectEqual(@as(usize, 4), state.model.terminal_count);
     const replacement_id = state.model.selectedTerminalId() orelse return error.TestExpectedTerminal;
     const replacement = state.model.provider.terminal(replacement_id) orelse return error.TestExpectedTerminal;
-    try testing.expect(replacement_id != closed_id);
+    try testing.expect(!replacement_id.eql(closed_id));
     try testing.expect(replacement.pty_key > closed_key);
     const replacement_bytes = replacement.output_bytes;
 
@@ -348,7 +348,7 @@ test "reordering preserves terminal identity process generation and attachments"
     try testing.expectEqual(app.LayoutMode.split, state.model.layout);
     try testing.expect(state.model.attachments[0] != null);
     try testing.expect(state.model.attachments[1] != null);
-    try testing.expect(state.model.attachments[0].? != state.model.attachments[1].?);
+    try testing.expect(!state.model.attachments[0].?.eql(state.model.attachments[1].?));
     for (state.model.attachments) |attached| try testing.expect(state.model.provider.terminal(attached.?) != null);
 }
 
@@ -372,8 +372,8 @@ test "versioned snapshot restores topology into fresh sessions without process s
     defer app.deinitModel(&restored);
     try testing.expectEqual(snapshot.version, app.topology_snapshot_version);
     try testing.expectEqual(state.model.terminal_count, restored.terminal_count);
-    try testing.expectEqualSlices(app.TerminalId, state.model.terminal_order[0..state.model.terminal_count], restored.terminal_order[0..restored.terminal_count]);
-    try testing.expectEqual(state.model.selectedTerminalId().?, restored.selectedTerminalId().?);
+    for (state.model.terminal_order[0..state.model.terminal_count], restored.terminal_order[0..restored.terminal_count]) |expected, actual| try testing.expect(expected.eql(actual));
+    try testing.expect(state.model.selectedTerminalRef().?.eql(restored.selectedTerminalRef().?));
     try testing.expectEqual(state.model.layout, restored.layout);
     try testing.expectApproxEqAbs(state.model.split_fraction, restored.split_fraction, 0.0001);
     try testing.expectEqualDeep(state.model.attachments, restored.attachments);
@@ -449,9 +449,9 @@ test "terminal identity allocation rejects exhaustion reserved keys and duplicat
 
     model.provider.next_terminal_raw = std.math.maxInt(u64) - 1;
     try testing.expectError(error.TerminalIdentityExhausted, model.provider.createTerminal());
-    model.provider.next_terminal_raw = @intFromEnum(app.TerminalId.terminal_1);
+    model.provider.next_terminal_raw = @intFromEnum(app.LocalTerminalId.terminal_1);
     try testing.expectError(error.TerminalIdentityCollision, model.provider.createTerminal());
-    model.provider.next_terminal_raw = @intFromEnum(app.TerminalId.terminal_2) + 1;
+    model.provider.next_terminal_raw = @intFromEnum(app.LocalTerminalId.terminal_2) + 1;
 
     model.provider.next_pty_key = std.math.maxInt(u64) - 1;
     try testing.expectError(error.TerminalIdentityExhausted, model.provider.createTerminal());
@@ -487,7 +487,7 @@ test "canonical snapshots reject topology rewrites and round trip exactly" {
     invalid.split_fraction = 0.99;
     try testing.expectError(error.InvalidTopology, invalid.validate());
     invalid = snapshot;
-    const exhausted: app.TerminalId = @enumFromInt(std.math.maxInt(u64) - 1);
+    const exhausted: app.LocalTerminalId = @enumFromInt(std.math.maxInt(u64) - 1);
     const old_id = invalid.terminal_order[0];
     invalid.terminal_order[0] = exhausted;
     if (invalid.selection.eql(.{ .terminal = old_id })) invalid.selection = .{ .terminal = exhausted };
