@@ -18,13 +18,22 @@ jobs:
   test:
     name: Zig 0.16 macOS
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v6
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
       - name: Test with the null platform
         run: zig build test -Dplatform=null --summary all
-      - name: Build the arm64 macOS app
-        run: zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe --summary all
+      - name: Package and verify the arm64 macOS app
+        run: |
+          set -euo pipefail
+          VERSION="$(awk -F '"' '/^[[:space:]]*\.version = / { print $2; exit }' app.zon)"
+          VERSION="$VERSION" ./scripts/package-macos.sh
+          ./scripts/soak-macos-app.sh \
+            --app "zig-out/release/Phux Cockpit.app" \
+            --cycles 3 \
+            --artifacts zig-out/soak-ci

@@ -14,9 +14,16 @@ DMG="${OUT_DIR}/${BASE}.dmg"
 CHECKSUMS="${OUT_DIR}/SHA256SUMS"
 STAGING="${ROOT}/zig-out/package/dmg-staging"
 NOTARY_ZIP="${ROOT}/zig-out/package/${BASE}-notarization.zip"
+ZIP_VERIFY="${ROOT}/zig-out/package/zip-verify"
+DMG_MOUNT="${ROOT}/zig-out/package/dmg-mount"
+DMG_ATTACHED="false"
 
 cleanup() {
-    rm -rf -- "${STAGING}"
+    if [[ "${DMG_ATTACHED}" == "true" ]]; then
+        /usr/bin/hdiutil detach -quiet "${DMG_MOUNT}" || \
+            /usr/bin/hdiutil detach -quiet -force "${DMG_MOUNT}" || true
+    fi
+    rm -rf -- "${STAGING}" "${ZIP_VERIFY}" "${DMG_MOUNT}"
     rm -f -- "${NOTARY_ZIP}"
 }
 trap cleanup EXIT
@@ -29,6 +36,27 @@ if [[ "${TARGET}" != "aarch64-macos" ]]; then
     printf 'error: release target must be aarch64-macos (got %s)\n' "${TARGET}" >&2
     exit 1
 fi
+if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'error: VERSION must be a semantic version (got %s)\n' "${VERSION}" >&2
+    exit 1
+fi
+
+notary_values=(
+    "${APPLE_NOTARY_KEY_PATH:-}"
+    "${APPLE_NOTARY_KEY_ID:-}"
+    "${APPLE_NOTARY_ISSUER_ID:-}"
+)
+notary_count=0
+for value in "${notary_values[@]}"; do
+    [[ -n "${value}" ]] && notary_count=$((notary_count + 1))
+done
+if [[ "${notary_count}" -ne 0 && "${notary_count}" -ne 3 ]]; then
+    printf 'error: notarization requires all three APPLE_NOTARY_* values or none\n' >&2
+    exit 1
+elif [[ "${notary_count}" -eq 3 && -z "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+    printf 'error: notarization credentials require MACOS_SIGNING_IDENTITY\n' >&2
+    exit 1
+fi
 
 for tool in zig codesign ditto hdiutil lipo plutil shasum unzip; do
     if ! command -v "${tool}" >/dev/null 2>&1; then
@@ -37,7 +65,7 @@ for tool in zig codesign ditto hdiutil lipo plutil shasum unzip; do
     fi
 done
 
-rm -rf -- "${PACKAGE_APP}" "${APP}" "${STAGING}"
+rm -rf -- "${PACKAGE_APP}" "${APP}" "${STAGING}" "${ZIP_VERIFY}" "${DMG_MOUNT}"
 rm -f -- "${ZIP}" "${DMG}" "${CHECKSUMS}" "${NOTARY_ZIP}"
 mkdir -p -- "${OUT_DIR}"
 
@@ -68,42 +96,15 @@ signature mode and THIRD_PARTY_NOTICES.md for bundled software licenses.
 EOF
 
 PLIST="${APP}/Contents/Info.plist"
-plist_value() {
-    /usr/bin/plutil -extract "$1" raw -o - "${PLIST}"
-}
-
-[[ "$(plist_value CFBundleIdentifier)" == "dev.phux.cockpit" ]] || {
-    printf 'error: unexpected CFBundleIdentifier\n' >&2
-    exit 1
-}
-[[ "$(plist_value CFBundleDisplayName)" == "Phux Cockpit" ]] || {
-    printf 'error: unexpected CFBundleDisplayName\n' >&2
-    exit 1
-}
-[[ "$(plist_value CFBundleShortVersionString)" == "${VERSION}" ]] || {
-    printf 'error: bundle version does not match VERSION=%s\n' "${VERSION}" >&2
-    exit 1
-}
-[[ "$(plist_value CFBundleExecutable)" == "phux-cockpit" ]] || {
-    printf 'error: unexpected CFBundleExecutable\n' >&2
-    exit 1
-}
-
-EXECUTABLE="${APP}/Contents/MacOS/phux-cockpit"
-[[ -x "${EXECUTABLE}" ]] || {
-    printf 'error: app executable is missing or not executable\n' >&2
-    exit 1
-}
-ARCHS="$(/usr/bin/lipo -archs "${EXECUTABLE}")"
-[[ " ${ARCHS} " == *" arm64 "* && " ${ARCHS} " != *" x86_64 "* ]] || {
-    printf 'error: expected an arm64-only executable, found: %s\n' "${ARCHS}" >&2
-    exit 1
-}
+/usr/bin/plutil -lint "${PLIST}" >/dev/null
 
 SIGNING_MODE="adhoc"
+VERIFIER_SIGNATURE_MODE="adhoc"
+ENTITLEMENTS_POLICY="absent"
 SIGNING_PLAN="${RESOURCES}/signing-plan.txt"
 if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
     SIGNING_MODE="identity"
+    VERIFIER_SIGNATURE_MODE="developer-id-unnotarized"
     sign_args=(--force --deep --options runtime --timestamp --sign "${MACOS_SIGNING_IDENTITY}")
     if [[ -n "${MACOS_ENTITLEMENTS:-}" ]]; then
         [[ -f "${MACOS_ENTITLEMENTS}" ]] || {
@@ -111,6 +112,7 @@ if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
             exit 1
         }
         sign_args+=(--entitlements "${MACOS_ENTITLEMENTS}")
+        ENTITLEMENTS_POLICY="allow"
     fi
     printf 'signing=identity\nsigned with %s\n' "${MACOS_SIGNING_IDENTITY}" > "${SIGNING_PLAN}"
     /usr/bin/codesign "${sign_args[@]}" "${APP}"
@@ -121,18 +123,68 @@ fi
 
 /usr/bin/codesign --verify --deep --strict --verbose=2 "${APP}"
 
-NOTARIZED="false"
-notary_values=(
-    "${APPLE_NOTARY_KEY_PATH:-}"
-    "${APPLE_NOTARY_KEY_ID:-}"
-    "${APPLE_NOTARY_ISSUER_ID:-}"
-)
-notary_count=0
-for value in "${notary_values[@]}"; do
-    [[ -n "${value}" ]] && notary_count=$((notary_count + 1))
-done
+verify_bundle() {
+    local bundle="$1"
+    local plist="${bundle}/Contents/Info.plist"
+    local resources="${bundle}/Contents/Resources"
+    local executable="${bundle}/Contents/MacOS/phux-cockpit"
+    local archs signing_marker
 
-if [[ "${notary_count}" -eq 3 && "${SIGNING_MODE}" == "identity" ]]; then
+    /usr/bin/plutil -lint "${plist}" >/dev/null
+    while IFS='=' read -r key expected; do
+        [[ "$(/usr/bin/plutil -extract "${key}" raw -o - "${plist}")" == "${expected}" ]] || {
+            printf 'error: unexpected %s in %s\n' "${key}" "${bundle}" >&2
+            return 1
+        }
+    done <<EOF
+CFBundleIdentifier=dev.phux.cockpit
+CFBundleName=Phux Cockpit
+CFBundleDisplayName=Phux Cockpit
+CFBundleExecutable=phux-cockpit
+CFBundleIconFile=AppIcon.icns
+CFBundlePackageType=APPL
+CFBundleShortVersionString=${VERSION}
+CFBundleVersion=${VERSION}
+LSMinimumSystemVersion=11.0
+EOF
+
+    [[ -x "${executable}" && -s "${resources}/AppIcon.icns" ]] || {
+        printf 'error: executable or application icon is missing from %s\n' "${bundle}" >&2
+        return 1
+    }
+    for resource in LICENSE.txt README.txt THIRD_PARTY_NOTICES.md signing-plan.txt; do
+        [[ -s "${resources}/${resource}" ]] || {
+            printf 'error: required resource %s is missing from %s\n' "${resource}" "${bundle}" >&2
+            return 1
+        }
+    done
+    IFS= read -r signing_marker < "${resources}/signing-plan.txt"
+    [[ "${signing_marker}" == "signing=${SIGNING_MODE}" ]] || {
+        printf 'error: signing metadata does not match package signature mode\n' >&2
+        return 1
+    }
+    archs="$(/usr/bin/lipo -archs "${executable}")"
+    [[ "${archs}" == "arm64" ]] || {
+        printf 'error: expected an arm64-only executable, found: %s\n' "${archs}" >&2
+        return 1
+    }
+    /usr/bin/codesign --verify --deep --strict --verbose=2 "${bundle}"
+}
+
+verify_signature() {
+    "${ROOT}/scripts/verify-macos-app.sh" \
+        --app "$1" \
+        --version "${VERSION}" \
+        --signature-mode "${VERIFIER_SIGNATURE_MODE}" \
+        --entitlements "${ENTITLEMENTS_POLICY}" \
+        --quarantine ignore
+}
+
+verify_bundle "${APP}"
+verify_signature "${APP}"
+
+NOTARIZED="false"
+if [[ "${notary_count}" -eq 3 ]]; then
     [[ -f "${APPLE_NOTARY_KEY_PATH}" ]] || {
         printf 'error: APPLE_NOTARY_KEY_PATH does not name a file\n' >&2
         exit 1
@@ -147,14 +199,18 @@ if [[ "${notary_count}" -eq 3 && "${SIGNING_MODE}" == "identity" ]]; then
     /usr/bin/xcrun stapler validate "${APP}"
     /usr/sbin/spctl --assess --type execute --verbose=2 "${APP}"
     NOTARIZED="true"
-elif [[ "${notary_count}" -ne 0 ]]; then
-    printf 'warning: notarization needs a signing identity and all three APPLE_NOTARY_* values; producing an unnotarized release\n' >&2
+    VERIFIER_SIGNATURE_MODE="developer-id-notarized"
 fi
 rm -f -- "${NOTARY_ZIP}"
 
 # ditto preserves the signed bundle's resource forks, metadata, and symlinks.
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "${APP}" "${ZIP}"
 /usr/bin/unzip -tq "${ZIP}"
+mkdir -p -- "${ZIP_VERIFY}"
+/usr/bin/ditto -x -k "${ZIP}" "${ZIP_VERIFY}"
+verify_bundle "${ZIP_VERIFY}/Phux Cockpit.app"
+verify_signature "${ZIP_VERIFY}/Phux Cockpit.app"
+rm -rf -- "${ZIP_VERIFY}"
 
 mkdir -p -- "${STAGING}"
 /usr/bin/ditto "${APP}" "${STAGING}/Phux Cockpit.app"
@@ -170,6 +226,18 @@ ln -s /Applications "${STAGING}/Applications"
     "${DMG}"
 /usr/bin/hdiutil verify -quiet "${DMG}"
 rm -rf -- "${STAGING}"
+mkdir -p -- "${DMG_MOUNT}"
+/usr/bin/hdiutil attach -quiet -readonly -nobrowse -mountpoint "${DMG_MOUNT}" "${DMG}"
+DMG_ATTACHED="true"
+verify_bundle "${DMG_MOUNT}/Phux Cockpit.app"
+verify_signature "${DMG_MOUNT}/Phux Cockpit.app"
+[[ -L "${DMG_MOUNT}/Applications" && "$(/usr/bin/readlink "${DMG_MOUNT}/Applications")" == "/Applications" ]] || {
+    printf 'error: disk image does not contain the expected Applications link\n' >&2
+    exit 1
+}
+/usr/bin/hdiutil detach -quiet "${DMG_MOUNT}"
+DMG_ATTACHED="false"
+rm -rf -- "${DMG_MOUNT}"
 
 (
     cd "${OUT_DIR}"

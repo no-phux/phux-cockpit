@@ -5,6 +5,16 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Terminal tabs now expose hidden process failures, while compact status chrome
+  prioritizes the active exception, preserves full diagnostic semantics, and
+  distinguishes spawn rejection from spawn failure.
+- Clean and abnormal exits now provide placement-specific Restart controls;
+  `cmd+R` continues to restart the focused terminal.
+- Current PTY input stalls clear after recovery; native delivery failures remain
+  distinct from bytes confirmed lost in an application queue.
+
 ## [0.3.0] - 2026-08-02
 
 ### Added
