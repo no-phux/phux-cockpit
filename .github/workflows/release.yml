@@ -15,6 +15,8 @@ permissions:
   contents: write
 
 jobs:
+  # Keep packaging and publishing together so signing keys and signed artifacts
+  # never need to cross a job boundary.
   macos:
     name: Package arm64 macOS release
     runs-on: macos-26
@@ -22,9 +24,10 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
 
       - name: Validate release tag
@@ -32,8 +35,9 @@ jobs:
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
+          git merge-base --is-ancestor HEAD origin/main
 
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
 
@@ -44,6 +48,7 @@ jobs:
           SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
         run: |
           set -euo pipefail
+          umask 077
           supplied=0
           [[ -n "${MACOS_CERTIFICATE}" ]] && supplied=$((supplied + 1))
           [[ -n "${MACOS_CERTIFICATE_PASSWORD}" ]] && supplied=$((supplied + 1))
@@ -53,8 +58,8 @@ jobs:
             exit 0
           fi
           if [[ "${supplied}" -ne 3 ]]; then
-            echo "Developer ID secrets are incomplete; the release will be ad-hoc signed." >&2
-            exit 0
+            echo "::error::Developer ID secrets are incomplete; configure all three or none."
+            exit 1
           fi
 
           certificate_path="${RUNNER_TEMP}/developer-id.p12"
@@ -79,6 +84,7 @@ jobs:
           NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
+          umask 077
           supplied=0
           [[ -n "${NOTARY_KEY}" ]] && supplied=$((supplied + 1))
           [[ -n "${NOTARY_KEY_ID}" ]] && supplied=$((supplied + 1))
@@ -88,11 +94,11 @@ jobs:
             exit 0
           fi
           if [[ "${supplied}" -ne 3 ]]; then
-            echo "Notarization secrets are incomplete; the release will be marked unnotarized." >&2
-            exit 0
+            echo "::error::Notarization secrets are incomplete; configure all three or none."
+            exit 1
           fi
 
-          key_path="${RUNNER_TEMP}/AuthKey_${NOTARY_KEY_ID}.p8"
+          key_path="${RUNNER_TEMP}/phux-cockpit-notary-key.p8"
           printf '%s' "${NOTARY_KEY}" | base64 -D > "${key_path}"
           {
             echo "APPLE_NOTARY_KEY_PATH=${key_path}"
@@ -110,7 +116,24 @@ jobs:
           export VERSION="${RELEASE_TAG#v}"
           ./scripts/package-macos.sh
 
+      - name: Soak packaged application lifecycle
+        run: |
+          ./scripts/soak-macos-app.sh \
+            --app "zig-out/release/Phux Cockpit.app" \
+            --cycles 10 \
+            --artifacts zig-out/soak-release
+
+      - name: Require Homebrew tap deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          if [[ -z "$DEPLOY_KEY" ]]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY must target phall1/homebrew-tap with write access."
+            exit 1
+          fi
+
       - name: Publish release
+        id: assets
         env:
           GH_TOKEN: ${{ github.token }}
           SIGNING_MODE: ${{ steps.package.outputs.signing }}
@@ -122,32 +145,60 @@ jobs:
             cat > "${notes}" <<EOF
           This release is Developer ID signed and Apple-notarized.
           EOF
+          elif [[ "${SIGNING_MODE}" == "identity" ]]; then
+            cat > "${notes}" <<EOF
+          This release is Developer ID signed but not Apple-notarized because
+          notarization credentials are not configured.
+          EOF
           else
             cat > "${notes}" <<EOF
-          This release is ad-hoc signed because Developer ID and notarization
-          credentials are not configured. The Homebrew cask clears the app's
-          quarantine attribute and reports this in its installation caveat.
-          Signing mode: ${SIGNING_MODE}.
+          This release is ad-hoc signed because Developer ID credentials are
+          not configured. The Homebrew cask clears the app's quarantine
+          attribute and reports this in its installation caveat.
           EOF
           fi
-          gh release create "${RELEASE_TAG}" \
-            zig-out/release/*.zip \
-            zig-out/release/*.dmg \
-            zig-out/release/SHA256SUMS \
-            --verify-tag \
-            --title "Phux Cockpit ${RELEASE_TAG}" \
-            --notes-file "${notes}"
-
-      - name: Require Homebrew tap deploy key
-        env:
-          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-        run: |
-          if [[ -z "$DEPLOY_KEY" ]]; then
-            echo "::error::HOMEBREW_TAP_DEPLOY_KEY must target phall1/homebrew-tap with write access."
-            exit 1
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            existing="$(mktemp -d)"
+            gh release download "${RELEASE_TAG}" \
+              --dir "${existing}" \
+              --pattern '*.zip' \
+              --pattern '*.dmg' \
+              --pattern SHA256SUMS
+            (cd "${existing}" && shasum -a 256 -c SHA256SUMS)
+            mkdir "${existing}/extracted"
+            ditto -x -k "${existing}"/*.zip "${existing}/extracted"
+            existing_app="${existing}/extracted/Phux Cockpit.app"
+            if codesign -dv --verbose=4 "${existing_app}" 2>&1 | grep -q '^Signature=adhoc$'; then
+              asset_signature=adhoc
+              asset_notarized=false
+            elif xcrun stapler validate "${existing_app}" >/dev/null 2>&1 && \
+                spctl --assess --type execute "${existing_app}" >/dev/null 2>&1; then
+              asset_signature=developer-id-notarized
+              asset_notarized=true
+            else
+              asset_signature=developer-id-unnotarized
+              asset_notarized=false
+            fi
+            ./scripts/verify-macos-app.sh \
+              --app "${existing_app}" \
+              --version "${RELEASE_TAG#v}" \
+              --signature-mode "${asset_signature}" \
+              --quarantine ignore
+            rm -f -- zig-out/release/*.zip zig-out/release/*.dmg zig-out/release/SHA256SUMS
+            cp "${existing}"/*.zip "${existing}"/*.dmg "${existing}/SHA256SUMS" zig-out/release/
+          else
+            gh release create "${RELEASE_TAG}" \
+              zig-out/release/*.zip \
+              zig-out/release/*.dmg \
+              zig-out/release/SHA256SUMS \
+              --verify-tag \
+              --title "Phux Cockpit ${RELEASE_TAG}" \
+              --notes-file "${notes}"
+            asset_notarized="${NOTARIZED}"
           fi
+          echo "notarized=${asset_notarized}" >> "${GITHUB_OUTPUT}"
 
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: phall1/homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
@@ -155,7 +206,7 @@ jobs:
 
       - name: Update Homebrew tap
         env:
-          NOTARIZED: ${{ steps.package.outputs.notarized }}
+          NOTARIZED: ${{ steps.assets.outputs.notarized }}
         run: |
           set -euo pipefail
           TAG="$RELEASE_TAG"
@@ -171,9 +222,10 @@ jobs:
           ruby -c Casks/phux-cockpit.rb
           bash .github/scripts/commit-update.sh Casks/phux-cockpit.rb "Brew cask update for Phux Cockpit $TAG"
 
-      - name: Remove temporary signing keychain
+      - name: Remove temporary signing credentials
         if: always()
         run: |
-          if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
-            security delete-keychain "${SIGNING_KEYCHAIN}" || true
-          fi
+          security delete-keychain "${RUNNER_TEMP}/phux-cockpit-signing.keychain-db" 2>/dev/null || true
+          rm -f -- \
+            "${RUNNER_TEMP}/developer-id.p12" \
+            "${RUNNER_TEMP}/phux-cockpit-notary-key.p8"

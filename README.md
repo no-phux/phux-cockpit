@@ -4,6 +4,11 @@ Phux Cockpit is a native macOS spatial runtime for terminal, web, and future
 control-plane surfaces. Version 0.3.0 replaces the embedded phux TUI and Work
 rail with native tabs and a real split-pane terminal substrate.
 
+The immediate goal is an exceptional native Phux terminal for terminal and
+TUI-agent work. Its stable execution and interaction primitives grow into a
+native control environment for large-scale directed machine work. See
+[Product Direction](docs/PRODUCT_DIRECTION.md).
+
 ## Spatial runtime
 
 - **Terminal 1** and **Terminal 2** are independent native terminal surfaces
@@ -24,6 +29,17 @@ rail with native tabs and a real split-pane terminal substrate.
 Both terminal executions stay live while hidden or split. libghostty-vt owns
 terminal state and native-sdk paints both into one Metal surface under strict
 combined command, text, glyph, and path budgets.
+
+Terminal tabs show an attention marker when a hidden process exits or develops
+an operational issue. Visible status chrome keeps lifecycle, confirmed outbound
+or reply loss, current input stalls, and native delivery failures separate
+instead of hiding one behind another. Recovered stalls disappear. Finished
+terminals expose a placement-specific **Restart** control for clean and abnormal
+exits.
+
+The local provider now owns terminal execution independently from layout. The
+model attaches stable terminal identities to UI placements, proving internally
+that placement changes need not restart a PTY or discard emulator state.
 
 ## Install
 
@@ -57,7 +73,7 @@ caveat.
 | `cmd+V` | Safely paste the system clipboard into the selected terminal |
 | `cmd+arrow-up` / `cmd+arrow-down` | Scroll one history line (`shift` scrolls a page) |
 | `cmd+home` / `cmd+end` | Jump to the top or bottom of history |
-| `cmd+R` | Restart the selected terminal after its process exits |
+| `cmd+R` | Restart the focused terminal after its process exits |
 
 Clicking a tab switches surfaces without stopping hidden execution. Clicking a
 split pane moves input ownership to it. The divider supports pointer dragging,
@@ -91,6 +107,20 @@ Create an arm64 app, ZIP, DMG, and `SHA256SUMS` under `zig-out/release`:
 
 ```sh
 ./scripts/package-macos.sh
+```
+
+Verify a packaged or installed bundle and run a process-lifecycle soak with:
+
+```sh
+./scripts/verify-macos-app.sh \
+  --app "zig-out/release/Phux Cockpit.app" \
+  --version 0.3.0 \
+  --signature-mode adhoc \
+  --quarantine absent
+./scripts/soak-macos-app.sh \
+  --app "zig-out/release/Phux Cockpit.app" \
+  --cycles 10 \
+  --artifacts zig-out/soak
 ```
 
 Local packaging ad-hoc signs the app. A release machine can provide a Developer

@@ -23,7 +23,7 @@ fn createSessions(cols: u16, rows: u16) ![app.pane_count]*grid.Session {
 }
 
 fn destroyModelSessions(model: *app.Model) void {
-    for (&model.panes) |*pane| pane.session.destroy();
+    app.deinitModel(model);
 }
 
 fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
@@ -383,10 +383,10 @@ test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
 test "ADVERSARIAL: either selected terminal gets the same full hostile-content budget" {
     const gpa = testing.allocator;
     const sessions = try createSessions(58, 40);
-    defer for (sessions) |each| each.destroy();
     for (sessions) |session| feedHostileRows(session, 58, 40);
 
     var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
     var painted: [app.pane_count]usize = @splat(0);
     var used: [app.pane_count]usize = @splat(0);
     for (sessions, 0..) |session, index| {
@@ -458,7 +458,7 @@ test "ADVERSARIAL: encoded KEYS (not just text) reach one pty only" {
 
     // Move focus and repeat: the bytes must switch streams entirely.
     try pressKey(harness, app_iface, "2", .{ .primary = true });
-    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
     try pressKey(harness, app_iface, "arrowup", .{});
     try testing.expect(app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len > 0);
     // Pane 0's stream did not grow.
@@ -478,7 +478,7 @@ test "ADVERSARIAL: the focus chord itself never leaks a byte to either child" {
     // Press AND release under kitty release reporting. The release omits
     // Command to model the modifier coming up first; the model-level
     // physical-key latch must still recognize and swallow it.
-    for (&app_state.model.panes) |*pane| pane.session.feed("\x1b[>11u");
+    for (app_state.model.panes) |*pane| pane.session.feed("\x1b[>11u");
     try pressKey(harness, app_iface, "2", .{ .primary = true });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -559,7 +559,7 @@ test "ADVERSARIAL: split wheel routing scrolls only the pane under the pointer" 
     const app_iface = app_state.app();
     const model = &app_state.model;
 
-    for (&model.panes) |*pane| {
+    for (model.panes) |*pane| {
         var line: [32]u8 = undefined;
         for (0..200) |i| pane.session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{i}) catch unreachable);
     }
@@ -622,7 +622,7 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
     const bottom1 = model.panes[1].session.scrollbar().offset;
 
     // Aim squarely at the selected Terminal 2 surface.
-    try testing.expectEqual(@as(u8, 1), model.focus);
+    try testing.expectEqual(app.Placement.secondary, model.focus_placement);
     const target = app.paneFrames(model, model.surface_size)[1];
     const cell_h = model.panes[1].session.cell_height;
     for (0..6) |_| {
