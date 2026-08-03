@@ -1107,7 +1107,6 @@ pub const CockpitHost = struct {
                 }
             },
             .gpu_surface_input => |input| {
-                if (try self.routeSecondaryTerminalPointer(runtime, input)) return;
                 const mask = appShortcutKeyMask(input.key);
                 const global_owned = mask != 0 and (self.global_shortcut_keys_held & mask) != 0;
                 if (input.kind == .key_up) self.global_shortcut_keys_held &= ~mask;
@@ -1247,7 +1246,7 @@ pub const CockpitHost = struct {
             terminal_id = owned.terminal_id;
             generation = owned.generation;
             frame = if (routed.target) |target|
-                if (terminalInteractionWidgetMatches(owned.terminal_id, target.id)) target.bounds else terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame
+                if (target.id == terminalInteractionWidgetId(owned.terminal_id)) target.bounds else terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame
             else
                 terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame;
         } else {
@@ -1288,69 +1287,6 @@ pub const CockpitHost = struct {
         return true;
     }
 
-    /// native-sdk v0.7.1 reserves button 1 for context menus and therefore
-    /// emits no `canvas_widget_pointer` for that stream. The raw echo is the
-    /// sole fallback for secondary press/drag/release; all other buttons stay
-    /// exclusively on the authoritative routed path above.
-    fn routeSecondaryTerminalPointer(
-        self: *CockpitHost,
-        runtime: *native_sdk.Runtime,
-        input: native_sdk.platform.GpuSurfaceInputEvent,
-    ) !bool {
-        if (input.button != 1 or !std.mem.eql(u8, input.label, canvas_label)) return false;
-        const phase: canvas.WidgetPointerPhase = switch (input.kind) {
-            .pointer_down => .down,
-            .pointer_up => .up,
-            .pointer_cancel => .cancel,
-            .pointer_drag => .move,
-            .pointer_move => .hover,
-            else => return false,
-        };
-
-        const capture = if (phase == .move or phase == .up or phase == .cancel)
-            pointerCaptureFor(&self.inner.model, input.window_id, input.pointer_id)
-        else
-            null;
-        var terminal_id: TerminalId = undefined;
-        var generation: u64 = 0;
-        var frame: geometry.RectF = .{};
-        if (capture) |owned| {
-            terminal_id = owned.terminal_id;
-            generation = owned.generation;
-            frame = terminalInteractionFrame(runtime, input.window_id, owned.terminal_id) orelse owned.frame;
-        } else {
-            if (phase == .move or phase == .up or phase == .cancel) return true;
-            const target = terminalInteractionHit(runtime, input.window_id, geometry.PointF.init(input.x, input.y)) orelse return false;
-            terminal_id = terminalIdForInteractionWidget(&self.inner.model, target.id) orelse return false;
-            const pane = self.inner.model.provider.terminal(terminal_id) orelse return true;
-            // Local ownership belongs to the native menu that the SDK has
-            // already presented before emitting this raw echo. Only a live
-            // mouse-reporting terminal consumes secondary input here.
-            if (!paneReportsMouse(pane)) return false;
-            generation = pane.session_generation;
-            frame = target.bounds;
-        }
-
-        try self.inner.dispatch(runtime, input.window_id, .{ .pointer = .{
-            .window_id = input.window_id,
-            .terminal_id = terminal_id,
-            .generation = generation,
-            .phase = phase,
-            .pointer_id = input.pointer_id,
-            .button = input.button,
-            .point = geometry.PointF.init(input.x, input.y),
-            .frame = frame,
-            .modifiers = .{
-                .shift = input.modifiers.shift,
-                .control = input.modifiers.control,
-                .alt = input.modifiers.option,
-                .super = input.modifiers.command,
-            },
-        } });
-        if (phase == .down) try self.focusSelectedContent(runtime, input.window_id);
-        return true;
-    }
-
     fn syncSelectionAutoscrollTimer(self: *CockpitHost, runtime: *native_sdk.Runtime) !void {
         const needed = modelHasSelectionAutoscroll(&self.inner.model);
         if (needed == self.selection_autoscroll_timer_active) return;
@@ -1377,18 +1313,13 @@ pub const CockpitHost = struct {
     }
 };
 
-fn terminalInteractionWidgetId(id: TerminalId, kind: canvas.WidgetKind) canvas.ObjectId {
-    return canvas.globalWidgetId(kind, .{ .index = @intCast(@intFromEnum(id)) });
-}
-
-fn terminalInteractionWidgetMatches(id: TerminalId, widget_id: canvas.ObjectId) bool {
-    return terminalInteractionWidgetId(id, .terminal) == widget_id or
-        terminalInteractionWidgetId(id, .panel) == widget_id;
+fn terminalInteractionWidgetId(id: TerminalId) canvas.ObjectId {
+    return canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(id)) });
 }
 
 fn terminalIdForInteractionWidget(model: *const Model, widget_id: canvas.ObjectId) ?TerminalId {
     for (model.terminal_order[0..model.terminal_count]) |id| {
-        if (terminalInteractionWidgetMatches(id, widget_id)) return id;
+        if (terminalInteractionWidgetId(id) == widget_id) return id;
     }
     return null;
 }
@@ -1398,26 +1329,12 @@ fn terminalInteractionFrame(
     window_id: native_sdk.platform.WindowId,
     id: TerminalId,
 ) ?geometry.RectF {
+    const widget_id = terminalInteractionWidgetId(id);
     for (runtime.views[0..runtime.view_count]) |*runtime_view| {
         if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
-        const layout = runtime_view.widgetLayoutTree();
-        if (layout.findById(terminalInteractionWidgetId(id, .terminal))) |node| return node.frame;
-        if (layout.findById(terminalInteractionWidgetId(id, .panel))) |node| return node.frame;
-        return null;
-    }
-    return null;
-}
-
-fn terminalInteractionHit(
-    runtime: *native_sdk.Runtime,
-    window_id: native_sdk.platform.WindowId,
-    point: geometry.PointF,
-) ?canvas.WidgetHit {
-    for (runtime.views[0..runtime.view_count]) |*runtime_view| {
-        if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
-        const hit = runtime_view.widgetLayoutTree().hitTestWithTokens(point, runtime_view.widget_tokens) orelse return null;
-        if (hit.kind != .terminal and hit.kind != .panel) return null;
-        return hit;
+        const node = runtime_view.widgetLayoutTree().findById(widget_id) orelse return null;
+        if (node.widget.kind != .terminal) return null;
+        return node.frame;
     }
     return null;
 }
@@ -3312,35 +3229,14 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
         .semantics = .{ .role = .group, .label = "Detached terminal placement" },
     }, .{});
     const screen = pane.session.screenText();
-    if (paneReportsMouse(pane)) {
-        // `.terminal` has an SDK-provided default menu even with no declared
-        // items. Use a panel while the live TUI owns secondary click so AppKit
-        // cannot enter menu tracking before Cockpit receives raw button 1.
-        return ui.panel(.{
-            .global_key = .{ .index = @intCast(@intFromEnum(pane.id)) },
-            .grow = 1,
-            .min_width = split_pane_min_width,
-            .opacity = 0,
-            .text = screen,
-            .on_press = .{ .focus_pane = placement },
-            .semantics = .{
-                .role = .group,
-                .focusable = true,
-                .label = if (screen.len > 0)
-                    ui.fmt("{s}\n{s}", .{ terminalTitle(ui, pane.id), screen })
-                else
-                    terminalTitle(ui, pane.id),
-            },
-        }, .{});
-    }
     const context_menu = [_]TerminalUi.ContextMenuItem{
         .{ .label = "Copy", .msg = .{ .copy_terminal = pane.id }, .enabled = pane.session.selectionActive() },
         .{ .label = "Paste", .msg = .{ .paste_terminal = pane.id }, .enabled = pane.acceptsInput() },
     };
-    // An unbound terminal widget contributes only native interaction and
-    // semantics over the app-owned libghostty painter. pty=0 prevents SDK
-    // session input; opacity=0 prevents duplicate pixels. The kind supplies
-    // the platform I-beam and a terminal text-value contract.
+    // One unbound terminal contributes native interaction and semantics over
+    // the app-owned libghostty painter. pty=0 prevents SDK session input;
+    // opacity=0 prevents duplicate pixels. Policy disabled keeps a live TUI's
+    // secondary stream routed; automatic lets the declared local menu win.
     return ui.terminal(.{
         .global_key = .{ .index = @intCast(@intFromEnum(pane.id)) },
         .grow = 1,
@@ -3349,6 +3245,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
         .text = screen,
         .on_press = .{ .focus_pane = placement },
         .context_menu = &context_menu,
+        .context_menu_policy = if (paneReportsMouse(pane)) .disabled else .automatic,
         .semantics = .{
             .focusable = true,
             .label = terminalTitle(ui, pane.id),

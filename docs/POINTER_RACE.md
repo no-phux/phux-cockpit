@@ -8,13 +8,12 @@ encoder coverage, frame scale, horizontal wheel support, and adversarial
 protocol cases. Capture and lifecycle ownership are replaced rather than taken
 unchanged from either branch.
 
-The result routes primary, middle, wheel, and hover edges from native-sdk's
-authoritative `canvas_widget_pointer` event. The only raw fallback is button 1:
-v0.7.1 reserves its whole stream for native context-menu handling and emits no
-routed widget event. A live mouse-reporting TUI gets that raw stream; local and
-ended terminals give it exclusively to the native menu. The fallback hit-tests
-the retained SDK tree, never app geometry, so every physical edge still has
-exactly one terminal path.
+The result routes every pointer edge from native-sdk's authoritative
+`canvas_widget_pointer` event. A temporary fork adds an explicit context-menu
+policy: `.disabled` bypasses menu handling and keeps button 1 on ordinary
+routing for a live mouse-reporting TUI; `.automatic` gives local and ended
+terminals exclusively to Cockpit's declared native menu. No raw pointer echo is
+applied to terminal input.
 
 ## Army A: Overlay
 
@@ -65,9 +64,9 @@ Review findings not retained:
 
 - `CockpitHost` consumes `canvas_widget_pointer`, including the SDK target,
   click count, and captured widget ID. Terminal events return before UiApp's
-  typed `on_press` dispatch. Button 1 uses the raw event only while a live TUI
-  owns mouse reporting; local ownership ignores that echo after the SDK menu
-  path. Every other raw pointer echo is ignored for terminal input.
+  typed `on_press` dispatch. The context-menu policy makes button 1 follow that
+  same routed path while a live TUI owns mouse reporting; every raw pointer echo
+  is ignored for terminal input.
 - A bounded capture table is keyed by `window_id + pointer_id` and stores
   `TerminalId + session_generation`. Different pointers coexist; stale edges
   cannot cancel or borrow another capture. Reorder and focus changes do not
@@ -90,11 +89,10 @@ Review findings not retained:
   a transition also retires captures minted under the old protocol.
 - Ghostty's gesture owns edge-drag autoscroll. One 15 ms host timer ticks every
   active local capture by exactly one row and stops when no gesture requests it.
-- Local and ended panes use a transparent unbound `.terminal` interaction
-  widget, supplying the native I-beam, a stable textbox name, and the real
-  viewport as `text_value`. A live mouse-reporting pane switches to a transparent
-  `.panel`, because SDK v0.7.1 gives `.terminal` an unavoidable default menu.
-  The app-owned Ghostty painter remains the sole pixel and selection owner.
+- Every pane uses one transparent unbound `.terminal` interaction widget,
+  supplying stable identity, the native I-beam, a textbox name, and the real
+  viewport as `text_value` in every mode. The app-owned Ghostty painter remains
+  the sole pixel and selection owner.
 - Right/control-click presents native pane-addressed Copy/Paste actions only
   under local ownership. While a live TUI reports mouse input, the native menu
   is intentionally absent and secondary down/up go exclusively to the child.
@@ -103,26 +101,28 @@ Review findings not retained:
 
 ## SDK Seam
 
-native-sdk v0.7.1 already publishes the authoritative routed
-`CanvasWidgetPointerEvent`, but an unbound terminal cannot bind an app-defined
-continuous pointer message. Its capture register is also one
+The temporary `phall1/native` pin at `9eb318d` extends native-sdk v0.7.1 with
+`ElementOptions.context_menu_policy`. The seam is upstream-ready and deliberately
+generic: `.automatic` preserves existing behavior, `.declared_only` suppresses
+SDK defaults, and `.disabled` bypasses menu handling while preserving ordinary
+pointer routing, capture, cursor, and semantics. An unbound terminal still
+cannot bind an app-defined continuous pointer message, and the SDK capture
+register is still one
 `canvas_widget_pressed_id` per canvas, not per `(window, pointer)`.
 
 The remaining adapter is deliberately narrow:
 
-1. Keep an inert `on_press` on the transparent interaction widget so the SDK
-   establishes its normal retained-widget press/capture target. Use `.terminal`
-   for local ownership and `.panel` for live TUI mouse reporting.
+1. Keep an inert `on_press` on one transparent unbound `.terminal` so the SDK
+   establishes its normal retained-widget press/capture target.
 2. Intercept the SDK's already-routed `canvas_widget_pointer` event in
-   `CockpitHost`; do not route the raw event again for buttons the SDK routes.
+   `CockpitHost`; never route the raw echo into terminal input.
 3. Resolve active motion/up/cancel through Cockpit's identity/generation capture
    table. If v0.7.1's canvas-global captured target belongs to another pointer,
    perform only an ID lookup for the owner's current retained bounds, never a
    coordinate hit test.
-4. Route button 1 from its raw echo only while the target's live generation has
-   mouse reporting active. Resolve its down against the retained SDK panel and
-   its continuation against Cockpit capture; otherwise leave the whole gesture
-   to the native menu.
+4. Set context-menu policy `.disabled` only while the target's live generation
+   has mouse reporting active; otherwise use `.automatic` with the declared
+   pane-addressed Copy/Paste menu.
 5. Do not forward a consumed terminal widget event into UiApp's `on_press`
    handler. Accessibility activation still uses that handler normally.
 
@@ -137,10 +137,10 @@ The null-platform suite covers routed single application, Ghostty cell/word/
 line selection, selection-copy-type, protocols and modes, modifiers, both wheel
 axes and fairness, scaled pixels, transition reset and capture fencing, hostile
 numeric input, independent pointers, autoscroll, native context actions,
-mode-exclusive secondary ownership, retained Shift selection, I-beam/text-value
-accessibility, persistent copy selection, all lifecycle fences, strict surface
-isolation, and stale post-close query output. The default run passes 142
-runnable tests with four expected screenshot skips;
+mode-exclusive secondary ownership, retained Shift selection, stable terminal
+kind/I-beam/text-value semantics, persistent copy selection, all lifecycle
+fences, strict surface isolation, and stale post-close query output. The default
+run passes 142 runnable tests with four expected screenshot skips;
 `COCKPIT_SHOTS=1` passes all 146 tests. The four
 inspected PNGs retain the one-terminal, tabs, split, and four-terminal product
 proofs without overlay artifacts. `zig build` separately passes and links the

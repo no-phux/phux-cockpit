@@ -3029,7 +3029,7 @@ fn releaseCanvasKey(harness: anytype, app_iface: anytype, key: []const u8, modif
 fn terminalInteractionFrame(harness: anytype, marker: []const u8) ?geometry.RectF {
     const layout = harness.runtime.views[0].widgetLayoutTree();
     for (layout.nodes) |node| {
-        if (node.widget.kind != .terminal and node.widget.kind != .panel) continue;
+        if (node.widget.kind != .terminal) continue;
         if (std.mem.indexOf(u8, node.widget.text, marker) == null) continue;
         return node.frame;
     }
@@ -4521,7 +4521,20 @@ test "secondary click ownership transitions between TUI reports and native menu"
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     var frame = terminalInteractionFrame(harness, "alpha beta") orelse return error.TestExpectedTerminalInteractionSurface;
     var layout = harness.runtime.views[0].widgetLayoutTree();
-    try testing.expectEqual(canvas.WidgetKind.panel, (layout.hitTest(terminalCellPoint(pane, frame, 0, 0)) orelse return error.TestExpectedTerminalInteractionSurface).kind);
+    var hit = layout.hitTest(terminalCellPoint(pane, frame, 0, 0)) orelse return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(canvas.WidgetKind.terminal, hit.kind);
+    try testing.expectEqual(canvas.WidgetCursor.text, layout.cursorForHit(hit));
+    const reporting_node = layout.findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.disabled, reporting_node.widget.context_menu_policy);
+    var reporting_semantics = false;
+    for (harness.runtime.views[0].widgetSemantics()) |node| {
+        if (node.id != hit.id) continue;
+        reporting_semantics = true;
+        try testing.expectEqual(canvas.WidgetRole.textbox, node.role);
+        try testing.expectEqualStrings("Terminal 1", node.label);
+        try testing.expect(std.mem.indexOf(u8, node.text_value, "alpha beta") != null);
+    }
+    try testing.expect(reporting_semantics);
 
     const shift = native_sdk.platform.ShortcutModifiers{ .shift = true };
     const selection_start = terminalCellPoint(pane, frame, 0, 0);
@@ -4560,10 +4573,14 @@ test "secondary click ownership transitions between TUI reports and native menu"
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     frame = terminalInteractionFrame(harness, "alpha beta") orelse return error.TestExpectedTerminalInteractionSurface;
     layout = harness.runtime.views[0].widgetLayoutTree();
-    try testing.expectEqual(canvas.WidgetKind.terminal, (layout.hitTest(terminalCellPoint(pane, frame, 0, 0)) orelse return error.TestExpectedTerminalInteractionSurface).kind);
+    hit = layout.hitTest(terminalCellPoint(pane, frame, 0, 0)) orelse return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(canvas.WidgetKind.terminal, hit.kind);
+    const local_node = layout.findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, local_node.widget.context_menu_policy);
     const before_local = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
     try pointerInputAdvanced(harness, iface, .pointer_down, point, .{ .button = 1 });
     try testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
+    try testing.expectEqual(@as(usize, 2), harness.null_platform.context_menu_item_count);
     try testing.expectEqualStrings("Copy", harness.null_platform.context_menu_items[0].label);
     try testing.expect(harness.null_platform.context_menu_items[0].enabled);
     try harness.runtime.dispatchPlatformEvent(iface, .{ .context_menu_action = .{
