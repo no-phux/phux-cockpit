@@ -92,9 +92,12 @@ split pane moves input ownership to it. The divider supports pointer dragging,
 arrow-key adjustment, Home, and End. Trackpad and wheel input route only to the
 terminal under the pointer. Dragging a selection beyond the top or bottom edge
 autoscrolls through history. Right-click or control-click opens native Copy and
-Paste actions, and a copied range remains highlighted until typing or another
-selection clears it. Terminal tab reorder remains available through the menu
-command and keyboard shortcut; direct tab dragging is not claimed.
+Paste actions while Cockpit owns pointer selection or the process has ended.
+While a live TUI enables mouse reporting, it exclusively owns secondary click,
+so the native menu is intentionally unavailable; Shift-drag selection remains
+copyable with `cmd+C`. A copied range remains highlighted until typing or
+another selection clears it. Terminal tab reorder remains available through the
+menu command and keyboard shortcut; direct tab dragging is not claimed.
 
 ## Requirements
 

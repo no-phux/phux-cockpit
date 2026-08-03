@@ -3029,7 +3029,7 @@ fn releaseCanvasKey(harness: anytype, app_iface: anytype, key: []const u8, modif
 fn terminalInteractionFrame(harness: anytype, marker: []const u8) ?geometry.RectF {
     const layout = harness.runtime.views[0].widgetLayoutTree();
     for (layout.nodes) |node| {
-        if (node.widget.kind != .terminal) continue;
+        if (node.widget.kind != .terminal and node.widget.kind != .panel) continue;
         if (std.mem.indexOf(u8, node.widget.text, marker) == null) continue;
         return node.frame;
     }
@@ -4504,7 +4504,7 @@ test "terminal interaction exposes I-beam text value and native Copy Paste" {
     try testing.expectEqual(pane.id, host.inner.model.paste_owner);
 }
 
-test "secondary raw fallback reports right button exactly once" {
+test "secondary click ownership transitions between TUI reports and native menu" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
@@ -4515,10 +4515,22 @@ test "secondary raw fallback reports right button exactly once" {
     defer host.deinit();
     const iface = host.app();
     const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
-    try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1002h\x1b[?1006h");
+    pane.session.reset();
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "alpha beta\r\n\x1b[?1002h\x1b[?1006h");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
-    const frame = app.paneFrames(&host.inner.model, size)[0];
+    var frame = terminalInteractionFrame(harness, "alpha beta") orelse return error.TestExpectedTerminalInteractionSurface;
+    var layout = harness.runtime.views[0].widgetLayoutTree();
+    try testing.expectEqual(canvas.WidgetKind.panel, (layout.hitTest(terminalCellPoint(pane, frame, 0, 0)) orelse return error.TestExpectedTerminalInteractionSurface).kind);
+
+    const shift = native_sdk.platform.ShortcutModifiers{ .shift = true };
+    const selection_start = terminalCellPoint(pane, frame, 0, 0);
+    const selection_finish = terminalCellPoint(pane, frame, 5, 0);
+    try pointerInputAdvanced(harness, iface, .pointer_down, selection_start, .{ .modifiers = shift });
+    try pointerInputAdvanced(harness, iface, .pointer_drag, selection_finish, .{ .modifiers = shift });
+    try pointerInputAdvanced(harness, iface, .pointer_up, selection_finish, .{ .modifiers = shift });
+    try expectPointerSelectionText(pane, "alpha");
+
     const point = terminalCellPoint(pane, frame, 2, 2);
     const before = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
     try pointerInputAdvanced(harness, iface, .pointer_down, point, .{
@@ -4526,8 +4538,44 @@ test "secondary raw fallback reports right button exactly once" {
         .modifiers = .{ .control = true },
     });
     try pointerInputAdvanced(harness, iface, .pointer_up, point, .{ .button = 1 });
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.context_menu_request_count);
     try testing.expectEqualStrings("\x1b[<18;3;3M\x1b[<2;3;3m", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
     try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
+    try expectPointerSelectionText(pane, "alpha");
+
+    // The native menu is intentionally absent while the TUI owns secondary
+    // click, but Shift selection remains available through the keyboard copy.
+    try pressCanvasKey(harness, iface, "c", .{ .primary = true });
+    const reported_mode_copy = host.inner.effects.pendingClipboardAt(0) orelse return error.TestExpectedClipboardWrite;
+    try testing.expectEqualStrings("alpha", reported_mode_copy.text);
+    try host.inner.effects.feedClipboardResult(app.clipboard_key, .ok, "");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try releaseCanvasKey(harness, iface, "c", .{ .primary = true });
+    try expectPointerSelectionText(pane, "alpha");
+
+    // Once reporting turns off, the retained interaction kind changes back to
+    // terminal: the native menu owns button 1 and no report reaches the child.
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1002l");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    frame = terminalInteractionFrame(harness, "alpha beta") orelse return error.TestExpectedTerminalInteractionSurface;
+    layout = harness.runtime.views[0].widgetLayoutTree();
+    try testing.expectEqual(canvas.WidgetKind.terminal, (layout.hitTest(terminalCellPoint(pane, frame, 0, 0)) orelse return error.TestExpectedTerminalInteractionSurface).kind);
+    const before_local = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
+    try pointerInputAdvanced(harness, iface, .pointer_down, point, .{ .button = 1 });
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
+    try testing.expectEqualStrings("Copy", harness.null_platform.context_menu_items[0].label);
+    try testing.expect(harness.null_platform.context_menu_items[0].enabled);
+    try harness.runtime.dispatchPlatformEvent(iface, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = app.canvas_label,
+        .token = harness.null_platform.context_menu_token,
+        .item_id = 1,
+    } });
+    try pointerInputAdvanced(harness, iface, .pointer_up, point, .{ .button = 1 });
+    try testing.expectEqual(before_local, host.inner.effects.ptyWrittenBytes(pane.pty_key).len);
+    const local_copy = host.inner.effects.pendingClipboardAt(0) orelse return error.TestExpectedClipboardWrite;
+    try testing.expectEqualStrings("alpha", local_copy.text);
 }
 
 test "selection edge drag autoscrolls one Ghostty row per timer tick" {

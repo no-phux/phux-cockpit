@@ -1247,7 +1247,7 @@ pub const CockpitHost = struct {
             terminal_id = owned.terminal_id;
             generation = owned.generation;
             frame = if (routed.target) |target|
-                if (target.id == terminalInteractionWidgetId(owned.terminal_id)) target.bounds else terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame
+                if (terminalInteractionWidgetMatches(owned.terminal_id, target.id)) target.bounds else terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame
             else
                 terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame;
         } else {
@@ -1323,6 +1323,10 @@ pub const CockpitHost = struct {
             const target = terminalInteractionHit(runtime, input.window_id, geometry.PointF.init(input.x, input.y)) orelse return false;
             terminal_id = terminalIdForInteractionWidget(&self.inner.model, target.id) orelse return false;
             const pane = self.inner.model.provider.terminal(terminal_id) orelse return true;
+            // Local ownership belongs to the native menu that the SDK has
+            // already presented before emitting this raw echo. Only a live
+            // mouse-reporting terminal consumes secondary input here.
+            if (!paneReportsMouse(pane)) return false;
             generation = pane.session_generation;
             frame = target.bounds;
         }
@@ -1373,13 +1377,18 @@ pub const CockpitHost = struct {
     }
 };
 
-fn terminalInteractionWidgetId(id: TerminalId) canvas.ObjectId {
-    return canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(id)) });
+fn terminalInteractionWidgetId(id: TerminalId, kind: canvas.WidgetKind) canvas.ObjectId {
+    return canvas.globalWidgetId(kind, .{ .index = @intCast(@intFromEnum(id)) });
+}
+
+fn terminalInteractionWidgetMatches(id: TerminalId, widget_id: canvas.ObjectId) bool {
+    return terminalInteractionWidgetId(id, .terminal) == widget_id or
+        terminalInteractionWidgetId(id, .panel) == widget_id;
 }
 
 fn terminalIdForInteractionWidget(model: *const Model, widget_id: canvas.ObjectId) ?TerminalId {
     for (model.terminal_order[0..model.terminal_count]) |id| {
-        if (terminalInteractionWidgetId(id) == widget_id) return id;
+        if (terminalInteractionWidgetMatches(id, widget_id)) return id;
     }
     return null;
 }
@@ -1389,12 +1398,12 @@ fn terminalInteractionFrame(
     window_id: native_sdk.platform.WindowId,
     id: TerminalId,
 ) ?geometry.RectF {
-    const widget_id = terminalInteractionWidgetId(id);
     for (runtime.views[0..runtime.view_count]) |*runtime_view| {
         if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
-        const node = runtime_view.widgetLayoutTree().findById(widget_id) orelse return null;
-        if (node.widget.kind != .terminal) return null;
-        return node.frame;
+        const layout = runtime_view.widgetLayoutTree();
+        if (layout.findById(terminalInteractionWidgetId(id, .terminal))) |node| return node.frame;
+        if (layout.findById(terminalInteractionWidgetId(id, .panel))) |node| return node.frame;
+        return null;
     }
     return null;
 }
@@ -1407,7 +1416,7 @@ fn terminalInteractionHit(
     for (runtime.views[0..runtime.view_count]) |*runtime_view| {
         if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
         const hit = runtime_view.widgetLayoutTree().hitTestWithTokens(point, runtime_view.widget_tokens) orelse return null;
-        if (hit.kind != .terminal) return null;
+        if (hit.kind != .terminal and hit.kind != .panel) return null;
         return hit;
     }
     return null;
@@ -1842,6 +1851,10 @@ fn terminalVisible(model: *const Model, id: TerminalId) bool {
     return false;
 }
 
+fn paneReportsMouse(pane: *const Pane) bool {
+    return pane.acceptsInput() and pane.session.term.flags.mouse_event != .none;
+}
+
 fn validPointerGeometry(event: TerminalPointerEvent) bool {
     return std.math.isFinite(event.point.x) and std.math.isFinite(event.point.y) and
         std.math.isFinite(event.frame.x) and std.math.isFinite(event.frame.y) and
@@ -1874,7 +1887,7 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
             // An ended child cannot own pointer input. Its last mode flags may
             // still say mouse reporting, but the static viewport must revert to
             // ordinary terminal selection without requiring Shift.
-            const mouse_reporting = pane.acceptsInput() and pane.session.term.flags.mouse_event != .none;
+            const mouse_reporting = paneReportsMouse(pane);
             const local_selection = event.button == 0 and (!mouse_reporting or event.modifiers.shift);
             if (local_selection) {
                 pane.selecting = false;
@@ -1904,7 +1917,10 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
             const button = terminalMouseButton(event.button) orelse return;
             if (!mouse_reporting or !pane.acceptsInput()) return;
             pane.selecting = false;
-            pane.session.clearSelection();
+            // A secondary report belongs to the TUI but does not revoke a
+            // Shift-created local selection; Cmd+C remains available while
+            // mouse reporting owns the native context-click gesture.
+            if (event.button != 1) pane.session.clearSelection();
             model.pointer_captures[slot] = .{
                 .active = true,
                 .window_id = event.window_id,
@@ -3296,6 +3312,27 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
         .semantics = .{ .role = .group, .label = "Detached terminal placement" },
     }, .{});
     const screen = pane.session.screenText();
+    if (paneReportsMouse(pane)) {
+        // `.terminal` has an SDK-provided default menu even with no declared
+        // items. Use a panel while the live TUI owns secondary click so AppKit
+        // cannot enter menu tracking before Cockpit receives raw button 1.
+        return ui.panel(.{
+            .global_key = .{ .index = @intCast(@intFromEnum(pane.id)) },
+            .grow = 1,
+            .min_width = split_pane_min_width,
+            .opacity = 0,
+            .text = screen,
+            .on_press = .{ .focus_pane = placement },
+            .semantics = .{
+                .role = .group,
+                .focusable = true,
+                .label = if (screen.len > 0)
+                    ui.fmt("{s}\n{s}", .{ terminalTitle(ui, pane.id), screen })
+                else
+                    terminalTitle(ui, pane.id),
+            },
+        }, .{});
+    }
     const context_menu = [_]TerminalUi.ContextMenuItem{
         .{ .label = "Copy", .msg = .{ .copy_terminal = pane.id }, .enabled = pane.session.selectionActive() },
         .{ .label = "Paste", .msg = .{ .paste_terminal = pane.id }, .enabled = pane.acceptsInput() },

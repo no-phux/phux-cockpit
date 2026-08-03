@@ -17,6 +17,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Terminal pointer interaction now includes native Copy/Paste menus, persistent
   copied highlights, I-beam and text-value accessibility, edge autoscroll,
   protocol-fenced captures, and fair independent wheel accumulation.
+- Secondary click has explicit mode ownership: a live mouse-reporting TUI gets
+  raw down/up without AppKit menu tracking; local and ended terminals get the
+  native Copy/Paste menu instead.
 
 ## [0.3.0] - 2026-08-02
 

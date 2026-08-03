@@ -11,8 +11,10 @@ unchanged from either branch.
 The result routes primary, middle, wheel, and hover edges from native-sdk's
 authoritative `canvas_widget_pointer` event. The only raw fallback is button 1:
 v0.7.1 reserves its whole stream for native context-menu handling and emits no
-routed widget event. That fallback hit-tests the retained SDK tree, never app
-geometry, so every physical edge still has exactly one terminal path.
+routed widget event. A live mouse-reporting TUI gets that raw stream; local and
+ended terminals give it exclusively to the native menu. The fallback hit-tests
+the retained SDK tree, never app geometry, so every physical edge still has
+exactly one terminal path.
 
 ## Army A: Overlay
 
@@ -63,9 +65,9 @@ Review findings not retained:
 
 - `CockpitHost` consumes `canvas_widget_pointer`, including the SDK target,
   click count, and captured widget ID. Terminal events return before UiApp's
-  typed `on_press` dispatch. Button 1 alone uses the raw event the SDK emits
-  after consuming its routed stream for the native menu; every other raw
-  pointer echo is ignored for terminal input.
+  typed `on_press` dispatch. Button 1 uses the raw event only while a live TUI
+  owns mouse reporting; local ownership ignores that echo after the SDK menu
+  path. Every other raw pointer echo is ignored for terminal input.
 - A bounded capture table is keyed by `window_id + pointer_id` and stores
   `TerminalId + session_generation`. Different pointers coexist; stale edges
   cannot cancel or borrow another capture. Reorder and focus changes do not
@@ -88,11 +90,16 @@ Review findings not retained:
   a transition also retires captures minted under the old protocol.
 - Ghostty's gesture owns edge-drag autoscroll. One 15 ms host timer ticks every
   active local capture by exactly one row and stops when no gesture requests it.
-- The transparent unbound `.terminal` interaction widget supplies the native
-  I-beam, a stable textbox name, and the real viewport as `text_value`, while
-  the app-owned Ghostty painter remains the sole pixel and selection owner.
-- Right/control-click presents native pane-addressed Copy/Paste actions. Copy
-  keeps the selected range highlighted after clipboard confirmation.
+- Local and ended panes use a transparent unbound `.terminal` interaction
+  widget, supplying the native I-beam, a stable textbox name, and the real
+  viewport as `text_value`. A live mouse-reporting pane switches to a transparent
+  `.panel`, because SDK v0.7.1 gives `.terminal` an unavoidable default menu.
+  The app-owned Ghostty painter remains the sole pixel and selection owner.
+- Right/control-click presents native pane-addressed Copy/Paste actions only
+  under local ownership. While a live TUI reports mouse input, the native menu
+  is intentionally absent and secondary down/up go exclusively to the child.
+  Shift local selection remains copyable through Cmd+C in that mode, and copy
+  keeps the range highlighted after clipboard confirmation.
 
 ## SDK Seam
 
@@ -103,17 +110,19 @@ continuous pointer message. Its capture register is also one
 
 The remaining adapter is deliberately narrow:
 
-1. Keep an inert `on_press` on the transparent unbound terminal so the SDK
-   establishes its normal retained-widget press/capture target.
+1. Keep an inert `on_press` on the transparent interaction widget so the SDK
+   establishes its normal retained-widget press/capture target. Use `.terminal`
+   for local ownership and `.panel` for live TUI mouse reporting.
 2. Intercept the SDK's already-routed `canvas_widget_pointer` event in
    `CockpitHost`; do not route the raw event again for buttons the SDK routes.
 3. Resolve active motion/up/cancel through Cockpit's identity/generation capture
    table. If v0.7.1's canvas-global captured target belongs to another pointer,
    perform only an ID lookup for the owner's current retained bounds, never a
    coordinate hit test.
-4. Route button 1 from its raw echo because v0.7.1 consumes that stream before
-   publishing `canvas_widget_pointer`; resolve its down against the retained
-   SDK tree and its continuation against Cockpit capture.
+4. Route button 1 from its raw echo only while the target's live generation has
+   mouse reporting active. Resolve its down against the retained SDK panel and
+   its continuation against Cockpit capture; otherwise leave the whole gesture
+   to the native menu.
 5. Do not forward a consumed terminal widget event into UiApp's `on_press`
    handler. Accessibility activation still uses that handler normally.
 
@@ -128,9 +137,10 @@ The null-platform suite covers routed single application, Ghostty cell/word/
 line selection, selection-copy-type, protocols and modes, modifiers, both wheel
 axes and fairness, scaled pixels, transition reset and capture fencing, hostile
 numeric input, independent pointers, autoscroll, native context actions,
-I-beam/text-value accessibility, persistent copy selection, all lifecycle
-fences, strict surface isolation, and stale post-close query output. The default
-run passes 142 runnable tests with four expected screenshot skips;
+mode-exclusive secondary ownership, retained Shift selection, I-beam/text-value
+accessibility, persistent copy selection, all lifecycle fences, strict surface
+isolation, and stale post-close query output. The default run passes 142
+runnable tests with four expected screenshot skips;
 `COCKPIT_SHOTS=1` passes all 146 tests. The four
 inspected PNGs retain the one-terminal, tabs, split, and four-terminal product
 proofs without overlay artifacts. `zig build` separately passes and links the
