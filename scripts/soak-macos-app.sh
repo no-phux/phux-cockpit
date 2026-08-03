@@ -11,7 +11,8 @@ Required:
 
 Options:
   --cycles COUNT             launch/termination cycles (default: 10)
-  --startup-timeout SECONDS  time to wait for both shells (default: 15)
+  --expected-shells COUNT    direct shells expected after launch (default: 1)
+  --startup-timeout SECONDS  time to wait for shells (default: 15)
   --shutdown-timeout SECONDS time to wait for clean shutdown (default: 10)
   --artifacts PATH           failure diagnostics directory
                              (default: ./soak-artifacts)
@@ -37,6 +38,7 @@ valid_path() {
 
 APP=''
 CYCLES=10
+EXPECTED_SHELLS=1
 STARTUP_TIMEOUT=15
 SHUTDOWN_TIMEOUT=10
 ARTIFACTS="${PWD}/soak-artifacts"
@@ -51,6 +53,11 @@ while [[ "$#" -gt 0 ]]; do
         --cycles)
             require_value "$@"
             CYCLES="$2"
+            shift 2
+            ;;
+        --expected-shells)
+            require_value "$@"
+            EXPECTED_SHELLS="$2"
             shift 2
             ;;
         --startup-timeout)
@@ -81,6 +88,7 @@ done
 valid_path "${APP}" || die '--app must not contain control characters'
 valid_path "${ARTIFACTS}" || die '--artifacts must not contain control characters'
 [[ "${CYCLES}" =~ ^[1-9][0-9]*$ ]] || die '--cycles must be a positive integer'
+[[ "${EXPECTED_SHELLS}" =~ ^[1-9][0-9]*$ ]] || die '--expected-shells must be a positive integer'
 [[ "${STARTUP_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] ||
     die '--startup-timeout must be a positive integer'
 [[ "${SHUTDOWN_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] ||
@@ -218,16 +226,17 @@ load_recorded_shells() {
     done < "${CURRENT_PID_FILE}"
 }
 
-same_two_pids() {
-    local pid found
+same_expected_pids() {
+    local pid found recorded
 
-    [[ "${#DIRECT_SHELL_PIDS[@]}" -eq 2 && "${#RECORDED_SHELL_PIDS[@]}" -eq 2 ]] ||
+    [[ "${#DIRECT_SHELL_PIDS[@]}" -eq "${EXPECTED_SHELLS}" &&
+        "${#RECORDED_SHELL_PIDS[@]}" -eq "${EXPECTED_SHELLS}" ]] ||
         return 1
-    [[ "${DIRECT_SHELL_PIDS[0]}" != "${DIRECT_SHELL_PIDS[1]}" ]] || return 1
     for pid in "${DIRECT_SHELL_PIDS[@]}"; do
         found='false'
-        [[ "${RECORDED_SHELL_PIDS[0]}" == "${pid}" ]] && found='true'
-        [[ "${RECORDED_SHELL_PIDS[1]}" == "${pid}" ]] && found='true'
+        for recorded in "${RECORDED_SHELL_PIDS[@]}"; do
+            [[ "${recorded}" == "${pid}" ]] && found='true'
+        done
         [[ "${found}" == 'true' ]] || return 1
     done
 }
@@ -391,7 +400,7 @@ EOF
     while true; do
         if ! app_identity_matches; then
             wait "${CURRENT_APP_PID}" 2>/dev/null || true
-            fail_cycle 'app exited before both shells became ready'
+            fail_cycle 'app exited before its shells became ready'
         fi
         app_state="$(process_state "${CURRENT_APP_PID}" || true)"
         [[ "${app_state}" != Z* ]] || fail_cycle 'app became a zombie during startup'
@@ -400,12 +409,12 @@ EOF
         load_recorded_shells
         [[ "${PID_FILE_MALFORMED}" == 'false' ]] ||
             fail_cycle 'controlled .zshrc produced malformed or duplicate shell PID records'
-        [[ "${#DIRECT_SHELL_PIDS[@]}" -le 2 ]] ||
-            fail_cycle "found more than two direct zsh children (${#DIRECT_SHELL_PIDS[@]})"
-        [[ "${#RECORDED_SHELL_PIDS[@]}" -le 2 ]] ||
-            fail_cycle "controlled .zshrc recorded more than two shell PIDs (${#RECORDED_SHELL_PIDS[@]})"
+        [[ "${#DIRECT_SHELL_PIDS[@]}" -le "${EXPECTED_SHELLS}" ]] ||
+            fail_cycle "found too many direct zsh children (${#DIRECT_SHELL_PIDS[@]}, expected ${EXPECTED_SHELLS})"
+        [[ "${#RECORDED_SHELL_PIDS[@]}" -le "${EXPECTED_SHELLS}" ]] ||
+            fail_cycle "controlled .zshrc recorded too many shell PIDs (${#RECORDED_SHELL_PIDS[@]}, expected ${EXPECTED_SHELLS})"
 
-        if same_two_pids; then
+        if same_expected_pids; then
             for shell_pid in "${DIRECT_SHELL_PIDS[@]}"; do
                 shell_state="$(process_state "${shell_pid}" || true)"
                 [[ -n "${shell_state}" && "${shell_state}" != Z* ]] ||
@@ -423,8 +432,12 @@ EOF
     app_pid_for_wait="${CURRENT_APP_PID}"
     /bin/kill -TERM "${CURRENT_APP_PID}" || fail_cycle 'could not terminate the exact app PID'
     shutdown_deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
-    shell_anomaly_counts=(0 0)
-    shell_anomaly_reasons=('' '')
+    shell_anomaly_counts=()
+    shell_anomaly_reasons=()
+    for ((shell_index = 0; shell_index < ${#TRACKED_SHELL_PIDS[@]}; shell_index++)); do
+        shell_anomaly_counts[shell_index]=0
+        shell_anomaly_reasons[shell_index]=''
+    done
     while true; do
         app_present='false'
         if app_identity_matches; then
@@ -475,9 +488,8 @@ EOF
         tracked_shell_identity_matches "${shell_index}" &&
             fail_cycle "tracked shell ${TRACKED_SHELL_PIDS[${shell_index}]} still exists after shutdown"
     done
-    printf 'cycle %s/%s: ok (app pid %s; shells %s, %s)\n' \
-        "${CURRENT_CYCLE}" "${CYCLES}" "${app_pid_for_wait}" \
-        "${TRACKED_SHELL_PIDS[0]}" "${TRACKED_SHELL_PIDS[1]}"
+    printf 'cycle %s/%s: ok (app pid %s; shells %s)\n' \
+        "${CURRENT_CYCLE}" "${CYCLES}" "${app_pid_for_wait}" "${TRACKED_SHELL_PIDS[*]}"
     CURRENT_APP_PID=''
     CURRENT_APP_IDENTITY=''
 done
