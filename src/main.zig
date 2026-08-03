@@ -20,6 +20,8 @@ const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 const vt = @import("ghostty-vt");
 const grid = @import("grid.zig");
+const provider_contract = @import("provider_contract");
+const phux_options = @import("phux_options");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -54,21 +56,165 @@ pub const webkit_parking_extent: f32 = 1;
 /// changes. Placement never owns process lifetime.
 pub const pane_count: usize = 2;
 
-/// Durable execution identity. This is deliberately not the PTY effect key,
-/// a provider array index, or a UI placement: those may all change without
-/// changing which terminal session the user is addressing.
-pub const TerminalId = enum(u64) {
-    terminal_1 = 0x7465_726d_0000_0001,
-    terminal_2 = 0x7465_726d_0000_0002,
-    _,
+pub const ProviderId = provider_contract.ProviderId;
+pub const LocalTerminalId = provider_contract.LocalTerminalId;
+pub const RemoteTerminalId = provider_contract.RemoteTerminalId;
+pub const TerminalId = provider_contract.TerminalId;
+pub const TerminalRef = provider_contract.TerminalRef;
+pub const Generation = provider_contract.Generation;
+pub const ReplicaOwner = provider_contract.ReplicaOwner;
+pub const PixelSize = provider_contract.PixelSize;
+pub const Viewport = provider_contract.Viewport;
+pub const KeyAction = provider_contract.KeyAction;
+pub const PhysicalKey = provider_contract.PhysicalKey;
+pub const ModifierMask = provider_contract.ModifierMask;
+pub const KeyInput = provider_contract.KeyInput;
+pub const MouseAction = provider_contract.MouseAction;
+pub const MouseButton = provider_contract.MouseButton;
+pub const MouseInput = provider_contract.MouseInput;
+pub const ScrollKind = provider_contract.ScrollKind;
+pub const Scroll = provider_contract.Scroll;
+pub const Presentation = provider_contract.Presentation;
+
+/// The optional provider module is selected by build configuration. Merely
+/// importing this boolean in the default lane brings in no C ABI or archive.
+pub const phux_enabled = phux_options.enabled;
+
+const DisabledPhuxProvider = struct {
+    const State = enum { new };
+    const Anchor = struct { opaque_id: u64 = 0 };
+    const SyncDelta = struct {
+        ready_published: bool = false,
+        generation_changed: bool = false,
+        added_count: usize = 0,
+        removed_count: usize = 0,
+    };
+
+    fn create(
+        _: std.mem.Allocator,
+        _: std.Io,
+        _: anytype,
+        _: []const u8,
+        _: []const u8,
+    ) error{Disabled}!*DisabledPhuxProvider {
+        return error.Disabled;
+    }
+    fn destroy(_: *DisabledPhuxProvider) void {}
+    fn open(_: *DisabledPhuxProvider, _: native_sdk.ChannelHandle) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn reconnect(_: *DisabledPhuxProvider, _: native_sdk.ChannelHandle) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn stop(_: *DisabledPhuxProvider) void {}
+    fn state(_: *const DisabledPhuxProvider) State {
+        return .new;
+    }
+    fn drainReadiness(_: *DisabledPhuxProvider) error{Disabled}!SyncDelta {
+        return error.Disabled;
+    }
+    fn terminalRefs(_: *const DisabledPhuxProvider, _: []TerminalRef) usize {
+        return 0;
+    }
+    fn contains(_: *const DisabledPhuxProvider, _: TerminalRef) bool {
+        return false;
+    }
+    fn owner(_: *const DisabledPhuxProvider, _: TerminalRef) ?ReplicaOwner {
+        return null;
+    }
+    fn ownerIsCurrent(_: *const DisabledPhuxProvider, _: ReplicaOwner) bool {
+        return false;
+    }
+    fn presentation(_: *const DisabledPhuxProvider, _: TerminalRef) ?Presentation {
+        return null;
+    }
+    fn viewportResize(_: *DisabledPhuxProvider, _: TerminalRef, _: Viewport) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn sendKey(_: *DisabledPhuxProvider, _: ReplicaOwner, _: *const KeyInput) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn sendFocus(_: *DisabledPhuxProvider, _: ReplicaOwner, _: bool) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn sendPaste(_: *DisabledPhuxProvider, _: ReplicaOwner, _: []const u8, _: bool) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn scrollViewport(_: *DisabledPhuxProvider, _: ReplicaOwner, _: Scroll) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn createAnchor(_: *DisabledPhuxProvider, _: ReplicaOwner, _: anytype) error{Disabled}!Anchor {
+        return error.Disabled;
+    }
+    fn releaseAnchor(_: *DisabledPhuxProvider, _: ReplicaOwner, _: Anchor) void {}
+    fn setSelection(_: *DisabledPhuxProvider, _: ReplicaOwner, _: Anchor, _: Anchor, _: bool) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn clearSelection(_: *DisabledPhuxProvider, _: ReplicaOwner) error{Disabled}!void {
+        return error.Disabled;
+    }
+    fn selectionText(_: *DisabledPhuxProvider, _: ReplicaOwner, _: std.mem.Allocator) error{Disabled}![]u8 {
+        return error.Disabled;
+    }
 };
+
+pub const PhuxProvider = if (phux_enabled)
+    @import("phux_provider").PhuxProvider
+else
+    DisabledPhuxProvider;
+const DisabledPointerModule = struct {
+    pub const EventQueue = struct {};
+    pub const Monitor = struct {};
+};
+const pointer_module = if (phux_enabled) @import("phux_pointer") else DisabledPointerModule;
+
+pub const phux_channel_key: u64 = 102;
+pub const pointer_channel_key: u64 = 103;
+pub const max_remote_terminals: usize = 64;
+
+pub const ProviderKind = enum { local, phux };
+
+pub fn providerKind(terminal_ref: TerminalRef) ProviderKind {
+    return if (terminal_ref.provider_id == .local) .local else .phux;
+}
 
 const max_held_terminal_keys: usize = 16;
 
 const HeldTerminalKey = struct {
     fingerprint: u64 = 0,
-    terminal_id: TerminalId = .terminal_1,
-    generation: u64 = 0,
+    owner: ReplicaOwner = .{
+        .terminal_ref = provider_contract.localTerminalRef(.terminal_1),
+        .generation = .{},
+    },
+};
+const PointerCapture = struct {
+    owner: ReplicaOwner,
+    button: MouseButton,
+};
+
+const PointerState = struct {
+    queue: pointer_module.EventQueue = .{},
+    monitor: ?pointer_module.Monitor = null,
+    capture: ?PointerCapture = null,
+    last_x: f64 = 0,
+    last_y: f64 = 0,
+};
+
+const RemoteUiState = struct {
+    terminal_ref: ?TerminalRef = null,
+    owner: ReplicaOwner = .{
+        .terminal_ref = provider_contract.localTerminalRef(.terminal_1),
+        .generation = .{},
+    },
+    selecting: bool = false,
+    rectangle: bool = false,
+    start_anchor: u64 = 0,
+    end_anchor: u64 = 0,
+    head_x: u16 = 0,
+    head_y: u32 = 0,
+    copied_bytes: u64 = 0,
+    copy_failed: bool = false,
+    wheel_accum: f32 = 0,
 };
 
 /// Fixed UI slots in the current two-pane cockpit. Attachments map these
@@ -90,8 +236,12 @@ pub const Placement = enum(u8) {
     }
 };
 
-pub fn initialTerminalId(index: usize) TerminalId {
-    return if (index == 0) .terminal_1 else .terminal_2;
+pub fn initialTerminalId(index: usize) LocalTerminalId {
+    return provider_contract.localTerminalId(index);
+}
+
+pub fn initialTerminalRef(index: usize) TerminalRef {
+    return provider_contract.localTerminalRefForIndex(index);
 }
 
 fn tabForPlacement(placement: Placement) TabId {
@@ -237,7 +387,7 @@ pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 // ------------------------------------------------------------------ model
 
-pub const Phase = enum { starting, live, ended, failed };
+pub const Phase = provider_contract.Phase;
 pub const LayoutMode = enum { single, split };
 
 /// ONE terminal pane: its emulator session, its pty, and every piece of
@@ -246,7 +396,7 @@ pub const LayoutMode = enum { single, split };
 /// its name, so the behaviour is the same code operating on a pane
 /// pointer instead of the model.
 pub const Pane = struct {
-    id: TerminalId,
+    id: TerminalRef,
     /// The emulator session, owned with this record by `LocalProvider`;
     /// everything inside derives from journaled inputs.
     session: *grid.Session,
@@ -321,6 +471,10 @@ pub const Pane = struct {
     }
 };
 
+fn replicaOwnerForPane(pane: *const Pane) ReplicaOwner {
+    return provider_contract.localReplicaOwner(pane.id, pane.session_generation);
+}
+
 /// Concrete local terminal backend. It owns every session and all state tied
 /// to that execution: PTY lifecycle/key, emulator, transport queues, and
 /// generation. The model only borrows this provider and attaches identities
@@ -334,7 +488,7 @@ pub const LocalProvider = struct {
         provider.* = .{ .gpa = gpa, .terminals = undefined };
         for (&provider.terminals, sessions, 0..) |*entry, session, index| {
             entry.* = .{
-                .id = initialTerminalId(index),
+                .id = initialTerminalRef(index),
                 .session = session,
                 .pty_key = ptyKey(index),
                 .argv = paneArgv(index),
@@ -349,18 +503,40 @@ pub const LocalProvider = struct {
         gpa.destroy(provider);
     }
 
-    pub fn terminal(provider: *LocalProvider, id: TerminalId) ?*Pane {
+    pub fn terminal(provider: *LocalProvider, terminal_ref: TerminalRef) ?*Pane {
+        if (!provider_contract.isLocal(terminal_ref)) return null;
         for (&provider.terminals) |*candidate| {
-            if (candidate.id == id) return candidate;
+            if (candidate.id.eql(terminal_ref)) return candidate;
         }
         return null;
     }
 
-    pub fn terminalConst(provider: *const LocalProvider, id: TerminalId) ?*const Pane {
+    pub fn terminalConst(provider: *const LocalProvider, terminal_ref: TerminalRef) ?*const Pane {
+        if (!provider_contract.isLocal(terminal_ref)) return null;
         for (&provider.terminals) |*candidate| {
-            if (candidate.id == id) return candidate;
+            if (candidate.id.eql(terminal_ref)) return candidate;
         }
         return null;
+    }
+
+    pub fn terminalRefs(provider: *const LocalProvider, out: []TerminalRef) usize {
+        const count = @min(out.len, provider.terminals.len);
+        for (out[0..count], 0..) |*slot, index| slot.* = provider.terminals[index].id;
+        return count;
+    }
+
+    pub fn contains(provider: *const LocalProvider, terminal_ref: TerminalRef) bool {
+        return provider.terminalConst(terminal_ref) != null;
+    }
+
+    pub fn owner(provider: *const LocalProvider, terminal_ref: TerminalRef) ?ReplicaOwner {
+        const pane = provider.terminalConst(terminal_ref) orelse return null;
+        return replicaOwnerForPane(pane);
+    }
+
+    pub fn ownerIsCurrent(provider: *const LocalProvider, owner_value: ReplicaOwner) bool {
+        const current = provider.owner(owner_value.terminal_ref) orelse return false;
+        return current.eql(owner_value);
     }
 
     pub fn terminalForPty(provider: *LocalProvider, key: u64) ?*Pane {
@@ -375,10 +551,16 @@ pub const Provider = LocalProvider;
 
 pub const Model = struct {
     provider: *LocalProvider,
+    phux_provider: ?*PhuxProvider = null,
+    remote_ui: [max_remote_terminals]RemoteUiState = [_]RemoteUiState{.{}} ** max_remote_terminals,
+    pointer_state: ?*PointerState = null,
     /// Compatibility view for the existing fixed two-terminal UI. Storage and
     /// ownership remain in `provider`; attachment routing never uses this alias.
     panes: *[pane_count]Pane,
-    attachments: [pane_count]?TerminalId = .{ .terminal_1, .terminal_2 },
+    attachments: [pane_count]?TerminalRef = .{
+        provider_contract.localTerminalRef(.terminal_1),
+        provider_contract.localTerminalRef(.terminal_2),
+    },
     /// Tab selection is independent from terminal focus. A tab may
     /// present a terminal, a native webview, or future non-terminal surface.
     selected_tab: TabId = .terminal_1,
@@ -406,20 +588,20 @@ pub const Model = struct {
     /// even when attachment or focus changes while the key is held.
     held_terminal_keys: [max_held_terminal_keys]HeldTerminalKey = [_]HeldTerminalKey{.{}} ** max_held_terminal_keys,
     /// A clipboard write is IN FLIGHT: further copies are no-ops until
-    /// its result lands, or the fixed-key re-request would be rejected
-    /// as a duplicate and overwrite the first copy's outcome. There is
-    /// ONE system clipboard, so this is a window-level fact, not a pane
-    /// one — `copy_owner` records which pane's selection is riding it,
-    /// so the result clears the right pane's highlight.
+    /// its result lands. The provider-qualified owner also fences the
+    /// completion to the exact local replica that issued it.
     copy_inflight: bool = false,
-    copy_owner: TerminalId = .terminal_1,
-    copy_owner_generation: u64 = 0,
-    /// One clipboard read may be in flight for the window. The owner and
-    /// its spawn generation pin delivery to the pane/session that asked,
-    /// even if keyboard focus moves before the result arrives.
+    copy_owner: ReplicaOwner = .{
+        .terminal_ref = provider_contract.localTerminalRef(.terminal_1),
+        .generation = .{},
+    },
+    /// One clipboard read may be in flight for the window. Focus and
+    /// attachment changes cannot retarget its provider-qualified owner.
     paste_inflight: bool = false,
-    paste_owner: TerminalId = .terminal_1,
-    paste_owner_generation: u64 = 0,
+    paste_owner: ReplicaOwner = .{
+        .terminal_ref = provider_contract.localTerminalRef(.terminal_1),
+        .generation = .{},
+    },
     /// The last paste read or atomic queue admission failed. This is
     /// window-level feedback displayed on `paste_owner`'s badge.
     paste_failed: bool = false,
@@ -447,6 +629,88 @@ pub const Model = struct {
     /// frame, no worse than the resize lag documented above.
     surface_size: geometry.SizeF = geometry.SizeF.init(window_width, window_height),
 
+    pub fn phux(model: *Model) ?*PhuxProvider {
+        if (comptime !phux_enabled) return null;
+        return model.phux_provider;
+    }
+
+    pub fn phuxConst(model: *const Model) ?*const PhuxProvider {
+        if (comptime !phux_enabled) return null;
+        return model.phux_provider;
+    }
+
+    pub fn containsTerminal(model: *const Model, terminal_ref: TerminalRef) bool {
+        return switch (providerKind(terminal_ref)) {
+            .local => model.provider.contains(terminal_ref),
+            .phux => if (model.phuxConst()) |remote| remote.contains(terminal_ref) else false,
+        };
+    }
+
+    pub fn terminalOwner(model: *const Model, terminal_ref: TerminalRef) ?ReplicaOwner {
+        return switch (providerKind(terminal_ref)) {
+            .local => model.provider.owner(terminal_ref),
+            .phux => if (model.phuxConst()) |remote| remote.owner(terminal_ref) else null,
+        };
+    }
+
+    pub fn ownerIsCurrent(model: *const Model, owner_value: ReplicaOwner) bool {
+        return switch (providerKind(owner_value.terminal_ref)) {
+            .local => model.provider.ownerIsCurrent(owner_value),
+            .phux => if (model.phuxConst()) |remote| remote.ownerIsCurrent(owner_value) else false,
+        };
+    }
+
+    pub fn remotePresentation(model: *const Model, terminal_ref: TerminalRef) ?Presentation {
+        if (providerKind(terminal_ref) != .phux) return null;
+        const remote = model.phuxConst() orelse return null;
+        return remote.presentation(terminal_ref);
+    }
+
+    fn remoteUi(model: *Model, terminal_ref: TerminalRef) ?*RemoteUiState {
+        const current_owner = model.terminalOwner(terminal_ref) orelse return null;
+        var vacant: ?*RemoteUiState = null;
+        for (&model.remote_ui) |*state| {
+            if (state.terminal_ref) |known| {
+                if (!known.eql(terminal_ref)) continue;
+                if (!state.owner.eql(current_owner)) {
+                    state.* = .{ .terminal_ref = terminal_ref, .owner = current_owner };
+                }
+                return state;
+            }
+            if (vacant == null) vacant = state;
+        }
+        const state = vacant orelse return null;
+        state.* = .{ .terminal_ref = terminal_ref, .owner = current_owner };
+        return state;
+    }
+
+    fn remoteUiConst(model: *const Model, terminal_ref: TerminalRef) ?*const RemoteUiState {
+        for (&model.remote_ui) |*state| {
+            if (state.terminal_ref) |known| if (known.eql(terminal_ref)) return state;
+        }
+        return null;
+    }
+
+    pub fn reconcileRemoteTerminals(model: *Model) void {
+        const remote = model.phuxConst() orelse return;
+        var refs: [max_remote_terminals]TerminalRef = undefined;
+        const count = remote.terminalRefs(&refs);
+        reconcileRemoteRefs(&model.attachments, refs[0..count]);
+        for (&model.remote_ui) |*state| {
+            const known = state.terminal_ref orelse continue;
+            var retained = false;
+            for (refs[0..count]) |terminal_ref| {
+                if (known.eql(terminal_ref)) {
+                    retained = true;
+                    break;
+                }
+            }
+            if (!retained) state.* = .{};
+        }
+        for (refs[0..count]) |terminal_ref| _ = model.remoteUi(terminal_ref);
+        model.reconcileAttachmentFocus();
+    }
+
     pub fn terminalAt(model: *Model, placement: Placement) ?*Pane {
         const id = model.attachments[placement.index()] orelse return null;
         return model.provider.terminal(id);
@@ -461,8 +725,12 @@ pub const Model = struct {
         return model.terminalAt(model.focus_placement) orelse unreachable;
     }
 
-    pub fn focusedTerminalId(model: *const Model) ?TerminalId {
+    pub fn focusedTerminalRef(model: *const Model) ?TerminalRef {
         return model.attachments[model.focus_placement.index()];
+    }
+
+    pub fn focusedTerminalId(model: *const Model) ?TerminalRef {
+        return model.focusedTerminalRef();
     }
 
     pub fn selectedPlacement(model: *const Model) ?Placement {
@@ -472,9 +740,13 @@ pub const Model = struct {
         };
     }
 
-    pub fn selectedTerminalId(model: *const Model) ?TerminalId {
+    pub fn selectedTerminalRef(model: *const Model) ?TerminalRef {
         const placement = model.selectedPlacement() orelse return null;
         return model.attachments[placement.index()];
+    }
+
+    pub fn selectedTerminalId(model: *const Model) ?TerminalRef {
+        return model.selectedTerminalRef();
     }
 
     pub fn selectedTerminalIndex(model: *const Model) ?u8 {
@@ -509,18 +781,18 @@ pub const Model = struct {
         }
     }
 
-    pub fn attach(model: *Model, placement: Placement, id: TerminalId) AttachError!void {
-        if (model.provider.terminal(id) == null) return error.UnknownTerminal;
+    pub fn attach(model: *Model, placement: Placement, terminal_ref: TerminalRef) AttachError!void {
+        if (!model.containsTerminal(terminal_ref)) return error.UnknownTerminal;
         for (model.attachments) |attached| {
-            if (attached != null and attached.? == id) return error.TerminalAlreadyAttached;
+            if (attached != null and attached.?.eql(terminal_ref)) return error.TerminalAlreadyAttached;
         }
         if (model.attachments[placement.index()] != null) return error.PlacementOccupied;
-        model.attachments[placement.index()] = id;
+        model.attachments[placement.index()] = terminal_ref;
         if (model.selectedPlacement() == placement) model.focus_placement = placement;
         model.reconcileAttachmentFocus();
     }
 
-    pub fn detach(model: *Model, placement: Placement) ?TerminalId {
+    pub fn detach(model: *Model, placement: Placement) ?TerminalRef {
         const index = placement.index();
         const detached = model.attachments[index] orelse return null;
         model.attachments[index] = null;
@@ -529,22 +801,92 @@ pub const Model = struct {
     }
 };
 
+pub fn reconcileRemoteRefs(
+    attachments: *[pane_count]?TerminalRef,
+    remote_refs: []const TerminalRef,
+) void {
+    for (attachments) |*attached| {
+        const current = attached.* orelse continue;
+        if (providerKind(current) != .phux) continue;
+        var retained = false;
+        for (remote_refs) |candidate| {
+            if (current.eql(candidate)) {
+                retained = true;
+                break;
+            }
+        }
+        if (!retained) attached.* = null;
+    }
+
+    for (remote_refs) |candidate| {
+        if (providerKind(candidate) != .phux) continue;
+        var already_attached = false;
+        for (attachments.*) |attached| {
+            if (attached != null and attached.?.eql(candidate)) {
+                already_attached = true;
+                break;
+            }
+        }
+        if (already_attached) continue;
+
+        for (attachments) |*attached| {
+            if (attached.* == null or providerKind(attached.*.?) == .local) {
+                attached.* = candidate;
+                break;
+            }
+        }
+    }
+}
+
 /// The initial cockpit model over `pane_count` heap-owned sessions: pane
 /// i takes pty key i+1 and its own spawn argv.
+pub fn initialModelWithPhux(
+    sessions: [pane_count]*grid.Session,
+    phux_provider: ?*PhuxProvider,
+) Model {
+    const local_provider = LocalProvider.create(std.heap.page_allocator, sessions) catch @panic("failed to allocate local terminal provider");
+    var pointer_state: ?*PointerState = null;
+    if (comptime phux_enabled) {
+        if (phux_provider != null) {
+            pointer_state = std.heap.page_allocator.create(PointerState) catch
+                @panic("failed to allocate pointer monitor state");
+            pointer_state.?.* = .{};
+        }
+    }
+    return .{
+        .provider = local_provider,
+        .phux_provider = phux_provider,
+        .pointer_state = pointer_state,
+        .panes = &local_provider.terminals,
+    };
+}
+
 pub fn initialModel(sessions: [pane_count]*grid.Session) Model {
-    const provider = LocalProvider.create(std.heap.page_allocator, sessions) catch @panic("failed to allocate local terminal provider");
-    return .{ .provider = provider, .panes = &provider.terminals };
+    return initialModelWithPhux(sessions, null);
 }
 
 pub fn deinitModel(model: *Model) void {
+    if (comptime phux_enabled) {
+        if (model.pointer_state) |pointer_state| {
+            if (pointer_state.monitor) |*monitor| monitor.stop();
+            std.heap.page_allocator.destroy(pointer_state);
+            model.pointer_state = null;
+        }
+    }
+    if (comptime phux_enabled) {
+        if (model.phux_provider) |remote| remote.destroy();
+        model.phux_provider = null;
+    }
     model.provider.destroy();
 }
 
 pub const Msg = union(enum) {
     shell: native_sdk.EffectPtyEvent,
+    phux_channel: native_sdk.EffectChannelEvent,
+    pointer_channel: native_sdk.EffectChannelEvent,
     key: canvas.WidgetKeyboardEvent,
     text: canvas.WidgetKeyboardEvent,
-    viewport: struct { terminal_id: TerminalId, cols: u16, rows: u16, size: geometry.SizeF },
+    viewport: struct { terminal_ref: TerminalRef, cols: u16, rows: u16, size: geometry.SizeF },
     surface_resized: geometry.SizeF,
     clipboard: native_sdk.EffectClipboardResult,
     paste_clipboard: native_sdk.EffectClipboardResult,
@@ -560,7 +902,7 @@ pub const Msg = union(enum) {
     /// Move keyboard focus to a placement (cmd+1/cmd+2, or a press on the
     /// placement's own stack). Detached placements are ignored.
     focus_pane: Placement,
-    attach_terminal: struct { placement: Placement, terminal_id: TerminalId },
+    attach_terminal: struct { placement: Placement, terminal_ref: TerminalRef },
     detach_terminal: Placement,
     /// The frame pump asks the update loop (which holds `fx`) to push
     /// more pending outbound bytes now that a frame elapsed — the child
@@ -762,6 +1104,42 @@ pub const CockpitHost = struct {
 
 fn initFx(model: *Model, fx: *Fx) void {
     for (&model.provider.terminals) |*pane| spawnPane(pane, fx);
+    openPhuxChannel(model, fx, false);
+    openPointerMonitor(model, fx);
+}
+
+fn openPhuxChannel(model: *Model, fx: *Fx, reconnect: bool) void {
+    const remote = model.phux() orelse return;
+    const handle = fx.openChannel(.{
+        .key = phux_channel_key,
+        .on_event = Fx.channelMsg(.phux_channel),
+        .max_pending = 1,
+    });
+    if (!handle.live()) return;
+    if (reconnect) {
+        remote.reconnect(handle) catch return;
+    } else {
+        remote.open(handle) catch return;
+    }
+}
+fn openPointerMonitor(model: *Model, fx: *Fx) void {
+    if (comptime !phux_enabled) return;
+    const pointer_state = model.pointer_state orelse return;
+    if (pointer_state.monitor != null) return;
+    const handle = fx.openChannel(.{
+        .key = pointer_channel_key,
+        .on_event = Fx.channelMsg(.pointer_channel),
+        .max_pending = 1,
+    });
+    if (!handle.live()) return;
+    pointer_state.monitor = pointer_module.Monitor.start(
+        std.heap.page_allocator,
+        &pointer_state.queue,
+        handle,
+    ) catch {
+        fx.closeChannel(pointer_channel_key);
+        return;
+    };
 }
 
 fn spawnPane(pane: *Pane, fx: *Fx) void {
@@ -813,6 +1191,15 @@ fn spawnPane(pane: *Pane, fx: *Fx) void {
 /// to the wrong terminal.
 fn paneForKey(model: *Model, key: u64) ?*Pane {
     return model.provider.terminalForPty(key);
+}
+
+fn remoteStateNeedsFocusReplay(
+    ready_published: bool,
+    added_count: usize,
+    removed_count: usize,
+    generation_changed: bool,
+) bool {
+    return ready_published or added_count != 0 or removed_count != 0 or generation_changed;
 }
 
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
@@ -872,30 +1259,99 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 .write => unreachable,
             }
         },
+        .phux_channel => |event| {
+            if (event.key != phux_channel_key) return;
+            const remote = model.phux() orelse return;
+            switch (event.kind) {
+                .data => {
+                    const delta = remote.drainReadiness() catch {
+                        remote.stop();
+                        fx.closeChannel(phux_channel_key);
+                        return;
+                    };
+                    const terminal_set_changed =
+                        delta.ready_published or delta.added_count != 0 or delta.removed_count != 0;
+                    if (terminal_set_changed) model.reconcileRemoteTerminals();
+                    if (remoteStateNeedsFocusReplay(
+                        delta.ready_published,
+                        delta.added_count,
+                        delta.removed_count,
+                        delta.generation_changed,
+                    )) {
+                        sendRemoteFocus(model, model.focusedTerminalRef(), model.focused);
+                    }
+                },
+                .closed, .rejected => {
+                    remote.stop();
+                    openPhuxChannel(model, fx, remote.state() != .new);
+                },
+            }
+        },
+        .pointer_channel => |event| {
+            if (comptime !phux_enabled) return;
+            if (event.key != pointer_channel_key) return;
+            const pointer_state = model.pointer_state orelse return;
+            switch (event.kind) {
+                .data => drainPointerEvents(model),
+                .closed, .rejected => {
+                    if (pointer_state.monitor) |*monitor| monitor.stop();
+                    pointer_state.monitor = null;
+                    pointer_state.queue.reset();
+                    pointer_state.capture = null;
+                    openPointerMonitor(model, fx);
+                },
+            }
+        },
         .key => |event| handleKey(model, fx, event),
         .text => |event| {
-            if (!model.focused or model.selectedTerminalId() == null) return;
-            const pane = model.focusedPane();
-            if (pane.selecting or !pane.acceptsInput()) return;
-            if (event.text.len == 0) return;
-            pane.session.scrollToBottom();
-            sendCommittedText(pane, fx, event.text);
+            if (!model.focused or model.selectedTerminalId() == null or event.text.len == 0) return;
+            const terminal_ref = model.focusedTerminalRef() orelse return;
+            if (model.provider.terminal(terminal_ref)) |pane| {
+                if (pane.selecting or !pane.acceptsInput()) return;
+                pane.session.scrollToBottom();
+                sendCommittedText(pane, fx, event.text);
+                return;
+            }
+            const state = model.remoteUi(terminal_ref) orelse return;
+            if (state.selecting) return;
+            const remote = model.phux() orelse return;
+            remote.scrollViewport(state.owner, .{ .kind = .bottom }) catch return;
+            var input: KeyInput = .{
+                .action = .press,
+                .physical = @enumFromInt(0),
+                .modifiers = providerModifiers(event),
+                .text = event.text,
+            };
+            remote.sendKey(state.owner, &input) catch {};
         },
         .viewport => |size| {
-            const pane = model.provider.terminal(size.terminal_id) orelse return;
             // Remember the surface the frame pump measured against, so
             // the wheel hit test has rectangles to resolve into.
             model.surface_size = size.size;
-            // Commit the new size only once the emulator actually took
-            // it: on an allocation failure the model keeps its old
-            // dimensions and the frame pump retries next frame, so the
-            // emulator and the pty never disagree about the grid.
-            if (!pane.session.resize(size.cols, size.rows)) return;
-            pane.cols = size.cols;
-            pane.rows = size.rows;
-            pane.session.refreshScreenText();
-            fx.ptyResize(pane.pty_key, size.cols, size.rows);
-            flushOutbound(pane, fx);
+            if (model.provider.terminal(size.terminal_ref)) |pane| {
+                // Remember the surface the frame pump measured against, so
+                // the wheel hit test has rectangles to resolve into.
+                model.surface_size = size.size;
+                // Commit the new size only once the emulator actually took
+                // it: on an allocation failure the model keeps its old
+                // dimensions and the frame pump retries next frame, so the
+                // emulator and the pty never disagree about the grid.
+                if (!pane.session.resize(size.cols, size.rows)) return;
+                pane.cols = size.cols;
+                pane.rows = size.rows;
+                pane.session.refreshScreenText();
+                fx.ptyResize(pane.pty_key, size.cols, size.rows);
+                flushOutbound(pane, fx);
+                return;
+            }
+            const remote = model.phux() orelse return;
+            const width: u16 = @intFromFloat(@min(size.size.width, std.math.maxInt(u16)));
+            const height: u16 = @intFromFloat(@min(size.size.height, std.math.maxInt(u16)));
+            remote.viewportResize(size.terminal_ref, .{
+                .cols = size.cols,
+                .rows = size.rows,
+                .pixels = .{ .width = width, .height = height },
+            }) catch {};
         },
         .surface_resized => |size| model.surface_size = size,
         .flush_outbound => {
@@ -910,35 +1366,43 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             model.chrome_top = chrome.insets.top;
         },
         .focus_changed => |focused| {
+            if (model.focused == focused) return;
             model.focused = focused;
+            sendRemoteFocus(model, model.focusedTerminalRef(), focused);
             // Window blur strands every pane's held-key latches, not
             // only the focused one's.
             if (!focused) {
                 for (&model.provider.terminals) |*pane| pane.macos_natural_keys_held = 0;
                 model.consumed_shortcut_keys_held = 0;
-                for (&model.held_terminal_keys) |*held| {
-                    if (held.fingerprint != 0) held.generation = 0;
-                }
+                for (&model.held_terminal_keys) |*held| held.* = .{};
             }
         },
         .wheel => |wheel| {
             if (model.selectedTerminalId() == null) return;
-            // Natural direction, like every terminal: swiping the
-            // content down (positive delta on hosts with natural
-            // scrolling) reveals history. Inert while a selection is
-            // armed - the caret and the emulator's absolute range must
-            // not desynchronize (the scroll-chord rule).
-            //
-            // Tab chrome and native surfaces never fall back to hidden panes.
-            // Pointer position rides on the message to enforce that boundary.
-            const pane = paneAtPoint(model, wheel.x, wheel.y) orelse return;
-            if (pane.selecting) return;
-            pane.wheel_accum += wheel.delta;
-            const cell_h = @max(1, pane.session.cell_height);
-            const rows = @trunc(pane.wheel_accum / cell_h);
+            const terminal_ref = terminalRefAtPoint(model, wheel.x, wheel.y) orelse return;
+            if (model.provider.terminal(terminal_ref)) |pane| {
+                if (pane.selecting) return;
+                pane.wheel_accum += wheel.delta;
+                const cell_h = @max(1, pane.session.cell_height);
+                const rows = @trunc(pane.wheel_accum / cell_h);
+                if (rows != 0) {
+                    pane.wheel_accum -= rows * cell_h;
+                    pane.session.scrollLines(-@as(isize, @intFromFloat(rows)));
+                }
+                return;
+            }
+            const state = model.remoteUi(terminal_ref) orelse return;
+            if (state.selecting) return;
+            const cell_h = @max(1, canvas.terminalCellMetrics(cockpitTokens(model)).height);
+            state.wheel_accum += wheel.delta;
+            const rows = @trunc(state.wheel_accum / cell_h);
             if (rows != 0) {
-                pane.wheel_accum -= rows * cell_h;
-                pane.session.scrollLines(-@as(isize, @intFromFloat(rows)));
+                state.wheel_accum -= rows * cell_h;
+                const remote = model.phux() orelse return;
+                remote.scrollViewport(state.owner, .{
+                    .kind = .delta,
+                    .value = -@as(i64, @intFromFloat(rows)),
+                }) catch {};
             }
         },
         .copy_selection => {
@@ -948,46 +1412,48 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         .clipboard => |result| {
             if (!model.copy_inflight) return;
             model.copy_inflight = false;
-            // The result belongs to the pane whose selection was copied,
-            // which may no longer be the focused one.
-            const pane = model.provider.terminal(model.copy_owner) orelse return;
-            // A restart invalidates the request. Its cancelled (or raced
-            // successful) result must not mutate the replacement session.
-            if (pane.session_generation != model.copy_owner_generation) return;
+            if (!model.ownerIsCurrent(model.copy_owner)) return;
+            if (model.provider.terminal(model.copy_owner.terminal_ref)) |pane| {
+                if (result.outcome == .ok) {
+                    pane.selecting = false;
+                    pane.session.clearSelection();
+                } else {
+                    pane.copied_bytes = 0;
+                    pane.copy_failed = true;
+                }
+                return;
+            }
+            const state = model.remoteUi(model.copy_owner.terminal_ref) orelse return;
             if (result.outcome == .ok) {
-                // Confirmed on the clipboard: the selection's job is
-                // done, and only NOW does it clear — a failed write
-                // needs it still standing to retry.
-                pane.selecting = false;
-                pane.session.clearSelection();
+                clearRemoteSelection(model, state);
             } else {
-                // The write failed after a successful read: same user
-                // story as a serialization failure — loud, the
-                // selection kept, never a silent no-op the user pastes
-                // stale content after.
-                pane.copied_bytes = 0;
-                pane.copy_failed = true;
+                state.copied_bytes = 0;
+                state.copy_failed = true;
             }
         },
         .paste_clipboard => |result| {
             if (!model.paste_inflight) return;
             model.paste_inflight = false;
-            const pane = model.provider.terminal(model.paste_owner) orelse return;
-            // A restart invalidates the request. Its cancelled (or raced
-            // successful) terminal result must not touch the new shell.
-            if (pane.session_generation != model.paste_owner_generation) return;
+            if (!model.ownerIsCurrent(model.paste_owner)) return;
             if (result.outcome != .ok) {
                 model.paste_failed = true;
                 return;
             }
-            // The child may have exited while the clipboard read was in
-            // flight. A successful read cannot make a dead pty writable.
-            if (!pane.acceptsInput()) {
-                model.paste_failed = true;
+            if (model.provider.terminal(model.paste_owner.terminal_ref)) |pane| {
+                if (!pane.acceptsInput()) {
+                    model.paste_failed = true;
+                    return;
+                }
+                model.paste_failed = false;
+                pasteClipboardText(model, pane, fx, result.text);
                 return;
             }
+            const remote = model.phux() orelse return;
+            remote.sendPaste(model.paste_owner, result.text, false) catch {
+                model.paste_failed = true;
+                return;
+            };
             model.paste_failed = false;
-            pasteClipboardText(model, pane, fx, result.text);
         },
         .restart => |placement| {
             // Restart ONLY a genuinely finished session. During
@@ -999,11 +1465,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             if (pane.phase != .ended and pane.phase != .failed) return;
             // Keep the clipboard key occupied until cancellation delivers;
             // the generation check above discards the stale result.
-            if (model.copy_inflight and model.copy_owner == pane.id) fx.cancel(clipboard_key);
+            if (model.copy_inflight and model.copy_owner.terminal_ref.eql(pane.id)) fx.cancel(clipboard_key);
             // Keep the read latched until its cancellation terminal
             // arrives, preventing key reuse while the old effect still
-            // owns it. The generation check above discards that result.
-            if (model.paste_owner == pane.id) {
+            // owns it. The generation fence above discards that result.
+            if (model.paste_owner.terminal_ref.eql(pane.id)) {
                 model.paste_failed = false;
                 if (model.paste_inflight) fx.cancel(paste_clipboard_key);
             }
@@ -1012,16 +1478,24 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         .focus_pane => |requested| {
             if (model.attachments[requested.index()] == null) return;
             if (requested == model.focus_placement) return;
+            const previous = model.focusedTerminalRef();
+            sendRemoteFocus(model, previous, false);
             model.focus_placement = requested;
             model.selected_tab = if (requested == .primary) .terminal_1 else .terminal_2;
+            sendRemoteFocus(model, model.focusedTerminalRef(), model.focused);
         },
         .select_tab => |tab| {
             if (tab == model.selected_tab) return;
+            const previous = model.focusedTerminalRef();
             model.selected_tab = tab;
             if (model.selectedPlacement()) |placement| {
                 if (model.attachments[placement.index()] != null) {
+                    if (placement != model.focus_placement) sendRemoteFocus(model, previous, false);
                     model.focus_placement = placement;
+                    sendRemoteFocus(model, model.focusedTerminalRef(), model.focused);
                 }
+            } else {
+                sendRemoteFocus(model, previous, false);
             }
         },
         .shortcut_tab => |tab| {
@@ -1051,33 +1525,179 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             update(model, .{ .focus_pane = Placement.fromIndex(@intCast(next)).? }, fx);
         },
         .browser_page => |page| {
+            sendRemoteFocus(model, model.focusedTerminalRef(), false);
             model.browser_page = page;
             model.browser_navigation_token +%= 1;
             model.selected_tab = .web;
         },
         .attach_terminal => |attachment| {
-            model.attach(attachment.placement, attachment.terminal_id) catch return;
+            model.attach(attachment.placement, attachment.terminal_ref) catch return;
+            if (attachment.placement == model.focus_placement)
+                sendRemoteFocus(model, attachment.terminal_ref, model.focused);
         },
         .detach_terminal => |placement| {
+            if (placement == model.focus_placement)
+                sendRemoteFocus(model, model.attachments[placement.index()], false);
             _ = model.detach(placement);
         },
     }
 }
 
-/// The pane whose rect contains a view point, or null when the point
-/// stands over the header band, a gutter, or outside the panes.
-fn paneAtPoint(model: *Model, x: f32, y: f32) ?*Pane {
+/// The provider-qualified terminal whose rect contains a view point.
+fn terminalRefAtPoint(model: *const Model, x: f32, y: f32) ?TerminalRef {
     const frames = paneFrames(model, model.surface_size);
     for (frames, 0..) |frame, index| {
         if (frame.width <= 0 or frame.height <= 0) continue;
         if (x >= frame.x and x < frame.x + frame.width and
             y >= frame.y and y < frame.y + frame.height)
         {
-            const placement = Placement.fromIndex(index).?;
-            return model.terminalAt(placement);
+            return model.attachments[Placement.fromIndex(index).?.index()];
         }
     }
     return null;
+}
+fn terminalFrame(model: *const Model, terminal_ref: TerminalRef) ?geometry.RectF {
+    const frames = paneFrames(model, model.surface_size);
+    for (model.attachments, 0..) |attached, index| {
+        if (attached) |value| {
+            if (value.eql(terminal_ref)) return frames[index];
+        }
+    }
+    return null;
+}
+
+fn pointerButton(button: u32) MouseButton {
+    return switch (button) {
+        0 => .left,
+        1 => .right,
+        2 => .middle,
+        3 => .button_4,
+        4 => .button_5,
+        else => .none,
+    };
+}
+
+fn sendPointerToOwner(
+    model: *Model,
+    owner: ReplicaOwner,
+    action: MouseAction,
+    button: MouseButton,
+    modifiers: ModifierMask,
+    x: f64,
+    y: f64,
+) bool {
+    if (comptime !phux_enabled) return false;
+    if (!model.ownerIsCurrent(owner)) return false;
+    const frame = terminalFrame(model, owner.terminal_ref) orelse return false;
+    const presentation = model.remotePresentation(owner.terminal_ref) orelse return false;
+    if (frame.width <= 0 or frame.height <= 0 or presentation.cols == 0 or presentation.rows == 0)
+        return false;
+    const remote = model.phux() orelse return false;
+    if (!(remote.mouseTracking(owner) catch return false)) return false;
+
+    const local_x = @max(0, @min(
+        @as(f64, @floatCast(frame.width)) - 1,
+        x - @as(f64, @floatCast(frame.x)),
+    ));
+    const local_y = @max(0, @min(
+        @as(f64, @floatCast(frame.height)) - 1,
+        y - @as(f64, @floatCast(frame.y)),
+    ));
+    const cell_x = @min(
+        @as(u16, @intFromFloat(@floor(
+            local_x * @as(f64, @floatFromInt(presentation.cols)) /
+                @as(f64, @floatCast(frame.width)),
+        ))),
+        presentation.cols - 1,
+    );
+    const cell_y = @min(
+        @as(u16, @intFromFloat(@floor(
+            local_y * @as(f64, @floatFromInt(presentation.rows)) /
+                @as(f64, @floatCast(frame.height)),
+        ))),
+        presentation.rows - 1,
+    );
+    remote.sendMouse(owner, &.{
+        .action = action,
+        .button = button,
+        .modifiers = modifiers,
+        .x = @floatFromInt(cell_x),
+        .y = @floatFromInt(cell_y),
+    }) catch return false;
+    return true;
+}
+
+fn dispatchPointerEvent(model: *Model, event: anytype) void {
+    if (comptime !phux_enabled) return;
+    const pointer_state = model.pointer_state orelse return;
+    pointer_state.last_x = event.x;
+    pointer_state.last_y = event.y;
+    const action: MouseAction = switch (event.eventKind() orelse return) {
+        .button_down => .press,
+        .button_up => .release,
+        .motion => .move,
+    };
+    const button = pointerButton(event.button);
+
+    var owner = if (pointer_state.capture) |capture|
+        capture.owner
+    else blk: {
+        const terminal_ref = terminalRefAtPoint(
+            model,
+            @floatCast(event.x),
+            @floatCast(event.y),
+        ) orelse return;
+        if (providerKind(terminal_ref) != .phux) return;
+        break :blk model.terminalOwner(terminal_ref) orelse return;
+    };
+    if (!model.ownerIsCurrent(owner)) {
+        pointer_state.capture = null;
+        const terminal_ref = terminalRefAtPoint(
+            model,
+            @floatCast(event.x),
+            @floatCast(event.y),
+        ) orelse return;
+        if (providerKind(terminal_ref) != .phux) return;
+        owner = model.terminalOwner(terminal_ref) orelse return;
+    }
+
+    const sent = sendPointerToOwner(
+        model,
+        owner,
+        action,
+        button,
+        @bitCast(event.modifiers),
+        event.x,
+        event.y,
+    );
+    if (action == .press and sent and button != .none) {
+        pointer_state.capture = .{ .owner = owner, .button = button };
+    } else if (action == .release) {
+        pointer_state.capture = null;
+    }
+}
+
+fn releasePointerCapture(model: *Model) void {
+    if (comptime !phux_enabled) return;
+    const pointer_state = model.pointer_state orelse return;
+    const capture = pointer_state.capture orelse return;
+    _ = sendPointerToOwner(
+        model,
+        capture.owner,
+        .release,
+        capture.button,
+        .{},
+        pointer_state.last_x,
+        pointer_state.last_y,
+    );
+    pointer_state.capture = null;
+}
+
+fn drainPointerEvents(model: *Model) void {
+    if (comptime !phux_enabled) return;
+    const pointer_state = model.pointer_state orelse return;
+    while (pointer_state.queue.take()) |event| dispatchPointerEvent(model, event);
+    if (pointer_state.queue.takeOverflow()) releasePointerCapture(model);
 }
 
 /// Append outbound bytes (typed keys, pastes, or query replies) to the
@@ -1203,63 +1823,71 @@ pub fn moveResponsesToOutbound(model: *Pane, fx: *Fx) void {
 }
 
 fn copySelection(model: *Model, fx: *Fx) void {
-    // ONE copy in flight: the clipboard write reuses a fixed key, so a
-    // second request before the first result drains would be rejected
-    // as a duplicate — and that rejection would overwrite the first
-    // copy's success with `copy_failed`. There is one system clipboard,
-    // so this holds ACROSS panes, not per pane.
     if (model.copy_inflight) return;
-    const pane = model.focusedPane();
-    pane.copy_failed = false;
-    const text = (pane.session.selectionText(pane.session.gpa) catch {
-        // Serialization failed with a selection ACTIVE: keep the
-        // selection for a retry and say so in the status — a copy that
-        // silently does nothing would leave the user pasting stale
-        // clipboard content.
-        pane.copy_failed = true;
-        pane.copied_bytes = 0;
-        return;
-    }) orelse {
-        // No emulator range while the MODEL still holds an anchor: a
-        // prior selection re-pin failed and cleared the highlight (see
-        // `applySelection`), so this copy has nothing to serialize —
-        // that is a failed copy, not a quiet no-op.
-        if (pane.session.selectionActive()) {
+    const terminal_ref = model.focusedTerminalRef() orelse return;
+    if (model.provider.terminal(terminal_ref)) |pane| {
+        pane.copy_failed = false;
+        const text = (pane.session.selectionText(pane.session.gpa) catch {
             pane.copy_failed = true;
             pane.copied_bytes = 0;
-        }
+            return;
+        }) orelse {
+            if (pane.session.selectionActive()) {
+                pane.copy_failed = true;
+                pane.copied_bytes = 0;
+            }
+            return;
+        };
+        defer pane.session.gpa.free(text);
+        pane.copied_bytes = text.len;
+        model.copy_inflight = true;
+        model.copy_owner = replicaOwnerForPane(pane);
+        fx.writeClipboard(.{
+            .key = clipboard_key,
+            .text = text,
+            .on_result = Fx.clipboardMsg(.clipboard),
+        });
+        return;
+    }
+
+    const state = model.remoteUi(terminal_ref) orelse return;
+    state.copy_failed = false;
+    const remote = model.phux() orelse return;
+    const text = remote.selectionText(state.owner, std.heap.page_allocator) catch {
+        state.copy_failed = true;
+        state.copied_bytes = 0;
         return;
     };
-    defer pane.session.gpa.free(text);
-    pane.copied_bytes = text.len;
+    defer std.heap.page_allocator.free(text);
+    state.copied_bytes = text.len;
     model.copy_inflight = true;
-    // Remember whose selection is riding the clipboard: the result may
-    // land after focus moved to the other pane.
-    model.copy_owner = pane.id;
-    model.copy_owner_generation = pane.session_generation;
+    model.copy_owner = state.owner;
     fx.writeClipboard(.{
         .key = clipboard_key,
         .text = text,
         .on_result = Fx.clipboardMsg(.clipboard),
     });
-    // The selection stays armed until the clipboard CONFIRMS: clearing
-    // it now would leave a failed write nothing to retry — the promised
-    // keep-on-failure needs the selection still standing when the
-    // result lands (the `.clipboard` arm clears it on success).
 }
 
 fn requestPaste(model: *Model, fx: *Fx) void {
-    // One read in flight: the fixed paste key remains occupied until its
-    // result is delivered. A repeated Cmd+V is consumed but cannot issue
-    // a duplicate request that would only be rejected.
     if (model.paste_inflight) return;
-    const pane = model.focusedPane();
-    model.paste_owner = pane.id;
-    model.paste_owner_generation = pane.session_generation;
+    const terminal_ref = model.focusedTerminalRef() orelse return;
+    model.paste_owner = model.terminalOwner(terminal_ref) orelse return;
     model.paste_failed = false;
-    if (!pane.acceptsInput()) {
-        model.paste_failed = true;
-        return;
+    if (model.provider.terminal(terminal_ref)) |pane| {
+        if (!pane.acceptsInput()) {
+            model.paste_failed = true;
+            return;
+        }
+    } else {
+        const presentation = model.remotePresentation(terminal_ref) orelse {
+            model.paste_failed = true;
+            return;
+        };
+        if (presentation.phase != .live) {
+            model.paste_failed = true;
+            return;
+        }
     }
     model.paste_inflight = true;
     fx.readClipboard(.{
@@ -1346,16 +1974,15 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
             model.consumed_shortcut_keys_held &= ~shortcut_mask;
             return;
         }
-        const pane = switch (takeHeldTerminalKeyOwner(model, event.key)) {
-            .pane => |owner| owner,
+        const owner = switch (takeHeldTerminalKeyOwner(model, event.key)) {
+            .owner => |value| value,
             .consume => return,
             .none => blk: {
-                if (model.selectedTerminalId() == null) return;
-                break :blk model.terminalAt(model.focus_placement) orelse return;
+                const terminal_ref = model.focusedTerminalRef() orelse return;
+                break :blk model.terminalOwner(terminal_ref) orelse return;
             },
         };
-        if (pane.selecting or !pane.acceptsInput()) return;
-        encodeKeyEvent(pane, fx, event, .release);
+        dispatchKeyEvent(model, fx, owner, event, .release);
         return;
     }
 
@@ -1410,11 +2037,15 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // must never leak into whichever terminal happened to be focused last.
     if (model.selectedTerminalId() == null) return;
 
-    // Keyboard input belongs to the active terminal tab.
-    const pane = model.terminalAt(model.focus_placement) orelse return;
-    const session = pane.session;
+    const terminal_ref = model.focusedTerminalRef() orelse return;
+    if (providerKind(terminal_ref) == .phux) {
+        handleRemoteKey(model, fx, terminal_ref, event);
+        return;
+    }
 
-    // App chords first: pane focus, selection mode, copy/paste,
+    // Keyboard input belongs to the active terminal tab.
+    const pane = model.provider.terminal(terminal_ref) orelse return;
+    const session = pane.session;
     // scrollback, restart.
     //
     if (primary and mods.shift and keyIs(event.key, "space")) {
@@ -1502,8 +2133,221 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // through the emulator (application cursor-key mode, kitty
     // protocol, and modifier encodings all honored); plain printable
     // presses arrive through `.text` instead and are ignored here.
-    rememberHeldTerminalKey(model, pane, event.key);
+    rememberHeldTerminalKey(model, replicaOwnerForPane(pane), event.key);
     encodeKeyEvent(pane, fx, event, .press);
+}
+
+fn providerModifiers(event: canvas.WidgetKeyboardEvent) ModifierMask {
+    return .{
+        .shift = event.modifiers.shift,
+        .control = event.modifiers.control,
+        .alt = event.modifiers.alt,
+        .super = event.modifiers.super and !event.modifiers.control,
+    };
+}
+
+fn physicalKeyForEvent(event: canvas.WidgetKeyboardEvent) PhysicalKey {
+    const key = event.key;
+    if (key.len == 1) {
+        const byte = std.ascii.toLower(key[0]);
+        if (byte >= 'a' and byte <= 'z') return @enumFromInt(20 + byte - 'a');
+        if (byte >= '0' and byte <= '9') return @enumFromInt(6 + byte - '0');
+        const value: u32 = switch (byte) {
+            '`' => 1,
+            '\\' => 2,
+            '[' => 3,
+            ']' => 4,
+            ',' => 5,
+            '=' => 16,
+            '-' => 46,
+            '.' => 47,
+            '\'' => 48,
+            ';' => 49,
+            '/' => 50,
+            ' ' => 63,
+            else => 0,
+        };
+        return @enumFromInt(value);
+    }
+    const value: u32 =
+        if (keyIs(key, "alt") or keyIs(key, "option")) 51 else if (keyIs(key, "capslock")) 54 else if (keyIs(key, "control") or keyIs(key, "ctrl")) 56 else if (keyIs(key, "meta") or keyIs(key, "command")) 59 else if (keyIs(key, "shift")) 61 else if (keyIs(key, "backspace")) 53 else if (keyIs(key, "enter")) 58 else if (keyIs(key, "tab")) 64 else if (keyIs(key, "delete")) 68 else if (keyIs(key, "end")) 69 else if (keyIs(key, "home")) 71 else if (keyIs(key, "insert")) 72 else if (keyIs(key, "pagedown")) 73 else if (keyIs(key, "pageup")) 74 else if (keyIs(key, "arrowdown")) 75 else if (keyIs(key, "arrowleft")) 76 else if (keyIs(key, "arrowright")) 77 else if (keyIs(key, "arrowup")) 78 else if (keyIs(key, "escape")) 120 else if (key.len >= 2 and (key[0] == 'f' or key[0] == 'F')) blk: {
+            const number = std.fmt.parseInt(u8, key[1..], 10) catch break :blk 0;
+            break :blk if (number >= 1 and number <= 25) 120 + number else 0;
+        } else 0;
+    return @enumFromInt(value);
+}
+
+fn dispatchKeyEvent(
+    model: *Model,
+    fx: *Fx,
+    owner: ReplicaOwner,
+    event: canvas.WidgetKeyboardEvent,
+    action: vt.input.KeyAction,
+) void {
+    if (!model.ownerIsCurrent(owner)) return;
+    if (model.provider.terminal(owner.terminal_ref)) |pane| {
+        if (pane.selecting or !pane.acceptsInput()) return;
+        encodeKeyEvent(pane, fx, event, action);
+        return;
+    }
+    const remote = model.phux() orelse return;
+    const physical = physicalKeyForEvent(event);
+    if (@intFromEnum(physical) == 0) return;
+    var input: KeyInput = .{
+        .action = switch (action) {
+            .release => .release,
+            .repeat => .repeat,
+            else => .press,
+        },
+        .physical = physical,
+        .modifiers = providerModifiers(event),
+    };
+    remote.sendKey(owner, &input) catch {};
+}
+
+fn sendRemoteFocus(model: *Model, terminal_ref: ?TerminalRef, focused: bool) void {
+    const ref = terminal_ref orelse return;
+    if (providerKind(ref) != .phux) return;
+    const owner = model.terminalOwner(ref) orelse return;
+    const remote = model.phux() orelse return;
+    remote.sendFocus(owner, focused) catch {};
+}
+
+fn beginRemoteSelection(model: *Model, terminal_ref: TerminalRef, state: *RemoteUiState) void {
+    const presentation = model.remotePresentation(terminal_ref) orelse return;
+    const cursor = presentation.grid.cursor orelse canvas.TerminalCursor{};
+    const remote = model.phux() orelse return;
+    const point: provider_contract.DocumentPoint = .{
+        .space = .viewport,
+        .row = @as(u32, cursor.y),
+        .column = cursor.x,
+    };
+    const start = remote.createAnchor(state.owner, point) catch return;
+    const end = remote.createAnchor(state.owner, point) catch {
+        remote.releaseAnchor(state.owner, start);
+        return;
+    };
+    remote.setSelection(state.owner, start, end, false) catch {
+        remote.releaseAnchor(state.owner, start);
+        remote.releaseAnchor(state.owner, end);
+        return;
+    };
+    state.selecting = true;
+    state.rectangle = false;
+    state.start_anchor = start.opaque_id;
+    state.end_anchor = end.opaque_id;
+    state.head_x = cursor.x;
+    state.head_y = cursor.y;
+}
+
+fn applyRemoteSelection(model: *Model, state: *RemoteUiState) void {
+    const remote = model.phux() orelse return;
+    const next = remote.createAnchor(state.owner, .{
+        .space = .viewport,
+        .row = state.head_y,
+        .column = state.head_x,
+    }) catch return;
+    remote.setSelection(
+        state.owner,
+        .{ .opaque_id = state.start_anchor },
+        next,
+        state.rectangle,
+    ) catch {
+        remote.releaseAnchor(state.owner, next);
+        return;
+    };
+    if (state.end_anchor != 0 and state.end_anchor != state.start_anchor)
+        remote.releaseAnchor(state.owner, .{ .opaque_id = state.end_anchor });
+    state.end_anchor = next.opaque_id;
+}
+
+fn moveRemoteSelection(model: *Model, terminal_ref: TerminalRef, state: *RemoteUiState, dx: i32, dy: i32) void {
+    const presentation = model.remotePresentation(terminal_ref) orelse return;
+    const max_x: i32 = @max(0, @as(i32, presentation.cols) - 1);
+    const max_y: i64 = @max(0, @as(i64, presentation.rows) - 1);
+    state.head_x = @intCast(std.math.clamp(@as(i32, state.head_x) + dx, 0, max_x));
+    state.head_y = @intCast(std.math.clamp(@as(i64, state.head_y) + dy, 0, max_y));
+    applyRemoteSelection(model, state);
+}
+
+fn clearRemoteSelection(model: *Model, state: *RemoteUiState) void {
+    const remote = model.phux() orelse return;
+    remote.clearSelection(state.owner) catch return;
+    if (state.start_anchor != 0)
+        remote.releaseAnchor(state.owner, .{ .opaque_id = state.start_anchor });
+    if (state.end_anchor != 0 and state.end_anchor != state.start_anchor)
+        remote.releaseAnchor(state.owner, .{ .opaque_id = state.end_anchor });
+    state.selecting = false;
+    state.rectangle = false;
+    state.start_anchor = 0;
+    state.end_anchor = 0;
+}
+
+fn handleRemoteKey(model: *Model, fx: *Fx, terminal_ref: TerminalRef, event: canvas.WidgetKeyboardEvent) void {
+    const state = model.remoteUi(terminal_ref) orelse return;
+    const mods = event.modifiers;
+    const primary = mods.hasCommandModifier();
+    const remote = model.phux() orelse return;
+
+    if (primary and mods.shift and keyIs(event.key, "space")) {
+        latchAppShortcut(model, event.key);
+        if (state.selecting) clearRemoteSelection(model, state) else beginRemoteSelection(model, terminal_ref, state);
+        return;
+    }
+    if (primary and keyIs(event.key, "c") and state.selecting) {
+        latchAppShortcut(model, event.key);
+        copySelection(model, fx);
+        return;
+    }
+    if (primary and keyIs(event.key, "v")) {
+        latchAppShortcut(model, event.key);
+        requestPaste(model, fx);
+        return;
+    }
+    if (!state.selecting and primary) {
+        if (keyIs(event.key, "arrowup") or keyIs(event.key, "arrowdown")) {
+            latchAppShortcut(model, event.key);
+            const amount: i64 = if (mods.shift) @intCast((model.remotePresentation(terminal_ref) orelse return).rows) else 1;
+            remote.scrollViewport(state.owner, .{
+                .kind = .delta,
+                .value = if (keyIs(event.key, "arrowup")) -amount else amount,
+            }) catch {};
+            return;
+        }
+        if (keyIs(event.key, "home") or keyIs(event.key, "end")) {
+            latchAppShortcut(model, event.key);
+            remote.scrollViewport(state.owner, .{
+                .kind = if (keyIs(event.key, "home")) .top else .bottom,
+            }) catch {};
+            return;
+        }
+    }
+    if (state.selecting) {
+        if (keyIs(event.key, "escape")) {
+            latchAppShortcut(model, event.key);
+            clearRemoteSelection(model, state);
+            return;
+        }
+        if (keyIs(event.key, "b")) {
+            state.rectangle = !state.rectangle;
+            applyRemoteSelection(model, state);
+            return;
+        }
+        if (keyIs(event.key, "enter")) {
+            latchAppShortcut(model, event.key);
+            copySelection(model, fx);
+            return;
+        }
+        if (keyIs(event.key, "arrowleft")) return moveRemoteSelection(model, terminal_ref, state, -1, 0);
+        if (keyIs(event.key, "arrowright")) return moveRemoteSelection(model, terminal_ref, state, 1, 0);
+        if (keyIs(event.key, "arrowup")) return moveRemoteSelection(model, terminal_ref, state, 0, -1);
+        if (keyIs(event.key, "arrowdown")) return moveRemoteSelection(model, terminal_ref, state, 0, 1);
+        return;
+    }
+    const presentation = model.remotePresentation(terminal_ref) orelse return;
+    if (presentation.phase != .live) return;
+    rememberHeldTerminalKey(model, state.owner, event.key);
+    dispatchKeyEvent(model, fx, state.owner, event, .press);
 }
 
 fn terminalKeyFingerprint(key: []const u8) u64 {
@@ -1515,7 +2359,7 @@ fn terminalKeyFingerprint(key: []const u8) u64 {
     return if (fingerprint == 0) 1 else fingerprint;
 }
 
-fn rememberHeldTerminalKey(model: *Model, pane: *const Pane, key: []const u8) void {
+fn rememberHeldTerminalKey(model: *Model, owner: ReplicaOwner, key: []const u8) void {
     const fingerprint = terminalKeyFingerprint(key);
     var target: usize = @intCast(fingerprint % max_held_terminal_keys);
     for (&model.held_terminal_keys, 0..) |*held, index| {
@@ -1527,26 +2371,24 @@ fn rememberHeldTerminalKey(model: *Model, pane: *const Pane, key: []const u8) vo
     }
     model.held_terminal_keys[target] = .{
         .fingerprint = fingerprint,
-        .terminal_id = pane.id,
-        .generation = pane.session_generation,
+        .owner = owner,
     };
 }
 
 const HeldTerminalKeyOwner = union(enum) {
     none,
     consume,
-    pane: *Pane,
+    owner: ReplicaOwner,
 };
 
 fn takeHeldTerminalKeyOwner(model: *Model, key: []const u8) HeldTerminalKeyOwner {
     const fingerprint = terminalKeyFingerprint(key);
     for (&model.held_terminal_keys) |*held| {
         if (held.fingerprint != fingerprint) continue;
-        const owner = held.*;
+        const owner = held.owner;
         held.* = .{};
-        const pane = model.provider.terminal(owner.terminal_id) orelse return .consume;
-        if (pane.session_generation != owner.generation) return .consume;
-        return .{ .pane = pane };
+        if (!model.ownerIsCurrent(owner)) return .consume;
+        return .{ .owner = owner };
     }
     return .none;
 }
@@ -1879,18 +2721,25 @@ fn placementAt(index: usize) Placement {
     return Placement.fromIndex(index) orelse unreachable;
 }
 
-fn terminalPaintIndex(id: TerminalId) usize {
-    return switch (id) {
-        .terminal_1 => 0,
-        .terminal_2 => 1,
-        else => @intCast(@intFromEnum(id) % pane_count),
-    };
+fn terminalPaintIndex(terminal_ref: TerminalRef) usize {
+    if (provider_contract.localId(terminal_ref)) |id| {
+        return switch (id) {
+            .terminal_1 => 0,
+            .terminal_2 => 1,
+            else => @intCast(@intFromEnum(id) % pane_count),
+        };
+    }
+    return @intCast(0x0000_8000_0000_0000 | (terminal_ref.hash() & 0x0000_7fff_ffff_ffff));
 }
 
 fn paneLifecycleText(ui: *TerminalUi, pane: *const Pane) []const u8 {
     return switch (pane.phase) {
         .starting => "STARTING",
+        .attaching => "ATTACHING",
         .live => "RUNNING",
+        .reconnecting => "RECONNECTING",
+        .tombstoned => "REMOVED",
+        .frozen => "FROZEN",
         .ended => switch (pane.exit_reason) {
             .exited => ui.fmt("EXIT {d}", .{pane.exit_code}),
             .signaled => ui.fmt("SIGNAL {d}", .{pane.exit_signal}),
@@ -1905,6 +2754,19 @@ fn paneLifecycleText(ui: *TerminalUi, pane: *const Pane) []const u8 {
     };
 }
 
+fn remoteLifecycleText(phase: Phase) []const u8 {
+    return switch (phase) {
+        .starting => "STARTING",
+        .attaching => "ATTACHING",
+        .live => "RUNNING",
+        .reconnecting => "RECONNECTING",
+        .tombstoned => "REMOVED",
+        .frozen => "FROZEN",
+        .ended => "ENDED",
+        .failed => "FAILED",
+    };
+}
+
 fn paneLifecycleFailed(pane: *const Pane) bool {
     return pane.phase == .failed or
         (pane.phase == .ended and (pane.exit_reason != .exited or pane.exit_code != 0));
@@ -1915,7 +2777,7 @@ fn paneHasConfirmedLoss(pane: *const Pane) bool {
 }
 
 fn paneNeedsAttention(model: *const Model, pane: *const Pane) bool {
-    const paste_failed = model.paste_owner == pane.id and model.paste_failed;
+    const paste_failed = model.paste_owner.terminal_ref.eql(pane.id) and model.paste_failed;
     return pane.phase == .ended or pane.phase == .failed or paneHasConfirmedLoss(pane) or
         pane.write_refusals > 0 or pane.native_delivery_failures > 0 or pane.copy_failed or paste_failed;
 }
@@ -1925,15 +2787,45 @@ fn emptyStatusNode(ui: *TerminalUi) TerminalUi.Node {
 }
 
 fn paneStatus(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Node {
-    const pane = model.terminalAtConst(placementAt(index)) orelse return ui.el(.badge, .{
+    const terminal_ref = model.attachments[placementAt(index).index()] orelse return ui.el(.badge, .{
         .size = .sm,
         .variant = .secondary,
         .text = if (index == 0) "TERMINAL 1 / DETACHED" else "TERMINAL 2 / DETACHED",
     }, .{});
+    if (providerKind(terminal_ref) == .phux) {
+        const presentation = model.remotePresentation(terminal_ref) orelse return ui.el(.badge, .{
+            .size = .sm,
+            .variant = .secondary,
+            .text = "PHUX / FROZEN",
+        }, .{});
+        const state = model.remoteUiConst(terminal_ref);
+        const activity = if (state != null and state.?.selecting)
+            ui.el(.badge, .{ .size = .sm, .variant = .secondary, .text = "SELECTING" }, .{})
+        else if (model.paste_owner.terminal_ref.eql(terminal_ref) and model.paste_inflight)
+            ui.el(.badge, .{ .size = .sm, .variant = .secondary, .text = "PASTING" }, .{})
+        else if (model.copy_inflight and model.copy_owner.terminal_ref.eql(terminal_ref))
+            ui.el(.badge, .{ .size = .sm, .variant = .secondary, .text = "COPYING" }, .{})
+        else
+            emptyStatusNode(ui);
+        return ui.row(.{ .gap = 4, .cross = .center }, .{
+            ui.text(.{
+                .style_tokens = .{ .foreground = .text_muted },
+                .semantics = .{ .label = ui.fmt("Phux terminal {s}, {s}", .{
+                    presentation.title,
+                    remoteLifecycleText(presentation.phase),
+                }) },
+            }, ui.fmt("{s} / {s}", .{
+                if (presentation.title.len == 0) "PHUX" else presentation.title,
+                remoteLifecycleText(presentation.phase),
+            })),
+            activity,
+        });
+    }
+    const pane = model.provider.terminalConst(terminal_ref) orelse unreachable;
     const lifecycle = paneLifecycleText(ui, pane);
     const title = if (index == 0) "TERMINAL 1" else "TERMINAL 2";
     const lifecycle_failed = paneLifecycleFailed(pane);
-    const paste_failed = model.paste_owner == pane.id and model.paste_failed;
+    const paste_failed = model.paste_owner.terminal_ref.eql(pane.id) and model.paste_failed;
     const lifecycle_semantics = ui.fmt(
         "{s} / {s}; OUTBOUND LOSS {d}B; REPLY LOSS {d}B; INPUT STALLED {d}; DELIVERY FAILURES {d}; {s}; {s}",
         .{
@@ -1973,9 +2865,9 @@ fn paneStatus(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Nod
         emptyStatusNode(ui);
     const activity = if (pane.selecting)
         ui.el(.badge, .{ .size = .sm, .variant = .secondary, .text = "SELECTING" }, .{})
-    else if (model.paste_owner == pane.id and model.paste_inflight)
+    else if (model.paste_owner.terminal_ref.eql(pane.id) and model.paste_inflight)
         ui.el(.badge, .{ .size = .sm, .variant = .secondary, .text = "PASTING" }, .{})
-    else if (model.copy_inflight and model.copy_owner == pane.id)
+    else if (model.copy_inflight and model.copy_owner.terminal_ref.eql(pane.id))
         ui.el(.badge, .{ .size = .sm, .variant = .secondary, .text = "COPYING" }, .{})
     else if (pane.copied_bytes > 0)
         ui.el(.badge, .{ .size = .sm, .variant = .secondary, .text = ui.fmt("COPIED {d}B", .{pane.copied_bytes}) }, .{})
@@ -1999,15 +2891,27 @@ fn paneStatus(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Nod
 
 fn tabTrigger(ui: *TerminalUi, model: *const Model, tab: Tab, shortcut: []const u8) TerminalUi.Node {
     const selected = model.selected_tab == tab.id;
+    const terminal_ref: ?TerminalRef = switch (tab.surface) {
+        .terminal => |placement| model.attachments[placement.index()],
+        .web => null,
+    };
     const pane = switch (tab.surface) {
         .terminal => |placement| model.terminalAtConst(placement),
         .web => null,
     };
     const detached = switch (tab.surface) {
-        .terminal => |placement| model.terminalAtConst(placement) == null,
+        .terminal => terminal_ref == null,
         .web => false,
     };
-    const attention = if (pane) |terminal| paneNeedsAttention(model, terminal) else false;
+    const attention = if (pane) |terminal|
+        paneNeedsAttention(model, terminal)
+    else if (terminal_ref) |ref|
+        if (model.remotePresentation(ref)) |presentation|
+            presentation.phase == .failed or presentation.phase == .tombstoned
+        else
+            true
+    else
+        false;
     const text = if (detached)
         ui.fmt("{s} DETACHED  {s}", .{ tab.title, shortcut })
     else if (attention)
@@ -2031,7 +2935,7 @@ fn tabTrigger(ui: *TerminalUi, model: *const Model, tab: Tab, shortcut: []const 
             terminal.write_refusals,
             terminal.native_delivery_failures,
             if (terminal.copy_failed) "failed" else "ok",
-            if (model.paste_owner == terminal.id and model.paste_failed) "failed" else "ok",
+            if (model.paste_owner.terminal_ref.eql(terminal.id) and model.paste_failed) "failed" else "ok",
             shortcut,
             if (selected) ", selected" else "",
         })
@@ -2053,13 +2957,18 @@ fn tabTrigger(ui: *TerminalUi, model: *const Model, tab: Tab, shortcut: []const 
 
 fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Node {
     const placement = placementAt(index);
-    const pane = model.terminalAtConst(placement) orelse return ui.el(.stack, .{
+    const terminal_ref = model.attachments[placement.index()] orelse return ui.el(.stack, .{
         .global_key = .{ .index = index },
         .grow = 1,
         .min_width = split_pane_min_width,
         .semantics = .{ .role = .group, .label = "Detached terminal placement" },
     }, .{});
-    const screen = pane.session.screenText();
+    const screen = if (model.provider.terminalConst(terminal_ref)) |pane|
+        pane.session.screenText()
+    else if (model.remotePresentation(terminal_ref)) |presentation|
+        presentation.grid.screen_text
+    else
+        "";
     return ui.el(.stack, .{
         .global_key = .{ .index = index },
         .grow = 1,
@@ -2181,24 +3090,42 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
     for (frames, 0..) |frame, index| {
         if (frame.width <= 0 or frame.height <= 0) continue;
         const placement = placementAt(index);
-        const pane = model.terminalAtConst(placement) orelse continue;
+        const terminal_ref = model.attachments[placement.index()] orelse continue;
         const first_of_split = split and painted == 0;
-        try grid.paint(pane.session, builder, .{
-            .frame = frame,
-            .background_frame = if (painted == 0)
-                geometry.RectF.init(0, 0, size.width, size.height)
-            else
-                frame,
-            .tokens = tokens,
-            .running = pane.phase == .live or pane.phase == .starting,
-            .focused = model.focused and model.focus_placement == placement,
-            .selecting = pane.selecting,
-            .command_budget = if (first_of_split) chrome_command_envelope / 2 else chrome_command_envelope,
-            .text_reserve = canvas.terminal_grid.widget_text_reserve + if (first_of_split) text_share else 0,
-            .glyph_budget = if (split) canvas.terminal_grid.widget_glyph_budget / 2 else canvas.terminal_grid.widget_glyph_budget,
-            .path_reserve = canvas.terminal_grid.widget_path_reserve + if (first_of_split) path_share else 0,
-            .id_base = grid.paneIdBase(terminalPaintIndex(pane.id)),
-        });
+        const background_frame = if (painted == 0)
+            geometry.RectF.init(0, 0, size.width, size.height)
+        else
+            frame;
+        if (model.provider.terminalConst(terminal_ref)) |pane| {
+            try grid.paint(pane.session, builder, .{
+                .frame = frame,
+                .background_frame = background_frame,
+                .tokens = tokens,
+                .running = pane.phase == .live or pane.phase == .starting,
+                .focused = model.focused and model.focus_placement == placement,
+                .selecting = pane.selecting,
+                .command_budget = if (first_of_split) chrome_command_envelope / 2 else chrome_command_envelope,
+                .text_reserve = canvas.terminal_grid.widget_text_reserve + if (first_of_split) text_share else 0,
+                .glyph_budget = if (split) canvas.terminal_grid.widget_glyph_budget / 2 else canvas.terminal_grid.widget_glyph_budget,
+                .path_reserve = canvas.terminal_grid.widget_path_reserve + if (first_of_split) path_share else 0,
+                .id_base = grid.paneIdBase(terminalPaintIndex(terminal_ref)),
+            });
+        } else {
+            const presentation = model.remotePresentation(terminal_ref) orelse continue;
+            try grid.paintTerminalGrid(presentation.grid, builder, .{
+                .frame = frame,
+                .background_frame = background_frame,
+                .tokens = tokens,
+                .running = presentation.phase == .live,
+                .focused = model.focused and model.focus_placement == placement,
+                .selecting = if (model.remoteUiConst(terminal_ref)) |state| state.selecting else false,
+                .command_budget = if (first_of_split) chrome_command_envelope / 2 else chrome_command_envelope,
+                .text_reserve = canvas.terminal_grid.widget_text_reserve + if (first_of_split) text_share else 0,
+                .glyph_budget = if (split) canvas.terminal_grid.widget_glyph_budget / 2 else canvas.terminal_grid.widget_glyph_budget,
+                .path_reserve = canvas.terminal_grid.widget_path_reserve + if (first_of_split) path_share else 0,
+                .id_base = grid.paneIdBase(terminalPaintIndex(terminal_ref)),
+            });
+        }
         painted += 1;
     }
 }
@@ -2257,17 +3184,35 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
         for (frames, 0..) |inner, index| {
             if (inner.width <= 0 or inner.height <= 0) continue;
             const placement = placementAt(index);
-            const pane = model.terminalAtConst(placement) orelse continue;
-            const session = pane.session;
-            if (session.cell_width <= 0 or session.cell_height <= 0) return if (pending) .flush_outbound else null;
+            const terminal_ref = model.attachments[placement.index()] orelse continue;
+            if (model.provider.terminalConst(terminal_ref)) |pane| {
+                const session = pane.session;
+                if (session.cell_width <= 0 or session.cell_height <= 0) return if (pending) .flush_outbound else null;
+                const proposed = grid.Session.clampGrid(
+                    @intFromFloat(@max(2, inner.width / session.cell_width)),
+                    @intFromFloat(@max(2, inner.height / session.cell_height)),
+                    if (model.layout == .split) grid.max_cells / pane_count else grid.max_cells,
+                );
+                if (proposed.x != pane.cols or proposed.y != pane.rows) {
+                    return .{ .viewport = .{
+                        .terminal_ref = terminal_ref,
+                        .cols = proposed.x,
+                        .rows = proposed.y,
+                        .size = frame.size,
+                    } };
+                }
+                continue;
+            }
+            const presentation = model.remotePresentation(terminal_ref) orelse continue;
+            const metrics = canvas.terminalCellMetrics(cockpitTokens(model));
             const proposed = grid.Session.clampGrid(
-                @intFromFloat(@max(2, inner.width / session.cell_width)),
-                @intFromFloat(@max(2, inner.height / session.cell_height)),
+                @intFromFloat(@max(2, inner.width / metrics.width)),
+                @intFromFloat(@max(2, inner.height / metrics.height)),
                 if (model.layout == .split) grid.max_cells / pane_count else grid.max_cells,
             );
-            if (proposed.x != pane.cols or proposed.y != pane.rows) {
+            if (proposed.x != presentation.cols or proposed.y != presentation.rows) {
                 return .{ .viewport = .{
-                    .terminal_id = pane.id,
+                    .terminal_ref = terminal_ref,
                     .cols = proposed.x,
                     .rows = proposed.y,
                     .size = frame.size,
@@ -2325,6 +3270,7 @@ pub fn appOptions() TerminalApp.Options {
         .on_lifecycle = onLifecycle,
         .on_frame = onFrame,
         .web_panes = webPanes,
+
         .on_command = onCommand,
         .chrome = .{
             .prefix_commands = chrome_command_envelope,
@@ -2333,20 +3279,42 @@ pub fn appOptions() TerminalApp.Options {
         },
     };
 }
+fn createConfiguredPhuxProvider(init: std.process.Init) !?*PhuxProvider {
+    if (comptime !phux_enabled) return null;
+
+    var socket_storage: [std.fs.max_path_bytes]u8 = undefined;
+    const socket_path = init.environ_map.get("PHUX_SOCKET") orelse blk: {
+        if (init.environ_map.get("XDG_RUNTIME_DIR")) |runtime_dir| {
+            break :blk try std.fmt.bufPrint(&socket_storage, "{s}/phux/phux.sock", .{runtime_dir});
+        }
+        const uid_segment = init.environ_map.get("UID") orelse
+            init.environ_map.get("USER") orelse
+            "default";
+        break :blk try std.fmt.bufPrint(&socket_storage, "/tmp/phux-{s}/phux.sock", .{uid_segment});
+    };
+    const session = init.environ_map.get("PHUX_SESSION") orelse "default";
+    return try PhuxProvider.create(
+        std.heap.page_allocator,
+        init.io,
+        .{ .unix = socket_path },
+        session,
+        "phux-cockpit",
+    );
+}
 
 pub fn main(init: std.process.Init) !void {
     var sessions: [pane_count]*grid.Session = undefined;
     var created: usize = 0;
     // The deferred expression runs at scope exit and reads `created`
-    // THEN, so a partial run (one session made, the next failing) frees
-    // exactly what exists — no double free, no leak.
+    // then, so a partial run frees exactly the sessions that exist.
     defer for (sessions[0..created]) |session| session.destroy();
     while (created < pane_count) : (created += 1) {
         sessions[created] = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
     }
-    const model = initialModel(sessions);
+    const remote_provider = try createConfiguredPhuxProvider(init);
+    var model = initialModelWithPhux(sessions, remote_provider);
     created = 0;
-    defer model.provider.destroy();
+    defer deinitModel(&model);
     const app_state = try std.heap.page_allocator.create(CockpitHost);
     defer std.heap.page_allocator.destroy(app_state);
     app_state.init(std.heap.page_allocator, model, appOptions());
@@ -2361,12 +3329,28 @@ pub fn main(init: std.process.Init) !void {
         .shortcuts = &cockpit_shortcuts,
         .security = .{
             .permissions = &app_permissions,
+
             .navigation = .{
                 .allowed_origins = &web_origins,
                 .external_links = .{ .action = .deny },
             },
         },
     }, init);
+}
+test "remote focus replays after publication and generation changes" {
+    try std.testing.expect(remoteStateNeedsFocusReplay(true, 0, 0, false));
+    try std.testing.expect(remoteStateNeedsFocusReplay(false, 1, 0, false));
+    try std.testing.expect(remoteStateNeedsFocusReplay(false, 0, 1, false));
+    try std.testing.expect(remoteStateNeedsFocusReplay(false, 0, 0, true));
+    try std.testing.expect(!remoteStateNeedsFocusReplay(false, 0, 0, false));
+}
+test "AppKit pointer buttons map to provider mouse buttons" {
+    try std.testing.expectEqual(MouseButton.left, pointerButton(0));
+    try std.testing.expectEqual(MouseButton.right, pointerButton(1));
+    try std.testing.expectEqual(MouseButton.middle, pointerButton(2));
+    try std.testing.expectEqual(MouseButton.button_4, pointerButton(3));
+    try std.testing.expectEqual(MouseButton.button_5, pointerButton(4));
+    try std.testing.expectEqual(MouseButton.none, pointerButton(std.math.maxInt(u32)));
 }
 
 test {

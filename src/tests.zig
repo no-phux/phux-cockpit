@@ -465,7 +465,7 @@ test "typed terminal attachments reject duplicates and preserve provider-owned s
     var model = app.initialModel(sessions);
     defer app.deinitModel(&model);
 
-    const id = app.TerminalId.terminal_1;
+    const id = app.initialTerminalRef(0);
     const terminal = model.provider.terminal(id) orelse return error.TestExpectedTerminal;
     terminal.session.feed("durable state");
     try testing.expectError(error.TerminalAlreadyAttached, model.attach(.secondary, id));
@@ -481,6 +481,86 @@ test "typed terminal attachments reject duplicates and preserve provider-owned s
     try model.attach(.secondary, id);
     try testing.expectEqual(id, model.attachments[app.Placement.secondary.index()].?);
     try testing.expect(model.terminalAt(.secondary) == terminal);
+}
+
+fn remoteTerminalRef(id: u32) !app.TerminalRef {
+    return .{
+        .provider_id = .phux,
+        .terminal_id = .{ .phux = try app.RemoteTerminalId.fromPhux(0, id, "local") },
+    };
+}
+
+test "local and remote terminal identities never collide" {
+    const local = app.initialTerminalRef(0);
+    const remote = try remoteTerminalRef(@truncate(@intFromEnum(app.initialTerminalId(0))));
+    try testing.expect(!local.eql(remote));
+    try testing.expectEqual(app.ProviderKind.local, app.providerKind(local));
+    try testing.expectEqual(app.ProviderKind.phux, app.providerKind(remote));
+}
+
+test "two remote terminals occupy independent existing placements" {
+    const first = try remoteTerminalRef(11);
+    const second = try remoteTerminalRef(12);
+    var attachments: [app.pane_count]?app.TerminalRef = .{
+        app.initialTerminalRef(0),
+        app.initialTerminalRef(1),
+    };
+    app.reconcileRemoteRefs(&attachments, &.{ first, second });
+    try testing.expect(attachments[0].?.eql(first));
+    try testing.expect(attachments[1].?.eql(second));
+    try testing.expect(!attachments[0].?.eql(attachments[1].?));
+}
+
+test "remote enumeration reorder retains stable placement identity" {
+    const first = try remoteTerminalRef(21);
+    const second = try remoteTerminalRef(22);
+    var attachments: [app.pane_count]?app.TerminalRef = .{
+        app.initialTerminalRef(0),
+        app.initialTerminalRef(1),
+    };
+    app.reconcileRemoteRefs(&attachments, &.{ first, second });
+    const before = attachments;
+    app.reconcileRemoteRefs(&attachments, &.{ second, first });
+    try testing.expect(attachments[0].?.eql(before[0].?));
+    try testing.expect(attachments[1].?.eql(before[1].?));
+}
+
+test "provider dispatch refuses a provider-qualified remote identity at the local backend" {
+    const sessions = try createSessions(80, 24);
+    var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
+
+    const local = app.initialTerminalRef(0);
+    const remote = try remoteTerminalRef(1);
+    try testing.expect(model.containsTerminal(local));
+    try testing.expect(!model.containsTerminal(remote));
+    try testing.expect(model.terminalOwner(local) != null);
+    try testing.expect(model.terminalOwner(remote) == null);
+    _ = model.detach(.primary);
+    try testing.expectError(error.UnknownTerminal, model.attach(.primary, remote));
+}
+
+test "local terminals keep scrollback and selection state independent" {
+    const sessions = try createSessions(20, 4);
+    var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
+    const first = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+    const second = model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
+
+    for (0..20) |index| {
+        var line: [24]u8 = undefined;
+        first.session.feed(std.fmt.bufPrint(&line, "first {d}\r\n", .{index}) catch unreachable);
+        second.session.feed(std.fmt.bufPrint(&line, "second {d}\r\n", .{index}) catch unreachable);
+    }
+    const second_offset = second.session.scrollbar().offset;
+    first.session.scrollLines(-3);
+    try testing.expect(first.session.scrollbar().offset != second_offset);
+    try testing.expectEqual(second_offset, second.session.scrollbar().offset);
+
+    first.session.beginSelection(false);
+    first.session.moveSelection(1, -1, true);
+    try testing.expect(first.session.selectionActive());
+    try testing.expect(!second.session.selectionActive());
 }
 
 // ------------------------------------------------- record/replay pinned
@@ -1075,7 +1155,9 @@ test "Cmd+V reads the clipboard and normalizes plain-paste newlines" {
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.paste_inflight);
-    try testing.expectEqual(app.TerminalId.terminal_1, app_state.model.paste_owner);
+    try testing.expect(app_state.model.paste_owner.eql(
+        app_state.model.provider.owner(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminalOwner,
+    ));
     try testing.expect(app.paste_clipboard_key != app.clipboard_key);
     const request = app_state.effects.pendingClipboardAt(0) orelse return error.TestExpectedClipboardRead;
     try testing.expectEqual(app.paste_clipboard_key, request.key);
@@ -1772,7 +1854,7 @@ test "restart resets every per-session counter and exit field" {
     pane.outbound_len = 11;
     pane.outbound_dropped = 13;
     pane.session.response_bytes_dropped = 2;
-    app_state.model.paste_owner = .terminal_1;
+    app_state.model.paste_owner = app_state.model.provider.owner(pane.id) orelse return error.TestExpectedTerminalOwner;
     app_state.model.paste_failed = true;
     try testing.expect(pane.output_batches > 0);
     try testing.expect(pane.output_bytes > 0);
@@ -2494,18 +2576,18 @@ test "detached terminal stays live and moved input and resize follow identity" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const model = &app_state.model;
-    const terminal = model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const terminal = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const original_session = terminal.session;
 
     app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
-    try testing.expectEqual(@as(?app.TerminalId, null), model.attachments[app.Placement.primary.index()]);
+    try testing.expectEqual(@as(?app.TerminalRef, null), model.attachments[app.Placement.primary.index()]);
     try app_state.effects.feedPtyOutput(app.ptyKey(0), "DETACHED LIVE\r\n");
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
     try testing.expectEqual(app.Phase.live, terminal.phase);
     try testing.expect(std.mem.indexOf(u8, terminal.session.screenText(), "DETACHED LIVE") != null);
 
     app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_id = .terminal_1 } }, &app_state.effects);
+    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
     app.update(model, .{ .select_tab = .terminal_2 }, &app_state.effects);
     try testing.expect(model.terminalAt(.secondary).?.session == original_session);
 
@@ -2513,11 +2595,11 @@ test "detached terminal stays live and moved input and resize follow identity" {
     try testing.expect(std.mem.endsWith(u8, app_state.effects.ptyWrittenBytes(app.ptyKey(0)), "moved"));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 
-    const other = model.provider.terminal(.terminal_2) orelse return error.TestExpectedTerminal;
+    const other = model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
     const other_cols = other.cols;
     const other_rows = other.rows;
     app.update(model, .{ .viewport = .{
-        .terminal_id = .terminal_1,
+        .terminal_ref = app.initialTerminalRef(0),
         .cols = 61,
         .rows = 17,
         .size = geometry.SizeF.init(701, 411),
@@ -2539,10 +2621,12 @@ test "clipboard completion follows terminal identity across attachment moves" {
     const model = &app_state.model;
 
     try pressCanvasKey(harness, app_state.app(), "v", .{ .primary = true, .command = true });
-    try testing.expectEqual(app.TerminalId.terminal_1, model.paste_owner);
+    try testing.expect(model.paste_owner.eql(
+        model.provider.owner(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminalOwner,
+    ));
     app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
     app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_id = .terminal_1 } }, &app_state.effects);
+    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
     app.update(model, .{ .select_tab = .terminal_2 }, &app_state.effects);
 
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "identity paste");
@@ -2566,7 +2650,7 @@ test "attachment changes keep selected and focused placements routable" {
     try testing.expectEqual(app.Placement.secondary, model.focus_placement);
 
     app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    try testing.expectEqual(@as(?app.TerminalId, null), model.focusedTerminalId());
+    try testing.expectEqual(@as(?app.TerminalRef, null), model.focusedTerminalRef());
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
     try releaseCanvasKey(harness, app_state.app(), "f1", .{});
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
@@ -2585,7 +2669,7 @@ test "attachment changes keep selected and focused placements routable" {
     try testing.expect(saw_detached_semantics);
     try testing.expect(saw_disabled_split);
 
-    app.update(model, .{ .attach_terminal = .{ .placement = .primary, .terminal_id = .terminal_1 } }, &app_state.effects);
+    app.update(model, .{ .attach_terminal = .{ .placement = .primary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
     try testing.expectEqual(app.TabId.terminal_1, model.selected_tab);
     try testing.expectEqual(app.Placement.primary, model.focus_placement);
     try typeCanvasText(harness, app_state.app(), "reattached");
@@ -2601,7 +2685,7 @@ test "terminal key release follows its press across attachment focus changes" {
     defer gpa.destroy(app_state);
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
-    const pane = app_state.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = app_state.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.feed("\x1b[>11u");
 
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
@@ -2623,7 +2707,7 @@ test "terminal key release from an ended generation cannot reach its replacement
     defer gpa.destroy(app_state);
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
-    const pane = app_state.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const pane = app_state.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     pane.session.feed("\x1b[>11u");
 
     try pressCanvasKey(harness, app_state.app(), "f1", .{});

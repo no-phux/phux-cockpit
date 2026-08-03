@@ -1,0 +1,1136 @@
+//! Owning-thread adapter for the stable phux client C ABI.
+//!
+//! `PhuxClient` and every pointer borrowed from it remain on the UI thread.
+//! The socket worker only stages complete frames in `phux_transport.Bridge`.
+//! Borrowed C grids are translated directly into the reusable final
+//! `canvas.TerminalGrid` buffers; there is no second emulator or projection.
+
+const std = @import("std");
+const native_sdk = @import("native_sdk");
+const transport = @import("phux_transport");
+const provider = @import("provider_contract");
+const canvas = native_sdk.canvas;
+const c = @cImport({
+    @cInclude("phux/client.h");
+});
+
+pub const enabled = true;
+pub const max_terminals: usize = 16;
+pub const max_notices: usize = 64;
+pub const max_search_results: usize = 256;
+pub const max_title_bytes: usize = 4096;
+pub const max_notice_bytes: usize = 64 * 1024;
+pub const max_grid_utf8_bytes: usize = canvas.max_display_list_text_bytes;
+
+pub const State = enum { new, hello_queued, negotiated, attached, detached, failed };
+pub const SyncDelta = struct {
+    ready_published: bool = false,
+    generation_changed: bool = false,
+    added_count: usize = 0,
+    removed_count: usize = 0,
+};
+pub const DocumentSpace = provider.DocumentSpace;
+pub const DocumentPoint = provider.DocumentPoint;
+pub const Anchor = struct { opaque_id: u64 = 0 };
+pub const SearchResult = struct { start: Anchor, end: Anchor };
+pub const NoticeKind = enum { status, job };
+pub const Notice = struct {
+    kind: NoticeKind,
+    detail: u32,
+    status_code: u32,
+    terminal_ref: provider.TerminalRef,
+    generation: provider.Generation,
+    bytes: []u8,
+};
+pub const Error = error{
+    InvalidState,
+    InvalidIdentity,
+    Protocol,
+    Engine,
+    OutOfMemory,
+    Panic,
+    NoValue,
+};
+
+const RemoteId = provider.RemoteTerminalId;
+
+const CanvasStore = struct {
+    cells: std.ArrayListUnmanaged(canvas.TerminalCell) = .empty,
+    rows: std.ArrayListUnmanaged(canvas.TerminalRow) = .empty,
+    utf8: std.ArrayListUnmanaged(u8) = .empty,
+    screen_text: std.ArrayListUnmanaged(u8) = .empty,
+    cursor: ?canvas.TerminalCursor = null,
+    scrollbar: canvas.TerminalScrollbar = .{},
+    selection_active: bool = false,
+
+    fn deinit(store: *CanvasStore, gpa: std.mem.Allocator) void {
+        store.cells.deinit(gpa);
+        store.rows.deinit(gpa);
+        store.utf8.deinit(gpa);
+        store.screen_text.deinit(gpa);
+    }
+
+    fn reserve(store: *CanvasStore, gpa: std.mem.Allocator) !void {
+        try store.utf8.ensureTotalCapacity(gpa, max_grid_utf8_bytes);
+        try store.cells.ensureTotalCapacity(gpa, canvas.max_terminal_cells);
+        try store.rows.ensureTotalCapacity(gpa, canvas.max_terminal_rows);
+        try store.screen_text.ensureTotalCapacity(
+            gpa,
+            max_grid_utf8_bytes + canvas.max_terminal_rows,
+        );
+    }
+
+    fn copyBorrowed(store: *CanvasStore, gpa: std.mem.Allocator, view: *const c.PhuxTerminalGridView) !void {
+        const cols: usize = view.cols;
+        const rows: usize = view.rows;
+        if (cols > canvas.max_terminal_cols or rows > canvas.max_terminal_rows) return error.Protocol;
+        if (view.cell_count > canvas.max_terminal_cells or view.cell_count != cols * rows) return error.Protocol;
+        if (view.utf8.len > max_grid_utf8_bytes) return error.Protocol;
+        if (view.cell_count != 0 and view.cells == null) return error.Protocol;
+        if (view.utf8.len != 0 and view.utf8.data == null) return error.Protocol;
+        const source_cells: []const c.PhuxTerminalCell = if (view.cell_count == 0)
+            &.{}
+        else
+            view.cells[0..view.cell_count];
+        const source_utf8: []const u8 = if (view.utf8.len == 0) &.{} else view.utf8.data[0..view.utf8.len];
+        const screen_text_limit = max_grid_utf8_bytes + canvas.max_terminal_rows;
+        var screen_text_len: usize = if (rows == 0) 0 else rows - 1;
+        for (source_cells) |raw| {
+            const start: usize = raw.utf8_offset;
+            const len: usize = raw.utf8_len;
+            if (start > source_utf8.len or len > source_utf8.len - start) return error.Protocol;
+            const cluster = source_utf8[start .. start + len];
+            if (cluster.len != 0) {
+                _ = std.unicode.Utf8View.init(cluster) catch return error.Protocol;
+            }
+            if (screen_text_len > screen_text_limit or len > screen_text_limit - screen_text_len)
+                return error.Protocol;
+            screen_text_len += len;
+        }
+        if (screen_text_len > screen_text_limit) return error.Protocol;
+        try store.reserve(gpa);
+        store.utf8.items.len = view.utf8.len;
+        if (view.utf8.len != 0) @memcpy(store.utf8.items, view.utf8.data[0..view.utf8.len]);
+        store.cells.items.len = view.cell_count;
+        store.rows.items.len = rows;
+        store.screen_text.clearRetainingCapacity();
+        store.selection_active = false;
+
+        for (store.cells.items, 0..) |*cell, index| {
+            const raw = source_cells[index];
+            const start: usize = raw.utf8_offset;
+            const len: usize = raw.utf8_len;
+            if (start > store.utf8.items.len or len > store.utf8.items.len - start) return error.Protocol;
+            const cluster = store.utf8.items[start .. start + len];
+            const decoded: u21 = if (cluster.len == 0) 0 else firstCodepoint(cluster) catch return error.Protocol;
+            var fg = canvas.Color.rgb8(raw.foreground_r, raw.foreground_g, raw.foreground_b);
+            var bg = canvas.Color.rgb8(raw.background_r, raw.background_g, raw.background_b);
+            if (raw.flags & c.PHUX_CLIENT_CELL_INVERSE != 0) std.mem.swap(canvas.Color, &fg, &bg);
+            const invisible = raw.flags & c.PHUX_CLIENT_CELL_INVISIBLE != 0;
+            const cp: u21 = if (invisible) 0 else decoded;
+            cell.* = .{
+                .cp = cp,
+                .cluster = if (cp == 0 or canvas.terminal_box.isBoxDrawing(cp)) "" else cluster,
+                .fg = fg,
+                .bg = bg,
+                .underline = raw.underline != c.PHUX_UNDERLINE_NONE,
+                .wide = switch (raw.wide) {
+                    c.PHUX_CELL_WIDE => .wide,
+                    c.PHUX_CELL_SPACER_TAIL, c.PHUX_CELL_SPACER_HEAD => .spacer,
+                    else => .narrow,
+                },
+            };
+            store.selection_active = store.selection_active or raw.flags & c.PHUX_CLIENT_CELL_SELECTED != 0;
+        }
+
+        for (store.rows.items, 0..) |*row, row_index| {
+            const first = row_index * cols;
+            const last = first + cols;
+            row.* = .{ .cells = store.cells.items[first..last] };
+            var selected_first: ?u16 = null;
+            var selected_last: u16 = 0;
+            for (source_cells[first..last], 0..) |raw, col| {
+                if (raw.flags & c.PHUX_CLIENT_CELL_SELECTED != 0) {
+                    if (selected_first == null) selected_first = @intCast(col);
+                    selected_last = @intCast(col);
+                }
+                const start: usize = raw.utf8_offset;
+                const len: usize = raw.utf8_len;
+                store.screen_text.appendSliceAssumeCapacity(store.utf8.items[start .. start + len]);
+            }
+            if (selected_first) |first_selected| row.selection = .{ first_selected, selected_last };
+            if (row_index + 1 < rows) store.screen_text.appendAssumeCapacity('\n');
+        }
+
+        store.cursor = if (view.cursor_visible) .{
+            .x = view.cursor_col,
+            .y = view.cursor_row,
+            .shape = switch (view.cursor_style) {
+                c.PHUX_CURSOR_BAR => .bar,
+                c.PHUX_CURSOR_UNDERLINE => .underline,
+                else => .block,
+            },
+        } else null;
+        store.scrollbar = .{
+            .offset = saturatingU32(view.history_viewport_offset),
+            .len = saturatingU32(view.history_visible_rows),
+            .total = saturatingU32(view.history_total_rows),
+        };
+    }
+
+    fn grid(store: *const CanvasStore, running: bool) canvas.TerminalGrid {
+        return .{
+            .rows = store.rows.items,
+            .background = canvas.Color.rgb8(13, 17, 23),
+            .foreground = canvas.Color.rgb8(230, 237, 243),
+            .cursor_color = canvas.Color.rgb8(88, 166, 255),
+            .selection_color = canvas.Color.rgb8(56, 139, 253),
+            .cursor = store.cursor,
+            .running = running,
+            .scrollbar = store.scrollbar,
+            .screen_text = store.screen_text.items,
+            .selection_active = store.selection_active,
+        };
+    }
+};
+
+const Terminal = struct {
+    id: RemoteId,
+    generation: provider.Generation = .{},
+    phase: provider.Phase = .attaching,
+    dirty: bool = false,
+    seen_in_attach: bool = false,
+    remove_at_barrier: bool = false,
+    published: bool = false,
+    canvas: CanvasStore = .{},
+    title: std.ArrayListUnmanaged(u8) = .empty,
+    pending_title: std.ArrayListUnmanaged(u8) = .empty,
+    pending_title_set: bool = false,
+    cols: u16 = 0,
+    rows: u16 = 0,
+    history_total_rows: u64 = 0,
+    history_viewport_offset: u64 = 0,
+    history_visible_rows: u64 = 0,
+    history_loading: bool = false,
+    history_has_more: bool = false,
+    history_pages_loaded: u64 = 0,
+    history_unread_rows: u64 = 0,
+
+    fn deinit(terminal: *Terminal, gpa: std.mem.Allocator) void {
+        terminal.canvas.deinit(gpa);
+        terminal.title.deinit(gpa);
+        terminal.pending_title.deinit(gpa);
+    }
+
+    fn terminalRef(terminal: *const Terminal) provider.TerminalRef {
+        return phuxRef(terminal.id);
+    }
+
+    fn owner(terminal: *const Terminal) provider.ReplicaOwner {
+        return .{ .terminal_ref = terminal.terminalRef(), .generation = terminal.generation };
+    }
+
+    fn presentation(terminal: *const Terminal) ?provider.Presentation {
+        if (!terminal.published) return null;
+        return .{
+            .grid = terminal.canvas.grid(terminal.phase == .live),
+            .owner = terminal.owner(),
+            .phase = terminal.phase,
+            .title = terminal.title.items,
+            .cols = terminal.cols,
+            .rows = terminal.rows,
+            .history_total_rows = terminal.history_total_rows,
+            .history_viewport_offset = terminal.history_viewport_offset,
+            .history_visible_rows = terminal.history_visible_rows,
+            .history_loading = terminal.history_loading,
+            .history_has_more = terminal.history_has_more,
+            .history_pages_loaded = terminal.history_pages_loaded,
+            .history_unread_rows = terminal.history_unread_rows,
+        };
+    }
+};
+
+fn markGridDirty(terminal: *Terminal, attached: bool) void {
+    terminal.dirty = true;
+    terminal.seen_in_attach = true;
+    terminal.remove_at_barrier = false;
+    if (attached and terminal.published) terminal.phase = .frozen;
+}
+
+pub const Host = struct {
+    gpa: std.mem.Allocator,
+    client: *c.PhuxClient,
+    bridge: *transport.Bridge,
+    terminals: std.ArrayListUnmanaged(Terminal) = .empty,
+    search_results: std.ArrayListUnmanaged(SearchResult) = .empty,
+    search_owner: ?provider.ReplicaOwner = null,
+    notices: std.ArrayListUnmanaged(Notice) = .empty,
+    attach_barrier_seen: bool = false,
+
+    pub fn create(gpa: std.mem.Allocator, bridge: *transport.Bridge) !*Host {
+        const host = try gpa.create(Host);
+        errdefer gpa.destroy(host);
+        host.* = .{ .gpa = gpa, .client = try newClient(), .bridge = bridge };
+        return host;
+    }
+
+    pub fn destroy(host: *Host) void {
+        host.clearSearchResults(null);
+        for (host.terminals.items) |*terminal| terminal.deinit(host.gpa);
+        host.terminals.deinit(host.gpa);
+        for (host.notices.items) |notice| host.gpa.free(notice.bytes);
+        host.notices.deinit(host.gpa);
+        host.search_results.deinit(host.gpa);
+        c.phux_client_free(host.client);
+        host.gpa.destroy(host);
+    }
+
+    pub fn state(host: *const Host) State {
+        return switch (c.phux_client_state(host.client)) {
+            c.PHUX_CLIENT_STATE_NEW => .new,
+            c.PHUX_CLIENT_STATE_HELLO_QUEUED => .hello_queued,
+            c.PHUX_CLIENT_STATE_NEGOTIATED => .negotiated,
+            c.PHUX_CLIENT_STATE_ATTACHED => .attached,
+            c.PHUX_CLIENT_STATE_DETACHED => .detached,
+            else => .failed,
+        };
+    }
+
+    pub fn start(host: *Host, client_name: []const u8) !void {
+        try outboundSize(client_name.len);
+        try resultError(c.phux_client_queue_hello(host.client, bytes(client_name)));
+        try host.stageOutgoing();
+    }
+
+    pub fn attach(host: *Host, session: []const u8, viewport: provider.Viewport) !void {
+        try outboundSize(session.len);
+        const options: c.PhuxAttachOptions = .{
+            .size = @sizeOf(c.PhuxAttachOptions),
+            .version = c.PHUX_CLIENT_ABI_VERSION,
+            .attach_id = 1,
+            .target_kind = c.PHUX_ATTACH_CREATE_IF_MISSING,
+            .session_id = 0,
+            .name = bytes(session),
+            .cols = viewport.cols,
+            .rows = viewport.rows,
+            .has_pixel_size = viewport.pixels != null,
+            .pixel_width = if (viewport.pixels) |pixels| pixels.width else 0,
+            .pixel_height = if (viewport.pixels) |pixels| pixels.height else 0,
+            .request_scrollback = true,
+            .scrollback_limit_lines = 5000,
+        };
+        try resultError(c.phux_client_queue_attach(host.client, &options));
+        try host.stageOutgoing();
+    }
+
+    /// Replace only the owning-thread C client. Published canvases and terminal
+    /// ordering remain frozen until the replacement reaches its ATTACHED barrier.
+    pub fn reconnect(host: *Host, client_name: []const u8) !void {
+        host.freezePublished();
+        errdefer host.freezePublished();
+        const replacement = try newClient();
+        host.clearSearchResults(null);
+        c.phux_client_free(host.client);
+        host.client = replacement;
+        host.attach_barrier_seen = false;
+        for (host.terminals.items) |*terminal| {
+            terminal.phase = if (terminal.published) .reconnecting else .attaching;
+            terminal.seen_in_attach = false;
+            terminal.remove_at_barrier = false;
+            terminal.dirty = false;
+            terminal.pending_title.items.len = 0;
+            terminal.pending_title_set = false;
+        }
+        try host.start(client_name);
+    }
+
+    pub fn freezePublished(host: *Host) void {
+        for (host.terminals.items) |*terminal| {
+            if (terminal.published and terminal.phase != .ended and terminal.phase != .failed)
+                terminal.phase = .frozen;
+        }
+    }
+
+    /// UI-thread wake handler. The worker never calls the C client.
+    pub fn drainReadiness(host: *Host) !SyncDelta {
+        errdefer host.freezePublished();
+        var delta: SyncDelta = .{};
+        while (host.bridge.incoming.take()) |frame| {
+            defer host.bridge.incoming.release(frame);
+            try resultError(c.phux_client_feed_frame(host.client, frame.ptr, frame.len));
+        }
+        try host.captureEffects();
+        if (host.state() == .attached and !host.attach_barrier_seen) {
+            delta.removed_count += host.pruneRemoved(true);
+            host.attach_barrier_seen = true;
+            delta.ready_published = true;
+            try host.publishDirty(&delta);
+        } else if (host.attach_barrier_seen) {
+            delta.removed_count += host.pruneRemoved(false);
+            try host.publishDirty(&delta);
+        }
+        try host.stageOutgoing();
+        return delta;
+    }
+
+    pub fn terminalRefs(host: *const Host, out: []provider.TerminalRef) usize {
+        var count: usize = 0;
+        for (host.terminals.items) |*terminal| {
+            if (!terminal.published) continue;
+            if (count < out.len) out[count] = terminal.terminalRef();
+            count += 1;
+        }
+        return @min(count, out.len);
+    }
+
+    pub fn contains(host: *const Host, terminal_ref: provider.TerminalRef) bool {
+        const terminal = host.findTerminalConst(terminal_ref) orelse return false;
+        return terminal.published;
+    }
+
+    pub fn owner(host: *const Host, terminal_ref: provider.TerminalRef) ?provider.ReplicaOwner {
+        const terminal = host.findTerminalConst(terminal_ref) orelse return null;
+        if (!terminal.published) return null;
+        return terminal.owner();
+    }
+
+    pub fn ownerIsCurrent(host: *const Host, owner_value: provider.ReplicaOwner) bool {
+        const terminal = host.findTerminalConst(owner_value.terminal_ref) orelse return false;
+        return terminal.phase == .live and terminal.owner().eql(owner_value);
+    }
+
+    pub fn presentation(host: *const Host, terminal_ref: provider.TerminalRef) ?provider.Presentation {
+        const terminal = host.findTerminalConst(terminal_ref) orelse return null;
+        return terminal.presentation();
+    }
+
+    pub fn viewportResize(host: *Host, terminal_ref: provider.TerminalRef, viewport: provider.Viewport) !void {
+        const terminal = host.findTerminal(terminal_ref) orelse return error.InvalidState;
+        const id = try host.currentCId(terminal.owner());
+        try resultError(c.phux_client_terminal_resize(
+            host.client,
+            &id,
+            viewport.cols,
+            viewport.rows,
+        ));
+        try resultError(c.phux_client_viewport_resize(
+            host.client,
+            viewport.cols,
+            viewport.rows,
+            viewport.pixels != null,
+            if (viewport.pixels) |pixels| pixels.width else 0,
+            if (viewport.pixels) |pixels| pixels.height else 0,
+        ));
+        try host.stageOutgoing();
+        try host.capturePublishStage();
+    }
+
+    pub fn sendKey(host: *Host, owner_value: provider.ReplicaOwner, input: *const provider.KeyInput) !void {
+        const id = try host.currentCId(owner_value);
+        try outboundSize(input.text.len);
+        const event: c.PhuxKeyEvent = .{
+            .size = @sizeOf(c.PhuxKeyEvent),
+            .version = c.PHUX_CLIENT_ABI_VERSION,
+            .action = switch (input.action) {
+                .press => c.PHUX_KEY_PRESS,
+                .repeat => c.PHUX_KEY_REPEAT,
+                .release => c.PHUX_KEY_RELEASE,
+            },
+            .key = @intFromEnum(input.physical),
+            .modifiers = @bitCast(input.modifiers),
+            .consumed_modifiers = 0,
+            .composing = input.composing,
+            .has_text = input.text.len != 0,
+            .text = bytes(input.text),
+            .has_unshifted_codepoint = input.unshifted_codepoint != null,
+            .unshifted_codepoint = if (input.unshifted_codepoint) |cp| cp else 0,
+        };
+        try resultError(c.phux_client_send_key(host.client, &id, &event));
+        try host.stageOutgoing();
+    }
+
+    pub fn sendMouse(host: *Host, owner_value: provider.ReplicaOwner, input: *const provider.MouseInput) !void {
+        const id = try host.currentCId(owner_value);
+        const event: c.PhuxMouseEvent = .{
+            .size = @sizeOf(c.PhuxMouseEvent),
+            .version = c.PHUX_CLIENT_ABI_VERSION,
+            .action = switch (input.action) {
+                .press => c.PHUX_MOUSE_PRESS,
+                .release => c.PHUX_MOUSE_RELEASE,
+                .move => c.PHUX_MOUSE_MOTION,
+            },
+            .button = switch (input.button) {
+                .none => c.PHUX_MOUSE_BUTTON_UNKNOWN,
+                .left => c.PHUX_MOUSE_BUTTON_LEFT,
+                .right => c.PHUX_MOUSE_BUTTON_RIGHT,
+                .middle => c.PHUX_MOUSE_BUTTON_MIDDLE,
+                .button_4 => c.PHUX_MOUSE_BUTTON_FOUR,
+                .button_5 => c.PHUX_MOUSE_BUTTON_FIVE,
+                else => c.PHUX_MOUSE_BUTTON_UNKNOWN,
+            },
+            .modifiers = @bitCast(input.modifiers),
+            .x = input.x,
+            .y = input.y,
+        };
+        try resultError(c.phux_client_send_mouse(host.client, &id, &event));
+        try host.stageOutgoing();
+    }
+
+    pub fn mouseTracking(host: *const Host, owner_value: provider.ReplicaOwner) !bool {
+        const id = try host.currentCIdConst(owner_value);
+        var tracking = false;
+        try resultError(c.phux_client_terminal_mouse_tracking(host.client, &id, &tracking));
+        return tracking;
+    }
+
+    pub fn sendFocus(host: *Host, owner_value: provider.ReplicaOwner, focused: bool) !void {
+        const id = try host.currentCId(owner_value);
+        try resultError(c.phux_client_send_focus(host.client, &id, focused));
+        try host.stageOutgoing();
+    }
+
+    pub fn sendPaste(host: *Host, owner_value: provider.ReplicaOwner, payload: []const u8, trusted: bool) !void {
+        const id = try host.currentCId(owner_value);
+        try outboundSize(payload.len);
+        try resultError(c.phux_client_send_paste(host.client, &id, if (payload.len == 0) null else payload.ptr, payload.len, trusted));
+        try host.stageOutgoing();
+    }
+
+    pub fn scrollViewport(host: *Host, owner_value: provider.ReplicaOwner, scroll: provider.Scroll) !void {
+        const id = try host.currentCId(owner_value);
+        const kind: u32 = switch (scroll.kind) {
+            .top => c.PHUX_VIEWPORT_SCROLL_TOP,
+            .bottom => c.PHUX_VIEWPORT_SCROLL_BOTTOM,
+            .delta => c.PHUX_VIEWPORT_SCROLL_DELTA,
+        };
+        try resultError(c.phux_client_scroll_viewport(host.client, &id, kind, scroll.value));
+        try host.capturePublishStage();
+    }
+
+    pub fn createAnchor(host: *Host, owner_value: provider.ReplicaOwner, point: DocumentPoint) !Anchor {
+        const id = try host.currentCId(owner_value);
+        var anchor: c.PhuxDocumentAnchor = undefined;
+        const raw_point: c.PhuxDocumentPoint = .{
+            .space = @intFromEnum(point.space),
+            .row = point.row,
+            .column = point.column,
+            .reserved = 0,
+        };
+        try resultError(c.phux_client_anchor_create(host.client, &id, raw_point, &anchor));
+        return .{ .opaque_id = anchor.opaque_id };
+    }
+
+    pub fn releaseAnchor(host: *Host, owner_value: provider.ReplicaOwner, anchor: Anchor) void {
+        const id = host.currentCId(owner_value) catch return;
+        _ = c.phux_client_anchor_release(host.client, &id, toCAnchor(anchor));
+    }
+
+    pub fn setSelection(host: *Host, owner_value: provider.ReplicaOwner, start_anchor: Anchor, end_anchor: Anchor, rectangle: bool) !void {
+        const id = try host.currentCId(owner_value);
+        try resultError(c.phux_client_selection_set(host.client, &id, toCAnchor(start_anchor), toCAnchor(end_anchor), rectangle));
+        try host.capturePublishStage();
+    }
+
+    pub fn clearSelection(host: *Host, owner_value: provider.ReplicaOwner) !void {
+        const id = try host.currentCId(owner_value);
+        try resultError(c.phux_client_selection_clear(host.client, &id));
+        try host.capturePublishStage();
+    }
+
+    pub fn search(host: *Host, owner_value: provider.ReplicaOwner, query: []const u8, case_sensitive: bool) ![]const SearchResult {
+        const id = try host.currentCId(owner_value);
+        try outboundSize(query.len);
+        host.clearSearchResults(null);
+        var borrowed: [*c]const c.PhuxSearchResult = null;
+        var count: usize = 0;
+        try resultError(c.phux_client_search(host.client, &id, bytes(query), case_sensitive, &borrowed, &count));
+        if (count > max_search_results or (count != 0 and borrowed == null)) {
+            if (borrowed != null) releaseBorrowedSearch(host.client, &id, borrowed[0..count]);
+            return error.OutOfMemory;
+        }
+        host.search_results.ensureTotalCapacity(host.gpa, count) catch {
+            releaseBorrowedSearch(host.client, &id, if (count == 0) &.{} else borrowed[0..count]);
+            return error.OutOfMemory;
+        };
+        host.search_results.items.len = count;
+        for (host.search_results.items, 0..) |*result, index| {
+            result.* = .{
+                .start = .{ .opaque_id = borrowed[index].start.opaque_id },
+                .end = .{ .opaque_id = borrowed[index].end.opaque_id },
+            };
+        }
+        host.search_owner = owner_value;
+        try host.capturePublishStage();
+        return host.search_results.items;
+    }
+
+    /// `expected_owner` fences UI cleanup so an obsolete result cannot clear a
+    /// newer generation's search anchors.
+    pub fn clearSearchResults(host: *Host, expected_owner: ?provider.ReplicaOwner) void {
+        const stored_owner = host.search_owner orelse return;
+        if (expected_owner) |expected| if (!stored_owner.eql(expected)) return;
+        const id = cId(remoteFromRef(stored_owner.terminal_ref) orelse {
+            host.search_results.items.len = 0;
+            host.search_owner = null;
+            return;
+        });
+        for (host.search_results.items) |result| {
+            _ = c.phux_client_anchor_release(host.client, &id, toCAnchor(result.start));
+            if (result.end.opaque_id != result.start.opaque_id)
+                _ = c.phux_client_anchor_release(host.client, &id, toCAnchor(result.end));
+        }
+        host.search_results.items.len = 0;
+        host.search_owner = null;
+    }
+
+    pub fn selectionText(host: *Host, owner_value: provider.ReplicaOwner, gpa: std.mem.Allocator) ![]u8 {
+        const id = try host.currentCId(owner_value);
+        var text: c.PhuxBytes = undefined;
+        try resultError(c.phux_client_selection_text(host.client, &id, &text));
+        if (text.len != 0 and text.data == null) return error.Protocol;
+        return gpa.dupe(u8, if (text.len == 0) &.{} else text.data[0..text.len]);
+    }
+
+    pub fn takeNotice(host: *Host) ?Notice {
+        if (host.notices.items.len == 0) return null;
+        return host.notices.orderedRemove(0);
+    }
+
+    pub fn releaseNotice(host: *Host, notice: Notice) void {
+        host.gpa.free(notice.bytes);
+    }
+
+    fn capturePublishStage(host: *Host) !void {
+        errdefer host.freezePublished();
+        try host.captureEffects();
+        if (host.attach_barrier_seen) {
+            var ignored: SyncDelta = .{};
+            _ = host.pruneRemoved(false);
+            try host.publishDirty(&ignored);
+        }
+        try host.stageOutgoing();
+    }
+
+    fn captureEffects(host: *Host) !void {
+        const count = c.phux_client_effect_count(host.client);
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            var effect: c.PhuxClientEffect = undefined;
+            try resultError(c.phux_client_effect_get(host.client, index, &effect));
+            const generation: provider.Generation = .{
+                .stream_id = effect.stream_id,
+                .bootstrap_id = effect.bootstrap_id,
+                .last_seq = effect.seq,
+            };
+            switch (effect.kind) {
+                c.PHUX_CLIENT_EFFECT_DAMAGE => {
+                    const terminal = try host.ensureTerminal(effect.terminal_id);
+                    if (effect.detail == c.PHUX_CLIENT_DAMAGE_REMOVED) {
+                        terminal.phase = .tombstoned;
+                        terminal.remove_at_barrier = true;
+                    } else {
+                        markGridDirty(terminal, host.attach_barrier_seen);
+                    }
+                },
+                c.PHUX_CLIENT_EFFECT_STATUS => {
+                    if (effect.detail == c.PHUX_CLIENT_STATUS_TITLE) {
+                        const terminal = try host.ensureTerminal(effect.terminal_id);
+                        const payload = try effectSlice(effect.bytes);
+                        if (payload.len > max_title_bytes) return error.Protocol;
+                        const destination = if (host.attach_barrier_seen and terminal.published)
+                            &terminal.title
+                        else
+                            &terminal.pending_title;
+                        try destination.ensureTotalCapacity(host.gpa, payload.len);
+                        destination.items.len = payload.len;
+                        if (payload.len != 0) @memcpy(destination.items, payload);
+                        if (destination == &terminal.pending_title) terminal.pending_title_set = true;
+                    } else if (effect.detail == c.PHUX_CLIENT_STATUS_RESYNC_REQUIRED) {
+                        if (try host.findTerminalRaw(effect.terminal_id)) |terminal| {
+                            terminal.phase = .tombstoned;
+                        } else {
+                            for (host.terminals.items) |*terminal| terminal.phase = .tombstoned;
+                        }
+                    } else if (effect.detail == c.PHUX_CLIENT_STATUS_DETACHED) {
+                        host.attach_barrier_seen = false;
+                        for (host.terminals.items) |*terminal| {
+                            terminal.phase = if (terminal.published) .reconnecting else .attaching;
+                            terminal.seen_in_attach = false;
+                            terminal.remove_at_barrier = false;
+                            terminal.pending_title.items.len = 0;
+                            terminal.pending_title_set = false;
+                        }
+                    } else if (effect.detail == c.PHUX_CLIENT_STATUS_SERVER_ERROR) {
+                        for (host.terminals.items) |*terminal| terminal.phase = .failed;
+                    } else if (effect.detail == c.PHUX_CLIENT_STATUS_HISTORY or effect.detail == c.PHUX_CLIENT_STATUS_HISTORY_UNAVAILABLE) {
+                        if (try host.findTerminalRaw(effect.terminal_id)) |terminal| terminal.dirty = true;
+                    }
+                    try host.appendNotice(.status, &effect, generation);
+                },
+                c.PHUX_CLIENT_EFFECT_JOB => try host.appendNotice(.job, &effect, generation),
+                else => return error.Protocol,
+            }
+        }
+        try resultError(c.phux_client_effect_clear(host.client));
+    }
+
+    fn publishDirty(host: *Host, delta: *SyncDelta) !void {
+        for (host.terminals.items) |*terminal| {
+            if (!terminal.dirty or terminal.remove_at_barrier or !terminal.seen_in_attach) continue;
+            // Reserve non-grid presentation storage before borrowing a view,
+            // so no allocation failure can strand its top anchor.
+            try terminal.title.ensureTotalCapacity(host.gpa, max_title_bytes);
+            const id = cId(terminal.id);
+            var view: c.PhuxTerminalGridView = undefined;
+            const result = c.phux_client_terminal_grid(host.client, &id, &view);
+            if (result == c.PHUX_CLIENT_NO_VALUE) {
+                if (terminal.published) terminal.phase = .frozen;
+                continue;
+            }
+            try resultError(result);
+            const returned_id = remoteFromC(view.terminal_id) catch |err| {
+                releaseTopAnchor(host.client, &id, view.top_anchor);
+                return err;
+            };
+            if (!returned_id.eql(terminal.id)) {
+                releaseTopAnchor(host.client, &id, view.top_anchor);
+                return error.InvalidIdentity;
+            }
+            const next_generation: provider.Generation = .{
+                .stream_id = view.stream_id,
+                .bootstrap_id = view.bootstrap_id,
+                .last_seq = view.last_seq,
+            };
+            const was_published = terminal.published;
+            const changed = was_published and !terminal.generation.sameReplica(next_generation);
+            terminal.canvas.copyBorrowed(host.gpa, &view) catch |err| {
+                releaseTopAnchor(host.client, &id, view.top_anchor);
+                return err;
+            };
+            if (view.top_anchor.opaque_id != 0)
+                try resultError(c.phux_client_anchor_release(host.client, &id, view.top_anchor));
+            if (terminal.pending_title_set) {
+                terminal.title.items.len = terminal.pending_title.items.len;
+                if (terminal.pending_title.items.len != 0)
+                    @memcpy(terminal.title.items, terminal.pending_title.items);
+                terminal.pending_title.items.len = 0;
+                terminal.pending_title_set = false;
+            }
+            terminal.generation = next_generation;
+            terminal.cols = view.cols;
+            terminal.rows = view.rows;
+            terminal.history_total_rows = view.history_total_rows;
+            terminal.history_viewport_offset = view.history_viewport_offset;
+            terminal.history_visible_rows = view.history_visible_rows;
+            terminal.history_loading = view.history_loading;
+            terminal.history_has_more = view.history_has_more;
+            terminal.history_pages_loaded = view.history_pages_loaded;
+            terminal.history_unread_rows = view.history_unread_rows;
+            terminal.phase = .live;
+            terminal.published = true;
+            terminal.dirty = false;
+            if (!was_published) delta.added_count += 1;
+            delta.generation_changed = delta.generation_changed or changed;
+        }
+    }
+
+    fn appendNotice(host: *Host, kind: NoticeKind, effect: *const c.PhuxClientEffect, generation: provider.Generation) !void {
+        const payload = try effectSlice(effect.bytes);
+        if (payload.len > max_notice_bytes) return error.Protocol;
+        const remote = try remoteFromC(effect.terminal_id);
+        const owned = host.gpa.dupe(u8, payload) catch return error.OutOfMemory;
+        errdefer host.gpa.free(owned);
+        if (host.notices.items.len == max_notices) {
+            const dropped = host.notices.orderedRemove(0);
+            host.gpa.free(dropped.bytes);
+        }
+        try host.notices.append(host.gpa, .{
+            .kind = kind,
+            .detail = effect.detail,
+            .status_code = effect.status_code,
+            .terminal_ref = phuxRef(remote),
+            .generation = generation,
+            .bytes = owned,
+        });
+    }
+
+    fn ensureTerminal(host: *Host, raw: c.PhuxTerminalId) !*Terminal {
+        const id = try remoteFromC(raw);
+        for (host.terminals.items) |*terminal| if (terminal.id.eql(id)) return terminal;
+        if (host.terminals.items.len == max_terminals) return error.OutOfMemory;
+        try host.terminals.append(host.gpa, .{ .id = id });
+        return &host.terminals.items[host.terminals.items.len - 1];
+    }
+
+    fn findTerminalRaw(host: *Host, raw: c.PhuxTerminalId) !?*Terminal {
+        const id = try remoteFromC(raw);
+        for (host.terminals.items) |*terminal| if (terminal.id.eql(id)) return terminal;
+        return null;
+    }
+
+    fn findTerminal(host: *Host, terminal_ref: provider.TerminalRef) ?*Terminal {
+        const id = remoteFromRef(terminal_ref) orelse return null;
+        for (host.terminals.items) |*terminal| if (terminal.id.eql(id)) return terminal;
+        return null;
+    }
+
+    fn findTerminalConst(host: *const Host, terminal_ref: provider.TerminalRef) ?*const Terminal {
+        const id = remoteFromRef(terminal_ref) orelse return null;
+        for (host.terminals.items) |*terminal| if (terminal.id.eql(id)) return terminal;
+        return null;
+    }
+
+    fn pruneRemoved(host: *Host, include_unseen: bool) usize {
+        var removed: usize = 0;
+        var index = host.terminals.items.len;
+        while (index > 0) {
+            index -= 1;
+            const terminal = &host.terminals.items[index];
+            if (!terminal.remove_at_barrier and (!include_unseen or terminal.seen_in_attach)) continue;
+            if (host.search_owner) |owner_value| {
+                if (owner_value.terminal_ref.eql(terminal.terminalRef())) host.clearSearchResults(owner_value);
+            }
+            terminal.deinit(host.gpa);
+            _ = host.terminals.orderedRemove(index);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    fn currentCId(host: *Host, owner_value: provider.ReplicaOwner) !c.PhuxTerminalId {
+        const terminal = host.findTerminal(owner_value.terminal_ref) orelse return error.InvalidState;
+        if (terminal.phase != .live or !terminal.owner().eql(owner_value)) return error.InvalidState;
+        return cId(terminal.id);
+    }
+
+    fn currentCIdConst(host: *const Host, owner_value: provider.ReplicaOwner) !c.PhuxTerminalId {
+        const terminal = host.findTerminalConst(owner_value.terminal_ref) orelse return error.InvalidState;
+        if (terminal.phase != .live or !terminal.owner().eql(owner_value)) return error.InvalidState;
+        return cId(terminal.id);
+    }
+
+    fn stageOutgoing(host: *Host) !void {
+        if (host.bridge.incoming.takeDisconnect() != null) {
+            host.freezePublished();
+            return error.Protocol;
+        }
+        const count = c.phux_client_outgoing_count(host.client);
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            var frame: c.PhuxBytes = undefined;
+            try resultError(c.phux_client_outgoing_get(host.client, index, &frame));
+            const payload = try effectSlice(frame);
+            if (!host.bridge.outgoing.stage(payload)) return error.OutOfMemory;
+        }
+        try resultError(c.phux_client_outgoing_clear(host.client));
+    }
+};
+
+fn newClient() !*c.PhuxClient {
+    var raw: ?*c.PhuxClient = null;
+    const options: c.PhuxClientOptions = .{
+        .size = @sizeOf(c.PhuxClientOptions),
+        .version = c.PHUX_CLIENT_ABI_VERSION,
+        .max_bootstrap_chunk_bytes = 256 * 1024,
+        .max_history_page_bytes = 1024 * 1024,
+        .max_history_page_rows = 1024,
+        .max_history_cache_bytes = 8 * 1024 * 1024,
+        .max_history_materialized_rows = 8192,
+        .history_prefetch_rows = 256,
+    };
+    try resultError(c.phux_client_new(&options, &raw));
+    return raw orelse error.InvalidState;
+}
+
+fn remoteFromC(raw: c.PhuxTerminalId) !RemoteId {
+    if (raw.host.len != 0 and raw.host.data == null) return error.InvalidIdentity;
+    const host_name: []const u8 = if (raw.host.len == 0) &.{} else raw.host.data[0..raw.host.len];
+    if (raw.kind == c.PHUX_TERMINAL_LOCAL) {
+        if (host_name.len != 0) return error.InvalidIdentity;
+    } else if (raw.kind == c.PHUX_TERMINAL_SATELLITE) {
+        if (host_name.len == 0) return error.InvalidIdentity;
+        _ = std.unicode.Utf8View.init(host_name) catch return error.InvalidIdentity;
+    } else return error.InvalidIdentity;
+    return RemoteId.fromPhux(raw.kind, raw.id, host_name) catch return error.InvalidIdentity;
+}
+
+fn remoteFromRef(terminal_ref: provider.TerminalRef) ?RemoteId {
+    if (terminal_ref.provider_id != .phux) return null;
+    return switch (terminal_ref.terminal_id) {
+        .phux => |id| id,
+        .local => null,
+    };
+}
+
+fn phuxRef(id: RemoteId) provider.TerminalRef {
+    return .{ .provider_id = .phux, .terminal_id = .{ .phux = id } };
+}
+
+fn cId(id: RemoteId) c.PhuxTerminalId {
+    const host_name = id.host();
+    return .{
+        .kind = id.kind,
+        .id = id.id,
+        .host = .{ .data = if (host_name.len == 0) null else host_name.ptr, .len = host_name.len },
+    };
+}
+fn firstCodepoint(cluster: []const u8) !u21 {
+    const sequence_len = try std.unicode.utf8ByteSequenceLength(cluster[0]);
+    if (sequence_len > cluster.len) return error.InvalidUtf8;
+    return std.unicode.utf8Decode(cluster[0..sequence_len]);
+}
+
+fn bytes(slice: []const u8) c.PhuxBytes {
+    return .{ .data = if (slice.len == 0) null else slice.ptr, .len = slice.len };
+}
+
+fn effectSlice(raw: c.PhuxBytes) ![]const u8 {
+    if (raw.len != 0 and raw.data == null) return error.Protocol;
+    return if (raw.len == 0) &.{} else raw.data[0..raw.len];
+}
+
+fn toCAnchor(anchor: Anchor) c.PhuxDocumentAnchor {
+    return .{ .opaque_id = anchor.opaque_id };
+}
+
+fn releaseTopAnchor(client: *c.PhuxClient, terminal_id: *const c.PhuxTerminalId, anchor: c.PhuxDocumentAnchor) void {
+    if (anchor.opaque_id != 0) _ = c.phux_client_anchor_release(client, terminal_id, anchor);
+}
+
+fn releaseBorrowedSearch(client: *c.PhuxClient, terminal_id: *const c.PhuxTerminalId, results: []const c.PhuxSearchResult) void {
+    for (results) |result| {
+        _ = c.phux_client_anchor_release(client, terminal_id, result.start);
+        if (result.end.opaque_id != result.start.opaque_id)
+            _ = c.phux_client_anchor_release(client, terminal_id, result.end);
+    }
+}
+
+fn resultError(result: c.PhuxClientResult) Error!void {
+    return switch (result) {
+        c.PHUX_CLIENT_OK => {},
+        c.PHUX_CLIENT_NO_VALUE => error.NoValue,
+        c.PHUX_CLIENT_INVALID_ARGUMENT, c.PHUX_CLIENT_INVALID_STATE => error.InvalidState,
+        c.PHUX_CLIENT_PROTOCOL_ERROR => error.Protocol,
+        c.PHUX_CLIENT_ENGINE_ERROR => error.Engine,
+        c.PHUX_CLIENT_OUT_OF_MEMORY => error.OutOfMemory,
+        else => error.Panic,
+    };
+}
+
+fn outboundSize(len: usize) !void {
+    if (len > c.PHUX_CLIENT_MAX_OUTBOUND_BYTES) return error.InvalidState;
+}
+
+fn saturatingU32(value: u64) u32 {
+    return @intCast(@min(value, @as(u64, std.math.maxInt(u32))));
+}
+
+test "contains hides terminals until their canvas is published" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+
+    const id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 7, "");
+    try host.terminals.append(host.gpa, .{ .id = id });
+    const terminal_ref = phuxRef(id);
+
+    try std.testing.expect(!host.contains(terminal_ref));
+    host.terminals.items[0].published = true;
+    try std.testing.expect(host.contains(terminal_ref));
+}
+
+test "grid damage freezes a published canvas until replacement copy" {
+    var published: Terminal = .{
+        .id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 8, ""),
+        .phase = .live,
+        .published = true,
+    };
+    markGridDirty(&published, true);
+    try std.testing.expectEqual(provider.Phase.frozen, published.phase);
+    try std.testing.expect(published.dirty);
+    try std.testing.expect(published.seen_in_attach);
+
+    var reconnecting: Terminal = .{
+        .id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 9, ""),
+        .phase = .reconnecting,
+        .published = true,
+    };
+    markGridDirty(&reconnecting, false);
+    try std.testing.expectEqual(provider.Phase.reconnecting, reconnecting.phase);
+
+    var unpublished: Terminal = .{
+        .id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 10, ""),
+    };
+    markGridDirty(&unpublished, true);
+    try std.testing.expectEqual(provider.Phase.attaching, unpublished.phase);
+    try std.testing.expect(!unpublished.published);
+}
+
+test "publish failure after attach freezes an existing canvas" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+
+    const id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 10, "");
+    try host.terminals.append(host.gpa, .{
+        .id = id,
+        .phase = .live,
+        .dirty = true,
+        .seen_in_attach = true,
+        .published = true,
+    });
+    host.attach_barrier_seen = true;
+    const original_allocator = host.gpa;
+    host.gpa = std.testing.failing_allocator;
+    defer host.gpa = original_allocator;
+
+    try std.testing.expectError(error.OutOfMemory, host.capturePublishStage());
+    try std.testing.expectEqual(provider.Phase.frozen, host.terminals.items[0].phase);
+}
+
+test "ATTACHED inventory remains pixel-invisible until READY publication" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+
+    const id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 21, "");
+    const terminal = try host.ensureTerminal(cId(id));
+    terminal.seen_in_attach = true;
+    terminal.dirty = true;
+    try terminal.canvas.screen_text.appendSlice(host.gpa, "staged pixels");
+    const terminal_ref = terminal.terminalRef();
+
+    const before_ready = try host.drainReadiness();
+    try std.testing.expect(!before_ready.ready_published);
+    try std.testing.expect(!host.contains(terminal_ref));
+    try std.testing.expect(host.presentation(terminal_ref) == null);
+    var refs: [1]provider.TerminalRef = undefined;
+    try std.testing.expectEqual(@as(usize, 0), host.terminalRefs(&refs));
+
+    // Publication is the host-side effect of the C client's dual READY fence.
+    terminal.generation = .{ .stream_id = 7, .bootstrap_id = 9, .last_seq = 4 };
+    terminal.phase = .live;
+    terminal.published = true;
+    terminal.dirty = false;
+    const ready = host.presentation(terminal_ref).?;
+    try std.testing.expectEqualStrings("staged pixels", ready.grid.screen_text);
+    try std.testing.expectEqual(provider.Phase.live, ready.phase);
+    try std.testing.expect(ready.grid.running);
+}
+
+test "generation fences stale completion while sequence progress remains current" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+
+    const id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 22, "");
+    try host.terminals.append(host.gpa, .{
+        .id = id,
+        .generation = .{ .stream_id = 30, .bootstrap_id = 40, .last_seq = 1 },
+        .phase = .live,
+        .published = true,
+    });
+    const terminal = &host.terminals.items[0];
+    const old_owner = terminal.owner();
+
+    terminal.generation.last_seq = 200;
+    try std.testing.expect(host.ownerIsCurrent(old_owner));
+
+    terminal.generation.bootstrap_id = 41;
+    const current_owner = terminal.owner();
+    host.search_owner = current_owner;
+    try host.search_results.append(host.gpa, .{
+        .start = .{ .opaque_id = 0 },
+        .end = .{ .opaque_id = 0 },
+    });
+
+    host.clearSearchResults(old_owner);
+    try std.testing.expectEqual(@as(usize, 1), host.search_results.items.len);
+    try std.testing.expect(host.search_owner.?.eql(current_owner));
+    try std.testing.expect(!host.ownerIsCurrent(old_owner));
+    try std.testing.expectError(error.InvalidState, host.sendFocus(old_owner, true));
+
+    terminal.generation.last_seq += 1;
+    try std.testing.expect(host.ownerIsCurrent(current_owner));
+    host.clearSearchResults(current_owner);
+    try std.testing.expectEqual(@as(usize, 0), host.search_results.items.len);
+    try std.testing.expect(host.search_owner == null);
+}
+
+test "reconnect freezes complete canvases and preserves terminal identities" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+
+    const first_id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 31, "");
+    const second_id = try RemoteId.fromPhux(c.PHUX_TERMINAL_SATELLITE, 8, "build-host");
+    try host.terminals.append(host.gpa, .{
+        .id = first_id,
+        .generation = .{ .stream_id = 1, .bootstrap_id = 2, .last_seq = 3 },
+        .phase = .live,
+        .published = true,
+    });
+    try host.terminals.append(host.gpa, .{
+        .id = second_id,
+        .generation = .{ .stream_id = 4, .bootstrap_id = 5, .last_seq = 6 },
+        .phase = .live,
+        .published = true,
+    });
+    try host.terminals.items[0].canvas.screen_text.appendSlice(host.gpa, "first complete grid");
+    try host.terminals.items[1].canvas.screen_text.appendSlice(host.gpa, "second complete grid");
+
+    var before: [2]provider.TerminalRef = undefined;
+    try std.testing.expectEqual(@as(usize, 2), host.terminalRefs(&before));
+    const old_owner = host.owner(before[0]).?;
+
+    try host.reconnect("cockpit");
+    try std.testing.expectEqual(State.hello_queued, host.state());
+    var after: [2]provider.TerminalRef = undefined;
+    try std.testing.expectEqual(@as(usize, 2), host.terminalRefs(&after));
+    try std.testing.expect(before[0].eql(after[0]));
+    try std.testing.expect(before[1].eql(after[1]));
+    try std.testing.expect(!host.ownerIsCurrent(old_owner));
+
+    const first = host.presentation(before[0]).?;
+    const second = host.presentation(before[1]).?;
+    try std.testing.expectEqual(provider.Phase.reconnecting, first.phase);
+    try std.testing.expectEqual(provider.Phase.reconnecting, second.phase);
+    try std.testing.expect(!first.grid.running);
+    try std.testing.expect(!second.grid.running);
+    try std.testing.expectEqualStrings("first complete grid", first.grid.screen_text);
+    try std.testing.expectEqualStrings("second complete grid", second.grid.screen_text);
+}
+
+test "reordered remote enumeration retains stable refs and lookup" {
+    var bridge = transport.Bridge.init(std.testing.allocator);
+    defer bridge.deinit();
+    const host = try Host.create(std.testing.allocator, &bridge);
+    defer host.destroy();
+
+    const first_id = try RemoteId.fromPhux(c.PHUX_TERMINAL_LOCAL, 41, "");
+    const second_id = try RemoteId.fromPhux(c.PHUX_TERMINAL_SATELLITE, 41, "satellite");
+    const first = try host.ensureTerminal(cId(first_id));
+    first.published = true;
+    first.phase = .live;
+    const second = try host.ensureTerminal(cId(second_id));
+    second.published = true;
+    second.phase = .live;
+
+    var initial: [2]provider.TerminalRef = undefined;
+    try std.testing.expectEqual(@as(usize, 2), host.terminalRefs(&initial));
+    _ = try host.ensureTerminal(cId(second_id));
+    _ = try host.ensureTerminal(cId(first_id));
+
+    var reordered: [2]provider.TerminalRef = undefined;
+    try std.testing.expectEqual(@as(usize, 2), host.terminalRefs(&reordered));
+    try std.testing.expect(initial[0].eql(reordered[0]));
+    try std.testing.expect(initial[1].eql(reordered[1]));
+    try std.testing.expect(host.contains(initial[0]));
+    try std.testing.expect(host.contains(initial[1]));
+    try std.testing.expect(!initial[0].eql(initial[1]));
+}
