@@ -173,35 +173,26 @@ pub const BrowserPage = enum {
     }
 };
 
-/// Terminal variants identify an ORDERED TAB POSITION, not a terminal.
-/// `Model.terminal_order` resolves that position to a durable TerminalId.
-pub const TabId = enum(u8) {
-    terminal_1,
-    terminal_2,
+/// Stable surface selection. Positional UI and keyboard navigation resolve to
+/// one of these identities at the input edge; model state never stores a tab
+/// slot that can silently identify a different terminal after reordering.
+pub const SurfaceSelection = union(enum) {
+    terminal: TerminalId,
     web,
-    terminal_3,
-    terminal_4,
+
+    pub fn eql(a: SurfaceSelection, b: SurfaceSelection) bool {
+        return switch (a) {
+            .terminal => |id| switch (b) {
+                .terminal => |other| id == other,
+                .web => false,
+            },
+            .web => switch (b) {
+                .web => true,
+                .terminal => false,
+            },
+        };
+    }
 };
-
-fn tabForTerminalIndex(index: usize) ?TabId {
-    return switch (index) {
-        0 => .terminal_1,
-        1 => .terminal_2,
-        2 => .terminal_3,
-        3 => .terminal_4,
-        else => null,
-    };
-}
-
-fn terminalIndexForTab(tab: TabId) ?usize {
-    return switch (tab) {
-        .terminal_1 => 0,
-        .terminal_2 => 1,
-        .terminal_3 => 2,
-        .terminal_4 => 3,
-        .web => null,
-    };
-}
 
 pub const web_origins = [_][]const u8{
     "zero://inline",
@@ -212,9 +203,11 @@ pub const web_origins = [_][]const u8{
 };
 
 pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
-    .{ .id = "tab.terminal-1", .key = "1", .modifiers = .{ .primary = true } },
-    .{ .id = "tab.terminal-2", .key = "2", .modifiers = .{ .primary = true } },
-    .{ .id = "tab.web", .key = "3", .modifiers = .{ .primary = true } },
+    .{ .id = "surface.1", .key = "1", .modifiers = .{ .primary = true } },
+    .{ .id = "surface.2", .key = "2", .modifiers = .{ .primary = true } },
+    .{ .id = "surface.3", .key = "3", .modifiers = .{ .primary = true } },
+    .{ .id = "surface.4", .key = "4", .modifiers = .{ .primary = true } },
+    .{ .id = "surface.5", .key = "5", .modifiers = .{ .primary = true } },
     .{ .id = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "layout.split", .key = "d", .modifiers = .{ .primary = true } },
@@ -438,8 +431,18 @@ pub const LocalProvider = struct {
 
     pub fn createTerminal(provider: *LocalProvider) !*Pane {
         if (provider.occupiedCount() >= max_terminal_count) return error.TerminalCapacityReached;
-        if (provider.next_terminal_raw == std.math.maxInt(u64) or provider.next_pty_key == std.math.maxInt(u64)) {
+        if (provider.next_terminal_raw >= std.math.maxInt(u64) - 1 or provider.next_pty_key >= std.math.maxInt(u64) - 1) {
             return error.TerminalIdentityExhausted;
+        }
+        for (0..max_terminal_count) |occupied| {
+            if (provider.states[occupied] == .vacant) continue;
+            const existing = provider.slotConst(occupied);
+            if (@intFromEnum(existing.id) == provider.next_terminal_raw or existing.pty_key == provider.next_pty_key) {
+                return error.TerminalIdentityCollision;
+            }
+        }
+        if (provider.next_pty_key == clipboard_key or provider.next_pty_key == paste_clipboard_key) {
+            return error.TerminalIdentityCollision;
         }
         var index: usize = 0;
         while (index < max_terminal_count and provider.states[index] != .vacant) : (index += 1) {}
@@ -453,8 +456,8 @@ pub const LocalProvider = struct {
             .pty_key = provider.next_pty_key,
             .argv = terminal_1_argv,
         };
-        provider.next_terminal_raw +%= 1;
-        provider.next_pty_key +%= 1;
+        provider.next_terminal_raw += 1;
+        provider.next_pty_key += 1;
         provider.states[index] = .active;
         return pane;
     }
@@ -489,9 +492,8 @@ pub const Model = struct {
     terminal_order: [max_terminal_count]TerminalId = .{ .terminal_1, .terminal_2, .terminal_1, .terminal_1 },
     terminal_count: usize = pane_count,
     attachments: [pane_count]?TerminalId = .{ .terminal_1, .terminal_2 },
-    /// Tab selection is independent from terminal focus. A tab may
-    /// present a terminal, a native webview, or future non-terminal surface.
-    selected_tab: TabId = .terminal_1,
+    /// Surface selection is a durable identity, independent from tab order.
+    selected_surface: SurfaceSelection = .{ .terminal = .terminal_1 },
     /// Placement is independent from execution identity. Split mode projects
     /// both existing terminal surfaces without respawning either process.
     layout: LayoutMode = .single,
@@ -584,9 +586,10 @@ pub const Model = struct {
     }
 
     pub fn selectedTerminalId(model: *const Model) ?TerminalId {
-        const index = terminalIndexForTab(model.selected_tab) orelse return null;
-        if (index >= model.terminal_count) return null;
-        return model.terminal_order[index];
+        return switch (model.selected_surface) {
+            .terminal => |id| if (model.provider.terminalConst(id) != null) id else null,
+            .web => null,
+        };
     }
 
     pub fn selectedTerminalIndex(model: *const Model) ?u8 {
@@ -599,10 +602,6 @@ pub const Model = struct {
             if (candidate == id) return index;
         }
         return null;
-    }
-
-    fn tabForTerminal(model: *const Model, id: TerminalId) ?TabId {
-        return tabForTerminalIndex(model.terminalOrderIndex(id) orelse return null);
     }
 
     pub const AttachError = error{ UnknownTerminal, TerminalAlreadyAttached, PlacementOccupied };
@@ -618,7 +617,7 @@ pub const Model = struct {
         if (model.selectedTerminalId() != null and model.selectedPlacement() == null) {
             if (fallback) |replacement| {
                 const replacement_id = model.attachments[replacement.index()].?;
-                model.selected_tab = model.tabForTerminal(replacement_id) orelse model.selected_tab;
+                model.selected_surface = .{ .terminal = replacement_id };
             }
         }
         if (model.attachments[model.focus_placement.index()] == null) {
@@ -665,7 +664,7 @@ pub const Model = struct {
 
     pub fn selectTerminal(model: *Model, id: TerminalId) bool {
         if (model.provider.terminal(id) == null) return false;
-        model.selected_tab = model.tabForTerminal(id) orelse return false;
+        model.selected_surface = .{ .terminal = id };
         model.attachForSelection(id);
         return true;
     }
@@ -675,13 +674,13 @@ pub const Model = struct {
             if (attached.* != null and model.provider.terminal(attached.*.?) == null) attached.* = null;
         }
         if (model.terminal_count == 0) {
-            model.selected_tab = .web;
+            model.selected_surface = .web;
             model.layout = .single;
             model.attachments = .{ null, null };
             return;
         }
         const selected = model.selectedTerminalId() orelse model.terminal_order[0];
-        model.selected_tab = model.tabForTerminal(selected) orelse .terminal_1;
+        model.selected_surface = .{ .terminal = selected };
         model.attachForSelection(selected);
         if (model.layout == .split) {
             const other_index = 1 - model.focus_placement.index();
@@ -704,20 +703,20 @@ pub const Model = struct {
         if (target_signed < 0 or target_signed >= model.terminal_count) return false;
         const target: usize = @intCast(target_signed);
         std.mem.swap(TerminalId, &model.terminal_order[current], &model.terminal_order[target]);
-        model.selected_tab = tabForTerminalIndex(target).?;
         return true;
     }
 
-    pub fn topologySnapshot(model: *const Model) TopologySnapshot {
+    pub fn topologySnapshot(model: *const Model) !TopologySnapshot {
         var snapshot: TopologySnapshot = .{
             .terminal_count = @intCast(model.terminal_count),
-            .selection = if (model.selectedTerminalId()) |id| .{ .terminal = id } else .web,
+            .selection = model.selected_surface,
             .layout = model.layout,
             .split_fraction = model.split_fraction,
             .attachments = model.attachments,
             .focused_attachment = model.focus_placement,
         };
         @memcpy(snapshot.terminal_order[0..model.terminal_count], model.terminal_order[0..model.terminal_count]);
+        try snapshot.validate();
         return snapshot;
     }
 };
@@ -735,11 +734,7 @@ pub fn initialModelWithIo(gpa: std.mem.Allocator, io: std.Io, sessions: [pane_co
 }
 
 pub const topology_snapshot_version: u16 = 1;
-
-pub const TopologySelection = union(enum) {
-    terminal: TerminalId,
-    web,
-};
+pub const process_restoration_supported = false;
 
 /// Persisted presentation topology only. It deliberately contains no PID,
 /// PTY key, emulator bytes, process phase, or claim that a process survived.
@@ -747,7 +742,7 @@ pub const TopologySnapshot = struct {
     version: u16 = topology_snapshot_version,
     terminal_count: u8 = 0,
     terminal_order: [max_terminal_count]TerminalId = [_]TerminalId{.terminal_1} ** max_terminal_count,
-    selection: TopologySelection = .web,
+    selection: SurfaceSelection = .web,
     layout: LayoutMode = .single,
     split_fraction: f32 = 0.5,
     attachments: [pane_count]?TerminalId = .{ null, null },
@@ -759,10 +754,13 @@ pub const TopologySnapshot = struct {
         const count: usize = snapshot.terminal_count;
         for (snapshot.terminal_order[0..count], 0..) |id, index| {
             const raw = @intFromEnum(id);
-            if (raw < first_terminal_raw or raw == std.math.maxInt(u64)) return error.InvalidTopology;
+            if (raw < first_terminal_raw or raw >= std.math.maxInt(u64) - 1) return error.InvalidTopology;
             for (snapshot.terminal_order[0..index]) |prior| {
                 if (prior == id) return error.InvalidTopology;
             }
+        }
+        for (snapshot.terminal_order[count..]) |id| {
+            if (id != .terminal_1) return error.InvalidTopology;
         }
         switch (snapshot.selection) {
             .terminal => |id| if (indexOfSnapshotTerminal(snapshot, id) == null) return error.InvalidTopology,
@@ -773,7 +771,27 @@ pub const TopologySnapshot = struct {
         };
         if (snapshot.attachments[0] != null and snapshot.attachments[1] != null and
             snapshot.attachments[0].? == snapshot.attachments[1].?) return error.InvalidTopology;
-        if (!std.math.isFinite(snapshot.split_fraction)) return error.InvalidTopology;
+        if (!std.math.isFinite(snapshot.split_fraction) or snapshot.split_fraction < 0.05 or snapshot.split_fraction > 0.95) {
+            return error.InvalidTopology;
+        }
+        if (count == 0) {
+            if (!snapshot.selection.eql(.web) or snapshot.layout != .single or
+                snapshot.attachments[0] != null or snapshot.attachments[1] != null or
+                snapshot.focused_attachment != .primary) return error.InvalidTopology;
+            return;
+        }
+        if (snapshot.layout == .split and (snapshot.attachments[0] == null or snapshot.attachments[1] == null)) {
+            return error.InvalidTopology;
+        }
+        const focused = snapshot.attachments[snapshot.focused_attachment.index()];
+        switch (snapshot.selection) {
+            .terminal => |id| if (focused == null or focused.? != id) return error.InvalidTopology,
+            .web => {
+                if ((snapshot.attachments[0] != null or snapshot.attachments[1] != null) and focused == null) {
+                    return error.InvalidTopology;
+                }
+            },
+        }
     }
 };
 
@@ -806,7 +824,7 @@ pub fn migrateTopologySnapshot(persisted: PersistedTopologySnapshot) !TopologySn
             var migrated: TopologySnapshot = .{
                 .terminal_count = legacy.terminal_count,
                 .layout = if (legacy.split and legacy.terminal_count >= 2) .split else .single,
-                .split_fraction = legacy.split_fraction,
+                .split_fraction = std.math.clamp(legacy.split_fraction, 0.05, 0.95),
             };
             for (0..legacy.terminal_count) |index| {
                 migrated.terminal_order[index] = @enumFromInt(first_terminal_raw + index);
@@ -853,22 +871,17 @@ pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopo
         provider.next_pty_key += 1;
         provider.next_terminal_raw = @max(provider.next_terminal_raw, @intFromEnum(pane.id) + 1);
     }
-    var model: Model = .{
+    const model: Model = .{
         .provider = provider,
         .panes = &provider.terminals,
         .terminal_order = snapshot.terminal_order,
         .terminal_count = snapshot.terminal_count,
         .attachments = snapshot.attachments,
-        .selected_tab = switch (snapshot.selection) {
-            .terminal => |id| tabForTerminalIndex(indexOfSnapshotTerminal(snapshot, id).?).?,
-            .web => .web,
-        },
+        .selected_surface = snapshot.selection,
         .layout = snapshot.layout,
-        .split_fraction = std.math.clamp(snapshot.split_fraction, 0.05, 0.95),
+        .split_fraction = snapshot.split_fraction,
         .focus_placement = snapshot.focused_attachment,
     };
-    if (model.selected_tab != .web) model.normalizeTopology();
-    if (model.layout == .split and (model.attachments[0] == null or model.attachments[1] == null)) model.layout = .single;
     return model;
 }
 
@@ -886,9 +899,8 @@ pub const Msg = union(enum) {
     paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
     restart: Placement,
-    select_tab: TabId,
-    select_terminal: TerminalId,
-    shortcut_tab: TabId,
+    select_surface: SurfaceSelection,
+    select_position: u8,
     cycle_tab: i8,
     new_terminal,
     close_terminal,
@@ -1029,9 +1041,9 @@ pub const CockpitHost = struct {
             },
             else => {},
         }
-        const selected_before = self.inner.model.selected_tab;
+        const selected_before = self.inner.model.selected_surface;
         try self.inner_app.event(runtime, event_value);
-        if (selected_before != self.inner.model.selected_tab) {
+        if (!selected_before.eql(self.inner.model.selected_surface)) {
             const window_id = switch (event_value) {
                 .shortcut => |shortcut| shortcut.window_id,
                 .gpu_surface_input => |input| input.window_id,
@@ -1163,6 +1175,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // Every pty event carries its own key: route it to the pane
             // that owns that key, never to "the" terminal.
             const pane = paneForKey(model, event.key) orelse return;
+            // Closing resources retain their exact transport key solely for
+            // the terminal exit acknowledgement. Late output, including VT
+            // queries that would synthesize replies, is discarded untouched.
+            if (model.provider.isClosing(pane.id)) {
+                if (event.kind == .exit) model.provider.retireClosing(pane.id);
+                return;
+            }
             switch (event.kind) {
                 .output => {
                     pane.phase = .live;
@@ -1191,8 +1210,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                     moveResponsesToOutbound(pane, fx);
                 },
                 .exit => {
-                    const terminal_id = pane.id;
-                    const closing = model.provider.isClosing(terminal_id);
                     pane.phase = if (event.reason == .rejected or event.reason == .spawn_failed) .failed else .ended;
                     pane.exit_code = event.code;
                     pane.exit_signal = event.signal;
@@ -1210,7 +1227,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                     pane.outbound_head = 0;
                     pane.outbound_len = 0;
                     pane.session.clearResponses();
-                    if (closing) model.provider.retireClosing(terminal_id);
                 },
                 // Write-admission verdicts are journal-only (replay
                 // machinery); the engine never delivers one as an event.
@@ -1362,43 +1378,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             if (model.attachments[requested.index()] == null) return;
             if (requested == model.focus_placement) return;
             model.focus_placement = requested;
-            model.selected_tab = model.tabForTerminal(model.attachments[requested.index()].?) orelse return;
+            model.selected_surface = .{ .terminal = model.attachments[requested.index()].? };
         },
-        .select_tab => |tab| {
-            if (tab == .web) {
-                model.selected_tab = .web;
-                return;
-            }
-            const index = terminalIndexForTab(tab) orelse return;
-            if (index < pane_count) {
-                if (model.attachments[index]) |attached| {
-                    _ = model.selectTerminal(attached);
-                    return;
-                }
-            }
-            if (index >= model.terminal_count) return;
-            _ = model.selectTerminal(model.terminal_order[index]);
+        .select_surface => |surface| switch (surface) {
+            .terminal => |id| _ = model.selectTerminal(id),
+            .web => model.selected_surface = .web,
         },
-        .select_terminal => |id| {
-            _ = model.selectTerminal(id);
-        },
-        .shortcut_tab => |tab| {
-            if (tab == .web) {
-                model.selected_tab = .web;
-                return;
+        .select_position => |position| {
+            if (position < model.terminal_count) {
+                _ = model.selectTerminal(model.terminal_order[position]);
+            } else if (position == model.terminal_count) {
+                model.selected_surface = .web;
             }
-            const index = terminalIndexForTab(tab) orelse return;
-            if (index < model.terminal_count) _ = model.selectTerminal(model.terminal_order[index]);
         },
         .cycle_tab => |delta| {
             const count: i8 = @intCast(model.terminal_count + 1);
-            const current: i8 = if (model.selected_tab == .web)
-                @intCast(model.terminal_count)
+            const current: i8 = if (model.selectedTerminalId()) |id|
+                @intCast(model.terminalOrderIndex(id) orelse 0)
             else
-                @intCast(terminalIndexForTab(model.selected_tab) orelse 0);
+                @intCast(model.terminal_count);
             const next: usize = @intCast(@mod(current + delta, count));
             if (next == model.terminal_count) {
-                model.selected_tab = .web;
+                model.selected_surface = .web;
             } else {
                 _ = model.selectTerminal(model.terminal_order[next]);
             }
@@ -1425,11 +1426,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 if (attached.* != null and attached.*.? == id) attached.* = null;
             }
             if (model.terminal_count == 0) {
-                model.selected_tab = .web;
+                model.selected_surface = .web;
                 model.layout = .single;
             } else {
                 const next_index = @min(order_index, model.terminal_count - 1);
-                model.selected_tab = tabForTerminalIndex(next_index).?;
+                model.selected_surface = .{ .terminal = model.terminal_order[next_index] };
                 model.normalizeTopology();
             }
             if (had_live_pty) {
@@ -1462,7 +1463,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         .browser_page => |page| {
             model.browser_page = page;
             model.browser_navigation_token +%= 1;
-            model.selected_tab = .web;
+            model.selected_surface = .web;
         },
         .attach_terminal => |attachment| {
             model.attach(attachment.placement, attachment.terminal_id) catch return;
@@ -1779,14 +1780,9 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
 
     // Tab selection is global and remains available while native WebKit
     // owns the content surface. Releases are latched by physical key above.
-    if (primary and !mods.shift and !mods.alt and !mods.control and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '3') {
+    if (primary and !mods.shift and !mods.alt and !mods.control and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '5') {
         latchAppShortcut(model, event.key);
-        const tab: TabId = switch (event.key[0]) {
-            '1' => .terminal_1,
-            '2' => .terminal_2,
-            else => .web,
-        };
-        update(model, .{ .shortcut_tab = tab }, fx);
+        update(model, .{ .select_position = event.key[0] - '1' }, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "[")) {
@@ -1989,6 +1985,8 @@ fn appShortcutKeyMask(key: []const u8) u32 {
     if (keyIs(key, "1")) return 1 << 0;
     if (keyIs(key, "2")) return 1 << 1;
     if (keyIs(key, "3")) return 1 << 12;
+    if (keyIs(key, "4")) return 1 << 20;
+    if (keyIs(key, "5")) return 1 << 21;
     if (keyIs(key, "space")) return 1 << 2;
     if (keyIs(key, "c")) return 1 << 3;
     if (keyIs(key, "r")) return 1 << 4;
@@ -2352,12 +2350,8 @@ fn emptyStatusNode(ui: *TerminalUi) TerminalUi.Node {
     return ui.el(.stack, .{}, .{});
 }
 
-fn paneStatus(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Node {
-    const pane = model.terminalAtConst(placementAt(index)) orelse return ui.el(.badge, .{
-        .size = .sm,
-        .variant = .secondary,
-        .text = if (index == 0) "TERMINAL 1 / DETACHED" else "TERMINAL 2 / DETACHED",
-    }, .{});
+fn paneStatus(ui: *TerminalUi, model: *const Model, index: usize, show_identity: bool) TerminalUi.Node {
+    const pane = model.terminalAtConst(placementAt(index)) orelse return emptyStatusNode(ui);
     const lifecycle = paneLifecycleText(ui, pane);
     const title = ui.fmt("TERMINAL {d}", .{terminalNumber(pane.id)});
     const lifecycle_failed = paneLifecycleFailed(pane);
@@ -2375,7 +2369,14 @@ fn paneStatus(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Nod
             if (paste_failed) "PASTE FAILED" else "paste ok",
         },
     );
-    const lifecycle_node = if (pane.phase == .starting or pane.phase == .live)
+    const lifecycle_node = if (pane.phase == .live and !show_identity)
+        emptyStatusNode(ui)
+    else if (pane.phase == .live)
+        ui.text(.{
+            .style_tokens = .{ .foreground = .text_muted },
+            .semantics = .{ .label = lifecycle_semantics },
+        }, title)
+    else if (pane.phase == .starting)
         ui.text(.{
             .style_tokens = .{ .foreground = .text_muted },
             .semantics = .{ .label = lifecycle_semantics },
@@ -2433,17 +2434,15 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, id: TerminalId, inde
         if (candidate != null and candidate.? == id) attached = true;
     }
     const title = terminalTitle(ui, id);
-    const shortcut = switch (index) {
-        0 => "CMD+1",
-        1 => "CMD+2",
-        else => "",
-    };
-    const text = if (!attached)
-        ui.fmt("{s} DETACHED  {s}", .{ title, shortcut })
-    else if (paneNeedsAttention(model, terminal))
-        ui.fmt("{s} !  {s}", .{ title, shortcut })
+    const compact = model.terminal_count + 1 > 3;
+    const visible_title = if (compact) ui.fmt("T{d}", .{terminalNumber(id)}) else title;
+    const shortcut = ui.fmt("CMD+{d}", .{index + 1});
+    const text = if (paneNeedsAttention(model, terminal))
+        if (compact) ui.fmt("{s} !", .{visible_title}) else ui.fmt("{s} !  {s}", .{ visible_title, shortcut })
+    else if (compact)
+        visible_title
     else
-        ui.fmt("{s}  {s}", .{ title, shortcut });
+        ui.fmt("{s}  {s}", .{ visible_title, shortcut });
     const semantics = if (!attached)
         ui.fmt("{s}, native terminal, detached; shortcut {s}{s}", .{ title, shortcut, if (selected) ", selected" else "" })
     else
@@ -2463,19 +2462,20 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, id: TerminalId, inde
         .key = .{ .index = @intCast(@intFromEnum(id)) },
         .text = text,
         .selected = selected,
-        .on_press = .{ .select_terminal = id },
+        .on_press = .{ .select_surface = .{ .terminal = id } },
         .semantics = .{ .label = semantics },
     }, .{});
 }
 
 fn webTabTrigger(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
-    const selected = model.selected_tab == .web;
+    const selected = model.selected_surface.eql(.web);
+    const shortcut = ui.fmt("CMD+{d}", .{model.terminal_count + 1});
     return ui.el(.segmented_control, .{
         .key = .{ .index = std.math.maxInt(usize) },
-        .text = "Web  CMD+3",
+        .text = if (model.terminal_count + 1 > 3) "Web" else ui.fmt("Web  {s}", .{shortcut}),
         .selected = selected,
-        .on_press = .{ .select_tab = .web },
-        .semantics = .{ .label = ui.fmt("Web, system WebKit, shortcut CMD+3{s}", .{if (selected) ", selected" else ""}) },
+        .on_press = .{ .select_surface = .web },
+        .semantics = .{ .label = ui.fmt("Web, system WebKit, shortcut {s}{s}", .{ shortcut, if (selected) ", selected" else "" }) },
     }, .{});
 }
 
@@ -2507,7 +2507,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
 fn splitTerminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Node {
     return ui.column(.{ .grow = 1, .min_width = split_pane_min_width }, .{
         ui.row(.{ .height = split_pane_header_height, .cross = .center }, .{
-            paneStatus(ui, model, index),
+            paneStatus(ui, model, index, true),
         }),
         terminalSurface(ui, model, index),
     });
@@ -2533,7 +2533,7 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     const terminal_index = model.selectedTerminalIndex();
     const context_controls = if (terminal_index) |index|
         if (model.layout == .single)
-            paneStatus(ui, model, index)
+            paneStatus(ui, model, index, false)
         else
             ui.el(.stack, .{}, .{})
     else
@@ -2547,31 +2547,16 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         ui.button(.{
             .size = .sm,
             .variant = .secondary,
-            .disabled = model.selectedTerminalId() == null or (model.terminalOrderIndex(model.selectedTerminalId().?) orelse 0) == 0,
-            .on_press = .{ .move_terminal = -1 },
-            .semantics = .{ .label = "Move terminal tab left, Command Shift Left" },
-        }, "<"),
-        ui.button(.{
-            .size = .sm,
-            .variant = .secondary,
-            .disabled = model.selectedTerminalId() == null or (model.terminalOrderIndex(model.selectedTerminalId().?) orelse model.terminal_count) + 1 >= model.terminal_count,
-            .on_press = .{ .move_terminal = 1 },
-            .semantics = .{ .label = "Move terminal tab right, Command Shift Right" },
-        }, ">"),
-        ui.button(.{
-            .size = .sm,
-            .variant = .secondary,
             .disabled = model.terminal_count >= max_terminal_count or model.provider.occupiedCount() >= max_terminal_count,
             .on_press = .new_terminal,
             .semantics = .{ .label = "New Terminal, Command T" },
-        }, "+"),
-        ui.button(.{
+        }, "New"),
+        if (model.selectedTerminalId() != null) ui.button(.{
             .size = .sm,
             .variant = .secondary,
-            .disabled = model.selectedTerminalId() == null,
             .on_press = .close_terminal,
             .semantics = .{ .label = "Close Terminal, Command W" },
-        }, "x"),
+        }, "Close") else emptyStatusNode(ui),
     });
 
     const header = ui.row(.{ .height = header_height, .gap = 8, .cross = .center, .window_drag = true }, .{
@@ -2760,9 +2745,11 @@ pub fn webPanes(model: *const Model, out: []TerminalApp.WebViewPane) usize {
 }
 
 pub fn onCommand(name: []const u8) ?Msg {
-    if (std.mem.eql(u8, name, "tab.terminal-1")) return .{ .shortcut_tab = .terminal_1 };
-    if (std.mem.eql(u8, name, "tab.terminal-2")) return .{ .shortcut_tab = .terminal_2 };
-    if (std.mem.eql(u8, name, "tab.web")) return .{ .shortcut_tab = .web };
+    if (std.mem.eql(u8, name, "surface.1")) return .{ .select_position = 0 };
+    if (std.mem.eql(u8, name, "surface.2")) return .{ .select_position = 1 };
+    if (std.mem.eql(u8, name, "surface.3")) return .{ .select_position = 2 };
+    if (std.mem.eql(u8, name, "surface.4")) return .{ .select_position = 3 };
+    if (std.mem.eql(u8, name, "surface.5")) return .{ .select_position = 4 };
     if (std.mem.eql(u8, name, "tab.previous")) return .{ .cycle_tab = -1 };
     if (std.mem.eql(u8, name, "tab.next")) return .{ .cycle_tab = 1 };
     if (std.mem.eql(u8, name, "layout.split")) return .toggle_split;

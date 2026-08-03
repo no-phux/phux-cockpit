@@ -390,7 +390,7 @@ test "ADVERSARIAL: either selected terminal gets the same full hostile-content b
     var painted: [app.pane_count]usize = @splat(0);
     var used: [app.pane_count]usize = @splat(0);
     for (sessions, 0..) |session, index| {
-        model.selected_tab = if (index == 0) .terminal_1 else .terminal_2;
+        model.selected_surface = .{ .terminal = if (index == 0) .terminal_1 else .terminal_2 };
         const frames = app.paneFrames(&model, geometry.SizeF.init(980, 640));
         try testing.expect(frames[index].width > 0);
         try testing.expectEqual(@as(f32, 0), frames[1 - index].width);
@@ -527,7 +527,7 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
     const bottom0 = model.panes[0].session.scrollbar().offset;
     const bottom1 = model.panes[1].session.scrollbar().offset;
     try testing.expect(bottom0 > 0 and bottom1 > 0);
-    try testing.expectEqual(app.TabId.terminal_1, model.selected_tab);
+    try testing.expectEqual(app.TerminalId.terminal_1, model.selectedTerminalId().?);
     const cell_h = model.panes[0].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -608,7 +608,7 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
     try testing.expectEqual(size.width, model.surface_size.width);
     try testing.expectEqual(size.height, model.surface_size.height);
     try pressKey(harness, app_iface, "2", .{ .primary = true });
-    try testing.expectEqual(app.TabId.terminal_2, model.selected_tab);
+    try testing.expectEqual(app.TerminalId.terminal_2, model.selectedTerminalId().?);
     try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[0].width);
     try testing.expect(app.paneFrames(model, model.surface_size)[1].width > 0);
 

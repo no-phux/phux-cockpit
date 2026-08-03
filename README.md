@@ -18,8 +18,9 @@ native control environment for large-scale directed machine work. See
 - **Split** projects at most two live terminal sessions simultaneously through
   a real draggable and keyboard-operable divider. Splitting, focusing,
   resizing, and collapsing never restart either process.
-- **Tabs** are native canvas controls with tab accessibility semantics. Direct
-  selection and next/previous shortcuts preserve hidden surface state.
+- **Tabs** are native canvas controls with tab accessibility semantics. They
+  compact to `T1` through `T4` at full capacity; Web remains stable and pinned
+  last. Direct selection and next/previous shortcuts preserve hidden state.
 - **Web** is a native WebKit surface for the explicitly allowed GitHub,
   Superlogical, and Mitchell Hashimoto top-level origins. It keeps its page
   process alive while another tab is selected. Native bridge commands are
@@ -32,16 +33,17 @@ terminal state and native-sdk paints the visible attachments into one Metal
 surface under strict combined command, text, glyph, and path budgets.
 
 Terminal tabs show an attention marker when a hidden process exits or develops
-an operational issue. Visible status chrome keeps lifecycle, confirmed outbound
-or reply loss, current input stalls, and native delivery failures separate
-instead of hiding one behind another. Recovered stalls disappear. Finished
-terminals expose a placement-specific **Restart** control for clean and abnormal
-exits.
+an operational issue. Healthy single-terminal mode has no permanent RUNNING
+banner. Split mode identifies each pane quietly; lifecycle text appears only for
+transitions and exceptions. Full lifecycle and I/O detail remains accessible.
+Recovered stalls disappear. Finished terminals expose a placement-specific
+**Restart** control for clean and abnormal exits.
 
 The local provider is a bounded dynamic registry independent from layout. New
 and Close are native actions; close tombstones one PTY until its exact exit is
-delivered, and PTY keys are never reused in-process. This prevents late output
-or exits from crossing into a replacement terminal.
+delivered, discards post-close output and generated terminal replies, and never
+reuses PTY keys in-process. This prevents stale traffic from crossing into a
+replacement terminal.
 
 `Model.topologySnapshot()` exposes the versioned persistence boundary for
 terminal count, tab order, selection, split attachments, focus, and divider
@@ -66,9 +68,7 @@ caveat.
 
 | Key | Action |
 |---|---|
-| `cmd+1` | Select Terminal 1 |
-| `cmd+2` | Select Terminal 2 |
-| `cmd+3` | Select Web |
+| `cmd+1` ... `cmd+5` | Select the surface at that current position; Web is always last |
 | `cmd+T` | Create and select a terminal, up to four |
 | `cmd+W` | Close the selected terminal; Web is never closed |
 | `cmd+shift+left` / `cmd+shift+right` | Move the selected terminal tab |
@@ -90,7 +90,8 @@ caveat.
 Clicking a tab switches surfaces without stopping hidden execution. Clicking a
 split pane moves input ownership to it. The divider supports pointer dragging,
 arrow-key adjustment, Home, and End. Trackpad and wheel input route only to the
-terminal under the pointer.
+terminal under the pointer. Terminal tab reorder remains available through the
+menu command and keyboard shortcut; direct tab dragging is not claimed.
 
 ## Requirements
 
@@ -159,7 +160,8 @@ scheduled updater independently repairs a missed release update.
   native phux control-plane client.
 - Terminal topology has a versioned snapshot/restore API. The executable does
   not yet choose a filesystem persistence policy; restoring always starts fresh
-  processes rather than claiming process survival.
+  processes. `process_restoration_supported` is explicitly `false`; filesystem
+  persistence remains outside this slice.
 - Detachable terminal windows are intentionally not faked. native-sdk v0.7.1
   needs per-secondary-window custom chrome and focus hooks before the same
   terminal surface can attach to another native window correctly.

@@ -4,6 +4,8 @@ const app = @import("main.zig");
 const grid = @import("grid.zig");
 
 const testing = std.testing;
+const automation = native_sdk.automation;
+const canvas = native_sdk.canvas;
 const TerminalApp = native_sdk.UiApp(app.Model, app.Msg);
 
 fn createSessions() ![app.pane_count]*grid.Session {
@@ -74,14 +76,17 @@ test "topology registry creates four unique terminals and refuses a fifth" {
     app.update(&state.model, .new_terminal, &state.effects);
     try testing.expectEqual(@as(usize, app.max_terminal_count), state.model.terminal_count);
     try testing.expectEqual(@as(usize, app.max_terminal_count), state.effects.pendingPtyCount());
-    app.update(&state.model, .{ .select_tab = .web }, &state.effects);
+    app.update(&state.model, .{ .select_surface = .web }, &state.effects);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .shortcut = .{
         .id = "terminal.close",
         .key = "w",
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.TabId.web, state.model.selected_tab);
+    try testing.expect(state.model.selected_surface.eql(.web));
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "Close"));
+    }
     try testing.expectEqual(@as(usize, app.max_terminal_count), state.model.terminal_count);
     try testing.expect(app.onCommand("terminal.new") != null);
     try testing.expect(app.onCommand("terminal.close") != null);
@@ -202,7 +207,7 @@ test "versioned snapshot restores topology into fresh sessions without process s
     const live_session = state.model.provider.terminal(live_id).?.session;
     live_session.feed("runtime state is intentionally not persisted");
 
-    const snapshot = state.model.topologySnapshot();
+    const snapshot = try state.model.topologySnapshot();
     try snapshot.validate();
     var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v1 = snapshot });
     defer app.deinitModel(&restored);
@@ -247,4 +252,203 @@ test "legacy topology migration is bounded normalized and validated" {
     dangling.selection = .{ .terminal = @enumFromInt(@intFromEnum(migrated.terminal_order[3]) + 100) };
     try testing.expectError(error.InvalidTopology, dangling.validate());
     try testing.expectError(error.InvalidTopology, app.migrateTopologySnapshot(.{ .v0 = .{ .terminal_count = 5 } }));
+}
+
+test "closing terminal discards stale output and generated replies until its exact exit" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    const closed_id = state.model.selectedTerminalId().?;
+    const closed = state.model.provider.terminal(closed_id).?;
+    const key = closed.pty_key;
+    const bytes_before = closed.output_bytes;
+    const writes_before = state.effects.ptyWrittenBytes(key).len;
+    app.update(&state.model, .close_terminal, &state.effects);
+    try testing.expect(state.model.provider.isClosing(closed_id));
+
+    // DSR would mutate the screen and enqueue a cursor-position reply if the
+    // closing resource were still allowed to ingest output.
+    try state.effects.feedPtyOutput(key, "STALE\x1b[6n\r\n");
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    try testing.expectEqual(bytes_before, closed.output_bytes);
+    try testing.expectEqual(@as(usize, 0), closed.session.pendingResponses().len);
+    try testing.expectEqual(writes_before, state.effects.ptyWrittenBytes(key).len);
+    try testing.expect(std.mem.indexOf(u8, closed.session.screenText(), "STALE") == null);
+    try testing.expect(state.model.provider.isClosing(closed_id));
+
+    try state.effects.feedPtyExit(key, -1, 0, .cancelled, 0);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    try testing.expect(state.model.provider.terminalForPty(key) == null);
+}
+
+test "terminal identity allocation rejects exhaustion reserved keys and duplicates" {
+    const sessions = try createSessions();
+    var model = try app.initialModelWithIo(testing.allocator, testing.io, sessions);
+    defer app.deinitModel(&model);
+
+    model.provider.next_terminal_raw = std.math.maxInt(u64) - 1;
+    try testing.expectError(error.TerminalIdentityExhausted, model.provider.createTerminal());
+    model.provider.next_terminal_raw = @intFromEnum(app.TerminalId.terminal_1);
+    try testing.expectError(error.TerminalIdentityCollision, model.provider.createTerminal());
+    model.provider.next_terminal_raw = @intFromEnum(app.TerminalId.terminal_2) + 1;
+
+    model.provider.next_pty_key = std.math.maxInt(u64) - 1;
+    try testing.expectError(error.TerminalIdentityExhausted, model.provider.createTerminal());
+    model.provider.next_pty_key = app.ptyKey(0);
+    try testing.expectError(error.TerminalIdentityCollision, model.provider.createTerminal());
+    model.provider.next_pty_key = app.clipboard_key;
+    try testing.expectError(error.TerminalIdentityCollision, model.provider.createTerminal());
+}
+
+test "canonical snapshots reject topology rewrites and round trip exactly" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .toggle_split, &state.effects);
+    state.model.split_fraction = 0.63;
+
+    const snapshot = try state.model.topologySnapshot();
+    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v1 = snapshot });
+    defer app.deinitModel(&restored);
+    try testing.expectEqualDeep(snapshot, try restored.topologySnapshot());
+    try testing.expect(!app.process_restoration_supported);
+
+    var invalid = snapshot;
+    invalid.attachments[invalid.focused_attachment.index()] = null;
+    try testing.expectError(error.InvalidTopology, invalid.validate());
+    invalid = snapshot;
+    invalid.layout = .split;
+    invalid.attachments[1] = null;
+    try testing.expectError(error.InvalidTopology, invalid.validate());
+    invalid = snapshot;
+    invalid.split_fraction = 0.99;
+    try testing.expectError(error.InvalidTopology, invalid.validate());
+    invalid = snapshot;
+    const exhausted: app.TerminalId = @enumFromInt(std.math.maxInt(u64) - 1);
+    const old_id = invalid.terminal_order[0];
+    invalid.terminal_order[0] = exhausted;
+    if (invalid.selection.eql(.{ .terminal = old_id })) invalid.selection = .{ .terminal = exhausted };
+    for (&invalid.attachments) |*attached| {
+        if (attached.* != null and attached.*.? == old_id) attached.* = exhausted;
+    }
+    try testing.expectError(error.InvalidTopology, invalid.validate());
+}
+
+fn fillTerminalCapacity(harness: anytype, state: *TerminalApp) !void {
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+}
+
+test "four-terminal accessibility is compact ordered and keyboard-complete" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    try fillTerminalCapacity(harness, state);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = native_sdk.geometry.SizeF.init(app.window_min_width, app.window_min_height),
+        .scale_factor = 2,
+        .frame_index = 2,
+        .timestamp_ns = 2_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    const buffer = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("four-terminals"), &writer);
+    const a11y = writer.buffered();
+    for (1..5) |number| {
+        var expected: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&expected, "Terminal {d}, native terminal", .{number});
+        try testing.expect(std.mem.indexOf(u8, a11y, label) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, a11y, "Web, system WebKit, shortcut CMD+5") != null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "New Terminal, Command T") != null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "Close Terminal, Command W") != null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "Move terminal tab left") == null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "DETACHED") == null);
+
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .key_down,
+        .key = "5",
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expect(state.model.selected_surface.eql(.web));
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .key_up,
+        .key = "5",
+    } });
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .key_down,
+        .key = "4",
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(state.model.terminal_order[3], state.model.selectedTerminalId().?);
+    try testing.expect(app.onCommand("surface.5") != null);
+}
+
+test "four-terminal tab layout stays inside the minimum window with Web last" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    try fillTerminalCapacity(harness, state);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    var tab_frames: [app.max_terminal_count + 1]native_sdk.geometry.RectF = undefined;
+    var tab_labels: [app.max_terminal_count + 1][]const u8 = undefined;
+    var tab_count: usize = 0;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind != .segmented_control) continue;
+        tab_frames[tab_count] = node.frame;
+        tab_labels[tab_count] = node.widget.text;
+        tab_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), tab_count);
+    for (tab_frames[0..tab_count], 0..) |frame, index| {
+        try testing.expect(frame.width > 0 and frame.height > 0);
+        try testing.expect(frame.x >= 0 and frame.x + frame.width <= app.window_min_width);
+        if (index > 0) try testing.expect(frame.x >= tab_frames[index - 1].x + tab_frames[index - 1].width);
+    }
+    try testing.expectEqualStrings("T1", tab_labels[0]);
+    try testing.expectEqualStrings("T4", tab_labels[3]);
+    try testing.expectEqualStrings("Web", tab_labels[4]);
+}
+
+const four_terminal_shot_path = "zig-out/cockpit-four-terminals.png";
+
+test "four-terminal compact chrome screenshot (env-gated)" {
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    try fillTerminalCapacity(harness, state);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, null);
+    const pixels = try testing.allocator.alloc(u8, pixel_size.byte_len);
+    defer testing.allocator.free(pixels);
+    const scratch = try testing.allocator.alloc(u8, pixel_size.byte_len);
+    defer testing.allocator.free(scratch);
+    const shot = try harness.runtime.renderCanvasScreenshot(1, app.canvas_label, null, pixels, scratch);
+    const encoded = try testing.allocator.alloc(u8, try canvas.png.encodedRgba8ByteLen(shot.width, shot.height));
+    defer testing.allocator.free(encoded);
+    var writer = std.Io.Writer.fixed(encoded);
+    try canvas.png.writeRgba8(&writer, shot.width, shot.height, shot.rgba8);
+    try std.Io.Dir.cwd().createDirPath(testing.io, "zig-out");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = four_terminal_shot_path, .data = writer.buffered() });
 }
