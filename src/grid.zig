@@ -24,6 +24,16 @@ const vt = @import("ghostty-vt");
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
+/// Ghostty's standard terminal word boundaries. The pinned VT module exports
+/// SelectionGesture but keeps its default codepoint policy private.
+const pointer_word_boundaries = [_]u21{
+    0,   ' ', '\t', '\'', '"',
+    '│',
+    '`', '|', ':',  ';',  ',',
+    '(', ')', '[',  ']',  '{',
+    '}', '<', '>',  '$',
+};
+
 /// Grid ceilings, derived from the per-view canvas budgets: the glyph
 /// budget (8192) bounds how many cells can hold ink at once, and the
 /// command budget bounds per-row style runs. A viewport is clamped to
@@ -94,6 +104,10 @@ pub const Session = struct {
     select_anchor: ?CellPos = null,
     select_head: CellPos = .{},
     select_block: bool = false,
+    /// Ghostty's native pointer-selection gesture. Its pins survive output
+    /// and viewport movement while a drag is active; the model only owns
+    /// which terminal/generation receives subsequent pointer phases.
+    pointer_selection: vt.SelectionGesture = .init,
     /// Cell metrics for the mono face at the terminal type size,
     /// refreshed whenever tokens/scale reach the painter.
     cell_width: f32 = 8,
@@ -111,6 +125,15 @@ pub const Session = struct {
     snap_text_len: usize = 0,
 
     pub const CellPos = struct { x: u16 = 0, y: u16 = 0 };
+
+    pub const PointerSelectionEvent = struct {
+        phase: canvas.WidgetPointerPhase,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        click_count: u8 = 1,
+    };
 
     /// Query-answer buffer's INITIAL size (it grows to fit).
     pub const response_capacity: usize = 16 * 1024;
@@ -335,6 +358,7 @@ pub const Session = struct {
 
     pub fn destroy(session: *Session) void {
         const gpa = session.gpa;
+        session.pointer_selection.deinit(&session.term);
         session.render.deinit(gpa);
         session.stream.deinit();
         session.term.deinit(gpa);
@@ -361,6 +385,7 @@ pub const Session = struct {
     /// mode would misencode the new shell's keys or misparse its first
     /// output as a continuation of the old stream.
     pub fn reset(session: *Session) void {
+        session.pointer_selection.reset(&session.term);
         session.term.fullReset();
         // `fullReset` (a RIS) leaves the OSC color state alone, so clear
         // it here: a shell that overrode palette entries (OSC 4) or the
@@ -506,7 +531,7 @@ pub const Session = struct {
     // ---------------------------------------------------- selection
 
     pub fn selectionActive(session: *const Session) bool {
-        return session.select_anchor != null;
+        return session.select_anchor != null or session.term.screens.active.selection != null;
     }
 
     /// Begin a keyboard selection at the terminal cursor (or extend the
@@ -555,8 +580,102 @@ pub const Session = struct {
     }
 
     pub fn clearSelection(session: *Session) void {
+        session.pointer_selection.reset(&session.term);
         session.select_anchor = null;
         session.term.screens.active.clearSelection();
+    }
+
+    /// Primary-pointer selection using Ghostty's own cell/word/line gesture.
+    /// Coordinates are relative to the exact retained terminal-widget frame;
+    /// captured drags may extend beyond it and clamp to the nearest edge.
+    pub fn pointerSelection(session: *Session, event: PointerSelectionEvent) bool {
+        if (!std.math.isFinite(event.x) or !std.math.isFinite(event.y) or
+            !std.math.isFinite(event.width) or !std.math.isFinite(event.height) or
+            event.width <= 0 or event.height <= 0 or
+            session.cell_width <= 0 or session.cell_height <= 0)
+        {
+            return false;
+        }
+
+        const screen = session.term.screens.active;
+        switch (event.phase) {
+            .down => {
+                const pin = session.pointerPin(event) orelse return false;
+                session.select_anchor = null;
+                session.pointer_selection.reset(&session.term);
+                const behavior: vt.SelectionGesture.Behavior = if (event.click_count >= 3)
+                    .line
+                else if (event.click_count == 2)
+                    .word
+                else
+                    .cell;
+                const behaviors = [3]vt.SelectionGesture.Behavior{ behavior, behavior, behavior };
+                const selected = session.pointer_selection.press(&session.term, .{
+                    .time = null,
+                    .pin = pin,
+                    .xpos = event.x,
+                    .ypos = event.y,
+                    .max_distance = @max(1, session.cell_width),
+                    .repeat_interval = 0,
+                    .word_boundary_codepoints = &pointer_word_boundaries,
+                    .behaviors = &behaviors,
+                }) catch {
+                    screen.clearSelection();
+                    return true;
+                };
+                if (selected) |selection| {
+                    screen.select(selection) catch screen.clearSelection();
+                } else {
+                    screen.clearSelection();
+                }
+                return true;
+            },
+            .move => return session.applyPointerDrag(event),
+            .up => {
+                const pin = session.pointerPin(event);
+                const changed = session.applyPointerDrag(event);
+                session.pointer_selection.release(&session.term, .{ .pin = pin });
+                return changed;
+            },
+            .cancel => {
+                session.pointer_selection.reset(&session.term);
+                return false;
+            },
+            .hover, .wheel => return false,
+        }
+    }
+
+    fn applyPointerDrag(session: *Session, event: PointerSelectionEvent) bool {
+        const pin = session.pointerPin(event) orelse return false;
+        const selection = session.pointer_selection.drag(&session.term, .{
+            .pin = pin,
+            .xpos = event.x,
+            .ypos = event.y,
+            .rectangle = false,
+            .word_boundary_codepoints = &pointer_word_boundaries,
+            .geometry = .{
+                .columns = session.cols(),
+                .cell_width = @intFromFloat(@max(1, @round(session.cell_width))),
+                .padding_left = 0,
+                .screen_height = @intFromFloat(@max(1, @round(event.height))),
+            },
+        }) orelse return false;
+        session.term.screens.active.select(selection) catch return false;
+        return true;
+    }
+
+    fn pointerPin(session: *Session, event: PointerSelectionEvent) ?vt.Pin {
+        const cols_count = session.cols();
+        const rows_count = session.rows();
+        if (cols_count == 0 or rows_count == 0) return null;
+        const max_x: f32 = @floatFromInt(cols_count - 1);
+        const max_y: f32 = @floatFromInt(rows_count - 1);
+        const cell_x = std.math.clamp(@floor(event.x / session.cell_width), 0, max_x);
+        const cell_y = std.math.clamp(@floor(event.y / session.cell_height), 0, max_y);
+        return session.term.screens.active.pages.pin(.{ .viewport = .{
+            .x = @intFromFloat(cell_x),
+            .y = @intFromFloat(cell_y),
+        } });
     }
 
     /// Re-derive the viewport-relative selection coordinates from the
