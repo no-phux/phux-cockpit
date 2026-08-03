@@ -40,8 +40,8 @@ test "Phux Cockpit identity and macOS pane commands are exact" {
     try testing.expectEqualStrings(app.canvas_label, app.appOptions().canvas_label);
 
     if (comptime builtin.os.tag != .macos) return;
-    try testing.expectEqualSlices([]const u8, &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\"; if command -v phux >/dev/null 2>&1; then exec phux; fi; printf '\nPhux CLI was not found.\nInstall it with:\n  brew install phall1/tap/phux\nThen press Cmd+R to retry.\n'; exit 127" }, app.paneArgv(0));
-    try testing.expectEqualSlices([]const u8, &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -l -i" }, app.paneArgv(1));
+    try testing.expectEqualSlices([]const u8, &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -i" }, app.paneArgv(0));
+    try testing.expectEqualSlices([]const u8, &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -i" }, app.paneArgv(1));
 }
 
 test "Phux Cockpit owns its dark graphite and lime visual register" {
@@ -647,7 +647,7 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
 fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
-    harness.runtime.options.shortcuts = &app.work_shortcuts;
+    harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
     const sessions = try createSessions(80, 24);
     const app_state = try gpa.create(TerminalApp);
     app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
@@ -932,7 +932,7 @@ test "consumed app shortcut releases never leak under kitty reporting" {
     try testing.expectEqual(@as(u8, 1), app_state.model.focus);
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try releaseCanvasKey(harness, app_iface, "2", .{});
-    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
 
     // Toggle selection on and back off. The second release arrives while
     // selection is no longer armed, so only the app-level latch can stop it.
@@ -940,7 +940,7 @@ test "consumed app shortcut releases never leak under kitty reporting" {
         try pressCanvasKey(harness, app_iface, "space", .{ .primary = true, .command = true, .shift = true });
         try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
         try releaseCanvasKey(harness, app_iface, "space", .{});
-        try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+        try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
     }
     try testing.expect(!app_state.model.panes[1].selecting);
 
@@ -951,12 +951,12 @@ test "consumed app shortcut releases never leak under kitty reporting" {
     try pressCanvasKey(harness, app_iface, "c", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try releaseCanvasKey(harness, app_iface, "c", .{});
-    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
 
     try pressCanvasKey(harness, app_iface, "arrowup", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try releaseCanvasKey(harness, app_iface, "arrowup", .{});
-    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
 
     // Escape turns selection off immediately, and Enter may turn it off
     // before key-up when clipboard completion is fast. Both releases still
@@ -983,7 +983,7 @@ test "consumed app shortcut releases never leak under kitty reporting" {
     try testing.expectEqual(app.Phase.starting, app_state.model.panes[1].phase);
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try releaseCanvasKey(harness, app_iface, "r", .{});
-    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
 
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
@@ -1006,7 +1006,7 @@ test "a non-shortcut re-press supersedes a stranded app shortcut latch" {
     // The key repeats after Command came up. This is now terminal input,
     // so the old app latch must not swallow its eventual release.
     try pressCanvasKey(harness, app_iface, "arrowup", .{});
-    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
     const before_release = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
     try releaseCanvasKey(harness, app_iface, "arrowup", .{});
     try testing.expect(app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len > before_release);
@@ -1094,7 +1094,7 @@ test "clipboard paste stays with its requesting terminal while Web is selected" 
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     try pressCanvasKey(harness, app_iface, "3", .{ .primary = true, .command = true });
-    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.web, app_state.model.selected_tab);
     try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "original owner");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
@@ -1123,7 +1123,7 @@ test "clipboard read failure is visible on the requesting pane" {
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("paste-failed"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "WORKSPACE / PASTE FAILED") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 1 / PASTE FAILED") != null);
 }
 
 test "clipboard result after pane exit is a visible paste failure" {
@@ -1165,7 +1165,7 @@ test "Cmd+V release never leaks under kitty reporting" {
     // Hosts commonly omit Command when the key comes up after the
     // modifier. The app-level latch still owns this physical release.
     try releaseCanvasKey(harness, app_iface, "v", .{});
-    try testing.expectEqual(@as(u16, 0), app_state.model.consumed_shortcut_keys_held);
+    try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
     try testing.expectEqualStrings("paste", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
 }
 
@@ -1196,6 +1196,7 @@ test "paste follows retained replies and atomic admission refuses every byte" {
     const ordered = app_state.effects.ptyWrittenBytes(app.ptyKey(0));
     try testing.expect(std.mem.startsWith(u8, ordered, reply));
     try testing.expect(std.mem.endsWith(u8, ordered, "after"));
+    try releaseCanvasKey(harness, app_iface, "v", .{});
 
     // In bracketed mode, less free ring space than the complete framed
     // paste refuses it whole: no opening fence can be queued by itself.
@@ -1854,13 +1855,13 @@ test "wheel scrolling over the grid scrolls history" {
     const bottom_offset = app_state.model.panes[0].session.scrollbar().offset;
     try testing.expect(bottom_offset > 0);
 
-    // The persistent Work rail is outside every terminal hit target.
+    // Native tab chrome is outside every terminal hit target.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
         .kind = .scroll,
-        .x = app.work_rail_width / 2,
-        .y = 300,
+        .x = 100,
+        .y = 30,
         .delta_y = app_state.model.panes[0].session.cell_height * 4,
     } });
     try testing.expectEqual(bottom_offset, app_state.model.panes[0].session.scrollbar().offset);
@@ -2030,6 +2031,7 @@ test "a selection outlives the copy until the clipboard confirms" {
     try testing.expect(app_state.model.panes[0].copy_failed);
     try testing.expect(app_state.model.panes[0].selecting);
     try testing.expect(app_state.model.panes[0].session.selectionActive());
+    try releaseCanvasKey(harness, app_iface, "enter", .{});
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -2267,7 +2269,7 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
 }
 
-// ---------------------------------------------------- cockpit: Work surfaces
+// ----------------------------------------------------- cockpit: tab surfaces
 
 const automation = native_sdk.automation;
 
@@ -2328,7 +2330,7 @@ test "switching terminal Works retains distinct id namespaces the diff accepts" 
         lists[index] = builder.displayList();
     }
 
-    // A Work switch diffs one selected terminal frame into the other.
+    // A tab switch diffs one selected terminal frame into the other.
     const changes = try testing.allocator.alloc(canvas.DiffChange, 4096);
     defer testing.allocator.free(changes);
     _ = try canvas.DisplayList.diff(lists[0], lists[1], changes);
@@ -2392,7 +2394,7 @@ test "a screen of double box drawing stays inside the selected terminal budget" 
 }
 
 /// The cockpit under the harness with both ptys live and distinct, even
-/// though only the selected Work is presented.
+/// though only the selected tab is presented in single mode.
 fn startTwoPaneCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     const app_state = try startFocusedTerminal(gpa, harness);
     const app_iface = app_state.app();
@@ -2442,7 +2444,7 @@ test "only the selected terminal paints and hidden terminal state remains live" 
     try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEALPHA", frames[0]);
     try expectDisplayListMissingMarker(harness.runtime.views[0].canvasDisplayList(), "PANEBRAVO");
 
-    // Pane 1 accepted output while hidden. Selecting Scratch reveals its
+    // Pane 1 accepted output while hidden. Selecting Terminal 2 reveals its
     // existing emulator rather than creating or resetting a surface.
     try app_state.effects.feedPtyOutput(app.ptyKey(1), "HIDDEN STATE\r\n");
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
@@ -2470,17 +2472,40 @@ test "selected terminal status is concise and the hidden status is absent" {
     var saw_workspace = false;
     var saw_scratch = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "WORKSPACE / RUNNING")) {
+        if (std.mem.eql(u8, layout.widget.text, "TERMINAL 1 / RUNNING")) {
             saw_workspace = true;
             try testing.expectEqual(canvas.WidgetVariant.primary, layout.widget.variant);
         }
-        if (std.mem.eql(u8, layout.widget.text, "SCRATCH / RUNNING")) saw_scratch = true;
+        if (std.mem.eql(u8, layout.widget.text, "TERMINAL 2 / RUNNING")) saw_scratch = true;
     }
     try testing.expect(saw_workspace);
     try testing.expect(!saw_scratch);
 }
 
-test "missing phux and selection mode are actionable in native chrome" {
+test "split exposes lifecycle status for both visible terminals" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
+    try releaseCanvasKey(harness, app_iface, "d", .{});
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 9, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+
+    const buffer = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("split-status"), &writer);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 1 / RUNNING") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 2 / EXIT 9 / CMD+R RETRY") != null);
+}
+
+test "terminal exit and selection mode are actionable in native chrome" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2494,27 +2519,27 @@ test "missing phux and selection mode are actionable in native chrome" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     var saw_missing = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "PHUX NOT FOUND / CMD+R RETRY")) {
+        if (std.mem.eql(u8, layout.widget.text, "TERMINAL 1 / EXIT 127 / CMD+R RETRY")) {
             saw_missing = true;
             try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
         }
     }
     try testing.expect(saw_missing);
 
-    // Scratch remains usable and teaches selection in context.
+    // The second terminal remains usable and teaches selection in context.
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
     try pressCanvasKey(harness, app_iface, "space", .{ .primary = true, .shift = true });
     var saw_selecting = false;
     var saw_help = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "SCRATCH / SELECTING")) saw_selecting = true;
+        if (std.mem.eql(u8, layout.widget.text, "TERMINAL 2 / SELECTING")) saw_selecting = true;
         if (std.mem.eql(u8, layout.widget.text, "Arrows move | Shift extends | Enter copies | Esc cancels")) saw_help = true;
     }
     try testing.expect(saw_selecting);
     try testing.expect(saw_help);
 }
 
-test "Work rows and only the selected terminal surface reach accessibility" {
+test "native tabs and only the selected terminal surface reach accessibility" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2532,20 +2557,20 @@ test "Work rows and only the selected terminal surface reach accessibility" {
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("cockpit"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Work") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Workspace, phux / durable work, shortcut") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Scratch, local / ephemeral, shortcut") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, native WebKit, shortcut") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "WORKSPACE / I/O LOSS") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Surfaces") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal 1, native terminal, shortcut") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal 2, native terminal, shortcut") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, system WebKit, shortcut") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 1 / I/O LOSS") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "outbound loss 7 bytes; reply loss 2 bytes") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Workspace terminal") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal 1") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEALPHA") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PANEBRAVO") == null);
     try testing.expect(harness.runtime.sessionStateFingerprint() != 0);
 
     var saw_workspace = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.startsWith(u8, layout.widget.text, "WORKSPACE")) {
+        if (std.mem.startsWith(u8, layout.widget.text, "TERMINAL 1")) {
             saw_workspace = true;
             try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
         }
@@ -2555,13 +2580,13 @@ test "Work rows and only the selected terminal surface reach accessibility" {
 
 // The eyes: the retained frame rendered offscreen through the
 // deterministic reference renderer and written as a PNG, so a human (or
-// an agent that can read images) can inspect the selected Work and rail.
+// an agent that can read images) can inspect the native tab substrate.
 // Skipped by default, never in CI:
 //
 //   COCKPIT_SHOTS=1 zig build test -Dplatform=null
-const cockpit_shot_path = "zig-out/cockpit-selected-work.png";
+const cockpit_shot_path = "zig-out/cockpit-native-tabs.png";
 
-test "cockpit selected-Work proof shot (env-gated)" {
+test "cockpit native-tab proof shot (env-gated)" {
     if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
     if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -2667,30 +2692,40 @@ fn rectCenter(rect: geometry.RectF) geometry.PointF {
     return geometry.PointF.init(rect.x + rect.width / 2, rect.y + rect.height / 2);
 }
 
-test "selected Work defaults to Workspace and paneFrames has one full content frame" {
+test "selected terminal defaults to the first tab and paneFrames has one full content frame" {
     const sessions = try createSessions(80, 24);
     defer for (sessions) |session| session.destroy();
     var model = app.initialModel(sessions);
-    try testing.expectEqual(app.WorkId.workspace, model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_1, model.selected_tab);
     try testing.expectEqual(@as(?u8, 0), model.selectedTerminalIndex());
 
-    const size = geometry.SizeF.init(1100, 640);
+    const size = geometry.SizeF.init(980, 640);
     var frames = app.paneFrames(&model, size);
-    try testing.expectEqual(app.work_rail_width, @as(f32, 208));
-    try testing.expectApproxEqAbs(@as(f32, 226), frames[0].x, 0.0001);
-    try testing.expectApproxEqAbs(@as(f32, 866), frames[0].width, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 8), frames[0].x, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 964), frames[0].width, 0.0001);
     try testing.expect(frames[0].height > 0);
     try testing.expectEqual(geometry.RectF{}, frames[1]);
 
-    model.selected_work = .scratch;
+    model.selected_tab = .terminal_2;
     frames = app.paneFrames(&model, size);
     try testing.expectEqual(geometry.RectF{}, frames[0]);
     try testing.expect(frames[1].width > 0);
 
-    model.selected_work = .web;
+    model.selected_tab = .web;
     frames = app.paneFrames(&model, size);
     try testing.expectEqual(geometry.RectF{}, frames[0]);
     try testing.expectEqual(geometry.RectF{}, frames[1]);
+
+    model.selected_tab = .terminal_1;
+    model.layout = .split;
+    model.split_fraction = 0.01;
+    frames = app.paneFrames(&model, size);
+    try testing.expect(frames[0].width >= app.split_pane_min_width - 0.01);
+    try testing.expect(frames[1].width >= app.split_pane_min_width - 0.01);
+    model.split_fraction = 0.99;
+    frames = app.paneFrames(&model, size);
+    try testing.expect(frames[0].width >= app.split_pane_min_width - 0.01);
+    try testing.expect(frames[1].width >= app.split_pane_min_width - 0.01);
 }
 
 test "the selected terminal stack lands exactly where paneFrames paints" {
@@ -2716,7 +2751,249 @@ test "the selected terminal stack lands exactly where paneFrames paints" {
     }
 }
 
-test "Cmd+1 and Cmd+2 select terminal Works and route text only to that Work" {
+test "Cmd+D projects both live terminals without respawning and collapse keeps the active pane" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    const first_session = app_state.model.panes[0].session;
+    const second_session = app_state.model.panes[1].session;
+    const generations = [_]u64{
+        app_state.model.panes[0].session_generation,
+        app_state.model.panes[1].session_generation,
+    };
+
+    try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
+    try releaseCanvasKey(harness, app_iface, "d", .{});
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    try testing.expectEqual(app.LayoutMode.split, app_state.model.layout);
+    const frames = app.paneFrames(&app_state.model, size);
+    try testing.expect(frames[0].width >= app.split_pane_min_width);
+    try testing.expect(frames[1].width >= app.split_pane_min_width);
+    try testing.expectApproxEqAbs(
+        size.width - 2 * 8,
+        frames[0].width + app.split_divider_width + frames[1].width,
+        0.001,
+    );
+    try testing.expect(app_state.model.panes[0].session == first_session);
+    try testing.expect(app_state.model.panes[1].session == second_session);
+    try testing.expectEqual(generations[0], app_state.model.panes[0].session_generation);
+    try testing.expectEqual(generations[1], app_state.model.panes[1].session_generation);
+    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEALPHA", frames[0]);
+    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEBRAVO", frames[1]);
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 0, .filled);
+    try expectPaneCursorPaintKind(harness.runtime.views[0].canvasDisplayList(), 1, .hollow);
+
+    const right_target = rectCenter(frames[1]);
+    try clickCanvas(harness, app_iface, right_target.x, right_target.y);
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try testing.expectEqual(app.TabId.terminal_2, app_state.model.selected_tab);
+
+    try pressCanvasKey(harness, app_iface, "arrowleft", .{ .primary = true, .option = true });
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try pressCanvasKey(harness, app_iface, "arrowright", .{ .primary = true, .option = true });
+    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
+    try testing.expectEqual(app.TabId.terminal_2, app_state.model.selected_tab);
+    try typeCanvasText(harness, app_iface, "right");
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("right", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+
+    try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    try testing.expectEqual(app.LayoutMode.single, app_state.model.layout);
+    const collapsed = app.paneFrames(&app_state.model, size);
+    try testing.expectEqual(@as(f32, 0), collapsed[0].width);
+    try testing.expect(collapsed[1].width > 0);
+}
+
+test "split divider keyboard resize stays in lockstep with terminal chrome and PTYs" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    var divider: ?geometry.RectF = null;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind == .split_divider) divider = node.frame;
+    }
+    const target = rectCenter(divider orelse return error.TestExpectedSplitDivider);
+    try clickCanvas(harness, app_iface, target.x, target.y);
+    const before = app_state.model.split_fraction;
+    try pressCanvasKey(harness, app_iface, "arrowright", .{});
+    try testing.expect(app_state.model.split_fraction > before);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    divider = null;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind == .split_divider) divider = node.frame;
+    }
+    const drag_start = rectCenter(divider orelse return error.TestExpectedSplitDivider);
+    const keyboard_fraction = app_state.model.split_fraction;
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .pointer_down,
+        .x = drag_start.x,
+        .y = drag_start.y,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .pointer_drag,
+        .x = drag_start.x + 60,
+        .y = drag_start.y,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .pointer_up,
+        .x = drag_start.x + 60,
+        .y = drag_start.y,
+    } });
+    try testing.expect(app_state.model.split_fraction > keyboard_fraction);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    const frames = app.paneFrames(&app_state.model, size);
+    for ([_][]const u8{ "PANEALPHA", "PANEBRAVO" }, 0..) |marker, index| {
+        const laid_out = paneStackFrame(harness, marker) orelse return error.TestExpectedPaneStack;
+        try testing.expectApproxEqAbs(frames[index].x, laid_out.x, 0.25);
+        try testing.expectApproxEqAbs(frames[index].width, laid_out.width, 0.25);
+    }
+
+    for (2..6) |frame_index| {
+        try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+            .label = app.canvas_label,
+            .size = size,
+            .scale_factor = 2,
+            .frame_index = @intCast(frame_index),
+            .timestamp_ns = @as(u64, frame_index) * 1_000_000,
+        } });
+    }
+    for (app_state.model.panes, frames) |pane, frame| {
+        const expected = grid.Session.clampGrid(
+            @intFromFloat(@max(2, frame.width / pane.session.cell_width)),
+            @intFromFloat(@max(2, frame.height / pane.session.cell_height)),
+            grid.max_cells,
+        );
+        try testing.expectEqual(expected.x, pane.cols);
+        try testing.expectEqual(expected.y, pane.rows);
+    }
+}
+
+test "tab cycling crosses terminal and Web surfaces without sending terminal bytes" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true });
+    try testing.expectEqual(app.TabId.terminal_2, app_state.model.selected_tab);
+    try releaseCanvasKey(harness, app_iface, "]", .{});
+    try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true });
+    try testing.expectEqual(app.TabId.web, app_state.model.selected_tab);
+    try releaseCanvasKey(harness, app_iface, "]", .{});
+    try pressCanvasKey(harness, app_iface, "[", .{ .primary = true, .shift = true });
+    try testing.expectEqual(app.TabId.terminal_2, app_state.model.selected_tab);
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+}
+
+test "extra modifiers bypass exact spatial shortcuts and reach the terminal" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true, .control = true });
+    try testing.expectEqual(app.TabId.terminal_1, app_state.model.selected_tab);
+    const after_bracket = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
+    try testing.expect(after_bracket > 0);
+
+    try pressCanvasKey(harness, app_iface, "arrowright", .{ .primary = true, .option = true, .shift = true });
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try testing.expect(app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len > after_bracket);
+    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
+
+    const before_single_pane_chord = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
+    app_state.model.panes[0].session.feed("\x1b[>11u");
+    try pressCanvasKey(harness, app_iface, "arrowright", .{ .primary = true, .option = true });
+    try testing.expectEqual(app.LayoutMode.single, app_state.model.layout);
+    try testing.expectEqual(@as(u8, 0), app_state.model.focus);
+    try testing.expect(app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len > before_single_pane_chord);
+}
+
+test "spatial shortcut releases never leak into kitty-reporting terminals" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
+    const sessions = try createSessions(80, 24);
+    const host = try gpa.create(app.CockpitHost);
+    defer gpa.destroy(host);
+    host.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    host.inner.effects.executor = .fake;
+    const app_iface = host.app();
+    try harness.start(app_iface);
+    for (&host.inner.model.panes) |*pane| pane.session.feed("\x1b[>11u");
+
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "layout.split",
+        .key = "d",
+        .window_id = 1,
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.LayoutMode.split, host.inner.model.layout);
+    try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
+    try testing.expectEqual(app.LayoutMode.split, host.inner.model.layout);
+    try releaseCanvasKey(harness, app_iface, "d", .{});
+
+    const cases = [_]struct {
+        id: []const u8,
+        key: []const u8,
+        modifiers: native_sdk.platform.ShortcutModifiers,
+    }{
+        .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
+        .{ .id = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
+    };
+    for (cases) |case| {
+        try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+            .id = case.id,
+            .key = case.key,
+            .window_id = 1,
+            .modifiers = case.modifiers,
+        } });
+        try releaseCanvasKey(harness, app_iface, case.key, .{});
+    }
+    try testing.expectEqualStrings("", host.inner.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try testing.expectEqualStrings("", host.inner.effects.ptyWrittenBytes(app.ptyKey(1)));
+}
+
+test "Cmd+1 and Cmd+2 select terminal tabs and route text only to that tab" {
     // THE ACCEPTANCE GATE for the whole spike: mis-routed input shows
     // up as bytes on the wrong pty, not as a subtle rendering
     // difference.
@@ -2730,7 +3007,7 @@ test "Cmd+1 and Cmd+2 select terminal Works and route text only to that Work" {
     const app_iface = app_state.app();
 
     try testing.expectEqual(@as(u8, 0), app_state.model.focus);
-    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_1, app_state.model.selected_tab);
     try typeCanvasText(harness, app_iface, "alpha");
     try testing.expectEqualStrings("alpha", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
@@ -2738,7 +3015,7 @@ test "Cmd+1 and Cmd+2 select terminal Works and route text only to that Work" {
     // cmd+2 moves the keyboard to pane 1.
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
     try testing.expectEqual(@as(u8, 1), app_state.model.focus);
-    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_2, app_state.model.selected_tab);
     try typeCanvasText(harness, app_iface, "bravo");
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
     // Pane 0's stream is untouched: the chord itself never reached it.
@@ -2747,36 +3024,36 @@ test "Cmd+1 and Cmd+2 select terminal Works and route text only to that Work" {
     // ...and back.
     try pressCanvasKey(harness, app_iface, "1", .{ .primary = true });
     try testing.expectEqual(@as(u8, 0), app_state.model.focus);
-    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_1, app_state.model.selected_tab);
     try typeCanvasText(harness, app_iface, "!");
     try testing.expectEqualStrings("alpha!", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-test "Work IDs and browser messages make focused model transitions" {
+test "tab IDs and browser messages make focused model transitions" {
     const sessions = try createSessions(80, 24);
     defer for (sessions) |session| session.destroy();
     var app_state = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
     defer app_state.deinit();
     app_state.effects.executor = .fake;
 
-    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_1, app_state.model.selected_tab);
     try testing.expectEqual(app.BrowserPage.github, app_state.model.browser_page);
     try testing.expectEqual(@as(?u8, 0), app_state.model.selectedTerminalIndex());
 
-    app.update(&app_state.model, .{ .select_work = .scratch }, &app_state.effects);
-    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
+    app.update(&app_state.model, .{ .select_tab = .terminal_2 }, &app_state.effects);
+    try testing.expectEqual(app.TabId.terminal_2, app_state.model.selected_tab);
     try testing.expectEqual(@as(u8, 1), app_state.model.focus);
     try testing.expectEqual(@as(?u8, 1), app_state.model.selectedTerminalIndex());
 
     app.update(&app_state.model, .{ .browser_page = .article }, &app_state.effects);
-    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.web, app_state.model.selected_tab);
     try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
     try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
     try testing.expectEqual(@as(u8, 1), app_state.model.focus);
 
     try testing.expectEqual(@as(u64, 1), app_state.model.browser_navigation_token);
-    app.update(&app_state.model, .{ .select_work = .workspace }, &app_state.effects);
+    app.update(&app_state.model, .{ .select_tab = .terminal_1 }, &app_state.effects);
     try testing.expectEqual(@as(u8, 0), app_state.model.focus);
     try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
 }
@@ -2799,7 +3076,7 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
     try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
 
     try pressCanvasKey(harness, app_iface, "3", .{ .primary = true });
-    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.web, app_state.model.selected_tab);
     try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
     try testing.expectEqual(@as(usize, 0), app_state.effects.pendingClipboardCount());
 
@@ -2829,7 +3106,7 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("web"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, native WebKit") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, system WebKit") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), app.webview_anchor) != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "GitHub") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Open GitHub") != null);
@@ -2838,12 +3115,12 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
     // WebKit focus. Its later physical release is latched and cannot leak to
     // a terminal using kitty key-release reporting.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
-        .id = "work.scratch",
+        .id = "tab.terminal-2",
         .key = "2",
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_2, app_state.model.selected_tab);
     const scratch_before_release = app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len;
     try releaseCanvasKey(harness, app_iface, "2", .{});
     try testing.expectEqual(scratch_before_release, app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len);
@@ -2875,12 +3152,12 @@ test "web pane root-navigation bindings are exact" {
     try testing.expect(harness.null_platform.webviews[0].frame.height <= 1);
     const navigations = harness.null_platform.webview_navigate_count;
     try app_state.dispatch(&harness.runtime, 1, .{ .browser_page = .superlogical });
-    try testing.expectEqual(app.WorkId.web, app_state.model.selected_work);
+    try testing.expectEqual(app.TabId.web, app_state.model.selected_tab);
     try testing.expectEqualStrings(app.BrowserPage.superlogical.url(), harness.null_platform.webviews[0].url);
     try testing.expectEqual(navigations + 1, harness.null_platform.webview_navigate_count);
     try testing.expectEqual(@as(u64, 1), app_state.model.browser_navigation_token);
     const web_frame = harness.null_platform.webviews[0].frame;
-    try testing.expect(web_frame.x >= app.work_rail_width);
+    try testing.expect(web_frame.x >= 0);
     try testing.expect(web_frame.y >= app.header_height);
     try testing.expect(web_frame.width > 500);
     try testing.expect(web_frame.height > 300);
@@ -2893,13 +3170,13 @@ test "web pane root-navigation bindings are exact" {
     try testing.expectEqual(@as(u64, 2), app_state.model.browser_navigation_token);
 }
 
-test "native Work shortcuts transfer first responder between canvas and WebKit" {
+test "native tab shortcuts transfer first responder between canvas and WebKit" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
-    harness.runtime.options.shortcuts = &app.work_shortcuts;
+    harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
 
     const sessions = try createSessions(80, 24);
     const host = try gpa.create(app.CockpitHost);
@@ -2912,12 +3189,12 @@ test "native Work shortcuts transfer first responder between canvas and WebKit" 
     try harness.start(app_iface);
 
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
-        .id = "work.web",
+        .id = "tab.web",
         .key = "3",
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.WorkId.web, host.inner.model.selected_work);
+    try testing.expectEqual(app.TabId.web, host.inner.model.selected_tab);
     var views_buffer: [4]native_sdk.ViewInfo = undefined;
     var views = harness.runtime.listViews(1, &views_buffer);
     var canvas_focused = false;
@@ -2930,12 +3207,12 @@ test "native Work shortcuts transfer first responder between canvas and WebKit" 
     try testing.expect(web_focused);
 
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
-        .id = "work.scratch",
+        .id = "tab.terminal-2",
         .key = "2",
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.WorkId.scratch, host.inner.model.selected_work);
+    try testing.expectEqual(app.TabId.terminal_2, host.inner.model.selected_tab);
     views = harness.runtime.listViews(1, &views_buffer);
     canvas_focused = false;
     web_focused = false;
@@ -2945,37 +3222,122 @@ test "native Work shortcuts transfer first responder between canvas and WebKit" 
     }
     try testing.expect(canvas_focused);
     try testing.expect(!web_focused);
+
+    // Key-up for Cmd+3 stayed with WebKit, but a later Cmd+3 must still work.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "tab.web",
+        .key = "3",
+        .window_id = 1,
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.TabId.web, host.inner.model.selected_tab);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "tab.terminal-2",
+        .key = "2",
+        .window_id = 1,
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.TabId.terminal_2, host.inner.model.selected_tab);
 }
 
-test "clicking a Work row selects Scratch and routes typing to it" {
+test "pointer tab actions return focus to terminal content and hand off WebKit" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
     defer harness.destroy(gpa);
-    const app_state = try startTwoPaneCockpit(gpa, harness);
-    defer gpa.destroy(app_state);
-    defer destroyModelSessions(&app_state.model);
-    defer app_state.deinit();
-    const app_iface = app_state.app();
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
 
-    try testing.expectEqual(app.WorkId.workspace, app_state.model.selected_work);
-    var scratch_frame: ?geometry.RectF = null;
+    const sessions = try createSessions(80, 24);
+    const host = try gpa.create(app.CockpitHost);
+    defer gpa.destroy(host);
+    host.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    host.inner.effects.executor = .fake;
+    const app_iface = host.app();
+    try harness.start(app_iface);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = size,
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    var terminal_2_frame: ?geometry.RectF = null;
+    var web_frame: ?geometry.RectF = null;
+    var split_frame: ?geometry.RectF = null;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (std.mem.indexOf(u8, node.widget.semantics.label, "Scratch, local / ephemeral") != null) scratch_frame = node.frame;
+        if (std.mem.indexOf(u8, node.widget.semantics.label, "Terminal 2, native terminal") != null) terminal_2_frame = node.frame;
+        if (std.mem.indexOf(u8, node.widget.semantics.label, "Web, system WebKit") != null) web_frame = node.frame;
+        if (std.mem.eql(u8, node.widget.text, "Split")) split_frame = node.frame;
     }
-    const target = rectCenter(scratch_frame orelse return error.TestExpectedWorkRow);
+    var terminal_1_id: ?canvas.ObjectId = null;
+    var web_id: ?canvas.ObjectId = null;
+    for (harness.runtime.views[0].widgetSemantics()) |node| {
+        if (std.mem.indexOf(u8, node.label, "Terminal 1, native terminal") != null) terminal_1_id = node.id;
+        if (std.mem.indexOf(u8, node.label, "Web, system WebKit") != null) web_id = node.id;
+    }
+    var target = rectCenter(split_frame orelse return error.TestExpectedSplitControl);
     try clickCanvas(harness, app_iface, target.x, target.y);
-    try testing.expectEqual(@as(u8, 1), app_state.model.focus);
-    try testing.expectEqual(app.WorkId.scratch, app_state.model.selected_work);
+    try testing.expectEqual(app.LayoutMode.split, host.inner.model.layout);
+    try clickCanvas(harness, app_iface, target.x, target.y);
+    try testing.expectEqual(app.LayoutMode.single, host.inner.model.layout);
 
-    // A stack is not focusable, so the press RELEASED widget focus and
-    // typing goes straight back to the terminal — pane 1's now.
-    try typeCanvasText(harness, app_iface, "clicked");
-    try testing.expectEqualStrings("clicked", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
-    try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    target = rectCenter(terminal_2_frame orelse return error.TestExpectedTab);
+    try clickCanvas(harness, app_iface, target.x, target.y);
+    try testing.expectEqual(@as(u8, 1), host.inner.model.focus);
+    try testing.expectEqual(app.TabId.terminal_2, host.inner.model.selected_tab);
+    try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
+
+    try pressCanvasKey(harness, app_iface, "enter", .{});
+    try pressCanvasKey(harness, app_iface, "space", .{});
+    try pressCanvasKey(harness, app_iface, "arrowup", .{});
+    try testing.expect(host.inner.effects.ptyWrittenBytes(app.ptyKey(1)).len > 2);
+    try testing.expectEqualStrings("", host.inner.effects.ptyWrittenBytes(app.ptyKey(0)));
+
+    target = rectCenter(web_frame orelse return error.TestExpectedTab);
+    try clickCanvas(harness, app_iface, target.x, target.y);
+    try testing.expectEqual(app.TabId.web, host.inner.model.selected_tab);
+    var views_buffer: [4]native_sdk.ViewInfo = undefined;
+    var views = harness.runtime.listViews(1, &views_buffer);
+    for (views) |item| {
+        if (std.mem.eql(u8, item.label, app.webview_label)) try testing.expect(item.focused);
+    }
+
+    // The tab band remains canvas-owned above WebKit, so it can bring the
+    // terminal back and clear the tab control's own widget focus atomically.
+    target = rectCenter(terminal_2_frame.?);
+    try clickCanvas(harness, app_iface, target.x, target.y);
+    try testing.expectEqual(app.TabId.terminal_2, host.inner.model.selected_tab);
+    try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
+    views = harness.runtime.listViews(1, &views_buffer);
+    for (views) |item| {
+        if (std.mem.eql(u8, item.label, app.canvas_label)) try testing.expect(item.focused);
+        if (std.mem.eql(u8, item.label, app.webview_label)) try testing.expect(!item.focused);
+    }
+
+    _ = try harness.runtime.dispatchCanvasWidgetAccessibilityAction(app_iface, 1, app.canvas_label, .{
+        .id = web_id orelse return error.TestExpectedTab,
+        .action = .press,
+    });
+    try testing.expectEqual(app.TabId.web, host.inner.model.selected_tab);
+    views = harness.runtime.listViews(1, &views_buffer);
+    for (views) |item| if (std.mem.eql(u8, item.label, app.webview_label)) try testing.expect(item.focused);
+
+    _ = try harness.runtime.dispatchCanvasWidgetAccessibilityAction(app_iface, 1, app.canvas_label, .{
+        .id = terminal_1_id orelse return error.TestExpectedTab,
+        .action = .press,
+    });
+    try testing.expectEqual(app.TabId.terminal_1, host.inner.model.selected_tab);
+    views = harness.runtime.listViews(1, &views_buffer);
+    for (views) |item| if (std.mem.eql(u8, item.label, app.canvas_label)) try testing.expect(item.focused);
 }
 
-test "the header has no focusable button hazard and Enter stays terminal input" {
+test "native tabs are keyboard focusable without stealing initial terminal input" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2985,12 +3347,14 @@ test "the header has no focusable button hazard and Enter stays terminal input" 
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        try testing.expect(node.widget.kind != .button);
-    }
+    var tab_count: usize = 0;
     for (harness.runtime.views[0].widgetSemantics()) |node| {
-        try testing.expect(!node.focusable);
+        if (node.role == .tab) {
+            try testing.expect(node.focusable);
+            tab_count += 1;
+        }
     }
+    try testing.expectEqual(@as(usize, 3), tab_count);
     try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
     try pressCanvasKey(harness, app_iface, "enter", .{});
     try testing.expectEqualStrings("\r", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));

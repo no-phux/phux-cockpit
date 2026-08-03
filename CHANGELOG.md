@@ -5,6 +5,29 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-02
+
+### Added
+
+- Native accessible tabs for two terminal surfaces and system WebKit.
+- A real draggable and keyboard-operable terminal split with model-owned
+  geometry, active-pane focus, and direct `cmd+D` control.
+- Previous/next tab shortcuts that remain available while WebKit owns the
+  native first responder, plus split-pane focus shortcuts on the terminal
+  canvas.
+- Combined two-terminal rendering budgets and adversarial coverage for IDs,
+  geometry, input isolation, PTY resizing, and process-lifetime independence.
+
+### Changed
+
+- Cockpit no longer launches or embeds the phux TUI. Both terminal surfaces
+  run ordinary login-configured interactive shells while the native
+  control-plane protocol remains future work.
+- Surface identity is independent from single/split placement; entering,
+  resizing, focusing, and leaving a split preserves both live sessions.
+- The Work rail has been replaced by a compact native tab and action band,
+  returning the full window width to content.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added
@@ -45,6 +68,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Local Shell is ephemeral and is not a durable phux session.
 - The release supports Apple silicon macOS only.
 
-[Unreleased]: https://github.com/phall1/phux-cockpit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/phall1/phux-cockpit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.3.0
 [0.2.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.2.0
 [0.1.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.1.0

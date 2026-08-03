@@ -1,51 +1,52 @@
 # Phux Cockpit
 
-Phux Cockpit is a native macOS workbench around
-[phux](https://github.com/phall1/phux). Version 0.2.0 introduces a stable Work
-rail over three real execution surfaces: the installed phux TUI, an ephemeral
-local scratch shell, and a focused system-WebKit research surface.
+Phux Cockpit is a native macOS spatial runtime for terminal, web, and future
+control-plane surfaces. Version 0.3.0 replaces the embedded phux TUI and Work
+rail with native tabs and a real split-pane terminal substrate.
 
-## Companion scope
+## Spatial runtime
 
-- **Workspace** runs the installed `phux` executable. It is the same durable
-  TUI and workspace state you get by running `phux` in a terminal.
-- **Scratch** is owned by this app process. It is ephemeral:
-  closing or restarting the app ends that shell, and it is not a durable phux
-  session.
+- **Terminal 1** and **Terminal 2** are independent native terminal surfaces
+  over login-configured interactive shells. Each owns its own PTY, emulator,
+  scrollback, selection, input queue, and retained-rendering namespace.
+- **Split** projects both live terminal sessions simultaneously through a real
+  draggable and keyboard-operable divider. Splitting, focusing, resizing, and
+  collapsing never restart either process.
+- **Tabs** are native canvas controls with tab accessibility semantics. Direct
+  selection and next/previous shortcuts preserve hidden surface state.
 - **Web** is a native WebKit surface for the explicitly allowed GitHub,
   Superlogical, and Mitchell Hashimoto top-level origins. It keeps its page
-  process alive while another Work is selected. Native bridge commands are
+  process alive while another tab is selected. Native bridge commands are
   disabled; WebKit subframes and page resources remain ordinary web content.
-- This release is **not** the future native `SessionKernel` client. It does not
-  embed `SessionKernel<NativeEngine>`, attach through a native protocol, or
-  replace phux's TUI. That integration waits for phux's versioned libghostty
-  checkpoint bootstrap and shared kernel layers.
+- Cockpit does not run the phux TUI. A future control-plane client will attach
+  native surfaces to phux sessions through a headless protocol.
 
-Both terminal executions stay live while hidden. The selected terminal is
-backed by libghostty-vt and painted into a native-sdk Metal surface; Web is a
-real platform webview layered into the same window. The native layer does not
-parse or fabricate phux application state.
+Both terminal executions stay live while hidden or split. libghostty-vt owns
+terminal state and native-sdk paints both into one Metal surface under strict
+combined command, text, glyph, and path budgets.
 
 ## Install
 
-Phux must be installed and available on `PATH`. Install the companion with
-Homebrew:
+Install with Homebrew:
 
 ```sh
 brew install --cask phall1/tap/phux-cockpit
 ```
 
-The cask installs the `phux` formula from the same tap, then places **Phux
-Cockpit** in Applications. Version 0.2.0 is ad-hoc signed; the cask clears its
-quarantine attribute and reports that fact in its caveat.
+The cask places **Phux Cockpit** in Applications. Version 0.3.0 is ad-hoc
+signed; the cask clears its quarantine attribute and reports that fact in its
+caveat.
 
 ## Keybindings
 
 | Key | Action |
 |---|---|
-| `cmd+1` | Select Workspace |
-| `cmd+2` | Select Scratch |
+| `cmd+1` | Select Terminal 1 |
+| `cmd+2` | Select Terminal 2 |
 | `cmd+3` | Select Web |
+| `cmd+shift+[` / `cmd+shift+]` | Select previous or next tab |
+| `cmd+D` | Split terminals or collapse to the active terminal |
+| `cmd+option+left` / `cmd+option+right` | Move keyboard focus across split panes |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |
 | `shift` + arrow keys | Extend the selection |
@@ -58,14 +59,14 @@ quarantine attribute and reports that fact in its caveat.
 | `cmd+home` / `cmd+end` | Jump to the top or bottom of history |
 | `cmd+R` | Restart the selected terminal after its process exits |
 
-Clicking a Work row switches surfaces without stopping hidden work. Trackpad
-and mouse-wheel input scrolls only inside the selected terminal; wheel input
-over the rail never leaks into a hidden execution.
+Clicking a tab switches surfaces without stopping hidden execution. Clicking a
+split pane moves input ownership to it. The divider supports pointer dragging,
+arrow-key adjustment, Home, and End. Trackpad and wheel input route only to the
+terminal under the pointer.
 
 ## Requirements
 
 - Apple silicon Mac running macOS 11 or later
-- `phux` installed and discoverable on `PATH` (the cask installs it)
 - Zig 0.16.0 and Xcode Command Line Tools for source builds
 - Internet access on the first source build to fetch pinned dependencies
 
@@ -112,20 +113,21 @@ scheduled updater independently repairs a missed release update.
 
 ## Limitations
 
-- Version 0.2.0 is an early product slice, not a native phux session client.
-- Workspace depends on an independently installed `phux`; the app does not
-  bundle or update phux.
-- Scratch is disposable and has no phux session semantics.
+- Version 0.3.0 establishes the spatial terminal substrate; it is not yet a
+  native phux control-plane client.
+- Terminal processes and layout are not restored between app launches.
+- Detachable terminal windows are intentionally not faked. native-sdk v0.7.1
+  needs per-secondary-window custom chrome and focus hooks before the same
+  terminal surface can attach to another native window correctly.
 - Web allowlists top-level navigation; it is not a content firewall for
   subframes or page resources. native-sdk v0.7.1 does not expose page title,
   committed-navigation, load-state, or native back/forward events to Zig, so
   Cockpit does not pretend to own general browser history.
-- The initial Work records are fixed; user-created durable Work and promotion
-  in place require the next persistence/session integration slice.
-- Window and shell state are not restored between launches.
+- The initial terminal and Web tabs are fixed; creating, closing, reordering,
+  and restoring tabs require the next durable topology slice.
 - Headless tests prove terminal and UI behavior but cannot prove live Metal
   presentation.
-- The 0.2.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
+- The 0.3.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
   performs the same explicit quarantine removal used by other apps in the tap.
 
 ## Project background
