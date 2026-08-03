@@ -67,6 +67,9 @@ pub const TerminalId = enum(u64) {
 const first_terminal_raw: u64 = @intFromEnum(TerminalId.terminal_1);
 
 const max_held_terminal_keys: usize = 16;
+const max_pointer_captures: usize = 8;
+const max_mouse_reports_per_event: usize = 64;
+const max_mouse_coordinate: f32 = 1_000_000;
 
 const HeldTerminalKey = struct {
     fingerprint: u64 = 0,
@@ -82,6 +85,7 @@ pub const PointerModifiers = struct {
 };
 
 pub const TerminalPointerEvent = struct {
+    window_id: native_sdk.platform.WindowId = 1,
     terminal_id: TerminalId,
     generation: u64,
     phase: canvas.WidgetPointerPhase,
@@ -96,13 +100,17 @@ pub const TerminalPointerEvent = struct {
 
 pub const PointerDragMode = enum { local_selection, mouse_report };
 
-pub const PointerDrag = struct {
+pub const PointerCapture = struct {
+    active: bool = false,
+    window_id: native_sdk.platform.WindowId = 0,
     terminal_id: TerminalId,
-    generation: u64,
-    pointer_id: u64,
-    button: i32,
-    mode: PointerDragMode,
-    frame: geometry.RectF,
+    generation: u64 = 0,
+    pointer_id: u64 = 0,
+    button: i32 = 0,
+    mode: PointerDragMode = .local_selection,
+    frame: geometry.RectF = .{},
+    last_point: geometry.PointF = .{},
+    modifiers: PointerModifiers = .{},
 };
 
 /// Fixed UI slots in the current two-pane cockpit. Attachments map these
@@ -309,10 +317,11 @@ pub const Pane = struct {
     /// Fractional wheel-scroll remainder in view points: deltas
     /// accumulate here and convert to whole scrollback rows.
     wheel_accum: f32 = 0,
+    mouse_wheel_x_accum: f32 = 0,
     /// Ghostty mouse-motion deduplication and the button currently owned by
     /// the TUI report stream. Both are session-generation state.
     mouse_last_cell: ?vt.Coordinate = null,
-    mouse_button: ?vt.input.MouseButton = null,
+    mouse_protocol_fingerprint: u8 = 0,
     /// Delivered output accounting for the status line (and the
     /// replay fingerprint: byte totals pin the fed stream).
     output_batches: u64 = 0,
@@ -570,9 +579,9 @@ pub const Model = struct {
     /// Terminal key releases return to the terminal that received the press,
     /// even when attachment or focus changes while the key is held.
     held_terminal_keys: [max_held_terminal_keys]HeldTerminalKey = [_]HeldTerminalKey{.{}} ** max_held_terminal_keys,
-    /// Pointer capture belongs to a durable terminal and exact process
-    /// generation, never to a pane slot or whichever tab is focused later.
-    pointer_drag: ?PointerDrag = null,
+    /// Captures are keyed by physical window+pointer and pin durable terminal
+    /// identity plus process generation. Unrelated pointers never share state.
+    pointer_captures: [max_pointer_captures]PointerCapture = [_]PointerCapture{.{ .terminal_id = .terminal_1 }} ** max_pointer_captures,
     /// A clipboard write is IN FLIGHT: further copies are no-ops until
     /// its result lands, or the fixed-key re-request would be rejected
     /// as a duplicate and overwrite the first copy's outcome. There is
@@ -614,6 +623,8 @@ pub const Model = struct {
     /// that ever honored a different size would leave this stale for one
     /// frame, no worse than the resize lag documented above.
     surface_size: geometry.SizeF = geometry.SizeF.init(window_width, window_height),
+    /// Backing pixels per canvas point from the latest accepted frame.
+    surface_scale_factor: f32 = 1,
 
     pub fn terminalAt(model: *Model, placement: Placement) ?*Pane {
         const id = model.attachments[placement.index()] orelse return null;
@@ -962,8 +973,14 @@ pub const Msg = union(enum) {
     shell: native_sdk.EffectPtyEvent,
     key: canvas.WidgetKeyboardEvent,
     text: canvas.WidgetKeyboardEvent,
-    viewport: struct { terminal_id: TerminalId, cols: u16, rows: u16, size: geometry.SizeF },
-    surface_resized: geometry.SizeF,
+    viewport: struct {
+        terminal_id: TerminalId,
+        cols: u16,
+        rows: u16,
+        size: geometry.SizeF,
+        scale_factor: f32 = 1,
+    },
+    surface_resized: struct { size: geometry.SizeF, scale_factor: f32 },
     clipboard: native_sdk.EffectClipboardResult,
     paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
@@ -988,8 +1005,8 @@ pub const Msg = union(enum) {
     /// may have read and freed FIFO space without producing output to
     /// trigger a flush.
     flush_outbound,
-    /// A raw phase resolved through the retained transparent terminal widget.
-    /// The adapter stamps durable identity and generation before update.
+    /// The SDK-routed retained-widget event, stamped with durable identity and
+    /// generation by CockpitHost's narrow v0.7.1 adapter.
     pointer: TerminalPointerEvent,
     /// Direct UiApp embeddings lack CockpitHost's routed-pointer adapter.
     /// Keep wheel behavior available there for headless harnesses.
@@ -1091,6 +1108,9 @@ pub const CockpitHost = struct {
                     return;
                 }
             },
+            .canvas_widget_pointer => |pointer_event| {
+                if (try self.routeTerminalPointer(runtime, pointer_event)) return;
+            },
             .shortcut => |shortcut| {
                 const mask = appShortcutKeyMask(shortcut.key);
                 if (mask != 0 and (self.inner.model.consumed_shortcut_keys_held & mask) != 0) {
@@ -1117,10 +1137,6 @@ pub const CockpitHost = struct {
         }
         const selected_before = self.inner.model.selected_surface;
         try self.inner_app.event(runtime, event_value);
-        switch (event_value) {
-            .gpu_surface_input => |input| try self.routeTerminalPointer(runtime, input),
-            else => {},
-        }
         if (!selected_before.eql(self.inner.model.selected_surface)) {
             const window_id = switch (event_value) {
                 .shortcut => |shortcut| shortcut.window_id,
@@ -1179,74 +1195,85 @@ pub const CockpitHost = struct {
         }
     }
 
-    /// Narrow v0.7.1 adapter: the retained transparent pane widget is
-    /// the authority for hit testing and identity; this host layer only turns
-    /// the routed raw phase into a typed Msg because custom widgets do not yet
-    /// expose an app-defined continuous pointer callback.
+    /// Narrow v0.7.1 adapter: consume the SDK's already-routed/captured widget
+    /// event exactly once. Custom widgets cannot bind a continuous pointer Msg,
+    /// and the SDK keeps only one pressed-widget register per canvas, so model
+    /// capture below supplies the missing per-window/per-pointer ownership.
     fn routeTerminalPointer(
         self: *CockpitHost,
         runtime: *native_sdk.Runtime,
-        input: native_sdk.platform.GpuSurfaceInputEvent,
-    ) !void {
-        if (!std.mem.eql(u8, input.label, canvas_label)) return;
-        const phase: canvas.WidgetPointerPhase = switch (input.kind) {
-            .pointer_down => .down,
-            .pointer_up => .up,
-            .pointer_cancel => .cancel,
-            .pointer_drag => .move,
-            .pointer_move => .move,
-            .scroll => .wheel,
-            else => return,
+        routed: native_sdk.runtime.CanvasWidgetPointerEvent,
+    ) !bool {
+        if (!std.mem.eql(u8, routed.view_label, canvas_label)) return false;
+        const pointer = routed.pointer;
+        // A new down supersedes only this physical pointer's old capture,
+        // even when the new target is chrome rather than another terminal.
+        if (pointer.phase == .down) {
+            if (pointerCaptureFor(&self.inner.model, routed.window_id, pointer.pointer_id)) |previous| {
+                try self.inner.dispatch(runtime, routed.window_id, .{ .pointer = .{
+                    .window_id = previous.window_id,
+                    .terminal_id = previous.terminal_id,
+                    .generation = previous.generation,
+                    .phase = .cancel,
+                    .pointer_id = previous.pointer_id,
+                    .button = previous.button,
+                    .point = previous.last_point,
+                    .frame = previous.frame,
+                    .modifiers = previous.modifiers,
+                } });
+            }
+        }
+        const capture = switch (pointer.phase) {
+            .move, .up, .cancel => pointerCaptureFor(&self.inner.model, routed.window_id, pointer.pointer_id),
+            .hover, .down, .wheel => null,
         };
 
         var terminal_id: TerminalId = undefined;
         var generation: u64 = 0;
         var frame: geometry.RectF = .{};
-        var owned = false;
-        if (phase == .move or phase == .up or phase == .cancel) {
-            if (self.inner.model.pointer_drag) |drag| {
-                if (drag.pointer_id == input.pointer_id) {
-                    terminal_id = drag.terminal_id;
-                    generation = drag.generation;
-                    frame = terminalInteractionFrame(runtime, input.window_id, drag.terminal_id) orelse drag.frame;
-                    owned = true;
+        if (capture) |owned| {
+            terminal_id = owned.terminal_id;
+            generation = owned.generation;
+            frame = if (routed.target) |target|
+                if (target.id == terminalInteractionWidgetId(owned.terminal_id)) target.bounds else terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame
+            else
+                terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame;
+        } else {
+            if (pointer.phase == .up or pointer.phase == .cancel or pointer.phase == .move) {
+                // A stale/unrelated terminal edge cannot borrow the SDK's
+                // canvas-global pressed id and disturb another pointer.
+                if (routed.target) |target| {
+                    if (terminalIdForInteractionWidget(&self.inner.model, target.id) != null) return true;
                 }
+                return false;
             }
-            if ((phase == .up or phase == .cancel) and !owned) return;
-        }
-
-        if (!owned) {
-            const routed = routeTerminalInteraction(runtime, input, phase) orelse return;
-            terminal_id = terminalIdForInteractionWidget(&self.inner.model, routed.id) orelse return;
-            const pane = self.inner.model.provider.terminal(terminal_id) orelse return;
+            const target = routed.target orelse return false;
+            terminal_id = terminalIdForInteractionWidget(&self.inner.model, target.id) orelse return false;
+            const pane = self.inner.model.provider.terminal(terminal_id) orelse return true;
             generation = pane.session_generation;
-            frame = routed.bounds;
+            frame = target.bounds;
         }
 
-        var click_count: u8 = 1;
-        for (runtime.views[0..runtime.view_count]) |*runtime_view| {
-            if (runtime_view.window_id == input.window_id and std.mem.eql(u8, runtime_view.label, canvas_label)) {
-                click_count = @max(runtime_view.canvas_widget_click_count, 1);
-                break;
-            }
-        }
-        try self.inner.dispatch(runtime, input.window_id, .{ .pointer = .{
+        try self.inner.dispatch(runtime, routed.window_id, .{ .pointer = .{
+            .window_id = routed.window_id,
             .terminal_id = terminal_id,
             .generation = generation,
-            .phase = phase,
-            .pointer_id = input.pointer_id,
-            .button = input.button,
-            .click_count = click_count,
-            .point = geometry.PointF.init(input.x, input.y),
+            .phase = pointer.phase,
+            .pointer_id = pointer.pointer_id,
+            .button = pointer.button,
+            .click_count = pointer.click_count,
+            .point = pointer.point,
             .frame = frame,
-            .delta = geometry.OffsetF.init(input.delta_x, input.delta_y),
+            .delta = pointer.delta,
             .modifiers = .{
-                .shift = input.modifiers.shift,
-                .control = input.modifiers.control,
-                .alt = input.modifiers.option,
-                .super = input.modifiers.command or input.modifiers.primary,
+                .shift = pointer.modifiers.shift,
+                .control = pointer.modifiers.control,
+                .alt = pointer.modifiers.alt,
+                .super = pointer.modifiers.super,
             },
         } });
+        if (pointer.phase == .down) try self.focusSelectedContent(runtime, routed.window_id);
+        return true;
     }
 
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
@@ -1286,34 +1313,6 @@ fn terminalInteractionFrame(
     return null;
 }
 
-fn routeTerminalInteraction(
-    runtime: *native_sdk.Runtime,
-    input: native_sdk.platform.GpuSurfaceInputEvent,
-    phase: canvas.WidgetPointerPhase,
-) ?canvas.WidgetHit {
-    for (runtime.views[0..runtime.view_count]) |*runtime_view| {
-        if (runtime_view.window_id != input.window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
-        var route_entries: [32]canvas.WidgetEventRouteEntry = undefined;
-        const route = runtime_view.widgetLayoutTree().routePointerEventWithTokens(.{
-            .phase = phase,
-            .point = geometry.PointF.init(input.x, input.y),
-            .delta = geometry.OffsetF.init(input.delta_x, input.delta_y),
-            .pointer_id = input.pointer_id,
-            .button = input.button,
-            .modifiers = .{
-                .shift = input.modifiers.shift,
-                .control = input.modifiers.control,
-                .alt = input.modifiers.option,
-                .super = input.modifiers.command or input.modifiers.primary,
-            },
-        }, runtime_view.widget_tokens, &route_entries) catch return null;
-        const target = route.target orelse return null;
-        if (target.kind != .panel) return null;
-        return target;
-    }
-    return null;
-}
-
 fn initFx(model: *Model, fx: *Fx) void {
     for (0..max_terminal_count) |index| {
         if (model.provider.states[index] == .active) spawnPane(model.provider.slot(index), fx);
@@ -1338,8 +1337,9 @@ fn spawnPane(pane: *Pane, fx: *Fx) void {
     model.copy_failed = false;
     model.macos_natural_keys_held = 0;
     model.wheel_accum = 0;
+    model.mouse_wheel_x_accum = 0;
     model.mouse_last_cell = null;
-    model.mouse_button = null;
+    model.mouse_protocol_fingerprint = 0;
     model.output_batches = 0;
     model.output_bytes = 0;
     // Drop any bytes still queued for the session that just ended — a
@@ -1392,6 +1392,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                     pane.output_batches += 1;
                     pane.output_bytes += event.bytes.len;
                     feedOutput(pane, fx, event.bytes);
+                    syncMouseProtocol(pane);
                     // Cells changed: refresh the grid's accessibility text
                     // (which also carries real cell state into the session
                     // fingerprint — byte counters alone would verify a
@@ -1418,6 +1419,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                     pane.exit_code = event.code;
                     pane.exit_signal = event.signal;
                     pane.exit_reason = event.reason;
+                    // The exit report proves this generation is no longer
+                    // live. Retire captures without synthesizing input to it.
+                    endCapturesForTerminal(model, fx, pane.id);
                     pane.native_delivery_failures = event.dropped_writes -| pane.write_refusals_total;
                     pane.write_refusals = 0;
                     // The child is gone: bytes still queued can never land —
@@ -1452,6 +1456,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // Remember the surface the frame pump measured against, so
             // the wheel hit test has rectangles to resolve into.
             model.surface_size = size.size;
+            if (validScale(size.scale_factor)) model.surface_scale_factor = size.scale_factor;
             // Commit the new size only once the emulator actually took
             // it: on an allocation failure the model keeps its old
             // dimensions and the frame pump retries next frame, so the
@@ -1463,7 +1468,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             fx.ptyResize(pane.pty_key, size.cols, size.rows);
             flushOutbound(pane, fx);
         },
-        .surface_resized => |size| model.surface_size = size,
+        .surface_resized => |surface| {
+            model.surface_size = surface.size;
+            if (validScale(surface.scale_factor)) model.surface_scale_factor = surface.scale_factor;
+        },
         .flush_outbound => {
             for (0..max_terminal_count) |index| {
                 if (model.provider.states[index] != .active) continue;
@@ -1482,6 +1490,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // Window blur strands every pane's held-key latches, not
             // only the focused one's.
             if (!focused) {
+                endAllCaptures(model, fx);
                 for (0..max_terminal_count) |index| {
                     if (model.provider.states[index] != .vacant) model.provider.slot(index).macos_natural_keys_held = 0;
                 }
@@ -1569,9 +1578,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 model.paste_failed = false;
                 if (model.paste_inflight) fx.cancel(paste_clipboard_key);
             }
-            if (model.pointer_drag) |drag| {
-                if (drag.terminal_id == pane.id) model.pointer_drag = null;
-            }
+            endCapturesForTerminal(model, fx, pane.id);
             spawnPane(pane, fx);
         },
         .focus_pane => |requested| {
@@ -1579,10 +1586,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             if (requested == model.focus_placement) return;
             model.focus_placement = requested;
             model.selected_surface = .{ .terminal = model.attachments[requested.index()].? };
+            endHiddenCaptures(model, fx);
         },
-        .select_surface => |surface| switch (surface) {
-            .terminal => |id| _ = model.selectTerminal(id),
-            .web => model.selected_surface = .web,
+        .select_surface => |surface| {
+            switch (surface) {
+                .terminal => |id| _ = model.selectTerminal(id),
+                .web => model.selected_surface = .web,
+            }
+            endHiddenCaptures(model, fx);
         },
         .select_position => |position| {
             if (position < model.terminal_count) {
@@ -1590,6 +1601,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             } else if (position == model.terminal_count) {
                 model.selected_surface = .web;
             }
+            endHiddenCaptures(model, fx);
         },
         .cycle_tab => |delta| {
             const count: i8 = @intCast(model.terminal_count + 1);
@@ -1603,21 +1615,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             } else {
                 _ = model.selectTerminal(model.terminal_order[next]);
             }
+            endHiddenCaptures(model, fx);
         },
         .new_terminal => {
             const pane = model.provider.createTerminal() catch return;
             model.terminal_order[model.terminal_count] = pane.id;
             model.terminal_count += 1;
             _ = model.selectTerminal(pane.id);
+            endHiddenCaptures(model, fx);
             spawnPane(pane, fx);
         },
         .close_terminal => {
             const id = model.selectedTerminalId() orelse return;
             const order_index = model.terminalOrderIndex(id) orelse return;
+            endCapturesForTerminal(model, fx, id);
             const pane = model.provider.beginClose(id) orelse return;
-            if (model.pointer_drag) |drag| {
-                if (drag.terminal_id == id) model.pointer_drag = null;
-            }
             const had_live_pty = pane.phase == .starting or pane.phase == .live;
             if (model.copy_inflight and model.copy_owner == id) fx.cancel(clipboard_key);
             if (model.paste_inflight and model.paste_owner == id) fx.cancel(paste_clipboard_key);
@@ -1636,6 +1648,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 model.selected_surface = .{ .terminal = model.terminal_order[next_index] };
                 model.normalizeTopology();
             }
+            endHiddenCaptures(model, fx);
             if (had_live_pty) {
                 fx.ptyKill(pane.pty_key);
             } else {
@@ -1650,6 +1663,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             if (!splitAvailable(model)) return;
             model.layout = if (model.layout == .single) .split else .single;
             model.normalizeTopology();
+            endHiddenCaptures(model, fx);
         },
         .split_resized => |fraction| {
             if (!std.math.isFinite(fraction)) return;
@@ -1666,12 +1680,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             model.browser_page = page;
             model.browser_navigation_token +%= 1;
             model.selected_surface = .web;
+            endHiddenCaptures(model, fx);
         },
         .attach_terminal => |attachment| {
             model.attach(attachment.placement, attachment.terminal_id) catch return;
         },
         .detach_terminal => |placement| {
+            if (model.attachments[placement.index()]) |id| endCapturesForTerminal(model, fx, id);
             _ = model.detach(placement);
+            endHiddenCaptures(model, fx);
         },
     }
 }
@@ -1685,6 +1702,7 @@ fn paneFrameForTerminal(model: *const Model, id: TerminalId) ?geometry.RectF {
 }
 
 fn paneAtPoint(model: *Model, x: f32, y: f32) ?*Pane {
+    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
     const frames = paneFrames(model, model.surface_size);
     for (frames, 0..) |frame, index| {
         if (!frame.normalized().containsPoint(geometry.PointF.init(x, y))) continue;
@@ -1693,37 +1711,47 @@ fn paneAtPoint(model: *Model, x: f32, y: f32) ?*Pane {
     return null;
 }
 
-fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) void {
-    const pane = model.provider.terminal(event.terminal_id) orelse {
-        model.pointer_drag = null;
-        return;
-    };
-    if (pane.session_generation != event.generation) {
-        model.pointer_drag = null;
-        return;
+fn pointerCaptureIndex(model: *const Model, window_id: native_sdk.platform.WindowId, pointer_id: u64) ?usize {
+    for (model.pointer_captures, 0..) |capture, index| {
+        if (capture.active and capture.window_id == window_id and capture.pointer_id == pointer_id) return index;
     }
+    return null;
+}
 
-    const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
-    const mouse_reporting = pane.session.term.flags.mouse_event != .none;
+fn pointerCaptureFor(model: *const Model, window_id: native_sdk.platform.WindowId, pointer_id: u64) ?PointerCapture {
+    const index = pointerCaptureIndex(model, window_id, pointer_id) orelse return null;
+    return model.pointer_captures[index];
+}
+
+fn freePointerCaptureIndex(model: *const Model) ?usize {
+    for (model.pointer_captures, 0..) |capture, index| if (!capture.active) return index;
+    return null;
+}
+
+fn terminalVisible(model: *const Model, id: TerminalId) bool {
+    if (model.selectedTerminalId() == null) return false;
+    if (model.layout == .single) return model.selectedTerminalId().? == id;
+    for (model.attachments) |attached| if (attached != null and attached.? == id) return true;
+    return false;
+}
+
+fn validPointerGeometry(event: TerminalPointerEvent) bool {
+    return std.math.isFinite(event.point.x) and std.math.isFinite(event.point.y) and
+        std.math.isFinite(event.frame.x) and std.math.isFinite(event.frame.y) and
+        std.math.isFinite(event.frame.width) and std.math.isFinite(event.frame.height) and
+        event.frame.width > 0 and event.frame.height > 0;
+}
+
+fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) void {
     switch (event.phase) {
         .down => {
-            if (model.pointer_drag) |previous| {
-                if (model.provider.terminal(previous.terminal_id)) |owner| {
-                    if (owner.session_generation == previous.generation) {
-                        if (previous.mode == .local_selection) {
-                            _ = owner.session.pointerSelection(.{
-                                .phase = .cancel,
-                                .x = 0,
-                                .y = 0,
-                                .width = previous.frame.width,
-                                .height = previous.frame.height,
-                            });
-                        }
-                        owner.mouse_button = null;
-                    }
-                }
-                model.pointer_drag = null;
-            }
+            // A second down for the same physical pointer terminates its old
+            // lease first. Other pointers remain completely independent.
+            if (pointerCaptureIndex(model, event.window_id, event.pointer_id)) |index| endPointerCapture(model, fx, index, true);
+            const pane = model.provider.terminal(event.terminal_id) orelse return;
+            if (pane.session_generation != event.generation or !terminalVisible(model, pane.id)) return;
+            if (!validPointerGeometry(event)) return;
+            syncMouseProtocol(pane);
             if (event.button == 0) {
                 for (model.attachments, 0..) |attached, index| {
                     if (attached != null and attached.? == pane.id) {
@@ -1734,6 +1762,9 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
                 }
             }
 
+            const slot = freePointerCaptureIndex(model) orelse return;
+            const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
+            const mouse_reporting = pane.session.term.flags.mouse_event != .none;
             const local_selection = event.button == 0 and (!mouse_reporting or event.modifiers.shift);
             if (local_selection) {
                 pane.selecting = false;
@@ -1745,35 +1776,61 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
                     .height = event.frame.height,
                     .click_count = event.click_count,
                 });
-                model.pointer_drag = .{
+                model.pointer_captures[slot] = .{
+                    .active = true,
+                    .window_id = event.window_id,
                     .terminal_id = pane.id,
                     .generation = pane.session_generation,
                     .pointer_id = event.pointer_id,
                     .button = event.button,
                     .mode = .local_selection,
                     .frame = event.frame,
+                    .last_point = event.point,
+                    .modifiers = event.modifiers,
                 };
                 return;
             }
 
             const button = terminalMouseButton(event.button) orelse return;
-            pane.mouse_button = button;
-            encodeMouseReport(pane, fx, .press, button, local, event.frame, event.modifiers);
-            model.pointer_drag = .{
+            if (!mouse_reporting or !pane.acceptsInput()) return;
+            pane.selecting = false;
+            pane.session.clearSelection();
+            model.pointer_captures[slot] = .{
+                .active = true,
+                .window_id = event.window_id,
                 .terminal_id = pane.id,
                 .generation = pane.session_generation,
                 .pointer_id = event.pointer_id,
                 .button = event.button,
                 .mode = .mouse_report,
                 .frame = event.frame,
+                .last_point = event.point,
+                .modifiers = event.modifiers,
             };
+            if (!encodeMouseReport(model, pane, fx, .press, button, local, event.frame, event.modifiers)) {
+                model.pointer_captures[slot].active = false;
+            }
         },
         .move => {
-            if (model.pointer_drag) |drag| {
-                if (drag.pointer_id != event.pointer_id or drag.terminal_id != pane.id or
-                    drag.generation != pane.session_generation) return;
-                model.pointer_drag.?.frame = event.frame;
-                switch (drag.mode) {
+            const capture_index = pointerCaptureIndex(model, event.window_id, event.pointer_id);
+            if (capture_index) |index| {
+                const capture = model.pointer_captures[index];
+                const pane = model.provider.terminal(capture.terminal_id) orelse {
+                    endPointerCapture(model, fx, index, true);
+                    return;
+                };
+                if (pane.session_generation != capture.generation or !terminalVisible(model, pane.id) or
+                    (capture.mode == .mouse_report and !pane.acceptsInput()))
+                {
+                    endPointerCapture(model, fx, index, true);
+                    return;
+                }
+                if (!validPointerGeometry(event)) return;
+                model.pointer_captures[index].frame = event.frame;
+                model.pointer_captures[index].last_point = event.point;
+                model.pointer_captures[index].modifiers = event.modifiers;
+                const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
+                switch (capture.mode) {
                     .local_selection => _ = pane.session.pointerSelection(.{
                         .phase = .move,
                         .x = local.x,
@@ -1782,11 +1839,12 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
                         .height = event.frame.height,
                         .click_count = event.click_count,
                     }),
-                    .mouse_report => encodeMouseReport(
+                    .mouse_report => _ = encodeMouseReport(
+                        model,
                         pane,
                         fx,
                         .motion,
-                        terminalMouseButton(drag.button),
+                        terminalMouseButton(capture.button),
                         local,
                         event.frame,
                         event.modifiers,
@@ -1794,71 +1852,101 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
                 }
                 return;
             }
-            if (mouse_reporting and !event.modifiers.shift) {
-                encodeMouseReport(pane, fx, .motion, null, local, event.frame, event.modifiers);
-            }
+            const pane = model.provider.terminal(event.terminal_id) orelse return;
+            if (pane.session_generation != event.generation or !terminalVisible(model, pane.id) or
+                !pane.acceptsInput() or !validPointerGeometry(event)) return;
+            syncMouseProtocol(pane);
+            if (pane.session.term.flags.mouse_event == .none or event.modifiers.shift) return;
+            const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
+            _ = encodeMouseReport(model, pane, fx, .motion, null, local, event.frame, event.modifiers);
         },
         .up, .cancel => {
-            const drag = model.pointer_drag orelse return;
-            if (drag.pointer_id != event.pointer_id or drag.terminal_id != pane.id or
-                drag.generation != pane.session_generation) return;
-            defer {
-                pane.mouse_button = null;
-                model.pointer_drag = null;
+            const index = pointerCaptureIndex(model, event.window_id, event.pointer_id) orelse return;
+            if (validPointerGeometry(event)) {
+                model.pointer_captures[index].frame = event.frame;
+                model.pointer_captures[index].last_point = event.point;
+                model.pointer_captures[index].modifiers = event.modifiers;
             }
-            switch (drag.mode) {
-                .local_selection => _ = pane.session.pointerSelection(.{
-                    .phase = if (event.phase == .cancel) .cancel else .up,
-                    .x = local.x,
-                    .y = local.y,
-                    .width = event.frame.width,
-                    .height = event.frame.height,
-                    .click_count = event.click_count,
-                }),
-                // A cancelled platform grab still owes the TUI a release;
-                // otherwise button-motion mode remains stuck indefinitely.
-                .mouse_report => encodeMouseReport(
-                    pane,
-                    fx,
-                    .release,
-                    terminalMouseButton(drag.button),
-                    local,
-                    event.frame,
-                    event.modifiers,
-                ),
-            }
+            endPointerCapture(model, fx, index, event.phase == .cancel);
         },
         .wheel => {
-            if (event.delta.dy == 0) return;
-            if (mouse_reporting and !event.modifiers.shift) {
-                pane.wheel_accum += event.delta.dy;
-                const cell_h = @max(1, pane.session.cell_height);
-                var reports: usize = 0;
-                while (@abs(pane.wheel_accum) >= cell_h and reports < 64) : (reports += 1) {
-                    const up = pane.wheel_accum > 0;
-                    pane.wheel_accum += if (up) -cell_h else cell_h;
-                    encodeMouseReport(
-                        pane,
-                        fx,
-                        .press,
-                        if (up) .four else .five,
-                        local,
-                        event.frame,
-                        event.modifiers,
-                    );
-                }
+            const pane = model.provider.terminal(event.terminal_id) orelse return;
+            if (pane.session_generation != event.generation or !terminalVisible(model, pane.id) or !validPointerGeometry(event)) return;
+            const finite_x = std.math.isFinite(event.delta.dx);
+            const finite_y = std.math.isFinite(event.delta.dy);
+            if ((!finite_x or event.delta.dx == 0) and (!finite_y or event.delta.dy == 0)) return;
+            syncMouseProtocol(pane);
+            const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
+            if (pane.acceptsInput() and pane.session.term.flags.mouse_event != .none and !event.modifiers.shift) {
+                pane.selecting = false;
+                pane.session.clearSelection();
+                accumulateWheel(&pane.wheel_accum, if (finite_y) event.delta.dy else 0, pane.session.cell_height);
+                accumulateWheel(&pane.mouse_wheel_x_accum, if (finite_x) event.delta.dx else 0, pane.session.cell_width);
+                var budget = max_mouse_reports_per_event;
+                flushMouseWheel(model, pane, fx, &pane.wheel_accum, .four, .five, pane.session.cell_height, local, event.frame, event.modifiers, &budget);
+                flushMouseWheel(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, pane.session.cell_width, local, event.frame, event.modifiers, &budget);
                 return;
             }
-            if (pane.selecting) return;
-            pane.wheel_accum += event.delta.dy;
-            const cell_h = @max(1, pane.session.cell_height);
-            const rows = @trunc(pane.wheel_accum / cell_h);
+            if (pane.selecting or !finite_y) return;
+            const cell_h = finiteQuantum(pane.session.cell_height);
+            accumulateWheel(&pane.wheel_accum, event.delta.dy, cell_h);
+            const report_bound: f32 = @floatFromInt(max_mouse_reports_per_event);
+            const rows = std.math.clamp(@trunc(pane.wheel_accum / cell_h), -report_bound, report_bound);
             if (rows != 0) {
                 pane.wheel_accum -= rows * cell_h;
                 pane.session.scrollLines(-@as(isize, @intFromFloat(rows)));
             }
         },
-        .hover => {},
+        .hover => {
+            const pane = model.provider.terminal(event.terminal_id) orelse return;
+            if (pane.session_generation != event.generation or !terminalVisible(model, pane.id) or
+                !pane.acceptsInput() or !validPointerGeometry(event)) return;
+            syncMouseProtocol(pane);
+            if (pane.session.term.flags.mouse_event != .any or event.modifiers.shift) return;
+            const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
+            _ = encodeMouseReport(model, pane, fx, .motion, null, local, event.frame, event.modifiers);
+        },
+    }
+}
+
+fn endPointerCapture(model: *Model, fx: *Fx, index: usize, cancelled: bool) void {
+    if (index >= model.pointer_captures.len or !model.pointer_captures[index].active) return;
+    const capture = model.pointer_captures[index];
+    model.pointer_captures[index].active = false;
+    const pane = model.provider.terminal(capture.terminal_id) orelse return;
+    if (pane.session_generation != capture.generation) return;
+    const local = geometry.PointF.init(capture.last_point.x - capture.frame.x, capture.last_point.y - capture.frame.y);
+    switch (capture.mode) {
+        .local_selection => _ = pane.session.pointerSelection(.{
+            .phase = if (cancelled) .cancel else .up,
+            .x = local.x,
+            .y = local.y,
+            .width = capture.frame.width,
+            .height = capture.frame.height,
+        }),
+        .mouse_report => if (pane.acceptsInput()) {
+            _ = encodeMouseReport(model, pane, fx, .release, terminalMouseButton(capture.button), local, capture.frame, capture.modifiers);
+        },
+    }
+}
+
+fn endCapturesForTerminal(model: *Model, fx: *Fx, id: TerminalId) void {
+    for (0..model.pointer_captures.len) |index| {
+        if (model.pointer_captures[index].active and model.pointer_captures[index].terminal_id == id) {
+            endPointerCapture(model, fx, index, true);
+        }
+    }
+}
+
+fn endAllCaptures(model: *Model, fx: *Fx) void {
+    for (0..model.pointer_captures.len) |index| endPointerCapture(model, fx, index, true);
+}
+
+fn endHiddenCaptures(model: *Model, fx: *Fx) void {
+    for (0..model.pointer_captures.len) |index| {
+        if (model.pointer_captures[index].active and !terminalVisible(model, model.pointer_captures[index].terminal_id)) {
+            endPointerCapture(model, fx, index, true);
+        }
     }
 }
 
@@ -1869,11 +1957,16 @@ fn terminalMouseButton(button: i32) ?vt.input.MouseButton {
         2 => .middle,
         3 => .four,
         4 => .five,
+        5 => .six,
+        6 => .seven,
+        7 => .eight,
+        8 => .nine,
         else => null,
     };
 }
 
 fn encodeMouseReport(
+    model: *const Model,
     pane: *Pane,
     fx: *Fx,
     action: vt.input.MouseAction,
@@ -1881,40 +1974,48 @@ fn encodeMouseReport(
     local: geometry.PointF,
     frame: geometry.RectF,
     modifiers: PointerModifiers,
-) void {
+) bool {
     const session = pane.session;
-    if (session.term.flags.mouse_event == .none or frame.width <= 0 or frame.height <= 0) return;
+    syncMouseProtocol(pane);
+    if (session.term.flags.mouse_event == .none or !validScale(model.surface_scale_factor) or
+        !std.math.isFinite(local.x) or !std.math.isFinite(local.y) or
+        !std.math.isFinite(frame.width) or !std.math.isFinite(frame.height) or
+        frame.width <= 0 or frame.height <= 0) return false;
 
-    const cell_width: u32 = @intFromFloat(@max(1, @round(session.cell_width)));
-    const cell_height: u32 = @intFromFloat(@max(1, @round(session.cell_height)));
     const pixel_protocol = session.term.flags.mouse_format == .sgr_pixels;
+    const scaled_width = frame.width * model.surface_scale_factor;
+    const scaled_height = frame.height * model.surface_scale_factor;
+    const scaled_x = local.x * model.surface_scale_factor;
+    const scaled_y = local.y * model.surface_scale_factor;
+    if (pixel_protocol and (!std.math.isFinite(scaled_width) or !std.math.isFinite(scaled_height) or
+        !std.math.isFinite(scaled_x) or !std.math.isFinite(scaled_y))) return false;
     const screen_width: u32 = if (pixel_protocol)
-        @intFromFloat(@max(1, @ceil(frame.width)))
+        boundedMouseDimension(scaled_width)
     else
-        @as(u32, session.cols()) * cell_width;
+        session.cols();
     const screen_height: u32 = if (pixel_protocol)
-        @intFromFloat(@max(1, @ceil(frame.height)))
+        boundedMouseDimension(scaled_height)
     else
-        @as(u32, session.rows()) * cell_height;
+        session.rows();
     const x = if (pixel_protocol)
-        local.x
+        boundedMouseCoordinate(scaled_x)
     else
-        local.x / session.cell_width * @as(f32, @floatFromInt(cell_width));
+        boundedMouseCoordinate(local.x / finiteQuantum(session.cell_width));
     const y = if (pixel_protocol)
-        local.y
+        boundedMouseCoordinate(scaled_y)
     else
-        local.y / session.cell_height * @as(f32, @floatFromInt(cell_height));
+        boundedMouseCoordinate(local.y / finiteQuantum(session.cell_height));
 
     var options: vt.input.MouseEncodeOptions = .{
         .event = session.term.flags.mouse_event,
         .format = session.term.flags.mouse_format,
         .size = .{
             .screen = .{ .width = screen_width, .height = screen_height },
-            .cell = .{ .width = cell_width, .height = cell_height },
+            .cell = .{ .width = 1, .height = 1 },
             .padding = .{},
         },
-        .any_button_pressed = pane.mouse_button != null,
-        .last_cell = &pane.mouse_last_cell,
+        .any_button_pressed = paneHasReportingCapture(model, pane.id, pane.session_generation),
+        .last_cell = if (pixel_protocol) null else &pane.mouse_last_cell,
     };
     if (action == .release) options.any_button_pressed = false;
 
@@ -1930,8 +2031,81 @@ fn encodeMouseReport(
             .super = modifiers.super,
         },
         .pos = .{ .x = x, .y = y },
-    }, options) catch return;
-    if (writer.end > 0) enqueueTransient(pane, fx, bytes[0..writer.end]);
+    }, options) catch return false;
+    const encoded = writer.buffered();
+    if (encoded.len == 0) return false;
+    enqueueTransient(pane, fx, encoded);
+    return true;
+}
+
+fn paneHasReportingCapture(model: *const Model, id: TerminalId, generation: u64) bool {
+    for (model.pointer_captures) |capture| {
+        if (capture.active and capture.mode == .mouse_report and capture.terminal_id == id and capture.generation == generation) return true;
+    }
+    return false;
+}
+
+fn validScale(scale: f32) bool {
+    return std.math.isFinite(scale) and scale > 0;
+}
+
+fn finiteQuantum(value: f32) f32 {
+    return if (std.math.isFinite(value) and value >= 1)
+        @min(value, max_mouse_coordinate)
+    else
+        1;
+}
+
+fn boundedMouseCoordinate(value: f32) f32 {
+    if (!std.math.isFinite(value)) return 0;
+    return std.math.clamp(value, -max_mouse_coordinate, max_mouse_coordinate);
+}
+
+fn boundedMouseDimension(value: f32) u32 {
+    return @intFromFloat(@max(1, @ceil(std.math.clamp(value, 1, max_mouse_coordinate))));
+}
+
+fn accumulateWheel(accum: *f32, delta: f32, quantum_value: f32) void {
+    if (!std.math.isFinite(accum.*)) accum.* = 0;
+    if (!std.math.isFinite(delta) or delta == 0) return;
+    const quantum = finiteQuantum(quantum_value);
+    const bound = quantum * @as(f32, max_mouse_reports_per_event);
+    accum.* = std.math.clamp(accum.* + std.math.clamp(delta, -bound, bound), -bound, bound);
+}
+
+fn flushMouseWheel(
+    model: *const Model,
+    pane: *Pane,
+    fx: *Fx,
+    accum: *f32,
+    positive: vt.input.MouseButton,
+    negative: vt.input.MouseButton,
+    quantum_value: f32,
+    local: geometry.PointF,
+    frame: geometry.RectF,
+    modifiers: PointerModifiers,
+    budget: *usize,
+) void {
+    const quantum = finiteQuantum(quantum_value);
+    while (budget.* > 0 and @abs(accum.*) >= quantum) : (budget.* -= 1) {
+        const button = if (accum.* > 0) positive else negative;
+        _ = encodeMouseReport(model, pane, fx, .press, button, local, frame, modifiers);
+        accum.* += if (accum.* > 0) -quantum else quantum;
+    }
+}
+
+fn mouseProtocolFingerprint(pane: *const Pane) u8 {
+    return 1 + (@as(u8, @intCast(@intFromEnum(pane.session.term.flags.mouse_event))) << 4) +
+        @as(u8, @intCast(@intFromEnum(pane.session.term.flags.mouse_format)));
+}
+
+fn syncMouseProtocol(pane: *Pane) void {
+    const fingerprint = mouseProtocolFingerprint(pane);
+    if (pane.mouse_protocol_fingerprint == fingerprint) return;
+    pane.mouse_protocol_fingerprint = fingerprint;
+    pane.mouse_last_cell = null;
+    pane.wheel_accum = 0;
+    pane.mouse_wheel_x_accum = 0;
 }
 
 /// Append outbound bytes (typed keys, pastes, or query replies) to the
@@ -2948,7 +3122,10 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
         .opacity = 0,
         .on_press = .{ .focus_pane = placement },
         .semantics = .{
-            .role = .textbox,
+            // The app owns terminal text painting and has no SDK text-value
+            // contract, so expose one honest focusable terminal group rather
+            // than claiming a native textbox value that does not exist.
+            .role = .group,
             .focusable = true,
             .label = if (screen.len > 0)
                 ui.fmt("{s}\n{s}", .{ terminalTitle(ui, pane.id), screen })
@@ -3156,6 +3333,7 @@ pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometr
 /// on the next frame without ever coupling either PTY's lifetime to layout.
 fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     if (frame.size.width <= 0 or frame.size.height <= 0) return null;
+    const frame_scale = if (validScale(frame.scale_factor)) frame.scale_factor else model.surface_scale_factor;
     const frames = paneFrames(model, frame.size);
     var pending = false;
     for (0..max_terminal_count) |index| {
@@ -3181,12 +3359,15 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
                     .cols = proposed.x,
                     .rows = proposed.y,
                     .size = frame.size,
+                    .scale_factor = frame_scale,
                 } };
             }
         }
     }
-    if (model.surface_size.width != frame.size.width or model.surface_size.height != frame.size.height) {
-        return .{ .surface_resized = frame.size };
+    if (model.surface_size.width != frame.size.width or model.surface_size.height != frame.size.height or
+        model.surface_scale_factor != frame_scale)
+    {
+        return .{ .surface_resized = .{ .size = frame.size, .scale_factor = frame_scale } };
     }
     if (pending) return .flush_outbound;
     return null;
