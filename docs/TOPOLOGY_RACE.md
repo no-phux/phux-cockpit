@@ -32,13 +32,29 @@ exit acknowledgement.
 
 ## Evidence
 
-The default null-platform suite passes 124 runnable tests with three expected
+The default null-platform suite passes 127 runnable tests with four expected
 screenshot skips. It covers existing product/lifecycle behavior plus stable
 selection, exact snapshots, exhaustion/collision rejection, stale post-close
 output/query replies, and four-terminal accessibility/layout. With
-`COCKPIT_SHOTS=1`, all 127 tests pass and emit deterministic native-canvas PNGs
-for standard tabs, split terminals, and the four-terminal compact state.
+`COCKPIT_SHOTS=1`, all 131 tests pass and emit deterministic native-canvas PNGs
+for one-terminal production launch, standard tabs, split terminals, and the
+four-terminal compact state.
 `zig build` separately passes the native macOS executable path.
+
+## Production Launch Refinement
+
+- `main` creates one emulator session and one PTY spawn. The established
+  two-terminal initializer remains available to dense product, lifecycle, and
+  adversarial test helpers; New exercises the same registry path for child two.
+- Split is disabled with fewer than two active provider resources. Cmd+D is not
+  globally registered and remains unlatched by the app until a second terminal
+  exists; with two terminals it retains the existing split behavior.
+- One-terminal model, exact child-count, accessibility, and screenshot tests pin
+  the production launch independently from the multi-terminal fixtures.
+
+The next race targets are provider-backed title/current-working-directory
+plumbing and terminal pointer forwarding. Neither is approximated in this
+refinement.
 
 ## Constraints
 

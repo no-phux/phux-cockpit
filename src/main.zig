@@ -143,9 +143,9 @@ const default_shell_argv: []const []const u8 = if (builtin.os.tag == .windows)
 else
     &.{ default_shell, "-i" };
 
-/// Both initial terminal tabs are native terminal surfaces over ordinary
-/// login-configured interactive shells. Cockpit no longer embeds the phux
-/// TUI as its primary UI.
+/// The initial terminal and any terminals created with New are native surfaces
+/// over ordinary login-configured interactive shells. Cockpit no longer embeds
+/// the phux TUI as its primary UI.
 const terminal_1_argv: []const []const u8 = if (builtin.os.tag == .macos)
     &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -i" }
 else
@@ -210,7 +210,6 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "surface.5", .key = "5", .modifiers = .{ .primary = true } },
     .{ .id = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
-    .{ .id = "layout.split", .key = "d", .modifiers = .{ .primary = true } },
     .{ .id = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
     .{ .id = "terminal.close", .key = "w", .modifiers = .{ .primary = true } },
     .{ .id = "tab.move-left", .key = "arrowleft", .modifiers = .{ .primary = true, .shift = true } },
@@ -353,6 +352,25 @@ pub const LocalProvider = struct {
                 .argv = paneArgv(index),
             };
         }
+        return provider;
+    }
+
+    pub fn createSingleWithIo(gpa: std.mem.Allocator, io: std.Io, session: *grid.Session) !*LocalProvider {
+        const provider = try gpa.create(LocalProvider);
+        provider.* = .{
+            .gpa = gpa,
+            .io = io,
+            .terminals = undefined,
+            .states = .{ .active, .vacant, .vacant, .vacant },
+            .next_terminal_raw = first_terminal_raw + 1,
+            .next_pty_key = 2,
+        };
+        provider.terminals[0] = .{
+            .id = .terminal_1,
+            .session = session,
+            .pty_key = ptyKey(0),
+            .argv = paneArgv(0),
+        };
         return provider;
     }
 
@@ -731,6 +749,19 @@ pub fn initialModel(sessions: [pane_count]*grid.Session) Model {
 pub fn initialModelWithIo(gpa: std.mem.Allocator, io: std.Io, sessions: [pane_count]*grid.Session) !Model {
     const provider = try LocalProvider.createWithIo(gpa, io, sessions);
     return .{ .provider = provider, .panes = &provider.terminals };
+}
+
+/// Production launch starts with one provider resource. The two-session
+/// initializer above remains the dense multi-terminal fixture used by existing
+/// product, lifecycle, and adversarial tests.
+pub fn initialProductionModelWithIo(gpa: std.mem.Allocator, io: std.Io, session: *grid.Session) !Model {
+    const provider = try LocalProvider.createSingleWithIo(gpa, io, session);
+    return .{
+        .provider = provider,
+        .panes = &provider.terminals,
+        .terminal_count = 1,
+        .attachments = .{ .terminal_1, null },
+    };
 }
 
 pub const topology_snapshot_version: u16 = 1;
@@ -1444,8 +1475,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             _ = model.moveTerminal(id, delta);
         },
         .toggle_split => {
-            if (model.selectedTerminalId() == null) return;
-            if (model.terminal_count < 2 and model.layout == .single) return;
+            if (!splitAvailable(model)) return;
             model.layout = if (model.layout == .single) .split else .single;
             model.normalizeTopology();
         },
@@ -1795,7 +1825,7 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         update(model, .{ .cycle_tab = 1 }, fx);
         return;
     }
-    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "d")) {
+    if (splitAvailable(model) and primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "d")) {
         latchAppShortcut(model, event.key);
         update(model, .toggle_split, fx);
         return;
@@ -2008,6 +2038,10 @@ fn appShortcutKeyMask(key: []const u8) u32 {
 }
 
 fn commandShortcutKeyMask(name: []const u8) u32 {
+    // Split is intentionally not globally registered while one terminal may
+    // be active, but injected/menu shortcut events still need duplicate-edge
+    // suppression once they reach this host.
+    if (std.mem.eql(u8, name, "layout.split")) return appShortcutKeyMask("d");
     for (cockpit_shortcuts) |shortcut| {
         if (std.mem.eql(u8, name, shortcut.id)) return appShortcutKeyMask(shortcut.key);
     }
@@ -2522,6 +2556,10 @@ fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     }, .{});
 }
 
+fn splitAvailable(model: *const Model) bool {
+    return model.provider.activeCount() >= 2 and model.selectedPlacement() != null;
+}
+
 pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     var triggers: [max_terminal_count + 1]TerminalUi.Node = undefined;
     for (&triggers) |*node| node.* = ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
@@ -2574,7 +2612,7 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
             .size = .sm,
             .text = "Split",
             .selected = model.layout == .split,
-            .disabled = model.selectedPlacement() == null,
+            .disabled = !splitAvailable(model),
             .on_press = .toggle_split,
             .semantics = .{ .label = "Toggle terminal split, Command D" },
         }, .{}),
@@ -2793,17 +2831,11 @@ pub fn appOptions() TerminalApp.Options {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var sessions: [pane_count]*grid.Session = undefined;
-    var created: usize = 0;
-    // The deferred expression runs at scope exit and reads `created`
-    // THEN, so a partial run (one session made, the next failing) frees
-    // exactly what exists — no double free, no leak.
-    defer for (sessions[0..created]) |session| session.destroy();
-    while (created < pane_count) : (created += 1) {
-        sessions[created] = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
-    }
-    const model = try initialModelWithIo(std.heap.page_allocator, init.io, sessions);
-    created = 0;
+    const session = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
+    const model = initialProductionModelWithIo(std.heap.page_allocator, init.io, session) catch |err| {
+        session.destroy();
+        return err;
+    };
     defer model.provider.destroy();
     const app_state = try std.heap.page_allocator.create(CockpitHost);
     defer std.heap.page_allocator.destroy(app_state);

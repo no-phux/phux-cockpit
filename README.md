@@ -11,10 +11,10 @@ native control environment for large-scale directed machine work. See
 
 ## Spatial runtime
 
-- Up to **four terminals** are independent native terminal surfaces over
-  login-configured interactive shells. Each has a durable terminal ID and owns
-  its own PTY, emulator, scrollback, selection, input queue, and retained-
-  rendering namespace. Tab order and visible placement do not own execution.
+- Cockpit launches with **one terminal** and one shell process. New creates
+  subsequent terminals, up to four. Each has a durable terminal ID and owns its
+  own PTY, emulator, scrollback, selection, input queue, and retained-rendering
+  namespace. Tab order and visible placement do not own execution.
 - **Split** projects at most two live terminal sessions simultaneously through
   a real draggable and keyboard-operable divider. Splitting, focusing,
   resizing, and collapsing never restart either process.
@@ -73,7 +73,7 @@ caveat.
 | `cmd+W` | Close the selected terminal; Web is never closed |
 | `cmd+shift+left` / `cmd+shift+right` | Move the selected terminal tab |
 | `cmd+shift+[` / `cmd+shift+]` | Select previous or next tab |
-| `cmd+D` | Split terminals or collapse to the active terminal |
+| `cmd+D` | Split terminals or collapse to the active terminal; unclaimed until two terminals exist |
 | `cmd+option+left` / `cmd+option+right` | Move keyboard focus across split panes |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |

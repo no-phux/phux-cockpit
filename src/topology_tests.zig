@@ -41,10 +41,169 @@ fn startCockpit(harness: anytype) !*TerminalApp {
     return state;
 }
 
+fn startProductionCockpit(harness: anytype) !*TerminalApp {
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
+    const session = try grid.Session.create(testing.allocator, testing.io, 80, 24);
+    errdefer session.destroy();
+    const model = try app.initialProductionModelWithIo(testing.allocator, testing.io, session);
+    const state = try testing.allocator.create(TerminalApp);
+    errdefer testing.allocator.destroy(state);
+    state.* = TerminalApp.init(std.heap.page_allocator, model, app.appOptions());
+    state.effects.executor = .fake;
+    try harness.start(state.app());
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = native_sdk.geometry.SizeF.init(980, 640),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+    return state;
+}
+
 fn stopCockpit(state: *TerminalApp) void {
     state.deinit();
     app.deinitModel(&state.model);
     testing.allocator.destroy(state);
+}
+
+test "production launch owns exactly one terminal and New spawns the second child" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startProductionCockpit(harness);
+    defer stopCockpit(state);
+
+    try testing.expectEqual(@as(usize, 1), state.model.terminal_count);
+    try testing.expectEqual(@as(usize, 1), state.model.provider.activeCount());
+    try testing.expectEqual(@as(usize, 1), state.model.provider.occupiedCount());
+    try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
+    try testing.expectEqual(app.TerminalId.terminal_1, state.model.terminal_order[0]);
+    try testing.expectEqual(app.TerminalId.terminal_1, state.model.selectedTerminalId().?);
+    try testing.expectEqual(app.TerminalId.terminal_1, state.model.attachments[0].?);
+    try testing.expectEqual(@as(?app.TerminalId, null), state.model.attachments[1]);
+    try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(.terminal_1).?.pty_key);
+    try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(.terminal_1).?.session_generation);
+
+    const initial_snapshot = try state.model.topologySnapshot();
+    try initial_snapshot.validate();
+    try testing.expectEqual(@as(u8, 1), initial_snapshot.terminal_count);
+    try testing.expectEqualDeep([app.pane_count]?app.TerminalId{ .terminal_1, null }, initial_snapshot.attachments);
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expectEqual(@as(usize, 2), state.model.terminal_count);
+    try testing.expectEqual(@as(usize, 2), state.model.provider.activeCount());
+    try testing.expectEqual(@as(usize, 2), state.effects.pendingPtyCount());
+    const second = state.model.provider.terminal(.terminal_2) orelse return error.TestExpectedTerminal;
+    try testing.expectEqual(@as(u64, 2), second.pty_key);
+    try testing.expectEqual(@as(u64, 1), second.session_generation);
+}
+
+test "one terminal disables Split and leaves Cmd+D unconsumed until New" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startProductionCockpit(harness);
+    defer stopCockpit(state);
+
+    var split_disabled = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, "Split")) split_disabled = node.widget.state.disabled;
+    }
+    try testing.expect(split_disabled);
+    for (app.cockpit_shortcuts) |shortcut| try testing.expect(!std.mem.eql(u8, shortcut.id, "layout.split"));
+    app.update(&state.model, .toggle_split, &state.effects);
+    try testing.expectEqual(app.LayoutMode.single, state.model.layout);
+
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .key_down,
+        .key = "d",
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.LayoutMode.single, state.model.layout);
+    try testing.expectEqual(@as(u32, 0), state.model.consumed_shortcut_keys_held);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .key_up,
+        .key = "d",
+    } });
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    var split_enabled = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, "Split")) split_enabled = !node.widget.state.disabled;
+    }
+    try testing.expect(split_enabled);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .key_down,
+        .key = "d",
+        .modifiers = .{ .primary = true },
+    } });
+    try testing.expectEqual(app.LayoutMode.split, state.model.layout);
+    try testing.expect(state.model.consumed_shortcut_keys_held != 0);
+}
+
+test "one-terminal production accessibility exposes one child and disabled Split" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startProductionCockpit(harness);
+    defer stopCockpit(state);
+    try state.effects.feedPtyOutput(1, "ONE TERMINAL\r\n");
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    const buffer = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("one-terminal"), &writer);
+    const a11y = writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, a11y, "Terminal 1, native terminal, RUNNING") != null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "Terminal 2") == null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "Web, system WebKit, shortcut CMD+2") != null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "ONE TERMINAL") != null);
+
+    var tab_count: usize = 0;
+    var split_disabled = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind == .segmented_control) tab_count += 1;
+        if (std.mem.eql(u8, node.widget.text, "Split")) split_disabled = node.widget.state.disabled;
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "TERMINAL 1 / RUNNING"));
+    }
+    try testing.expectEqual(@as(usize, 2), tab_count);
+    try testing.expect(split_disabled);
+}
+
+const one_terminal_shot_path = "zig-out/cockpit-one-terminal.png";
+
+test "one-terminal production screenshot (env-gated)" {
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startProductionCockpit(harness);
+    defer stopCockpit(state);
+    try state.effects.feedPtyOutput(1, "ONE TERMINAL\r\n");
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, null);
+    const pixels = try testing.allocator.alloc(u8, pixel_size.byte_len);
+    defer testing.allocator.free(pixels);
+    const scratch = try testing.allocator.alloc(u8, pixel_size.byte_len);
+    defer testing.allocator.free(scratch);
+    const shot = try harness.runtime.renderCanvasScreenshot(1, app.canvas_label, null, pixels, scratch);
+    const encoded = try testing.allocator.alloc(u8, try canvas.png.encodedRgba8ByteLen(shot.width, shot.height));
+    defer testing.allocator.free(encoded);
+    var writer = std.Io.Writer.fixed(encoded);
+    try canvas.png.writeRgba8(&writer, shot.width, shot.height, shot.rgba8);
+    try std.Io.Dir.cwd().createDirPath(testing.io, "zig-out");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = one_terminal_shot_path, .data = writer.buffered() });
 }
 
 test "topology registry creates four unique terminals and refuses a fifth" {
