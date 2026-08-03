@@ -9,6 +9,7 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const app = @import("main.zig");
 const grid = @import("grid.zig");
+const vt = @import("ghostty-vt");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -115,6 +116,59 @@ test "ADVERSARIAL: a torrent into pane 0 leaves pane 1's emulator bit-identical"
     try testing.expect(std.mem.indexOf(u8, after_text, "PANEBRAVO") != null);
     // ...and pane 0 never learned pane 1's content either.
     try testing.expect(std.mem.indexOf(u8, alpha, "PANEBRAVO") == null);
+}
+
+test "ADVERSARIAL: scrollback search and selection remain terminal-local" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const app_state = try startCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+    const model = &app_state.model;
+
+    for (0..48) |index| {
+        var line_buffer: [64]u8 = undefined;
+        const alpha = try std.fmt.bufPrint(&line_buffer, "alpha-history-{d}\r\n", .{index});
+        try app_state.effects.feedPtyOutput(app.ptyKey(0), alpha);
+        const bravo = try std.fmt.bufPrint(&line_buffer, "bravo-history-{d}\r\n", .{index});
+        try app_state.effects.feedPtyOutput(app.ptyKey(1), bravo);
+        try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    }
+    try app_state.effects.feedPtyOutput(app.ptyKey(0), "ONLY_ALPHA_NEEDLE\r\n");
+    try app_state.effects.feedPtyOutput(app.ptyKey(1), "ONLY_BRAVO_NEEDLE\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+
+    const bravo_offset = model.panes[1].session.scrollbar().offset;
+    model.panes[0].session.scrollLines(-6);
+    try testing.expect(model.panes[0].session.scrollbar().offset < bravo_offset);
+    try testing.expectEqual(bravo_offset, model.panes[1].session.scrollbar().offset);
+
+    model.panes[0].session.beginSelection(false);
+    model.panes[0].session.moveSelection(-4, 0, true);
+    try testing.expect(model.panes[0].session.selectionActive());
+    try testing.expect(!model.panes[1].session.selectionActive());
+
+    var alpha_in_alpha = try vt.search.Active.init(gpa, "ONLY_ALPHA_NEEDLE");
+    defer alpha_in_alpha.deinit();
+    _ = try alpha_in_alpha.update(&model.panes[0].session.term.screens.active.pages);
+    try testing.expect(alpha_in_alpha.next() != null);
+
+    var alpha_in_bravo = try vt.search.Active.init(gpa, "ONLY_ALPHA_NEEDLE");
+    defer alpha_in_bravo.deinit();
+    _ = try alpha_in_bravo.update(&model.panes[1].session.term.screens.active.pages);
+    try testing.expect(alpha_in_bravo.next() == null);
+
+    var bravo_in_bravo = try vt.search.Active.init(gpa, "ONLY_BRAVO_NEEDLE");
+    defer bravo_in_bravo.deinit();
+    _ = try bravo_in_bravo.update(&model.panes[1].session.term.screens.active.pages);
+    try testing.expect(bravo_in_bravo.next() != null);
+
+    model.panes[0].session.clearSelection();
+    try testing.expect(!model.panes[0].session.selectionActive());
+    try testing.expect(!model.panes[1].session.selectionActive());
 }
 
 test "ADVERSARIAL: a hard reset of pane 0 does not reset pane 1" {
