@@ -14,6 +14,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `cmd+R` continues to restart the focused terminal.
 - Current PTY input stalls clear after recovery; native delivery failures remain
   distinct from bytes confirmed lost in an application queue.
+- Terminal pointer interaction now includes native Copy/Paste menus, persistent
+  copied highlights, I-beam and text-value accessibility, edge autoscroll,
+  protocol-fenced captures, and fair independent wheel accumulation.
 
 ## [0.3.0] - 2026-08-02
 

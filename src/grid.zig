@@ -135,6 +135,13 @@ pub const Session = struct {
         click_count: u8 = 1,
     };
 
+    pub const PointerAutoscrollEvent = struct {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    };
+
     /// Query-answer buffer's INITIAL size (it grows to fit).
     pub const response_capacity: usize = 16 * 1024;
 
@@ -664,18 +671,57 @@ pub const Session = struct {
         return true;
     }
 
+    pub fn pointerAutoscrollActive(session: *const Session) bool {
+        return session.pointer_selection.left_drag_autoscroll != .none;
+    }
+
+    /// Advance an edge drag by one Ghostty-owned row. The host supplies the
+    /// cadence; one invocation is deliberately bounded to one viewport row.
+    pub fn pointerAutoscroll(session: *Session, event: PointerAutoscrollEvent) bool {
+        if (!session.pointerAutoscrollActive() or
+            !std.math.isFinite(event.x) or !std.math.isFinite(event.y) or
+            !std.math.isFinite(event.width) or !std.math.isFinite(event.height) or
+            event.width <= 0 or event.height <= 0 or
+            session.cell_width <= 0 or session.cell_height <= 0)
+        {
+            return false;
+        }
+        const coordinate = session.pointerViewportCoordinate(event.x, event.y) orelse return false;
+        const selection = session.pointer_selection.autoscrollTick(&session.term, .{
+            .viewport = coordinate,
+            .xpos = event.x,
+            .ypos = event.y,
+            .rectangle = false,
+            .word_boundary_codepoints = &pointer_word_boundaries,
+            .geometry = .{
+                .columns = session.cols(),
+                .cell_width = @intFromFloat(@max(1, @round(session.cell_width))),
+                .padding_left = 0,
+                .screen_height = @intFromFloat(@max(1, @round(event.height))),
+            },
+        }) orelse return false;
+        session.term.screens.active.select(selection) catch return false;
+        session.refreshScreenText();
+        return true;
+    }
+
     fn pointerPin(session: *Session, event: PointerSelectionEvent) ?vt.Pin {
+        const coordinate = session.pointerViewportCoordinate(event.x, event.y) orelse return null;
+        return session.term.screens.active.pages.pin(.{ .viewport = coordinate });
+    }
+
+    fn pointerViewportCoordinate(session: *const Session, x: f32, y: f32) ?vt.Coordinate {
         const cols_count = session.cols();
         const rows_count = session.rows();
         if (cols_count == 0 or rows_count == 0) return null;
         const max_x: f32 = @floatFromInt(cols_count - 1);
         const max_y: f32 = @floatFromInt(rows_count - 1);
-        const cell_x = std.math.clamp(@floor(event.x / session.cell_width), 0, max_x);
-        const cell_y = std.math.clamp(@floor(event.y / session.cell_height), 0, max_y);
-        return session.term.screens.active.pages.pin(.{ .viewport = .{
+        const cell_x = std.math.clamp(@floor(x / session.cell_width), 0, max_x);
+        const cell_y = std.math.clamp(@floor(y / session.cell_height), 0, max_y);
+        return .{
             .x = @intFromFloat(cell_x),
             .y = @intFromFloat(cell_y),
-        } });
+        };
     }
 
     /// Re-derive the viewport-relative selection coordinates from the

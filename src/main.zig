@@ -69,6 +69,8 @@ const first_terminal_raw: u64 = @intFromEnum(TerminalId.terminal_1);
 const max_held_terminal_keys: usize = 16;
 const max_pointer_captures: usize = 8;
 const max_mouse_reports_per_event: usize = 64;
+pub const selection_autoscroll_timer_id: u64 = 1;
+const selection_autoscroll_interval_ns: u64 = 15 * std.time.ns_per_ms;
 const max_mouse_coordinate: f32 = 1_000_000;
 
 const HeldTerminalKey = struct {
@@ -108,6 +110,7 @@ pub const PointerCapture = struct {
     pointer_id: u64 = 0,
     button: i32 = 0,
     mode: PointerDragMode = .local_selection,
+    mouse_protocol_fingerprint: u8 = 0,
     frame: geometry.RectF = .{},
     last_point: geometry.PointF = .{},
     modifiers: PointerModifiers = .{},
@@ -314,10 +317,12 @@ pub const Pane = struct {
     /// selection stays live for a retry. Cleared by the next copy
     /// attempt and by a restart.
     copy_failed: bool = false,
-    /// Fractional wheel-scroll remainder in view points: deltas
-    /// accumulate here and convert to whole scrollback rows.
-    wheel_accum: f32 = 0,
+    /// Local scrollback and child mouse reporting are separate consumers.
+    /// A protocol transition must not erase a user's partial local scroll.
+    scrollback_wheel_accum: f32 = 0,
+    mouse_wheel_y_accum: f32 = 0,
     mouse_wheel_x_accum: f32 = 0,
+    mouse_wheel_next_horizontal: bool = false,
     /// Ghostty mouse-motion deduplication and the button currently owned by
     /// the TUI report stream. Both are session-generation state.
     mouse_last_cell: ?vt.Coordinate = null,
@@ -984,6 +989,8 @@ pub const Msg = union(enum) {
     clipboard: native_sdk.EffectClipboardResult,
     paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
+    copy_terminal: TerminalId,
+    paste_terminal: TerminalId,
     restart: Placement,
     select_surface: SurfaceSelection,
     select_position: u8,
@@ -1005,6 +1012,7 @@ pub const Msg = union(enum) {
     /// may have read and freed FIFO space without producing output to
     /// trigger a flush.
     flush_outbound,
+    selection_autoscroll,
     /// The SDK-routed retained-widget event, stamped with durable identity and
     /// generation by CockpitHost's narrow v0.7.1 adapter.
     pointer: TerminalPointerEvent,
@@ -1033,6 +1041,7 @@ pub const CockpitHost = struct {
     /// until a canvas release or a different shortcut edge so repeated
     /// callbacks for one edge execute the command exactly once.
     global_shortcut_keys_held: u32 = 0,
+    selection_autoscroll_timer_active: bool = false,
 
     pub fn init(self: *CockpitHost, allocator: std.mem.Allocator, model: Model, options: TerminalApp.Options) void {
         var host_options = options;
@@ -1043,6 +1052,7 @@ pub const CockpitHost = struct {
         self.inner_app = self.inner.app();
         self.suppressed_canvas_shortcuts = 0;
         self.global_shortcut_keys_held = 0;
+        self.selection_autoscroll_timer_active = false;
     }
 
     pub fn deinit(self: *CockpitHost) void {
@@ -1080,6 +1090,7 @@ pub const CockpitHost = struct {
 
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const self: *CockpitHost = @ptrCast(@alignCast(context));
+        defer self.syncSelectionAutoscrollTimer(runtime) catch {};
         switch (event_value) {
             .command => |command| {
                 if (command.source == .shortcut) {
@@ -1096,6 +1107,7 @@ pub const CockpitHost = struct {
                 }
             },
             .gpu_surface_input => |input| {
+                if (try self.routeSecondaryTerminalPointer(runtime, input)) return;
                 const mask = appShortcutKeyMask(input.key);
                 const global_owned = mask != 0 and (self.global_shortcut_keys_held & mask) != 0;
                 if (input.kind == .key_up) self.global_shortcut_keys_held &= ~mask;
@@ -1276,8 +1288,82 @@ pub const CockpitHost = struct {
         return true;
     }
 
+    /// native-sdk v0.7.1 reserves button 1 for context menus and therefore
+    /// emits no `canvas_widget_pointer` for that stream. The raw echo is the
+    /// sole fallback for secondary press/drag/release; all other buttons stay
+    /// exclusively on the authoritative routed path above.
+    fn routeSecondaryTerminalPointer(
+        self: *CockpitHost,
+        runtime: *native_sdk.Runtime,
+        input: native_sdk.platform.GpuSurfaceInputEvent,
+    ) !bool {
+        if (input.button != 1 or !std.mem.eql(u8, input.label, canvas_label)) return false;
+        const phase: canvas.WidgetPointerPhase = switch (input.kind) {
+            .pointer_down => .down,
+            .pointer_up => .up,
+            .pointer_cancel => .cancel,
+            .pointer_drag => .move,
+            .pointer_move => .hover,
+            else => return false,
+        };
+
+        const capture = if (phase == .move or phase == .up or phase == .cancel)
+            pointerCaptureFor(&self.inner.model, input.window_id, input.pointer_id)
+        else
+            null;
+        var terminal_id: TerminalId = undefined;
+        var generation: u64 = 0;
+        var frame: geometry.RectF = .{};
+        if (capture) |owned| {
+            terminal_id = owned.terminal_id;
+            generation = owned.generation;
+            frame = terminalInteractionFrame(runtime, input.window_id, owned.terminal_id) orelse owned.frame;
+        } else {
+            if (phase == .move or phase == .up or phase == .cancel) return true;
+            const target = terminalInteractionHit(runtime, input.window_id, geometry.PointF.init(input.x, input.y)) orelse return false;
+            terminal_id = terminalIdForInteractionWidget(&self.inner.model, target.id) orelse return false;
+            const pane = self.inner.model.provider.terminal(terminal_id) orelse return true;
+            generation = pane.session_generation;
+            frame = target.bounds;
+        }
+
+        try self.inner.dispatch(runtime, input.window_id, .{ .pointer = .{
+            .window_id = input.window_id,
+            .terminal_id = terminal_id,
+            .generation = generation,
+            .phase = phase,
+            .pointer_id = input.pointer_id,
+            .button = input.button,
+            .point = geometry.PointF.init(input.x, input.y),
+            .frame = frame,
+            .modifiers = .{
+                .shift = input.modifiers.shift,
+                .control = input.modifiers.control,
+                .alt = input.modifiers.option,
+                .super = input.modifiers.command,
+            },
+        } });
+        if (phase == .down) try self.focusSelectedContent(runtime, input.window_id);
+        return true;
+    }
+
+    fn syncSelectionAutoscrollTimer(self: *CockpitHost, runtime: *native_sdk.Runtime) !void {
+        const needed = modelHasSelectionAutoscroll(&self.inner.model);
+        if (needed == self.selection_autoscroll_timer_active) return;
+        if (needed) {
+            try runtime.startTimer(selection_autoscroll_timer_id, selection_autoscroll_interval_ns, true);
+        } else {
+            try runtime.cancelTimer(selection_autoscroll_timer_id);
+        }
+        self.selection_autoscroll_timer_active = needed;
+    }
+
     fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *CockpitHost = @ptrCast(@alignCast(context));
+        if (self.selection_autoscroll_timer_active) {
+            runtime.cancelTimer(selection_autoscroll_timer_id) catch {};
+            self.selection_autoscroll_timer_active = false;
+        }
         try self.inner_app.stop(runtime);
     }
 
@@ -1288,7 +1374,7 @@ pub const CockpitHost = struct {
 };
 
 fn terminalInteractionWidgetId(id: TerminalId) canvas.ObjectId {
-    return canvas.globalWidgetId(.panel, .{ .index = @intCast(@intFromEnum(id)) });
+    return canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(id)) });
 }
 
 fn terminalIdForInteractionWidget(model: *const Model, widget_id: canvas.ObjectId) ?TerminalId {
@@ -1307,8 +1393,22 @@ fn terminalInteractionFrame(
     for (runtime.views[0..runtime.view_count]) |*runtime_view| {
         if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
         const node = runtime_view.widgetLayoutTree().findById(widget_id) orelse return null;
-        if (node.widget.kind != .panel) return null;
+        if (node.widget.kind != .terminal) return null;
         return node.frame;
+    }
+    return null;
+}
+
+fn terminalInteractionHit(
+    runtime: *native_sdk.Runtime,
+    window_id: native_sdk.platform.WindowId,
+    point: geometry.PointF,
+) ?canvas.WidgetHit {
+    for (runtime.views[0..runtime.view_count]) |*runtime_view| {
+        if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
+        const hit = runtime_view.widgetLayoutTree().hitTestWithTokens(point, runtime_view.widget_tokens) orelse return null;
+        if (hit.kind != .terminal) return null;
+        return hit;
     }
     return null;
 }
@@ -1336,8 +1436,10 @@ fn spawnPane(pane: *Pane, fx: *Fx) void {
     model.copied_bytes = 0;
     model.copy_failed = false;
     model.macos_natural_keys_held = 0;
-    model.wheel_accum = 0;
+    model.scrollback_wheel_accum = 0;
+    model.mouse_wheel_y_accum = 0;
     model.mouse_wheel_x_accum = 0;
+    model.mouse_wheel_next_horizontal = false;
     model.mouse_last_cell = null;
     model.mouse_protocol_fingerprint = 0;
     model.output_batches = 0;
@@ -1391,8 +1493,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                     pane.phase = .live;
                     pane.output_batches += 1;
                     pane.output_bytes += event.bytes.len;
+                    const pointer_protocol_before = pane.mouse_protocol_fingerprint;
                     feedOutput(pane, fx, event.bytes);
                     syncMouseProtocol(pane);
+                    if (pointer_protocol_before != 0 and pointer_protocol_before != pane.mouse_protocol_fingerprint) {
+                        endMismatchedMouseCaptures(model, fx, pane);
+                    }
                     // Cells changed: refresh the grid's accessibility text
                     // (which also carries real cell state into the session
                     // fingerprint — byte counters alone would verify a
@@ -1482,6 +1588,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                 moveResponsesToOutbound(pane, fx);
             }
         },
+        .selection_autoscroll => handleSelectionAutoscroll(model, fx),
         .chrome_changed => |chrome| {
             model.chrome_top = chrome.insets.top;
         },
@@ -1514,8 +1621,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .copy_selection => {
             if (model.selectedTerminalId() == null) return;
-            copySelection(model, fx);
+            copySelection(model, fx, model.focusedPane().id);
         },
+        .copy_terminal => |id| copySelection(model, fx, id),
+        .paste_terminal => |id| requestPaste(model, fx, id),
         .clipboard => |result| {
             if (!model.copy_inflight) return;
             model.copy_inflight = false;
@@ -1526,11 +1635,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             // successful) result must not mutate the replacement session.
             if (pane.session_generation != model.copy_owner_generation) return;
             if (result.outcome == .ok) {
-                // Confirmed on the clipboard: the selection's job is
-                // done, and only NOW does it clear — a failed write
-                // needs it still standing to retry.
+                // Native terminals keep a copied range highlighted. Typing,
+                // a new selection, or restart clears it; copy success does not.
                 pane.selecting = false;
-                pane.session.clearSelection();
             } else {
                 // The write failed after a successful read: same user
                 // story as a serialization failure — loud, the
@@ -1752,7 +1859,7 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
             if (pane.session_generation != event.generation or !terminalVisible(model, pane.id)) return;
             if (!validPointerGeometry(event)) return;
             syncMouseProtocol(pane);
-            if (event.button == 0) {
+            if (event.button == 0 or event.button == 1) {
                 for (model.attachments, 0..) |attached, index| {
                     if (attached != null and attached.? == pane.id) {
                         model.focus_placement = Placement.fromIndex(index).?;
@@ -1764,7 +1871,10 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
 
             const slot = freePointerCaptureIndex(model) orelse return;
             const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
-            const mouse_reporting = pane.session.term.flags.mouse_event != .none;
+            // An ended child cannot own pointer input. Its last mode flags may
+            // still say mouse reporting, but the static viewport must revert to
+            // ordinary terminal selection without requiring Shift.
+            const mouse_reporting = pane.acceptsInput() and pane.session.term.flags.mouse_event != .none;
             const local_selection = event.button == 0 and (!mouse_reporting or event.modifiers.shift);
             if (local_selection) {
                 pane.selecting = false;
@@ -1803,6 +1913,7 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
                 .pointer_id = event.pointer_id,
                 .button = event.button,
                 .mode = .mouse_report,
+                .mouse_protocol_fingerprint = pane.mouse_protocol_fingerprint,
                 .frame = event.frame,
                 .last_point = event.point,
                 .modifiers = event.modifiers,
@@ -1820,7 +1931,8 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
                     return;
                 };
                 if (pane.session_generation != capture.generation or !terminalVisible(model, pane.id) or
-                    (capture.mode == .mouse_report and !pane.acceptsInput()))
+                    (capture.mode == .mouse_report and
+                        (!pane.acceptsInput() or !mouseCaptureProtocolMatches(pane, capture))))
                 {
                     endPointerCapture(model, fx, index, true);
                     return;
@@ -1880,20 +1992,18 @@ fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) vo
             if (pane.acceptsInput() and pane.session.term.flags.mouse_event != .none and !event.modifiers.shift) {
                 pane.selecting = false;
                 pane.session.clearSelection();
-                accumulateWheel(&pane.wheel_accum, if (finite_y) event.delta.dy else 0, pane.session.cell_height);
+                accumulateWheel(&pane.mouse_wheel_y_accum, if (finite_y) event.delta.dy else 0, pane.session.cell_height);
                 accumulateWheel(&pane.mouse_wheel_x_accum, if (finite_x) event.delta.dx else 0, pane.session.cell_width);
-                var budget = max_mouse_reports_per_event;
-                flushMouseWheel(model, pane, fx, &pane.wheel_accum, .four, .five, pane.session.cell_height, local, event.frame, event.modifiers, &budget);
-                flushMouseWheel(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, pane.session.cell_width, local, event.frame, event.modifiers, &budget);
+                flushMouseWheels(model, pane, fx, local, event.frame, event.modifiers);
                 return;
             }
             if (pane.selecting or !finite_y) return;
             const cell_h = finiteQuantum(pane.session.cell_height);
-            accumulateWheel(&pane.wheel_accum, event.delta.dy, cell_h);
+            accumulateWheel(&pane.scrollback_wheel_accum, event.delta.dy, cell_h);
             const report_bound: f32 = @floatFromInt(max_mouse_reports_per_event);
-            const rows = std.math.clamp(@trunc(pane.wheel_accum / cell_h), -report_bound, report_bound);
+            const rows = std.math.clamp(@trunc(pane.scrollback_wheel_accum / cell_h), -report_bound, report_bound);
             if (rows != 0) {
-                pane.wheel_accum -= rows * cell_h;
+                pane.scrollback_wheel_accum -= rows * cell_h;
                 pane.session.scrollLines(-@as(isize, @intFromFloat(rows)));
             }
         },
@@ -1924,7 +2034,7 @@ fn endPointerCapture(model: *Model, fx: *Fx, index: usize, cancelled: bool) void
             .width = capture.frame.width,
             .height = capture.frame.height,
         }),
-        .mouse_report => if (pane.acceptsInput()) {
+        .mouse_report => if (pane.acceptsInput() and mouseCaptureProtocolMatches(pane, capture)) {
             _ = encodeMouseReport(model, pane, fx, .release, terminalMouseButton(capture.button), local, capture.frame, capture.modifiers);
         },
     }
@@ -1933,6 +2043,18 @@ fn endPointerCapture(model: *Model, fx: *Fx, index: usize, cancelled: bool) void
 fn endCapturesForTerminal(model: *Model, fx: *Fx, id: TerminalId) void {
     for (0..model.pointer_captures.len) |index| {
         if (model.pointer_captures[index].active and model.pointer_captures[index].terminal_id == id) {
+            endPointerCapture(model, fx, index, true);
+        }
+    }
+}
+
+fn endMismatchedMouseCaptures(model: *Model, fx: *Fx, pane: *Pane) void {
+    for (0..model.pointer_captures.len) |index| {
+        const capture = model.pointer_captures[index];
+        if (capture.active and capture.mode == .mouse_report and
+            capture.terminal_id == pane.id and capture.generation == pane.session_generation and
+            capture.mouse_protocol_fingerprint != pane.mouse_protocol_fingerprint)
+        {
             endPointerCapture(model, fx, index, true);
         }
     }
@@ -1947,6 +2069,37 @@ fn endHiddenCaptures(model: *Model, fx: *Fx) void {
         if (model.pointer_captures[index].active and !terminalVisible(model, model.pointer_captures[index].terminal_id)) {
             endPointerCapture(model, fx, index, true);
         }
+    }
+}
+
+fn modelHasSelectionAutoscroll(model: *const Model) bool {
+    for (model.pointer_captures) |capture| {
+        if (!capture.active or capture.mode != .local_selection) continue;
+        const pane = model.provider.terminalConst(capture.terminal_id) orelse continue;
+        if (pane.session_generation == capture.generation and
+            terminalVisible(model, pane.id) and pane.session.pointerAutoscrollActive()) return true;
+    }
+    return false;
+}
+
+fn handleSelectionAutoscroll(model: *Model, fx: *Fx) void {
+    for (0..model.pointer_captures.len) |index| {
+        const capture = model.pointer_captures[index];
+        if (!capture.active or capture.mode != .local_selection) continue;
+        const pane = model.provider.terminal(capture.terminal_id) orelse {
+            endPointerCapture(model, fx, index, true);
+            continue;
+        };
+        if (pane.session_generation != capture.generation or !terminalVisible(model, pane.id)) {
+            endPointerCapture(model, fx, index, true);
+            continue;
+        }
+        _ = pane.session.pointerAutoscroll(.{
+            .x = capture.last_point.x - capture.frame.x,
+            .y = capture.last_point.y - capture.frame.y,
+            .width = capture.frame.width,
+            .height = capture.frame.height,
+        });
     }
 }
 
@@ -2045,6 +2198,13 @@ fn paneHasReportingCapture(model: *const Model, id: TerminalId, generation: u64)
     return false;
 }
 
+fn mouseCaptureProtocolMatches(pane: *Pane, capture: PointerCapture) bool {
+    syncMouseProtocol(pane);
+    return capture.mouse_protocol_fingerprint != 0 and
+        capture.mouse_protocol_fingerprint == pane.mouse_protocol_fingerprint and
+        pane.session.term.flags.mouse_event != .none;
+}
+
 fn validScale(scale: f32) bool {
     return std.math.isFinite(scale) and scale > 0;
 }
@@ -2073,7 +2233,7 @@ fn accumulateWheel(accum: *f32, delta: f32, quantum_value: f32) void {
     accum.* = std.math.clamp(accum.* + std.math.clamp(delta, -bound, bound), -bound, bound);
 }
 
-fn flushMouseWheel(
+fn flushMouseWheelOnce(
     model: *const Model,
     pane: *Pane,
     fx: *Fx,
@@ -2084,13 +2244,38 @@ fn flushMouseWheel(
     local: geometry.PointF,
     frame: geometry.RectF,
     modifiers: PointerModifiers,
-    budget: *usize,
-) void {
+) bool {
     const quantum = finiteQuantum(quantum_value);
-    while (budget.* > 0 and @abs(accum.*) >= quantum) : (budget.* -= 1) {
-        const button = if (accum.* > 0) positive else negative;
-        _ = encodeMouseReport(model, pane, fx, .press, button, local, frame, modifiers);
-        accum.* += if (accum.* > 0) -quantum else quantum;
+    if (@abs(accum.*) < quantum) return false;
+    const button = if (accum.* > 0) positive else negative;
+    _ = encodeMouseReport(model, pane, fx, .press, button, local, frame, modifiers);
+    accum.* += if (accum.* > 0) -quantum else quantum;
+    return true;
+}
+
+fn flushMouseWheels(
+    model: *const Model,
+    pane: *Pane,
+    fx: *Fx,
+    local: geometry.PointF,
+    frame: geometry.RectF,
+    modifiers: PointerModifiers,
+) void {
+    var budget = max_mouse_reports_per_event;
+    while (budget > 0) : (budget -= 1) {
+        const horizontal_first = pane.mouse_wheel_next_horizontal;
+        const first = if (horizontal_first)
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, pane.session.cell_width, local, frame, modifiers)
+        else
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_y_accum, .four, .five, pane.session.cell_height, local, frame, modifiers);
+        const second = if (first)
+            false
+        else if (horizontal_first)
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_y_accum, .four, .five, pane.session.cell_height, local, frame, modifiers)
+        else
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, pane.session.cell_width, local, frame, modifiers);
+        if (!first and !second) return;
+        pane.mouse_wheel_next_horizontal = !horizontal_first;
     }
 }
 
@@ -2104,8 +2289,9 @@ fn syncMouseProtocol(pane: *Pane) void {
     if (pane.mouse_protocol_fingerprint == fingerprint) return;
     pane.mouse_protocol_fingerprint = fingerprint;
     pane.mouse_last_cell = null;
-    pane.wheel_accum = 0;
+    pane.mouse_wheel_y_accum = 0;
     pane.mouse_wheel_x_accum = 0;
+    pane.mouse_wheel_next_horizontal = false;
 }
 
 /// Append outbound bytes (typed keys, pastes, or query replies) to the
@@ -2230,14 +2416,14 @@ pub fn moveResponsesToOutbound(model: *Pane, fx: *Fx) void {
     model.session.clearResponses();
 }
 
-fn copySelection(model: *Model, fx: *Fx) void {
+fn copySelection(model: *Model, fx: *Fx, terminal_id: TerminalId) void {
     // ONE copy in flight: the clipboard write reuses a fixed key, so a
     // second request before the first result drains would be rejected
     // as a duplicate — and that rejection would overwrite the first
     // copy's success with `copy_failed`. There is one system clipboard,
     // so this holds ACROSS panes, not per pane.
     if (model.copy_inflight) return;
-    const pane = model.focusedPane();
+    const pane = model.provider.terminal(terminal_id) orelse return;
     pane.copy_failed = false;
     const text = (pane.session.selectionText(pane.session.gpa) catch {
         // Serialization failed with a selection ACTIVE: keep the
@@ -2270,18 +2456,17 @@ fn copySelection(model: *Model, fx: *Fx) void {
         .text = text,
         .on_result = Fx.clipboardMsg(.clipboard),
     });
-    // The selection stays armed until the clipboard CONFIRMS: clearing
-    // it now would leave a failed write nothing to retry — the promised
-    // keep-on-failure needs the selection still standing when the
-    // result lands (the `.clipboard` arm clears it on success).
+    // Keep the range highlighted after submission and completion. A failed
+    // write remains retryable; a successful copy follows native terminal
+    // convention until typing, a new selection, or restart clears it.
 }
 
-fn requestPaste(model: *Model, fx: *Fx) void {
+fn requestPaste(model: *Model, fx: *Fx, terminal_id: TerminalId) void {
     // One read in flight: the fixed paste key remains occupied until its
     // result is delivered. A repeated Cmd+V is consumed but cannot issue
     // a duplicate request that would only be rejected.
     if (model.paste_inflight) return;
-    const pane = model.focusedPane();
+    const pane = model.provider.terminal(terminal_id) orelse return;
     model.paste_owner = pane.id;
     model.paste_owner_generation = pane.session_generation;
     model.paste_failed = false;
@@ -2474,12 +2659,12 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     }
     if (primary and keyIs(event.key, "c") and (pane.selecting or session.selectionActive())) {
         latchAppShortcut(model, event.key);
-        copySelection(model, fx);
+        copySelection(model, fx, pane.id);
         return;
     }
     if (primary and keyIs(event.key, "v")) {
         latchAppShortcut(model, event.key);
-        requestPaste(model, fx);
+        requestPaste(model, fx, pane.id);
         return;
     }
     if (primary and keyIs(event.key, "r") and (pane.phase == .ended or pane.phase == .failed)) {
@@ -2529,7 +2714,7 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         }
         if (keyIs(event.key, "enter")) {
             latchAppShortcut(model, event.key);
-            copySelection(model, fx);
+            copySelection(model, fx, pane.id);
             return;
         }
         const step: i32 = 1;
@@ -3111,28 +3296,27 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
         .semantics = .{ .role = .group, .label = "Detached terminal placement" },
     }, .{});
     const screen = pane.session.screenText();
-    // A transparent retained widget is the interaction surface over the
-    // app-owned libghostty painter. A panel (rather than terminal pty=0)
-    // avoids the SDK's duplicate session input and default context menu while
-    // preserving layout, hit testing, capture, focus and automation geometry.
-    return ui.panel(.{
+    const context_menu = [_]TerminalUi.ContextMenuItem{
+        .{ .label = "Copy", .msg = .{ .copy_terminal = pane.id }, .enabled = pane.session.selectionActive() },
+        .{ .label = "Paste", .msg = .{ .paste_terminal = pane.id }, .enabled = pane.acceptsInput() },
+    };
+    // An unbound terminal widget contributes only native interaction and
+    // semantics over the app-owned libghostty painter. pty=0 prevents SDK
+    // session input; opacity=0 prevents duplicate pixels. The kind supplies
+    // the platform I-beam and a terminal text-value contract.
+    return ui.terminal(.{
         .global_key = .{ .index = @intCast(@intFromEnum(pane.id)) },
         .grow = 1,
         .min_width = split_pane_min_width,
         .opacity = 0,
+        .text = screen,
         .on_press = .{ .focus_pane = placement },
+        .context_menu = &context_menu,
         .semantics = .{
-            // The app owns terminal text painting and has no SDK text-value
-            // contract, so expose one honest focusable terminal group rather
-            // than claiming a native textbox value that does not exist.
-            .role = .group,
             .focusable = true,
-            .label = if (screen.len > 0)
-                ui.fmt("{s}\n{s}", .{ terminalTitle(ui, pane.id), screen })
-            else
-                terminalTitle(ui, pane.id),
+            .label = terminalTitle(ui, pane.id),
         },
-    }, .{});
+    });
 }
 
 fn splitTerminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Node {
@@ -3401,6 +3585,10 @@ pub fn onCommand(name: []const u8) ?Msg {
     return null;
 }
 
+pub fn onTimer(id: u64, _: u64) ?Msg {
+    return if (id == selection_autoscroll_timer_id) .selection_autoscroll else null;
+}
+
 // ------------------------------------------------------------------ main
 
 pub fn appOptions() TerminalApp.Options {
@@ -3418,6 +3606,7 @@ pub fn appOptions() TerminalApp.Options {
         .key_release_events = true,
         .on_text = onText,
         .on_wheel = onWheel,
+        .on_timer = onTimer,
         .on_chrome = onChrome,
         .on_lifecycle = onLifecycle,
         .on_frame = onFrame,

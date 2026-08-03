@@ -1767,7 +1767,9 @@ test "restart resets every per-session counter and exit field" {
     pane.copied_bytes = 12;
     pane.copy_failed = true;
     pane.macos_natural_keys_held = 7;
-    pane.wheel_accum = 4.5;
+    pane.scrollback_wheel_accum = 4.5;
+    pane.mouse_wheel_y_accum = 3.5;
+    pane.mouse_wheel_x_accum = 2.5;
     pane.outbound_head = 9;
     pane.outbound_len = 11;
     pane.outbound_dropped = 13;
@@ -1796,7 +1798,9 @@ test "restart resets every per-session counter and exit field" {
     try testing.expectEqual(@as(u64, 0), pane.copied_bytes);
     try testing.expect(!pane.copy_failed);
     try testing.expectEqual(@as(u8, 0), pane.macos_natural_keys_held);
-    try testing.expectEqual(@as(f32, 0), pane.wheel_accum);
+    try testing.expectEqual(@as(f32, 0), pane.scrollback_wheel_accum);
+    try testing.expectEqual(@as(f32, 0), pane.mouse_wheel_y_accum);
+    try testing.expectEqual(@as(f32, 0), pane.mouse_wheel_x_accum);
     try testing.expectEqual(@as(u64, 0), pane.output_batches);
     try testing.expectEqual(@as(u64, 0), pane.output_bytes);
     try testing.expectEqual(@as(u32, 0), pane.write_refusals);
@@ -2069,7 +2073,7 @@ test "scrollback chords pause while a selection is armed" {
     try testing.expect(app_state.model.panes[0].session.scrollbar().offset != before);
 }
 
-test "a selection outlives the copy until the clipboard confirms" {
+test "a copied selection persists while failure remains retryable" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -2105,7 +2109,8 @@ test "a selection outlives the copy until the clipboard confirms" {
     try testing.expect(app_state.model.panes[0].selecting);
     try testing.expect(app_state.model.panes[0].session.selectionActive());
 
-    // A FAILED write keeps it and reports; a retry that succeeds clears.
+    // A failed write keeps selection mode armed for retry. Success exits the
+    // keyboard mode but preserves the conventional terminal highlight.
     try app_state.effects.feedClipboardResult(app.clipboard_key, .rejected, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try testing.expect(app_state.model.panes[0].copy_failed);
@@ -2122,7 +2127,7 @@ test "a selection outlives the copy until the clipboard confirms" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try testing.expect(!app_state.model.panes[0].copy_failed);
     try testing.expect(!app_state.model.panes[0].selecting);
-    try testing.expect(!app_state.model.panes[0].session.selectionActive());
+    try testing.expect(app_state.model.panes[0].session.selectionActive());
 }
 
 test "an armed selection follows its text when output scrolls the screen" {
@@ -2899,12 +2904,13 @@ test "native tabs and only the selected terminal surface reach accessibility" {
     try testing.expect(harness.runtime.sessionStateFingerprint() != 0);
 
     var terminal_nodes: usize = 0;
-    const terminal_id = canvas.globalWidgetId(.panel, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) });
+    const terminal_id = canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) });
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        try testing.expect(layout.widget.semantics.role != .textbox);
         if (layout.widget.id != terminal_id) continue;
         terminal_nodes += 1;
-        try testing.expectEqual(canvas.WidgetRole.group, layout.widget.semantics.role);
+        try testing.expectEqual(canvas.WidgetKind.terminal, layout.widget.kind);
+        try testing.expectEqualStrings("Terminal 1", layout.widget.semantics.label);
+        try testing.expectEqualStrings("PANEALPHA", layout.widget.text[0.."PANEALPHA".len]);
         try testing.expectEqual(@as(?f32, null), layout.widget.semantics.value);
         try testing.expect(layout.widget.semantics.focusable);
     }
@@ -3023,8 +3029,8 @@ fn releaseCanvasKey(harness: anytype, app_iface: anytype, key: []const u8, modif
 fn terminalInteractionFrame(harness: anytype, marker: []const u8) ?geometry.RectF {
     const layout = harness.runtime.views[0].widgetLayoutTree();
     for (layout.nodes) |node| {
-        if (node.widget.kind != .panel or node.widget.semantics.role != .group) continue;
-        if (std.mem.indexOf(u8, node.widget.semantics.label, marker) == null) continue;
+        if (node.widget.kind != .terminal) continue;
+        if (std.mem.indexOf(u8, node.widget.text, marker) == null) continue;
         return node.frame;
     }
     return null;
@@ -3821,7 +3827,7 @@ test "native tabs are keyboard focusable without stealing initial terminal input
     }
     try testing.expectEqual(@as(usize, 3), tab_count);
     try testing.expectEqual(
-        canvas.globalWidgetId(.panel, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }),
+        canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }),
         harness.runtime.views[0].canvas_widget_focused_id,
     );
     try pressCanvasKey(harness, app_iface, "enter", .{});
@@ -3942,13 +3948,13 @@ test "terminal overlays are stable identity-keyed and isolate chrome divider and
     var overlay_count: usize = 0;
     var divider: geometry.RectF = .{};
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (node.widget.kind == .panel and node.widget.semantics.role == .group and
-            (node.widget.id == canvas.globalWidgetId(.panel, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }) or
-                node.widget.id == canvas.globalWidgetId(.panel, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_2)) })))
+        if (node.widget.kind == .terminal and
+            (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }) or
+                node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_2)) })))
         {
-            const id: usize = if (node.widget.id == canvas.globalWidgetId(.panel, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }))
+            const id: usize = if (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_1)) }))
                 0
-            else if (node.widget.id == canvas.globalWidgetId(.panel, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_2)) }))
+            else if (node.widget.id == canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.TerminalId.terminal_2)) }))
                 1
             else
                 return error.UnexpectedTerminalOverlay;
@@ -4123,7 +4129,7 @@ test "Ghostty pointer selection keeps single word line gestures distinct from ke
     try host.inner.effects.feedClipboardResult(app.clipboard_key, .ok, "");
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
 
-    // Re-select after the confirmed copy cleared its highlight, then prove
+    // Start a new selection over the persistent copied highlight, then prove
     // ordinary committed text clears pointer selection and reaches the PTY.
     try pointerInputAdvanced(harness, iface, .pointer_down, alpha_start, .{ .timestamp_ns = 3_000_000_000 });
     try pointerInputAdvanced(harness, iface, .pointer_drag, alpha_end, .{ .timestamp_ns = 3_010_000_000 });
@@ -4316,12 +4322,12 @@ test "pointer lifecycle matrix releases live owners once and fences restart gene
     try host.inner.effects.feedPtyExit(pane.pty_key, 0, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     const old_generation = pane.session_generation;
-    try pointerInputAdvanced(harness, iface, .pointer_down, point, .{ .modifiers = .{ .shift = true } });
+    try pointerInputAdvanced(harness, iface, .pointer_down, point, .{});
     try testing.expectEqual(@as(usize, 1), activePointerCaptureCount(&host.inner.model));
     try host.inner.dispatch(&harness.runtime, 1, .{ .restart = .primary });
     try testing.expect(pane.session_generation != old_generation);
     try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
-    try pointerInputAdvanced(harness, iface, .pointer_drag, terminalCellPoint(pane, frame, 4, 0), .{ .modifiers = .{ .shift = true } });
+    try pointerInputAdvanced(harness, iface, .pointer_drag, terminalCellPoint(pane, frame, 4, 0), .{});
     try testing.expect(!pane.session.selectionActive());
 
     // A generation mismatch retires capture without writing to the replacement.
@@ -4379,7 +4385,8 @@ test "multiple pointer captures are isolated and hostile wheel values stay bound
     const after_wheel = host.inner.effects.ptyWrittenBytes(left.pty_key).len;
     try pointerInputAdvanced(harness, iface, .scroll, left_point, .{ .delta_x = std.math.nan(f32), .delta_y = std.math.inf(f32) });
     try testing.expectEqual(after_wheel, host.inner.effects.ptyWrittenBytes(left.pty_key).len);
-    try testing.expect(std.math.isFinite(left.wheel_accum));
+    try testing.expect(std.math.isFinite(left.scrollback_wheel_accum));
+    try testing.expect(std.math.isFinite(left.mouse_wheel_y_accum));
     try testing.expect(std.math.isFinite(left.mouse_wheel_x_accum));
 }
 
@@ -4421,6 +4428,200 @@ test "mouse protocol transitions reset motion dedupe and wheel residue" {
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     try pointerInputAdvanced(harness, iface, .scroll, point, .{ .delta_y = half });
     try testing.expectEqual(before, host.inner.effects.ptyWrittenBytes(pane.pty_key).len);
+}
+
+test "terminal interaction exposes I-beam text value and native Copy Paste" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const iface = host.app();
+    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    pane.session.reset();
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "copy this");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const frame = terminalInteractionFrame(harness, "copy this") orelse return error.TestExpectedTerminalInteractionSurface;
+    const start = terminalCellPoint(pane, frame, 0, 0);
+    const finish = terminalCellPoint(pane, frame, 4, 0);
+    try pointerInputAdvanced(harness, iface, .pointer_down, start, .{});
+    try pointerInputAdvanced(harness, iface, .pointer_drag, finish, .{});
+    try pointerInputAdvanced(harness, iface, .pointer_up, finish, .{});
+    try expectPointerSelectionText(pane, "copy");
+
+    const layout = harness.runtime.views[0].widgetLayoutTree();
+    const hit = layout.hitTest(start) orelse return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(canvas.WidgetKind.terminal, hit.kind);
+    try testing.expectEqual(canvas.WidgetCursor.text, layout.cursorForHit(hit));
+    var semantics_found = false;
+    for (harness.runtime.views[0].widgetSemantics()) |node| {
+        if (node.id != hit.id) continue;
+        semantics_found = true;
+        try testing.expectEqual(canvas.WidgetRole.textbox, node.role);
+        try testing.expectEqualStrings("Terminal 1", node.label);
+        try testing.expect(std.mem.indexOf(u8, node.text_value, "copy this") != null);
+        try testing.expect(node.focusable);
+        // The custom Ghostty selection is cell-pin based, not a byte range
+        // into the flattened accessibility text.
+        try testing.expectEqual(@as(?canvas.TextRange, null), node.text_selection);
+    }
+    try testing.expect(semantics_found);
+
+    try pointerInputAdvanced(harness, iface, .pointer_down, start, .{
+        .button = 1,
+        .modifiers = .{ .control = true },
+    });
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
+    try testing.expectEqual(@as(usize, 2), harness.null_platform.context_menu_item_count);
+    try testing.expectEqualStrings("Copy", harness.null_platform.context_menu_items[0].label);
+    try testing.expect(harness.null_platform.context_menu_items[0].enabled);
+    try testing.expectEqualStrings("Paste", harness.null_platform.context_menu_items[1].label);
+    try testing.expect(harness.null_platform.context_menu_items[1].enabled);
+    try harness.runtime.dispatchPlatformEvent(iface, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = app.canvas_label,
+        .token = harness.null_platform.context_menu_token,
+        .item_id = 1,
+    } });
+    const copy = host.inner.effects.pendingClipboardAt(0) orelse return error.TestExpectedClipboardWrite;
+    try testing.expectEqualStrings("copy", copy.text);
+    try host.inner.effects.feedClipboardResult(app.clipboard_key, .ok, "");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try testing.expect(pane.session.selectionActive());
+
+    try pointerInputAdvanced(harness, iface, .pointer_down, start, .{ .button = 1 });
+    try harness.runtime.dispatchPlatformEvent(iface, .{ .context_menu_action = .{
+        .window_id = 1,
+        .view_label = app.canvas_label,
+        .token = harness.null_platform.context_menu_token,
+        .item_id = 2,
+    } });
+    try testing.expect(host.inner.model.paste_inflight);
+    try testing.expectEqual(pane.id, host.inner.model.paste_owner);
+}
+
+test "secondary raw fallback reports right button exactly once" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const iface = host.app();
+    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1002h\x1b[?1006h");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const frame = app.paneFrames(&host.inner.model, size)[0];
+    const point = terminalCellPoint(pane, frame, 2, 2);
+    const before = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
+    try pointerInputAdvanced(harness, iface, .pointer_down, point, .{
+        .button = 1,
+        .modifiers = .{ .control = true },
+    });
+    try pointerInputAdvanced(harness, iface, .pointer_up, point, .{ .button = 1 });
+    try testing.expectEqualStrings("\x1b[<18;3;3M\x1b[<2;3;3m", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
+    try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
+}
+
+test "selection edge drag autoscrolls one Ghostty row per timer tick" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const iface = host.app();
+    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    pane.session.reset();
+    var lines: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&lines);
+    for (0..80) |index| try writer.print("row {d}\r\n", .{index});
+    try host.inner.effects.feedPtyOutput(pane.pty_key, writer.buffered());
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const frame = app.paneFrames(&host.inner.model, size)[0];
+    const start = terminalCellPoint(pane, frame, 2, 1);
+    const above = geometry.PointF.init(start.x, frame.y - 8);
+    try pointerInputAdvanced(harness, iface, .pointer_down, start, .{});
+    try pointerInputAdvanced(harness, iface, .pointer_drag, above, .{});
+    try testing.expect(host.selection_autoscroll_timer_active);
+    const timer = harness.null_platform.startedTimer(app.selection_autoscroll_timer_id) orelse return error.TestExpectedTimer;
+    try testing.expect(timer.active and timer.repeats);
+    try testing.expectEqual(@as(u64, 15 * std.time.ns_per_ms), timer.interval_ns);
+    const before = pane.session.scrollbar().offset;
+    try harness.runtime.dispatchPlatformEvent(iface, harness.null_platform.fireTimer(app.selection_autoscroll_timer_id, 20 * std.time.ns_per_ms) orelse return error.TestExpectedTimer);
+    try testing.expect(before > 0);
+    try testing.expectEqual(before - 1, pane.session.scrollbar().offset);
+    try pointerInputAdvanced(harness, iface, .pointer_up, above, .{});
+    try testing.expect(!host.selection_autoscroll_timer_active);
+    try testing.expect(!harness.null_platform.startedTimer(app.selection_autoscroll_timer_id).?.active);
+}
+
+test "wheel reporting is axis-fair and does not consume local residue" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const iface = host.app();
+    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    const frame = app.paneFrames(&host.inner.model, size)[0];
+    const point = terminalCellPoint(pane, frame, 2, 2);
+    try pointerInputAdvanced(harness, iface, .scroll, point, .{ .delta_y = pane.session.cell_height / 2 });
+    const local_residue = pane.scrollback_wheel_accum;
+    try testing.expect(local_residue > 0);
+
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1003h\x1b[?1006h");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    const before = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
+    try pointerInputAdvanced(harness, iface, .scroll, point, .{
+        .delta_x = std.math.floatMax(f32),
+        .delta_y = std.math.floatMax(f32),
+    });
+    const reports = host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..];
+    try testing.expectEqual(@as(usize, 32), std.mem.count(u8, reports, "\x1b[<64;"));
+    try testing.expectEqual(@as(usize, 32), std.mem.count(u8, reports, "\x1b[<66;"));
+    try testing.expectEqual(local_residue, pane.scrollback_wheel_accum);
+    try testing.expect(pane.mouse_wheel_y_accum >= pane.session.cell_height);
+    try testing.expect(pane.mouse_wheel_x_accum >= pane.session.cell_width);
+}
+
+test "mouse capture is fenced by its press protocol fingerprint" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const iface = host.app();
+    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1002h\x1b[?1006h");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    const frame = app.paneFrames(&host.inner.model, size)[0];
+    const point = terminalCellPoint(pane, frame, 2, 2);
+    try pointerInputAdvanced(harness, iface, .pointer_down, point, .{});
+    const capture = activePointerCapture(&host.inner.model, 7) orelse return error.TestExpectedCapture;
+    try testing.expectEqual(pane.mouse_protocol_fingerprint, capture.mouse_protocol_fingerprint);
+    const before_transition = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1006l\x1b[?1015h");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
+    try pointerInputAdvanced(harness, iface, .pointer_drag, terminalCellPoint(pane, frame, 3, 2), .{});
+    try testing.expectEqual(before_transition, host.inner.effects.ptyWrittenBytes(pane.pty_key).len);
 }
 
 test "only the selected terminal has a cursor command and deactivation hollows it" {
