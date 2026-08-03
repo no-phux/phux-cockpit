@@ -4595,6 +4595,99 @@ test "secondary click ownership transitions between TUI reports and native menu"
     try testing.expectEqualStrings("alpha", local_copy.text);
 }
 
+test "secondary report gesture survives protocol disable without menu takeover" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const iface = host.app();
+    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    pane.session.reset();
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "transition\r\n\x1b[?1002h\x1b[?1006h");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const frame = terminalInteractionFrame(harness, "transition") orelse return error.TestExpectedTerminalInteractionSurface;
+    const point = terminalCellPoint(pane, frame, 2, 2);
+    const hit = harness.runtime.views[0].widgetLayoutTree().hitTest(point) orelse return error.TestExpectedTerminalInteractionSurface;
+    const before = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
+
+    try pointerInputAdvanced(harness, iface, .pointer_down, point, .{ .button = 1 });
+    try testing.expectEqualStrings("\x1b[<2;3;3M", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
+    try testing.expectEqual(@as(usize, 1), activePointerCaptureCount(&host.inner.model));
+    try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
+    try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
+
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1002l");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
+    try testing.expectEqualStrings("\x1b[<2;3;3M", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const rebuilt = harness.runtime.views[0].widgetLayoutTree().findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, rebuilt.widget.context_menu_policy);
+    try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
+    try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
+
+    try pointerInputAdvanced(harness, iface, .pointer_up, point, .{ .button = 1 });
+    try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_pressed_id);
+    try testing.expectEqual(.none, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
+    try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
+    try testing.expectEqualStrings("\x1b[<2;3;3M", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.context_menu_request_count);
+}
+
+test "secondary report gesture survives process exit cancel without menu takeover" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const iface = host.app();
+    const pane = host.inner.model.provider.terminal(.terminal_1) orelse return error.TestExpectedTerminal;
+    pane.session.reset();
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "exiting\r\n\x1b[?1002h\x1b[?1006h");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const frame = terminalInteractionFrame(harness, "exiting") orelse return error.TestExpectedTerminalInteractionSurface;
+    const point = terminalCellPoint(pane, frame, 2, 2);
+    const hit = harness.runtime.views[0].widgetLayoutTree().hitTest(point) orelse return error.TestExpectedTerminalInteractionSurface;
+    const before = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
+
+    try pointerInputAdvanced(harness, iface, .pointer_down, point, .{ .button = 1 });
+    try testing.expectEqualStrings("\x1b[<2;3;3M", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
+    try testing.expectEqual(@as(usize, 1), activePointerCaptureCount(&host.inner.model));
+    try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
+    try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
+
+    try host.inner.effects.feedPtyExit(pane.pty_key, 0, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try testing.expectEqual(.ended, pane.phase);
+    try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
+    // The fake executor retires its write-capture window with the transport.
+    // These counters prove exit cleanup did not attempt or drop a release.
+    try testing.expectEqual(@as(u32, 0), pane.write_refusals_total);
+    try testing.expectEqual(@as(u64, 0), pane.outbound_dropped);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const rebuilt = harness.runtime.views[0].widgetLayoutTree().findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, rebuilt.widget.context_menu_policy);
+    try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
+    try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
+
+    try pointerInputAdvanced(harness, iface, .pointer_cancel, point, .{ .button = 1 });
+    try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_pressed_id);
+    try testing.expectEqual(.none, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
+    try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
+    try testing.expectEqual(@as(u32, 0), pane.write_refusals_total);
+    try testing.expectEqual(@as(u64, 0), pane.outbound_dropped);
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.context_menu_request_count);
+}
+
 test "selection edge drag autoscrolls one Ghostty row per timer tick" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);

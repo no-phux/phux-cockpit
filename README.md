@@ -106,7 +106,7 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Internet access on the first source build to fetch pinned dependencies
 
 native-sdk is temporarily pinned to
-[`phall1/native@9eb318d`](https://github.com/phall1/native/commit/9eb318d421ff0c664bc2a58b8e0f2cd88da9bd66),
+[`phall1/native@992f9f5`](https://github.com/phall1/native/commit/992f9f59695d1a723559190caca94800820ae7be),
 an upstream-ready context-menu-policy seam over v0.7.1. libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
 Zig 0.16-compatible checkpoint.

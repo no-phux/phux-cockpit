@@ -7,8 +7,8 @@
         // Temporary fork pin carrying the upstream-ready terminal
         // context-menu policy seam used for exclusive TUI mouse ownership.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/9eb318d421ff0c664bc2a58b8e0f2cd88da9bd66.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQsO36AFXNtD1wm2dGP2e57RpSW0C7oIKzRIiovbm",
+            .url = "https://github.com/phall1/native/archive/992f9f59695d1a723559190caca94800820ae7be.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQibm6AHGTM6FbIGe9X3wrQqiLyB-BZ_nH-CNQ2Ty",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

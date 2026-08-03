@@ -101,13 +101,15 @@ Review findings not retained:
 
 ## SDK Seam
 
-The temporary `phall1/native` pin at `9eb318d` extends native-sdk v0.7.1 with
+The temporary `phall1/native` pin at `992f9f5` extends native-sdk v0.7.1 with
 `ElementOptions.context_menu_policy`. The seam is upstream-ready and deliberately
 generic: `.automatic` preserves existing behavior, `.declared_only` suppresses
 SDK defaults, and `.disabled` bypasses menu handling while preserving ordinary
-pointer routing, capture, cursor, and semantics. An unbound terminal still
-cannot bind an app-defined continuous pointer message, and the SDK capture
-register is still one
+pointer routing, capture, cursor, and semantics. Secondary ownership is decided
+on down and retained through matching up/cancel even if a rebuild changes the
+policy, preventing menu takeover while an ordinary gesture is in flight. An
+unbound terminal still cannot bind an app-defined continuous pointer message,
+and the SDK capture register is still one
 `canvas_widget_pressed_id` per canvas, not per `(window, pointer)`.
 
 The remaining adapter is deliberately narrow:
