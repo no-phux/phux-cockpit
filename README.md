@@ -11,35 +11,66 @@ native control environment for large-scale directed machine work. See
 
 ## Spatial runtime
 
-- **Terminal 1** and **Terminal 2** are independent native terminal surfaces
-  over login-configured interactive shells. Each owns its own PTY, emulator,
-  scrollback, selection, input queue, and retained-rendering namespace.
-- **Split** projects both live terminal sessions simultaneously through a real
-  draggable and keyboard-operable divider. Splitting, focusing, resizing, and
-  collapsing never restart either process.
-- **Tabs** are native canvas controls with tab accessibility semantics. Direct
-  selection and next/previous shortcuts preserve hidden surface state.
+- Cockpit launches with **one terminal** and one shell process. New creates
+  subsequent terminals, up to four. Each has a durable terminal ID and owns its
+  own PTY, emulator, scrollback, selection, input queue, and retained-rendering
+  namespace. Tab order and visible placement do not own execution.
+- **Split** projects at most two live terminal sessions simultaneously through
+  a real draggable and keyboard-operable divider. Splitting, focusing,
+  resizing, and collapsing never restart either process.
+- **Tabs** are native canvas controls with tab accessibility semantics. They
+  compact to `T1` through `T4` at full capacity; Web remains stable and pinned
+  last. Direct selection and next/previous shortcuts preserve hidden state.
 - **Web** is a native WebKit surface for the explicitly allowed GitHub,
   Superlogical, and Mitchell Hashimoto top-level origins. It keeps its page
   process alive while another tab is selected. Native bridge commands are
   disabled; WebKit subframes and page resources remain ordinary web content.
-- Cockpit does not run the phux TUI. A future control-plane client will attach
-  native surfaces to phux sessions through a headless protocol.
+- **Phux terminals** published by a coordinator enter the same bounded tab
+  topology as local ones. One that appears becomes a tab; it takes a visible
+  pane when you select it, never by displacing a live local terminal. `cmd+W`
+  closes local terminals only — a phux terminal's lifetime is not Cockpit's to
+  end. Cockpit still does not run the phux TUI.
 
-Both terminal executions stay live while hidden or split. libghostty-vt owns
-terminal state and native-sdk paints both into one Metal surface under strict
-combined command, text, glyph, and path budgets.
+## Chrome that emerges
+
+At rest Cockpit is a terminal, not an application frame around one. A single
+healthy terminal gets the whole content area: no tab strip, no toolbar, no
+status banner.
+
+The band appears when the workspace actually has structure to show — a second
+terminal, a split, the Web surface, or a terminal that needs attention — and
+retracts when that structure goes away. Reveal is driven only by discrete state
+you caused; nothing incidental moves it, because every change to the band
+reflows the content area and resizes a live PTY.
+
+The band is presentation, never the only path: `cmd+T`, `cmd+W`, `cmd+D`, and
+`cmd+1`..`cmd+5` reach the model whether or not it is showing. The window stays
+draggable by its titlebar inset in every state.
+
+All terminal executions stay live while hidden or reordered. libghostty-vt owns
+terminal state and native-sdk paints the visible attachments into one Metal
+surface under strict combined command, text, glyph, and path budgets.
 
 Terminal tabs show an attention marker when a hidden process exits or develops
-an operational issue. Visible status chrome keeps lifecycle, confirmed outbound
-or reply loss, current input stalls, and native delivery failures separate
-instead of hiding one behind another. Recovered stalls disappear. Finished
-terminals expose a placement-specific **Restart** control for clean and abnormal
-exits.
+an operational issue, and an exception is itself enough to bring the band back
+when a lone terminal is in trouble. Healthy single-terminal mode has no
+permanent RUNNING banner. Split mode identifies each pane quietly; lifecycle
+text appears only for transitions and exceptions. Full lifecycle and I/O detail remains accessible.
+Recovered stalls disappear. Finished terminals expose a placement-specific
+**Restart** control for clean and abnormal exits.
 
-The local provider now owns terminal execution independently from layout. The
-model attaches stable terminal identities to UI placements, proving internally
-that placement changes need not restart a PTY or discard emulator state.
+The local provider is a bounded dynamic registry independent from layout. New
+and Close are native actions; close tombstones one PTY until its exact exit is
+delivered, discards post-close output and generated terminal replies, and never
+reuses PTY keys in-process. This prevents stale traffic from crossing into a
+replacement terminal.
+
+`Model.topologySnapshot()` exposes the versioned persistence boundary for
+terminal count, tab order, selection, split attachments, focus, and divider
+position. `restoreModel()` validates or migrates that snapshot and creates new
+emulator sessions and shell processes. The snapshot intentionally contains no
+PID, PTY key, screen memory, or process-survival claim. See
+[Topology Snapshots](docs/TOPOLOGY_SNAPSHOTS.md).
 
 ## Install
 
@@ -57,11 +88,12 @@ caveat.
 
 | Key | Action |
 |---|---|
-| `cmd+1` | Select Terminal 1 |
-| `cmd+2` | Select Terminal 2 |
-| `cmd+3` | Select Web |
+| `cmd+1` ... `cmd+5` | Select the surface at that current position; Web is always last |
+| `cmd+T` | Create and select a terminal, up to four |
+| `cmd+W` | Close the selected terminal; Web is never closed |
+| `cmd+shift+left` / `cmd+shift+right` | Move the selected terminal tab |
 | `cmd+shift+[` / `cmd+shift+]` | Select previous or next tab |
-| `cmd+D` | Split terminals or collapse to the active terminal |
+| `cmd+D` | Split terminals or collapse to the active terminal; unclaimed until two terminals exist |
 | `cmd+option+left` / `cmd+option+right` | Move keyboard focus across split panes |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |
@@ -78,7 +110,14 @@ caveat.
 Clicking a tab switches surfaces without stopping hidden execution. Clicking a
 split pane moves input ownership to it. The divider supports pointer dragging,
 arrow-key adjustment, Home, and End. Trackpad and wheel input route only to the
-terminal under the pointer.
+terminal under the pointer. Dragging a selection beyond the top or bottom edge
+autoscrolls through history. Right-click or control-click opens native Copy and
+Paste actions while Cockpit owns pointer selection or the process has ended.
+While a live TUI enables mouse reporting, it exclusively owns secondary click,
+so the native menu is intentionally unavailable; Shift-drag selection remains
+copyable with `cmd+C`. A copied range remains highlighted until typing or
+another selection clears it. Terminal tab reorder remains available through the
+menu command and keyboard shortcut; direct tab dragging is not claimed.
 
 ## Requirements
 
@@ -86,9 +125,11 @@ terminal under the pointer.
 - Zig 0.16.0 and Xcode Command Line Tools for source builds
 - Internet access on the first source build to fetch pinned dependencies
 
-native-sdk is pinned to v0.7.1. libghostty-vt is pinned to Ghostty commit
-`7aa9591746ffa4d2eee458960c76554352832595`, the existing Zig 0.16-compatible
-checkpoint.
+native-sdk is temporarily pinned to
+[`phall1/native@992f9f5`](https://github.com/phall1/native/commit/992f9f59695d1a723559190caca94800820ae7be),
+an upstream-ready context-menu-policy seam over v0.7.1. libghostty-vt is pinned
+to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
+Zig 0.16-compatible checkpoint.
 
 ## Build and test
 
@@ -145,7 +186,10 @@ scheduled updater independently repairs a missed release update.
 
 - Version 0.3.0 establishes the spatial terminal substrate; it is not yet a
   native phux control-plane client.
-- Terminal processes and layout are not restored between app launches.
+- Terminal topology has a versioned snapshot/restore API. The executable does
+  not yet choose a filesystem persistence policy; restoring always starts fresh
+  processes. `process_restoration_supported` is explicitly `false`; filesystem
+  persistence remains outside this slice.
 - Detachable terminal windows are intentionally not faked. native-sdk v0.7.1
   needs per-secondary-window custom chrome and focus hooks before the same
   terminal surface can attach to another native window correctly.
@@ -153,8 +197,6 @@ scheduled updater independently repairs a missed release update.
   subframes or page resources. native-sdk v0.7.1 does not expose page title,
   committed-navigation, load-state, or native back/forward events to Zig, so
   Cockpit does not pretend to own general browser history.
-- The initial terminal and Web tabs are fixed; creating, closing, reordering,
-  and restoring tabs require the next durable topology slice.
 - Headless tests prove terminal and UI behavior but cannot prove live Metal
   presentation.
 - The 0.3.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
