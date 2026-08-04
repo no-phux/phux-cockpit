@@ -98,6 +98,7 @@ const DisabledPhuxProvider = struct {
     const SyncDelta = struct {
         ready_published: bool = false,
         generation_changed: bool = false,
+        detached: bool = false,
         added_count: usize = 0,
         removed_count: usize = 0,
     };
@@ -138,6 +139,9 @@ const DisabledPhuxProvider = struct {
         return false;
     }
     fn presentation(_: *const DisabledPhuxProvider, _: TerminalRef) ?Presentation {
+        return null;
+    }
+    fn lastViewport(_: *const DisabledPhuxProvider, _: TerminalRef) ?Viewport {
         return null;
     }
     fn viewportResize(_: *DisabledPhuxProvider, _: TerminalRef, _: Viewport) error{Disabled}!void {
@@ -1910,9 +1914,15 @@ fn openPhuxChannel(model: *Model, fx: *Fx, reconnect: bool) void {
     });
     if (!handle.live()) return;
     if (reconnect) {
-        remote.reconnect(handle) catch return;
+        remote.reconnect(handle) catch {
+            fx.closeChannel(phux_channel_key);
+            return;
+        };
     } else {
-        remote.open(handle) catch return;
+        remote.open(handle) catch {
+            fx.closeChannel(phux_channel_key);
+            return;
+        };
     }
 }
 fn openPointerMonitor(model: *Model, fx: *Fx) void {
@@ -2111,6 +2121,11 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                         fx.closeChannel(phux_channel_key);
                         return;
                     };
+                    if (delta.detached) {
+                        remote.stop();
+                        fx.closeChannel(phux_channel_key);
+                        return;
+                    }
                     const terminal_set_changed =
                         delta.ready_published or delta.added_count != 0 or delta.removed_count != 0;
                     if (terminal_set_changed) model.reconcileRemoteTerminals();
@@ -2191,12 +2206,9 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 return;
             }
             const remote = model.phux() orelse return;
-            const width: u16 = @intFromFloat(@min(size.size.width, std.math.maxInt(u16)));
-            const height: u16 = @intFromFloat(@min(size.size.height, std.math.maxInt(u16)));
             remote.viewportResize(size.terminal_ref, .{
                 .cols = size.cols,
                 .rows = size.rows,
-                .pixels = .{ .width = width, .height = height },
             }) catch {};
         },
         .surface_resized => |surface| {
@@ -4623,8 +4635,7 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         // At rest there is no band at all. Every control it carried stays
         // reachable: New is cmd+T, Close cmd+W, Split cmd+D, and the surfaces
         // are cmd+1..cmd+5 — the band is presentation, never the only path.
-    else
-        ui.el(.stack, .{ .height = 0, .semantics = .{ .hidden = true } }, .{});
+        else ui.el(.stack, .{ .height = 0, .semantics = .{ .hidden = true } }, .{});
 
     const content = if (terminal_index) |index| blk: {
         const terminals = if (model.layout == .split)
@@ -4710,7 +4721,8 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
                 .id_base = grid.paneIdBase(terminalPaintIndex(model, terminal_ref)),
             });
         } else {
-            const presentation = model.remotePresentation(terminal_ref) orelse continue;
+            const remote = model.phuxConst() orelse continue;
+            const presentation = remote.presentation(terminal_ref) orelse continue;
             try grid.paintTerminalGrid(presentation.grid, builder, .{
                 .frame = frame,
                 .background_frame = background_frame,
@@ -4798,28 +4810,32 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
                     if (model.layout == .split) grid.max_cells / pane_count else grid.max_cells,
                 );
                 if (proposed.x != pane.cols or proposed.y != pane.rows) {
-                    return .{ .viewport = .{
-                        .terminal_ref = terminal_ref,
-                        .cols = proposed.x,
-                        .rows = proposed.y,
-                        .size = frame.size,
-                        // Carry the real scale: the `.viewport` arm commits
-                        // whatever arrives, and the field's `= 1` default
-                        // would silently reset a Retina surface to 1x on every
-                        // local grid resize.
-                        .scale_factor = frame_scale,
-                    } };
+                    return .{
+                        .viewport = .{
+                            .terminal_ref = terminal_ref,
+                            .cols = proposed.x,
+                            .rows = proposed.y,
+                            .size = frame.size,
+                            // Carry the real scale: the `.viewport` arm commits
+                            // whatever arrives, and the field's `= 1` default
+                            // would silently reset a Retina surface to 1x on every
+                            // local grid resize.
+                            .scale_factor = frame_scale,
+                        },
+                    };
                 }
                 continue;
             }
-            const presentation = model.remotePresentation(terminal_ref) orelse continue;
+            const remote = model.phuxConst() orelse continue;
+            if (remote.presentation(terminal_ref) == null) continue;
             const metrics = canvas.terminalCellMetrics(cockpitTokens(model));
             const proposed = grid.Session.clampGrid(
                 @intFromFloat(@max(2, inner.width / metrics.width)),
                 @intFromFloat(@max(2, inner.height / metrics.height)),
                 if (model.layout == .split) grid.max_cells / pane_count else grid.max_cells,
             );
-            if (proposed.x != presentation.cols or proposed.y != presentation.rows) {
+            const viewport: Viewport = .{ .cols = proposed.x, .rows = proposed.y };
+            if (remote.lastViewport(terminal_ref) == null or !remote.lastViewport(terminal_ref).?.eql(viewport)) {
                 return .{ .viewport = .{
                     .terminal_ref = terminal_ref,
                     .cols = proposed.x,

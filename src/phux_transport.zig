@@ -157,6 +157,12 @@ pub const FrameQueue = struct {
         return frame;
     }
 
+    pub fn hasPending(queue: *FrameQueue) bool {
+        queue.mutex.lock();
+        defer queue.mutex.unlock();
+        return queue.read_index != queue.frames.items.len;
+    }
+
     pub fn release(queue: *FrameQueue, frame: []u8) void {
         queue.gpa.free(frame);
     }

@@ -116,14 +116,15 @@ pub const TerminalRefContext = struct {
 };
 
 /// Published provider generation. `last_seq` is progress within a replica, not
-/// replica identity; reconnect fences compare only stream and bootstrap IDs.
+/// replica identity; reconnect fences compare host epoch, stream, and bootstrap.
 pub const Generation = struct {
+    epoch_id: u64 = 0,
     stream_id: u64 = 0,
     bootstrap_id: u64 = 0,
     last_seq: u64 = 0,
 
     pub fn sameReplica(a: Generation, b: Generation) bool {
-        return a.stream_id == b.stream_id and a.bootstrap_id == b.bootstrap_id;
+        return a.epoch_id == b.epoch_id and a.stream_id == b.stream_id and a.bootstrap_id == b.bootstrap_id;
     }
 };
 
@@ -159,6 +160,12 @@ pub const Viewport = struct {
     cols: u16,
     rows: u16,
     pixels: ?PixelSize = null,
+
+    pub fn eql(a: Viewport, b: Viewport) bool {
+        if (a.cols != b.cols or a.rows != b.rows) return false;
+        if (a.pixels == null or b.pixels == null) return a.pixels == null and b.pixels == null;
+        return a.pixels.?.width == b.pixels.?.width and a.pixels.?.height == b.pixels.?.height;
+    }
 };
 
 pub const KeyAction = enum { press, repeat, release };
@@ -270,4 +277,19 @@ fn mixHash(a: u64, b: u64) u64 {
     hasher.update(std.mem.asBytes(&a));
     hasher.update(std.mem.asBytes(&b));
     return hasher.final();
+}
+
+test "replica identity includes provider epoch stream and bootstrap" {
+    const base: Generation = .{ .epoch_id = 1, .stream_id = 2, .bootstrap_id = 3, .last_seq = 4 };
+    try std.testing.expect(base.sameReplica(.{ .epoch_id = 1, .stream_id = 2, .bootstrap_id = 3, .last_seq = 99 }));
+    try std.testing.expect(!base.sameReplica(.{ .epoch_id = 9, .stream_id = 2, .bootstrap_id = 3 }));
+    try std.testing.expect(!base.sameReplica(.{ .epoch_id = 1, .stream_id = 9, .bootstrap_id = 3 }));
+    try std.testing.expect(!base.sameReplica(.{ .epoch_id = 1, .stream_id = 2, .bootstrap_id = 9 }));
+}
+
+test "viewport equality includes pixel geometry" {
+    const base: Viewport = .{ .cols = 80, .rows = 24, .pixels = .{ .width = 800, .height = 480 } };
+    try std.testing.expect(base.eql(base));
+    try std.testing.expect(!base.eql(.{ .cols = 80, .rows = 24, .pixels = .{ .width = 801, .height = 480 } }));
+    try std.testing.expect(!base.eql(.{ .cols = 80, .rows = 24 }));
 }

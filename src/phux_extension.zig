@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
 const transport = @import("phux_transport");
 const posix = std.posix;
+const max_flush_batch: usize = 16;
 
 /// Endpoint slices are borrowed and must remain alive until `Worker.stop` has
 /// returned.
@@ -121,20 +122,22 @@ pub const Worker = struct {
 
         var header: [4]u8 = undefined;
         while (!worker.stopping.load(.acquire)) {
-            if (!flushOutgoing(worker, fd)) return;
+            if (!flushOutgoing(worker, fd, null)) return;
             var poll_fds = [_]posix.pollfd{.{
                 .fd = fd,
                 .events = posix.POLL.IN,
                 .revents = 0,
             }};
-            const ready = posix.poll(&poll_fds, 50) catch return;
+            const timeout: i32 = if (worker.bridge.outgoing.hasPending()) 0 else 50;
+            const ready = posix.poll(&poll_fds, timeout) catch return;
             if (ready == 0) continue;
             if (poll_fds[0].revents & posix.POLL.IN == 0) {
                 if (poll_fds[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) return;
                 continue;
             }
 
-            if (!readExact(worker, fd, &header)) return;
+            var frame_started: ?posix.timespec = monotonicTime() orelse return;
+            if (!readExact(worker, fd, &header, &frame_started)) return;
             const len: usize = std.mem.readInt(u32, &header, .big);
             if (len == 0 or len > transport.max_frame_bytes - header.len) {
                 worker.bridge.incoming.markDisconnected(.oversized_frame);
@@ -148,7 +151,7 @@ pub const Worker = struct {
                 return;
             };
             @memcpy(frame[0..header.len], &header);
-            if (!readExact(worker, fd, frame[header.len..])) {
+            if (!readExact(worker, fd, frame[header.len..], &frame_started)) {
                 worker.gpa.free(frame);
                 return;
             }
@@ -173,27 +176,32 @@ pub const Worker = struct {
     }
 };
 
-fn flushOutgoing(worker: *Worker, fd: posix.fd_t) bool {
-    while (worker.bridge.outgoing.take()) |frame| {
+fn flushOutgoing(worker: *Worker, fd: posix.fd_t, frame_started: ?posix.timespec) bool {
+    for (0..max_flush_batch) |_| {
+        const frame = worker.bridge.outgoing.take() orelse break;
         defer worker.bridge.outgoing.release(frame);
         if (frame.len < 5 or frame.len > transport.max_frame_bytes) return false;
         var header: [4]u8 = undefined;
         @memcpy(header[0..], frame[0..4]);
         const declared = std.mem.readInt(u32, &header, .big);
         if (declared == 0 or @as(usize, declared) != frame.len - 4) return false;
-        if (!writeExact(fd, frame)) return false;
+        if (!writeExact(worker, fd, frame, frame_started)) return false;
     }
     if (worker.bridge.outgoing.takeDisconnect() != null) return false;
     return true;
 }
 
-fn readExact(worker: *Worker, fd: posix.fd_t, output: []u8) bool {
+fn readExact(worker: *Worker, fd: posix.fd_t, output: []u8, frame_started: *?posix.timespec) bool {
     var offset: usize = 0;
     while (offset < output.len) {
+        if (frame_started.*) |value| {
+            const now = monotonicTime() orelse return false;
+            if (elapsedNanos(value, now) >= 5 * std.time.ns_per_s) return false;
+        }
         if (worker.stopping.load(.acquire)) return false;
         // Replies are flushed between partial reads so a peer waiting for a
         // response cannot deadlock a large incoming frame.
-        if (!flushOutgoing(worker, fd)) return false;
+        if (!flushOutgoing(worker, fd, frame_started.*)) return false;
         var poll_fds = [_]posix.pollfd{.{
             .fd = fd,
             .events = posix.POLL.IN,
@@ -208,14 +216,26 @@ fn readExact(worker: *Worker, fd: posix.fd_t, output: []u8) bool {
         const count = posix.read(fd, output[offset..]) catch return false;
         if (count == 0) return false;
         offset += count;
+        if (frame_started.* == null) frame_started.* = monotonicTime() orelse return false;
     }
     return true;
 }
 
-fn writeExact(fd: posix.fd_t, input: []const u8) bool {
+fn writeExact(worker: ?*Worker, fd: posix.fd_t, input: []const u8, frame_started: ?posix.timespec) bool {
     var offset: usize = 0;
+    const started = monotonicTime() orelse return false;
     while (offset < input.len) {
-        const flags: u32 = if (comptime @hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
+        const now = monotonicTime() orelse return false;
+        const elapsed_ns = elapsedNanos(started, now);
+        if (elapsed_ns >= std.time.ns_per_s) return false;
+        if (frame_started) |value| {
+            if (elapsedNanos(value, now) >= 5 * std.time.ns_per_s) return false;
+        }
+        if (worker) |value| {
+            if (value.stopping.load(.acquire)) return false;
+        }
+        const flags: u32 = (if (comptime @hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0) |
+            (if (comptime @hasDecl(posix.MSG, "DONTWAIT")) posix.MSG.DONTWAIT else 0);
         const rc = std.c.send(fd, input[offset..].ptr, input.len - offset, flags);
         switch (posix.errno(rc)) {
             .SUCCESS => {
@@ -223,10 +243,33 @@ fn writeExact(fd: posix.fd_t, input: []const u8) bool {
                 offset += @intCast(rc);
             },
             .INTR => continue,
+            .AGAIN => {
+                var poll_fds = [_]posix.pollfd{.{
+                    .fd = fd,
+                    .events = posix.POLL.OUT,
+                    .revents = 0,
+                }};
+                const ready = posix.poll(&poll_fds, 50) catch return false;
+                if (ready == 0) continue;
+                if (poll_fds[0].revents & posix.POLL.OUT == 0) return false;
+            },
             else => return false,
         }
     }
     return true;
+}
+
+fn monotonicTime() ?posix.timespec {
+    var value: posix.timespec = undefined;
+    return switch (posix.errno(posix.system.clock_gettime(.MONOTONIC, &value))) {
+        .SUCCESS => value,
+        else => null,
+    };
+}
+
+fn elapsedNanos(started: posix.timespec, now: posix.timespec) i128 {
+    return (@as(i128, now.sec) - @as(i128, started.sec)) * std.time.ns_per_s +
+        (@as(i128, now.nsec) - @as(i128, started.nsec));
 }
 
 fn configureSocket(fd: posix.fd_t) !void {
@@ -428,7 +471,19 @@ test "write after peer teardown reports failure without process signal" {
     defer _ = std.c.close(sockets[0]);
     try configureSocket(sockets[0]);
     _ = std.c.close(sockets[1]);
-    try std.testing.expect(!writeExact(sockets[0], "terminal reply"));
+    try std.testing.expect(!writeExact(null, sockets[0], "terminal reply", null));
+}
+
+test "a non-reading peer cannot hold one frame writer forever" {
+    const sockets = try socketPair();
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+    const small_buffer: c_int = 4096;
+    try posix.setsockopt(sockets[0], posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small_buffer));
+    const payload = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0x5a);
+    try std.testing.expect(!writeExact(null, sockets[0], payload, null));
 }
 
 test "final complete frame remains readable when peer has shut down" {
@@ -436,7 +491,7 @@ test "final complete frame remains readable when peer has shut down" {
     defer _ = std.c.close(sockets[0]);
     defer _ = std.c.close(sockets[1]);
     const frame = [_]u8{ 0, 0, 0, 1, 0x42 };
-    try std.testing.expect(writeExact(sockets[0], &frame));
+    try std.testing.expect(writeExact(null, sockets[0], &frame, null));
     try std.testing.expectEqual(@as(c_int, 0), std.c.shutdown(sockets[0], std.c.SHUT.WR));
 
     var poll_fds = [_]posix.pollfd{.{
@@ -471,7 +526,7 @@ test "nonblocking connect mode can be restored for framed IO" {
     defer _ = std.c.close(sockets[1]);
     try setNonblocking(sockets[0], true);
     try setNonblocking(sockets[0], false);
-    try std.testing.expect(writeExact(sockets[0], "frame"));
+    try std.testing.expect(writeExact(null, sockets[0], "frame", null));
 }
 
 test "localhost resolves without requiring a numeric TCP address" {
