@@ -1,8 +1,8 @@
 # Phux Cockpit
 
 Phux Cockpit is a native macOS spatial runtime for terminal, web, and future
-control-plane surfaces. Version 0.3.0 replaces the embedded phux TUI and Work
-rail with native tabs and a real split-pane terminal substrate.
+control-plane surfaces. Version 0.4.0 brings native Phux terminals into the
+same bounded tabs and split-pane substrate as local terminal processes.
 
 The immediate goal is an exceptional native Phux terminal for terminal and
 TUI-agent work. Its stable execution and interaction primitives grow into a
@@ -80,7 +80,7 @@ Install with Homebrew:
 brew install --cask phall1/tap/phux-cockpit
 ```
 
-The cask places **Phux Cockpit** in Applications. Version 0.3.0 is ad-hoc
+The cask places **Phux Cockpit** in Applications. Version 0.4.0 is ad-hoc
 signed; the cask clears its quarantine attribute and reports that fact in its
 caveat.
 
@@ -155,7 +155,7 @@ Verify a packaged or installed bundle and run a process-lifecycle soak with:
 ```sh
 ./scripts/verify-macos-app.sh \
   --app "zig-out/release/Phux Cockpit.app" \
-  --version 0.3.0 \
+  --version 0.4.0 \
   --signature-mode adhoc \
   --quarantine absent
 ./scripts/soak-macos-app.sh \
@@ -184,8 +184,8 @@ scheduled updater independently repairs a missed release update.
 
 ## Limitations
 
-- Version 0.3.0 establishes the spatial terminal substrate; it is not yet a
-  native phux control-plane client.
+- Native Phux terminal identity and lifetime remain coordinator-owned; Cockpit
+  projects published terminals but does not fake remote close or restoration.
 - Terminal topology has a versioned snapshot/restore API. The executable does
   not yet choose a filesystem persistence policy; restoring always starts fresh
   processes. `process_restoration_supported` is explicitly `false`; filesystem
@@ -199,7 +199,7 @@ scheduled updater independently repairs a missed release update.
   Cockpit does not pretend to own general browser history.
 - Headless tests prove terminal and UI behavior but cannot prove live Metal
   presentation.
-- The 0.3.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
+- The 0.4.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
   performs the same explicit quarantine removal used by other apps in the tap.
 
 ## Project background
