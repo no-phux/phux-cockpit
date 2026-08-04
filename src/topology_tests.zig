@@ -679,3 +679,87 @@ test "four-terminal compact chrome screenshot (env-gated)" {
     try std.Io.Dir.cwd().createDirPath(testing.io, "zig-out");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = four_terminal_shot_path, .data = writer.buffered() });
 }
+
+fn remoteRef(id: u32) !app.TerminalRef {
+    return .{
+        .provider_id = .phux,
+        .terminal_id = .{ .phux = try app.RemoteTerminalId.fromPhux(0, id, "local") },
+    };
+}
+
+test "remote focus is derived from selection, attachment, and window key state" {
+    const sessions = try createSessions();
+    var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
+
+    const remote = try remoteRef(71);
+    model.attachments[0] = remote;
+    model.focus_placement = .primary;
+    model.selected_surface = .{ .terminal = remote };
+    model.focused = true;
+    try testing.expect(app.remoteFocusTarget(&model).?.eql(remote));
+
+    // Leaving for Web must retract remote focus, and RETURNING to the very
+    // same attachment must restore it. Publishing per message arm missed the
+    // return, because the attachment never changed.
+    model.selected_surface = .web;
+    try testing.expectEqual(@as(?app.TerminalRef, null), app.remoteFocusTarget(&model));
+    model.selected_surface = .{ .terminal = remote };
+    try testing.expect(app.remoteFocusTarget(&model).?.eql(remote));
+
+    // The window losing key retracts it too.
+    model.focused = false;
+    try testing.expectEqual(@as(?app.TerminalRef, null), app.remoteFocusTarget(&model));
+    model.focused = true;
+
+    // A local terminal is not a remote focus target at all.
+    model.attachments[0] = app.initialTerminalRef(0);
+    model.selected_surface = .{ .terminal = app.initialTerminalRef(0) };
+    try testing.expectEqual(@as(?app.TerminalRef, null), app.remoteFocusTarget(&model));
+}
+
+test "normalizing topology leaves an explicit Web selection alone" {
+    const sessions = try createSessions();
+    var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
+
+    // Web is a choice, not a dangling selection. Normalization runs on every
+    // provider publication, so it must not yank the operator back to a
+    // terminal just because no terminal is selected.
+    model.selected_surface = .web;
+    model.normalizeTopology();
+    try testing.expect(model.selected_surface.eql(.web));
+    try testing.expectEqual(app.LayoutMode.single, model.layout);
+
+    // A selection naming a terminal that is gone IS repaired.
+    model.selected_surface = .{ .terminal = try remoteRef(72) };
+    model.normalizeTopology();
+    try testing.expect(model.selectedTerminalRef() != null);
+    try testing.expect(model.selectedTerminalRef().?.eql(model.terminal_order[0]));
+}
+
+test "a local grid resize preserves the surface scale factor" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startProductionCockpit(harness);
+    defer stopCockpit(state);
+
+    // The first frame lands before the grid has cell metrics, so drive frames
+    // until the local grid actually moves off its 80x24 default. That resize
+    // is the message under test: it must carry the real scale, because the
+    // `.viewport` arm commits whatever arrives and the field's `= 1` default
+    // would silently drop a Retina surface to 1x.
+    var frame_index: u64 = 2;
+    while (frame_index < 8 and state.model.provider.terminals[0].cols == 80) : (frame_index += 1) {
+        try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_frame = .{
+            .label = app.canvas_label,
+            .size = native_sdk.geometry.SizeF.init(700, 420),
+            .scale_factor = 2,
+            .frame_index = frame_index,
+            .timestamp_ns = frame_index * 1_000_000,
+        } });
+        try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+    }
+    try testing.expect(state.model.provider.terminals[0].cols != 80);
+    try testing.expectApproxEqAbs(@as(f32, 2), state.model.surface_scale_factor, 0.0001);
+}

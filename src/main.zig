@@ -1114,7 +1114,7 @@ pub const Model = struct {
         return true;
     }
 
-    fn normalizeTopology(model: *Model) void {
+    pub fn normalizeTopology(model: *Model) void {
         for (&model.attachments) |*attached| {
             if (attached.* != null and !model.containsTerminal(attached.*.?)) attached.* = null;
         }
@@ -1122,6 +1122,16 @@ pub const Model = struct {
             model.selected_surface = .web;
             model.layout = .single;
             model.attachments = .{ null, null };
+            return;
+        }
+        // `.web` is a CHOICE, not a dangling selection — and
+        // `selectedTerminalRef` returns null for both. Normalization runs on
+        // every provider publication, so conflating them would yank an
+        // operator off the Web surface the moment a coordinator announced a
+        // session. Only repair a selection that named a terminal which is
+        // gone; leave an explicit Web selection alone.
+        if (model.selected_surface == .web) {
+            model.layout = .single;
             return;
         }
         const selected = model.selectedTerminalRef() orelse model.terminal_order[0];
@@ -1990,7 +2000,36 @@ fn remoteStateNeedsFocusReplay(
     return ready_published or added_count != 0 or removed_count != 0 or generation_changed;
 }
 
+/// The terminal that should currently believe it holds keyboard focus, or
+/// null when nothing remote should.
+///
+/// Remote focus is DERIVED, never announced by individual message arms. Focus
+/// moves through many paths — tab shortcuts, tab cycling, a pointer press, New,
+/// Close, attach/detach, leaving for the Web surface, the window itself losing
+/// key — and every arm that has to remember to publish it is an arm that can
+/// forget. Several already had: keyboard tab selection left a Phux terminal
+/// latched focused while typing went elsewhere, and returning from Web
+/// re-selected a terminal that had been told it was blurred.
+pub fn remoteFocusTarget(model: *const Model) ?TerminalRef {
+    if (!model.focused) return null;
+    if (model.selected_surface == .web) return null;
+    const terminal_ref = model.focusedTerminalRef() orelse return null;
+    if (providerKind(terminal_ref) != .phux) return null;
+    return terminal_ref;
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
+    const focus_before = remoteFocusTarget(model);
+    updateModel(model, msg, fx);
+    const focus_after = remoteFocusTarget(model);
+    if (optRefEql(focus_before, focus_after)) return;
+    // Blur first, then focus: a provider that sees two focused terminals for
+    // even one message would have to guess which one owns the keyboard.
+    if (focus_before) |terminal_ref| sendRemoteFocus(model, terminal_ref, false);
+    if (focus_after) |terminal_ref| sendRemoteFocus(model, terminal_ref, true);
+}
+
+fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
     switch (msg) {
         .shell => |event| {
             // Every pty event carries its own key: route it to the pane
@@ -2081,7 +2120,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
                         delta.removed_count,
                         delta.generation_changed,
                     )) {
-                        sendRemoteFocus(model, model.focusedTerminalRef(), model.focused);
+                        // This replay is NOT redundant with the derived delta
+                        // in `update`. Here the focused identity did not
+                        // change — the replica behind it did. A new generation
+                        // has never been told anything, so it must be told
+                        // again even though `remoteFocusTarget` is unmoved.
+                        sendRemoteFocus(model, remoteFocusTarget(model), model.focused);
                     }
                 },
                 .closed, .rejected => {
@@ -2176,7 +2220,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         .focus_changed => |focused| {
             if (model.focused == focused) return;
             model.focused = focused;
-            sendRemoteFocus(model, model.focusedTerminalRef(), focused);
             // Window blur strands every pane's held-key latches, not
             // only the focused one's.
             if (!focused) {
@@ -2298,28 +2341,17 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         .focus_pane => |requested| {
             if (model.attachments[requested.index()] == null) return;
             if (requested == model.focus_placement) return;
-            const previous = model.focusedTerminalRef();
-            sendRemoteFocus(model, previous, false);
             model.focus_placement = requested;
             model.selected_surface = .{ .terminal = model.attachments[requested.index()].? };
-            sendRemoteFocus(model, model.focusedTerminalRef(), model.focused);
             endHiddenCaptures(model, fx);
         },
         .select_surface => |surface| {
             if (surface.eql(model.selected_surface)) return;
-            const previous = model.focusedTerminalRef();
             switch (surface) {
                 .terminal => |id| {
                     if (!model.selectTerminal(id)) return;
-                    if (!optRefEql(previous, model.focusedTerminalRef())) {
-                        sendRemoteFocus(model, previous, false);
-                        sendRemoteFocus(model, model.focusedTerminalRef(), model.focused);
-                    }
                 },
-                .web => {
-                    model.selected_surface = .web;
-                    sendRemoteFocus(model, previous, false);
-                },
+                .web => model.selected_surface = .web,
             }
             endHiddenCaptures(model, fx);
         },
@@ -2407,7 +2439,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
             if (model.attachments[placement.index()] != null) update(model, .{ .focus_pane = placement }, fx);
         },
         .browser_page => |page| {
-            sendRemoteFocus(model, model.focusedTerminalRef(), false);
             model.browser_page = page;
             model.browser_navigation_token +%= 1;
             model.selected_surface = .web;
@@ -2415,13 +2446,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .attach_terminal => |attachment| {
             model.attach(attachment.placement, attachment.terminal_ref) catch return;
-            if (attachment.placement == model.focus_placement)
-                sendRemoteFocus(model, attachment.terminal_ref, model.focused);
         },
         .detach_terminal => |placement| {
             if (model.attachments[placement.index()]) |id| endCapturesForTerminal(model, fx, id);
-            if (placement == model.focus_placement)
-                sendRemoteFocus(model, model.attachments[placement.index()], false);
             _ = model.detach(placement);
             endHiddenCaptures(model, fx);
         },
@@ -4776,6 +4803,11 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
                         .cols = proposed.x,
                         .rows = proposed.y,
                         .size = frame.size,
+                        // Carry the real scale: the `.viewport` arm commits
+                        // whatever arrives, and the field's `= 1` default
+                        // would silently reset a Retina surface to 1x on every
+                        // local grid resize.
+                        .scale_factor = frame_scale,
                     } };
                 }
                 continue;
