@@ -6,10 +6,10 @@ and a live local process. The current version is `1`, and
 
 ## Persisted State
 
-- Ordered stable terminal IDs, up to native-sdk's four-PTY limit
-- Selected terminal ID or the permanent Web surface
+- Ordered stable **local** terminal IDs, up to native-sdk's four-PTY limit
+- Selected local terminal ID or the permanent Web surface
 - Single or split layout
-- At most two attached terminal IDs, focused attachment, and split fraction
+- At most two attached local terminal IDs, focused attachment, and split fraction
 
 ## Deliberately Ephemeral State
 
@@ -17,6 +17,27 @@ and a live local process. The current version is `1`, and
 - PTY effect keys and spawn generations
 - Emulator cells, scrollback, selection, and pending input
 - Process phase, exit status, and clipboard operations
+- **Every Phux (remote) terminal identity**
+
+## Local Only, By Construction
+
+Snapshots carry local topology only. A Phux terminal exists because its
+coordinator says so; writing one into a Cockpit snapshot would claim a
+durability this app does not have and cannot honor — on the next launch that
+terminal may be gone, owned by another client, or renumbered.
+
+The snapshot types enforce this rather than relying on discipline:
+`terminal_order` and `attachments` hold `LocalTerminalId`, and the selection is
+a dedicated `SnapshotSelection` whose terminal arm is local. A model whose
+selection names a remote terminal persists as `.web`.
+
+Because a live model may hold remote identities in tab order, in a placement,
+or as the selection, `Model.topologySnapshot()` **filters** them out and then
+settles what filtering disturbed: a split with only one surviving attachment
+collapses to single, a selection whose terminal is gone falls back to Web, and
+focus moves to a retained attachment. This settling is confined to the
+projection into snapshot space; it never mutates the live model, and the
+emitted snapshot is still passed through `validate()` before it is returned.
 
 `restoreModel()` validates references and uniqueness before allocating fresh
 libghostty-vt sessions. Starting the restored app spawns one new shell per
@@ -39,10 +60,11 @@ therefore rejects non-canonical state:
 - divider fractions are finite and already within `0.05...0.95`
 - an empty registry selects Web, uses single layout, and has no attachments
 
-`Model.topologySnapshot()` returns an error if an internal transient topology is
-not canonical rather than silently rewriting it. Version 0 migration may
-explicitly normalize its older, less expressive representation before emitting
-a validated version 1 snapshot.
+`Model.topologySnapshot()` returns an error if the projected topology is still
+not canonical after the remote-filtering settlement described above — it never
+emits an invalid snapshot and never rewrites the live model to make one valid.
+Version 0 migration may explicitly normalize its older, less expressive
+representation before emitting a validated version 1 snapshot.
 
 ## Migration
 
