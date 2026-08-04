@@ -3013,7 +3013,7 @@ test "native tabs and only the selected terminal surface reach accessibility" {
         if (layout.widget.id != terminal_id) continue;
         terminal_nodes += 1;
         try testing.expectEqual(canvas.WidgetKind.terminal, layout.widget.kind);
-        try testing.expectEqualStrings("Terminal 1", layout.widget.semantics.label);
+        try testing.expect(std.mem.startsWith(u8, layout.widget.semantics.label, "Terminal 1, native terminal"));
         try testing.expectEqualStrings("PANEALPHA", layout.widget.text[0.."PANEALPHA".len]);
         try testing.expectEqual(@as(?f32, null), layout.widget.semantics.value);
         try testing.expect(layout.widget.semantics.focusable);
@@ -3846,14 +3846,18 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
     var web_frame: ?geometry.RectF = null;
     var split_frame: ?geometry.RectF = null;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (std.mem.indexOf(u8, node.widget.semantics.label, "Terminal 2, native terminal") != null) terminal_2_frame = node.frame;
+        if (node.widget.kind == .segmented_control and
+            std.mem.indexOf(u8, node.widget.semantics.label, "Terminal 2, native terminal") != null) terminal_2_frame = node.frame;
         if (std.mem.indexOf(u8, node.widget.semantics.label, "Web, system WebKit") != null) web_frame = node.frame;
         if (std.mem.eql(u8, node.widget.text, "Split")) split_frame = node.frame;
     }
     var terminal_1_id: ?canvas.ObjectId = null;
     var web_id: ?canvas.ObjectId = null;
     for (harness.runtime.views[0].widgetSemantics()) |node| {
-        if (std.mem.indexOf(u8, node.label, "Terminal 1, native terminal") != null) terminal_1_id = node.id;
+        // Only a TAB label carries its shortcut; the terminal surface shares
+        // the descriptive prefix but is not a selector.
+        if (std.mem.indexOf(u8, node.label, "Terminal 1, native terminal") != null and
+            std.mem.indexOf(u8, node.label, "shortcut CMD+") != null) terminal_1_id = node.id;
         if (std.mem.indexOf(u8, node.label, "Web, system WebKit") != null) web_id = node.id;
     }
     var target = rectCenter(split_frame orelse return error.TestExpectedSplitControl);
@@ -4566,7 +4570,7 @@ test "terminal interaction exposes I-beam text value and native Copy Paste" {
         if (node.id != hit.id) continue;
         semantics_found = true;
         try testing.expectEqual(canvas.WidgetRole.textbox, node.role);
-        try testing.expectEqualStrings("Terminal 1", node.label);
+        try testing.expect(std.mem.startsWith(u8, node.label, "Terminal 1, native terminal"));
         try testing.expect(std.mem.indexOf(u8, node.text_value, "copy this") != null);
         try testing.expect(node.focusable);
         // The custom Ghostty selection is cell-pin based, not a byte range
@@ -4635,7 +4639,7 @@ test "secondary click ownership transitions between TUI reports and native menu"
         if (node.id != hit.id) continue;
         reporting_semantics = true;
         try testing.expectEqual(canvas.WidgetRole.textbox, node.role);
-        try testing.expectEqualStrings("Terminal 1", node.label);
+        try testing.expect(std.mem.startsWith(u8, node.label, "Terminal 1, native terminal"));
         try testing.expect(std.mem.indexOf(u8, node.text_value, "alpha beta") != null);
     }
     try testing.expect(reporting_semantics);

@@ -101,17 +101,20 @@ test "production launch owns exactly one terminal and New spawns the second chil
     try testing.expectEqual(@as(u64, 1), second.session_generation);
 }
 
-test "one terminal disables Split and leaves Cmd+D unconsumed until New" {
+test "one terminal shows no control band and leaves Cmd+D unconsumed until New" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startProductionCockpit(harness);
     defer stopCockpit(state);
 
-    var split_disabled = false;
+    // At rest Cockpit is a terminal, not a frame around one: the band is
+    // absent entirely rather than present-and-disabled.
+    try testing.expect(!app.chromeRevealed(&state.model));
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (std.mem.eql(u8, node.widget.text, "Split")) split_disabled = node.widget.state.disabled;
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "Split"));
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "New"));
+        try testing.expect(node.widget.kind != .segmented_control);
     }
-    try testing.expect(split_disabled);
     for (app.cockpit_shortcuts) |shortcut| try testing.expect(!std.mem.eql(u8, shortcut.id, "layout.split"));
     app.update(&state.model, .toggle_split, &state.effects);
     try testing.expectEqual(app.LayoutMode.single, state.model.layout);
@@ -132,7 +135,9 @@ test "one terminal disables Split and leaves Cmd+D unconsumed until New" {
         .key = "d",
     } });
 
+    // A second terminal is real structure, so the band emerges with it.
     try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expect(app.chromeRevealed(&state.model));
     var split_enabled = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (std.mem.eql(u8, node.widget.text, "Split")) split_enabled = !node.widget.state.disabled;
@@ -149,7 +154,7 @@ test "one terminal disables Split and leaves Cmd+D unconsumed until New" {
     try testing.expect(state.model.consumed_shortcut_keys_held != 0);
 }
 
-test "one-terminal production accessibility exposes one child and disabled Split" {
+test "one-terminal production accessibility is the terminal alone, and the band emerges with the second" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startProductionCockpit(harness);
@@ -163,20 +168,83 @@ test "one-terminal production accessibility exposes one child and disabled Split
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("one-terminal"), &writer);
     const a11y = writer.buffered();
-    try testing.expect(std.mem.indexOf(u8, a11y, "Terminal 1, native terminal, RUNNING") != null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "Terminal 1, native terminal") != null);
     try testing.expect(std.mem.indexOf(u8, a11y, "Terminal 2") == null);
-    try testing.expect(std.mem.indexOf(u8, a11y, "Web, system WebKit, shortcut CMD+2") != null);
     try testing.expect(std.mem.indexOf(u8, a11y, "ONE TERMINAL") != null);
+    // No band at rest means no tab strip and no topology controls in the
+    // accessibility tree either — a screen reader hears one terminal, which is
+    // what is actually there. cmd+T, cmd+W, and cmd+D still reach the model.
+    try testing.expect(std.mem.indexOf(u8, a11y, "Web, system WebKit") == null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "New Terminal, Command T") == null);
 
     var tab_count: usize = 0;
-    var split_disabled = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (node.widget.kind == .segmented_control) tab_count += 1;
-        if (std.mem.eql(u8, node.widget.text, "Split")) split_disabled = node.widget.state.disabled;
         try testing.expect(!std.mem.eql(u8, node.widget.text, "TERMINAL 1 / RUNNING"));
     }
-    try testing.expectEqual(@as(usize, 2), tab_count);
-    try testing.expect(split_disabled);
+    try testing.expectEqual(@as(usize, 0), tab_count);
+
+    // The window stays movable with no band: the titlebar inset carries the
+    // drag region unconditionally.
+    var saw_window_drag = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.window_drag) saw_window_drag = true;
+    }
+    try testing.expect(saw_window_drag);
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+    var revealed_tabs: usize = 0;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind == .segmented_control) revealed_tabs += 1;
+    }
+    // Two terminals plus Web.
+    try testing.expectEqual(@as(usize, 3), revealed_tabs);
+}
+
+test "a terminal that needs attention pulls the band back even when it is alone" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startProductionCockpit(harness);
+    defer stopCockpit(state);
+    try testing.expect(!app.chromeRevealed(&state.model));
+
+    // A lone terminal whose process dies is exactly the case where calm must
+    // yield: the band returns so its state and Restart are reachable.
+    try state.effects.feedPtyExit(app.ptyKey(0), 1, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    try testing.expect(app.chromeRevealed(&state.model));
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    var saw_restart = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, "Restart")) saw_restart = true;
+    }
+    try testing.expect(saw_restart);
+}
+
+test "revealing the band is the only thing that resizes the content area" {
+    const sessions = try createSessions();
+    var model = app.initialModel(sessions);
+    defer app.deinitModel(&model);
+    const size = native_sdk.geometry.SizeF.init(980, 640);
+
+    // Two terminals: revealed.
+    try testing.expect(app.chromeRevealed(&model));
+    const revealed = app.paneFrames(&model, size)[0];
+
+    // Collapse to one healthy terminal and the content area reclaims exactly
+    // the band's height — no more, no less.
+    model.terminal_count = 1;
+    model.attachments = .{ app.initialTerminalRef(0), null };
+    model.selected_surface = .{ .terminal = app.initialTerminalRef(0) };
+    try testing.expect(!app.chromeRevealed(&model));
+    const bare = app.paneFrames(&model, size)[0];
+
+    try testing.expectApproxEqAbs(revealed.y - app.header_height, bare.y, 0.0001);
+    try testing.expectApproxEqAbs(revealed.height + app.header_height, bare.height, 0.0001);
+    try testing.expectApproxEqAbs(revealed.x, bare.x, 0.0001);
+    try testing.expectApproxEqAbs(revealed.width, bare.width, 0.0001);
 }
 
 const one_terminal_shot_path = "zig-out/cockpit-one-terminal.png";

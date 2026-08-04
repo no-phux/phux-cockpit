@@ -41,8 +41,19 @@ pub const window_min_height: f32 = 420;
 /// The grid's padding inside the window.
 const grid_inset: f32 = 8;
 
-/// Native tabs and the active-surface toolbar sit above every content
-/// surface. Terminal frames start below this band.
+/// The tab and control band, when it is present at all.
+///
+/// Cockpit at rest is a TERMINAL, not an application frame around one: a
+/// single healthy terminal gets the whole content area and no band. The band
+/// emerges when the workspace actually has structure to show — a second
+/// terminal, a split, the Web surface, or a terminal that needs attention —
+/// and retracts when that structure goes away. See `chromeRevealed`.
+///
+/// Reveal is driven only by DISCRETE state the operator caused. Nothing
+/// incidental (a pointer passing near the top edge, a transient repaint) may
+/// move this band: every change to it reflows the content area and resizes a
+/// live PTY, and a terminal that reflows under the cursor is the exact jank
+/// this design exists to remove.
 pub const header_height: f32 = 40;
 pub const split_divider_width: f32 = 9;
 pub const split_pane_min_width: f32 = 240;
@@ -4395,6 +4406,24 @@ fn webTabTrigger(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     }, .{});
 }
 
+/// The spoken identity of a terminal SURFACE.
+///
+/// This is deliberately self-sufficient rather than leaning on the tab that
+/// usually sits above it: at rest there is no band, so the surface is the only
+/// thing in the tree that can tell a screen reader what this terminal is and
+/// how it is doing.
+fn terminalSurfaceLabel(ui: *TerminalUi, model: *const Model, id: TerminalRef) []const u8 {
+    const title = terminalTitle(ui, model, id);
+    if (model.provider.terminalConst(id)) |pane| {
+        return ui.fmt("{s}, native terminal, {s}", .{ title, paneLifecycleText(ui, pane) });
+    }
+    const phase = if (model.remotePresentation(id)) |presentation|
+        remoteLifecycleText(presentation.phase)
+    else
+        "UNAVAILABLE";
+    return ui.fmt("{s}, phux terminal, {s}", .{ title, phase });
+}
+
 fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalUi.Node {
     const placement = placementAt(index);
     const terminal_ref = model.attachments[placement.index()] orelse return ui.el(.stack, .{
@@ -4424,7 +4453,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
             .on_press = .{ .focus_pane = placement },
             .semantics = .{
                 .focusable = true,
-                .label = terminalTitle(ui, model, terminal_ref),
+                .label = terminalSurfaceLabel(ui, model, terminal_ref),
             },
         }, .{});
     }
@@ -4448,7 +4477,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, index: usize) TerminalU
         .context_menu_policy = if (paneReportsMouse(local_pane)) .disabled else .automatic,
         .semantics = .{
             .focusable = true,
-            .label = terminalTitle(ui, model, local_pane.id),
+            .label = terminalSurfaceLabel(ui, model, local_pane.id),
         },
     });
 }
@@ -4473,6 +4502,37 @@ fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
 
 fn splitAvailable(model: *const Model) bool {
     return model.provider.activeCount() >= 2 and model.selectedPlacement() != null;
+}
+
+/// Whether the tab and control band is part of the layout this frame.
+///
+/// Each clause is a piece of structure the operator can SEE the reason for:
+///
+/// - more than one terminal: tab order is now load-bearing, and the second
+///   terminal may be a Phux session the coordinator just published — this is
+///   how remote work announces itself without a permanent fleet panel;
+/// - the Web surface: it is not a terminal and needs its own controls;
+/// - split: two placements need to be told apart;
+/// - attention: a terminal exited, failed, lost I/O, or stalled. A hidden
+///   terminal in trouble is exactly the case where a marker must be able to
+///   reach the operator, so this clause outranks calm.
+///
+/// Everything else — one healthy terminal — is a bare terminal.
+pub fn chromeRevealed(model: *const Model) bool {
+    if (model.terminal_count > 1) return true;
+    if (model.selectedTerminalRef() == null) return true;
+    if (model.layout == .split) return true;
+    for (model.terminal_order[0..model.terminal_count]) |id| {
+        if (terminalNeedsAttention(model, id)) return true;
+    }
+    return false;
+}
+
+/// The top of the content area: the hidden-inset titlebar band, plus the
+/// control band when it is revealed.
+fn contentTop(model: *const Model) f32 {
+    const titlebar = @max(grid_inset, model.chrome_top + 4);
+    return titlebar + if (chromeRevealed(model)) header_height else 0;
 }
 
 pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
@@ -4512,7 +4572,8 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         }, "Close") else emptyStatusNode(ui),
     });
 
-    const header = ui.row(.{ .height = header_height, .gap = 8, .cross = .center, .window_drag = true }, .{
+    const revealed = chromeRevealed(model);
+    const header = if (revealed) ui.row(.{ .height = header_height, .gap = 8, .cross = .center, .window_drag = true }, .{
         ui.el(.tabs, .{ .gap = 4, .semantics = .{ .label = "Surfaces" } }, .{
             triggers[0],
             triggers[1],
@@ -4531,7 +4592,12 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
             .on_press = .toggle_split,
             .semantics = .{ .label = "Toggle terminal split, Command D" },
         }, .{}),
-    });
+    })
+        // At rest there is no band at all. Every control it carried stays
+        // reachable: New is cmd+T, Close cmd+W, Split cmd+D, and the surfaces
+        // are cmd+1..cmd+5 — the band is presentation, never the only path.
+    else
+        ui.el(.stack, .{ .height = 0, .semantics = .{ .hidden = true } }, .{});
 
     const content = if (terminal_index) |index| blk: {
         const terminals = if (model.layout == .split)
@@ -4559,9 +4625,21 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         .semantics = .{ .label = webview_anchor },
     }, .{});
 
+    // The hidden-inset titlebar band. It carries `window_drag` UNCONDITIONALLY,
+    // because it is the only element that can: the SDK has no
+    // movable-by-background fallback, so a frame where nothing declares
+    // `window_drag` is a frame where the window cannot be moved at all. The
+    // control band above declares it too, but the control band is not always
+    // there — this one is. It sits entirely within the titlebar inset, above
+    // the first terminal row, so claiming presses here never costs the
+    // terminal a click.
     const titlebar_band = @max(0, @max(grid_inset, model.chrome_top + 4) - grid_inset);
     return ui.column(.{ .padding = grid_inset }, .{
-        ui.el(.stack, .{ .height = titlebar_band }, .{}),
+        ui.el(.stack, .{
+            .height = titlebar_band,
+            .window_drag = true,
+            .semantics = .{ .label = "Phux Cockpit window" },
+        }, .{}),
         header,
         content,
     });
@@ -4624,16 +4702,18 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
     }
 }
 
-/// Terminal placement below the hidden-inset titlebar and native tab band.
-/// Single mode gives the selected terminal the content frame; split mode
-/// projects both live sessions around the same divider geometry as `ui.split`.
+/// Terminal placement below the hidden-inset titlebar and, when revealed, the
+/// control band. Single mode gives the selected terminal the content frame;
+/// split mode projects both live sessions around the same divider geometry as
+/// `ui.split`.
 ///
 /// This is the SECOND derivation of these rectangles — `view()` is the
 /// first, and the layout engine owns that one. `ChromeOptions.build`
 /// never receives the laid-out tree, so the two cannot share a result;
-/// the layout-agreement test is what keeps them honest.
+/// the layout-agreement test is what keeps them honest. Both sides now read
+/// `contentTop`, so the reveal rule cannot drift between them.
 pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometry.RectF {
-    const top = @max(grid_inset, model.chrome_top + 4) + header_height;
+    const top = contentTop(model);
     const x = grid_inset;
     const width = @max(0, size.width - grid_inset * 2);
     const height = @max(0, size.height - top - grid_inset);

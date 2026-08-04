@@ -7,6 +7,22 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Cockpit at rest is now a bare terminal. The tab and control band emerges only
+  when the workspace has structure to show — a second terminal, a split, the Web
+  surface, or a terminal needing attention — and retracts when it does not.
+  Reveal is driven only by discrete state the operator caused, so nothing
+  incidental reflows the content area or resizes a live PTY. Every control the
+  band carried stays reachable by keyboard in every state, and the titlebar
+  inset keeps the window draggable when the band is absent.
+- Terminal surfaces now carry a self-sufficient accessibility label (identity,
+  provider, and lifecycle) rather than relying on the tab above them.
+- Phux terminals published by a coordinator now enter the same bounded tab
+  topology as local terminals instead of claiming a visible placement on
+  discovery. Reconciliation prunes placements whose remote terminal is gone and
+  no longer evicts a live local terminal. `cmd+W` closes local terminals only.
+- Topology snapshots persist local topology only, through a dedicated snapshot
+  selection type; a remote terminal's existence belongs to its coordinator.
+
 - Terminal tabs now expose hidden process failures, while compact status chrome
   prioritizes the active exception, preserves full diagnostic semantics, and
   distinguishes spawn rejection from spawn failure.

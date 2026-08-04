@@ -25,17 +25,37 @@ native control environment for large-scale directed machine work. See
   Superlogical, and Mitchell Hashimoto top-level origins. It keeps its page
   process alive while another tab is selected. Native bridge commands are
   disabled; WebKit subframes and page resources remain ordinary web content.
-- Cockpit does not run the phux TUI. A future control-plane client will attach
-  native surfaces to phux sessions through a headless protocol.
+- **Phux terminals** published by a coordinator enter the same bounded tab
+  topology as local ones. One that appears becomes a tab; it takes a visible
+  pane when you select it, never by displacing a live local terminal. `cmd+W`
+  closes local terminals only — a phux terminal's lifetime is not Cockpit's to
+  end. Cockpit still does not run the phux TUI.
+
+## Chrome that emerges
+
+At rest Cockpit is a terminal, not an application frame around one. A single
+healthy terminal gets the whole content area: no tab strip, no toolbar, no
+status banner.
+
+The band appears when the workspace actually has structure to show — a second
+terminal, a split, the Web surface, or a terminal that needs attention — and
+retracts when that structure goes away. Reveal is driven only by discrete state
+you caused; nothing incidental moves it, because every change to the band
+reflows the content area and resizes a live PTY.
+
+The band is presentation, never the only path: `cmd+T`, `cmd+W`, `cmd+D`, and
+`cmd+1`..`cmd+5` reach the model whether or not it is showing. The window stays
+draggable by its titlebar inset in every state.
 
 All terminal executions stay live while hidden or reordered. libghostty-vt owns
 terminal state and native-sdk paints the visible attachments into one Metal
 surface under strict combined command, text, glyph, and path budgets.
 
 Terminal tabs show an attention marker when a hidden process exits or develops
-an operational issue. Healthy single-terminal mode has no permanent RUNNING
-banner. Split mode identifies each pane quietly; lifecycle text appears only for
-transitions and exceptions. Full lifecycle and I/O detail remains accessible.
+an operational issue, and an exception is itself enough to bring the band back
+when a lone terminal is in trouble. Healthy single-terminal mode has no
+permanent RUNNING banner. Split mode identifies each pane quietly; lifecycle
+text appears only for transitions and exceptions. Full lifecycle and I/O detail remains accessible.
 Recovered stalls disappear. Finished terminals expose a placement-specific
 **Restart** control for clean and abnormal exits.
 
