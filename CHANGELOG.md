@@ -5,6 +5,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-04
+
 ### Changed
 
 - Cockpit at rest is now a bare terminal. The tab and control band emerges only
@@ -100,7 +102,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Local Shell is ephemeral and is not a durable phux session.
 - The release supports Apple silicon macOS only.
 
-[Unreleased]: https://github.com/phall1/phux-cockpit/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/phall1/phux-cockpit/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.4.0
 [0.3.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.3.0
 [0.2.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.2.0
 [0.1.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.1.0
