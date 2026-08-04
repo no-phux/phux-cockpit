@@ -144,10 +144,12 @@ pub const PhuxProvider = struct {
     pub fn presentation(self: *const PhuxProvider, terminal_ref: provider.TerminalRef) ?provider.Presentation {
         return self.host.presentation(terminal_ref);
     }
+    pub fn lastViewport(self: *const PhuxProvider, terminal_ref: provider.TerminalRef) ?provider.Viewport {
+        return self.host.lastViewport(terminal_ref);
+    }
 
     pub fn viewportResize(self: *PhuxProvider, terminal_ref: provider.TerminalRef, viewport: provider.Viewport) !void {
         try self.host.viewportResize(terminal_ref, viewport);
-        self.attach_viewport = viewport;
     }
     pub fn sendKey(self: *PhuxProvider, owner_value: provider.ReplicaOwner, input: *const provider.KeyInput) !void {
         return self.host.sendKey(owner_value, input);

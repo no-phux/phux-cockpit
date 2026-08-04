@@ -26,6 +26,7 @@ pub const State = enum { new, hello_queued, negotiated, attached, detached, fail
 pub const SyncDelta = struct {
     ready_published: bool = false,
     generation_changed: bool = false,
+    detached: bool = false,
     added_count: usize = 0,
     removed_count: usize = 0,
 };
@@ -215,6 +216,7 @@ const Terminal = struct {
     history_has_more: bool = false,
     history_pages_loaded: u64 = 0,
     history_unread_rows: u64 = 0,
+    viewport: ?provider.Viewport = null,
 
     fn deinit(terminal: *Terminal, gpa: std.mem.Allocator) void {
         terminal.canvas.deinit(gpa);
@@ -266,6 +268,7 @@ pub const Host = struct {
     search_owner: ?provider.ReplicaOwner = null,
     notices: std.ArrayListUnmanaged(Notice) = .empty,
     attach_barrier_seen: bool = false,
+    client_generation: u64 = 1,
 
     pub fn create(gpa: std.mem.Allocator, bridge: *transport.Bridge) !*Host {
         const host = try gpa.create(Host);
@@ -328,10 +331,13 @@ pub const Host = struct {
     pub fn reconnect(host: *Host, client_name: []const u8) !void {
         host.freezePublished();
         errdefer host.freezePublished();
+        const next_generation = std.math.add(u64, host.client_generation, 1) catch
+            return error.GenerationExhausted;
         const replacement = try newClient();
         host.clearSearchResults(null);
         c.phux_client_free(host.client);
         host.client = replacement;
+        host.client_generation = next_generation;
         host.attach_barrier_seen = false;
         for (host.terminals.items) |*terminal| {
             terminal.phase = if (terminal.published) .reconnecting else .attaching;
@@ -340,6 +346,7 @@ pub const Host = struct {
             terminal.dirty = false;
             terminal.pending_title.items.len = 0;
             terminal.pending_title_set = false;
+            terminal.viewport = null;
         }
         try host.start(client_name);
     }
@@ -360,6 +367,7 @@ pub const Host = struct {
             try resultError(c.phux_client_feed_frame(host.client, frame.ptr, frame.len));
         }
         try host.captureEffects();
+        delta.detached = host.state() == .detached;
         if (host.state() == .attached and !host.attach_barrier_seen) {
             delta.removed_count += host.pruneRemoved(true);
             host.attach_barrier_seen = true;
@@ -404,6 +412,10 @@ pub const Host = struct {
         return terminal.presentation();
     }
 
+    pub fn lastViewport(host: *const Host, terminal_ref: provider.TerminalRef) ?provider.Viewport {
+        return (host.findTerminalConst(terminal_ref) orelse return null).viewport;
+    }
+
     pub fn viewportResize(host: *Host, terminal_ref: provider.TerminalRef, viewport: provider.Viewport) !void {
         const terminal = host.findTerminal(terminal_ref) orelse return error.InvalidState;
         const id = try host.currentCId(terminal.owner());
@@ -413,16 +425,9 @@ pub const Host = struct {
             viewport.cols,
             viewport.rows,
         ));
-        try resultError(c.phux_client_viewport_resize(
-            host.client,
-            viewport.cols,
-            viewport.rows,
-            viewport.pixels != null,
-            if (viewport.pixels) |pixels| pixels.width else 0,
-            if (viewport.pixels) |pixels| pixels.height else 0,
-        ));
         try host.stageOutgoing();
         try host.capturePublishStage();
+        terminal.viewport = viewport;
     }
 
     pub fn sendKey(host: *Host, owner_value: provider.ReplicaOwner, input: *const provider.KeyInput) !void {
@@ -545,11 +550,11 @@ pub const Host = struct {
         var count: usize = 0;
         try resultError(c.phux_client_search(host.client, &id, bytes(query), case_sensitive, &borrowed, &count));
         if (count > max_search_results or (count != 0 and borrowed == null)) {
-            if (borrowed != null) releaseBorrowedSearch(host.client, &id, borrowed[0..count]);
+            _ = c.phux_client_search_results_release(host.client);
             return error.OutOfMemory;
         }
         host.search_results.ensureTotalCapacity(host.gpa, count) catch {
-            releaseBorrowedSearch(host.client, &id, if (count == 0) &.{} else borrowed[0..count]);
+            _ = c.phux_client_search_results_release(host.client);
             return error.OutOfMemory;
         };
         host.search_results.items.len = count;
@@ -618,6 +623,7 @@ pub const Host = struct {
             var effect: c.PhuxClientEffect = undefined;
             try resultError(c.phux_client_effect_get(host.client, index, &effect));
             const generation: provider.Generation = .{
+                .epoch_id = host.client_generation,
                 .stream_id = effect.stream_id,
                 .bootstrap_id = effect.bootstrap_id,
                 .last_seq = effect.seq,
@@ -697,6 +703,7 @@ pub const Host = struct {
                 return error.InvalidIdentity;
             }
             const next_generation: provider.Generation = .{
+                .epoch_id = host.client_generation,
                 .stream_id = view.stream_id,
                 .bootstrap_id = view.bootstrap_id,
                 .last_seq = view.last_seq,
@@ -895,14 +902,6 @@ fn toCAnchor(anchor: Anchor) c.PhuxDocumentAnchor {
 
 fn releaseTopAnchor(client: *c.PhuxClient, terminal_id: *const c.PhuxTerminalId, anchor: c.PhuxDocumentAnchor) void {
     if (anchor.opaque_id != 0) _ = c.phux_client_anchor_release(client, terminal_id, anchor);
-}
-
-fn releaseBorrowedSearch(client: *c.PhuxClient, terminal_id: *const c.PhuxTerminalId, results: []const c.PhuxSearchResult) void {
-    for (results) |result| {
-        _ = c.phux_client_anchor_release(client, terminal_id, result.start);
-        if (result.end.opaque_id != result.start.opaque_id)
-            _ = c.phux_client_anchor_release(client, terminal_id, result.end);
-    }
 }
 
 fn resultError(result: c.PhuxClientResult) Error!void {
