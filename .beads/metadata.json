@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "phux_cockpit",
+  "project_id": "7d14bf4c-4769-4c1e-ad4a-bebe73532ba0"
+}
