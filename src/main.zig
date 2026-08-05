@@ -260,4 +260,5 @@ test {
     _ = @import("tests/pointer_selection_tests.zig");
     _ = @import("tests/mouse_protocol_tests.zig");
     _ = @import("tests/adversarial_isolation_tests.zig");
+    _ = @import("tests/layout_tree_tests.zig");
 }
