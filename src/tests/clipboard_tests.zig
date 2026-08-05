@@ -25,10 +25,10 @@ test "Cmd+V reads the clipboard and normalizes plain-paste newlines" {
 
     for (0..120) |index| {
         var line: [24]u8 = undefined;
-        app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{index}) catch unreachable);
+        app_state.model.provider.slots[0].session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{index}) catch unreachable);
     }
-    app_state.model.panes[0].session.scrollToTop();
-    const history_offset = app_state.model.panes[0].session.scrollbar().offset;
+    app_state.model.provider.slots[0].session.scrollToTop();
+    const history_offset = app_state.model.provider.slots[0].session.scrollbar().offset;
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.paste_inflight);
@@ -45,7 +45,7 @@ test "Cmd+V reads the clipboard and normalizes plain-paste newlines" {
     try testing.expectEqualStrings("alpha\rbeta\r\rgamma", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expect(!app_state.model.paste_inflight);
     try testing.expect(!app_state.model.paste_failed);
-    try testing.expect(app_state.model.panes[0].session.scrollbar().offset > history_offset);
+    try testing.expect(app_state.model.provider.slots[0].session.scrollbar().offset > history_offset);
 }
 
 test "Cmd+V uses bracketed paste framing and preserves newlines" {
@@ -58,7 +58,7 @@ test "Cmd+V uses bracketed paste framing and preserves newlines" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.panes[0].session.feed("\x1b[?2004h");
+    app_state.model.provider.slots[0].session.feed("\x1b[?2004h");
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "alpha\nbeta");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
@@ -96,9 +96,10 @@ test "clipboard paste stays with its requesting terminal while Web is selected" 
     const app_iface = app_state.app();
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
-    try pressCanvasKey(harness, app_iface, "3", .{ .primary = true, .command = true });
-    try testing.expect(app_state.model.selected_surface.eql(.web));
-    try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
+    // One tab, so the Web surface sits at cmd+2.
+    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true, .command = true });
+    try testing.expect(app_state.model.selectedSurface().eql(.web));
+    try testing.expectEqual(@as(?app.TerminalRef, null), app_state.model.selectedTerminalRef());
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "original owner");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
 
@@ -126,8 +127,10 @@ test "clipboard read failure is visible on the requesting pane" {
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("paste-failed"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 1 / STARTING") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "PASTE FAILED") != null);
+    // The diagnostic sentence lives in the accessibility label only; the
+    // `PASTE FAILED` badge is no longer painted as product chrome.
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal 1, native terminal, STARTING") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "paste failed") != null);
 }
 
 test "clipboard result after pane exit is a visible paste failure" {
@@ -141,14 +144,16 @@ test "clipboard result after pane exit is a visible paste failure" {
     const app_iface = app_state.app();
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    // An ABNORMAL end: a clean one closes the pane, and there would be no
+    // requesting terminal left to fail the paste against.
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 4, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "too late");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
 
     try testing.expect(app_state.model.paste_failed);
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
-    try testing.expectEqual(@as(usize, 0), app_state.model.panes[0].outbound_len);
+    try testing.expectEqual(@as(usize, 0), app_state.model.provider.slots[0].outbound_len);
 }
 
 test "Cmd+V release never leaks under kitty reporting" {
@@ -161,7 +166,7 @@ test "Cmd+V release never leaks under kitty reporting" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.panes[0].session.feed("\x1b[>11u");
+    app_state.model.provider.slots[0].session.feed("\x1b[>11u");
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "paste");
@@ -182,7 +187,7 @@ test "paste follows retained replies and atomic admission refuses every byte" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
-    const pane = &app_state.model.panes[0];
+    const pane = &app_state.model.provider.slots[0];
 
     // A terminal query reply predates the paste. It must reach stdin
     // first even though its ring admission was initially blocked.
@@ -228,7 +233,7 @@ test "a second copy while the write is in flight is a no-op, never a false failu
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.panes[0].session.feed("copy me");
+    app_state.model.provider.slots[0].session.feed("copy me");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -260,8 +265,8 @@ test "a second copy while the write is in flight is a no-op, never a false failu
     } });
     try app_state.effects.feedClipboardResult(app.clipboard_key, .ok, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expect(!app_state.model.panes[0].copy_failed);
-    try testing.expect(!app_state.model.panes[0].selecting);
+    try testing.expect(!app_state.model.provider.slots[0].copy_failed);
+    try testing.expect(!app_state.model.provider.slots[0].selecting);
     try testing.expect(!app_state.model.copy_inflight);
 }
 
@@ -276,12 +281,12 @@ test "restart cancels an owned clipboard read and ignores its stale result" {
     const app_iface = app_state.app();
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
-    const old_generation = app_state.model.panes[0].session_generation;
+    const old_generation = app_state.model.provider.slots[0].session_generation;
     try testing.expect(app_state.model.paste_inflight);
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 4, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
-    try testing.expect(app_state.model.panes[0].session_generation != old_generation);
+    try testing.expect(app_state.model.provider.slots[0].session_generation != old_generation);
     try testing.expect(app_state.model.paste_inflight);
 
     // The cancellation terminal is delivered after the replacement
@@ -302,7 +307,7 @@ test "restart cancels an owned clipboard write and ignores its stale result" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
-    const pane = &app_state.model.panes[0];
+    const pane = &app_state.model.provider.slots[0];
 
     pane.session.feed("copy me");
     pane.selecting = true;
@@ -312,7 +317,7 @@ test "restart cancels an owned clipboard write and ignores its stale result" {
     const old_generation = pane.session_generation;
     try testing.expect(app_state.model.copy_inflight);
 
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 4, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
     try testing.expect(pane.session_generation != old_generation);
@@ -338,7 +343,7 @@ test "a copied selection persists while failure remains retryable" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.panes[0].session.feed("copy me");
+    app_state.model.provider.slots[0].session.feed("copy me");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -361,16 +366,16 @@ test "a copied selection persists while failure remains retryable" {
     } });
     // The write is in flight: the selection must still stand — a failed
     // result needs something to retry.
-    try testing.expect(app_state.model.panes[0].selecting);
-    try testing.expect(app_state.model.panes[0].session.selectionActive());
+    try testing.expect(app_state.model.provider.slots[0].selecting);
+    try testing.expect(app_state.model.provider.slots[0].session.selectionActive());
 
     // A failed write keeps selection mode armed for retry. Success exits the
     // keyboard mode but preserves the conventional terminal highlight.
     try app_state.effects.feedClipboardResult(app.clipboard_key, .rejected, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expect(app_state.model.panes[0].copy_failed);
-    try testing.expect(app_state.model.panes[0].selecting);
-    try testing.expect(app_state.model.panes[0].session.selectionActive());
+    try testing.expect(app_state.model.provider.slots[0].copy_failed);
+    try testing.expect(app_state.model.provider.slots[0].selecting);
+    try testing.expect(app_state.model.provider.slots[0].session.selectionActive());
     try releaseCanvasKey(harness, app_iface, "enter", .{});
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -380,9 +385,9 @@ test "a copied selection persists while failure remains retryable" {
     } });
     try app_state.effects.feedClipboardResult(app.clipboard_key, .ok, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expect(!app_state.model.panes[0].copy_failed);
-    try testing.expect(!app_state.model.panes[0].selecting);
-    try testing.expect(app_state.model.panes[0].session.selectionActive());
+    try testing.expect(!app_state.model.provider.slots[0].copy_failed);
+    try testing.expect(!app_state.model.provider.slots[0].selecting);
+    try testing.expect(app_state.model.provider.slots[0].session.selectionActive());
 }
 
 test "a copy over a vanished emulator range reports failure, never a quiet no-op" {
@@ -395,7 +400,7 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.panes[0].session.feed("some text\r\n");
+    app_state.model.provider.slots[0].session.feed("some text\r\n");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -403,12 +408,12 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
     } });
-    try testing.expect(app_state.model.panes[0].selecting);
+    try testing.expect(app_state.model.provider.slots[0].selecting);
 
     // Simulate a failed selection re-pin: the emulator range vanished
     // while the model still holds its anchor (`applySelection` clears
     // the highlight when it cannot pin).
-    app_state.model.panes[0].session.term.screens.active.clearSelection();
+    app_state.model.provider.slots[0].session.term.screens.active.clearSelection();
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -416,7 +421,7 @@ test "a copy over a vanished emulator range reports failure, never a quiet no-op
         .key = "c",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(app_state.model.panes[0].copy_failed);
+    try testing.expect(app_state.model.provider.slots[0].copy_failed);
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(1));
 }
 
@@ -434,9 +439,11 @@ test "clipboard completion follows terminal identity across attachment moves" {
     try testing.expect(model.paste_owner.eql(
         model.provider.owner(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminalOwner,
     ));
-    app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
-    app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
+    // The pane moves around underneath the in-flight read: a tab switch, a
+    // reorder, and back. The clipboard result must still land on the
+    // terminal that ASKED for it, addressed by identity.
+    app.update(model, .{ .select_position = 1 }, &app_state.effects);
+    app.update(model, .{ .move_terminal = -1 }, &app_state.effects);
     app.update(model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } }, &app_state.effects);
 
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "identity paste");

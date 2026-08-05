@@ -5,6 +5,7 @@ const provider_contract = @import("provider_contract");
 const support = @import("phux_support.zig");
 const local = @import("../providers/local/provider.zig");
 const topology = @import("topology.zig");
+const layout = @import("layout.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -17,15 +18,13 @@ pub const Presentation = support.Presentation;
 pub const MouseButton = support.MouseButton;
 pub const Pane = local.Pane;
 pub const LocalProvider = local.LocalProvider;
-pub const Placement = topology.Placement;
-pub const LayoutMode = topology.LayoutMode;
 pub const TabPlacement = topology.TabPlacement;
 pub const SurfaceSelection = topology.SurfaceSelection;
 pub const TopologySnapshot = topology.TopologySnapshot;
 pub const SnapshotSelection = topology.SnapshotSelection;
 pub const PersistedTopologySnapshot = topology.PersistedTopologySnapshot;
-pub const pane_count = local.pane_count;
-pub const max_terminal_count = local.max_terminal_count;
+pub const max_terminals = local.max_terminals;
+pub const max_tabs = topology.max_tabs;
 pub const max_remote_terminals = support.max_remote_terminals;
 
 pub const max_held_terminal_keys: usize = 16;
@@ -120,30 +119,26 @@ pub const BrowserPage = enum {
     }
 };
 
+/// The workspace: a list of TABS, each owning a `layout.Tree` of panes.
+///
+/// The selected tab plus that tree's own `focus` fully determine what is
+/// focused — there is no second focus variable to keep in sync. `web_selected`
+/// is the one thing outside the tab model: the WebKit surface takes over the
+/// content area without belonging to a tab.
 pub const Model = struct {
     provider: *LocalProvider,
     phux_provider: ?*PhuxProvider = null,
     remote_ui: [max_remote_terminals]RemoteUiState = [_]RemoteUiState{.{}} ** max_remote_terminals,
     pointer_state: ?*PointerState = null,
-    panes: *[pane_count]Pane,
-    terminal_order: [max_terminal_count]TerminalRef = .{
-        provider_contract.localTerminalRef(.terminal_1),
-        provider_contract.localTerminalRef(.terminal_2),
-        provider_contract.localTerminalRef(.terminal_1),
-        provider_contract.localTerminalRef(.terminal_1),
-    },
-    terminal_count: usize = pane_count,
-    attachments: [pane_count]?TerminalRef = .{
-        provider_contract.localTerminalRef(.terminal_1),
-        provider_contract.localTerminalRef(.terminal_2),
-    },
-    selected_surface: SurfaceSelection = .{ .terminal = provider_contract.localTerminalRef(.terminal_1) },
-    layout: LayoutMode = .single,
+    tabs: [max_tabs]layout.Tree = [_]layout.Tree{.{}} ** max_tabs,
+    tab_count: usize = 0,
+    selected_tab: usize = 0,
+    /// The web surface owns the content area. Independent of `selected_tab`,
+    /// so returning from Web restores the tab that was there.
+    web_selected: bool = false,
     tab_placement: TabPlacement = .top,
-    split_fraction: f32 = 0.5,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
-    focus_placement: Placement = .primary,
     focused: bool = true,
     consumed_shortcut_keys_held: u32 = 0,
     held_terminal_keys: [max_held_terminal_keys]HeldTerminalKey = [_]HeldTerminalKey{.{}} ** max_held_terminal_keys,
@@ -223,26 +218,181 @@ pub const Model = struct {
         return null;
     }
 
+    // ------------------------------------------------------------ tabs
+
+    pub fn tree(model: *Model, index: usize) ?*layout.Tree {
+        if (index >= model.tab_count) return null;
+        return &model.tabs[index];
+    }
+
+    pub fn treeConst(model: *const Model, index: usize) ?*const layout.Tree {
+        if (index >= model.tab_count) return null;
+        return &model.tabs[index];
+    }
+
+    pub fn selectedTree(model: *Model) ?*layout.Tree {
+        if (model.web_selected) return null;
+        return model.tree(model.selected_tab);
+    }
+
+    pub fn selectedTreeConst(model: *const Model) ?*const layout.Tree {
+        if (model.web_selected) return null;
+        return model.treeConst(model.selected_tab);
+    }
+
+    /// The surface the content area shows. Derived: there is no stored copy
+    /// to drift from the tab list.
+    pub fn selectedSurface(model: *const Model) SurfaceSelection {
+        const terminal_ref = model.focusedTerminalRef() orelse return .web;
+        return .{ .terminal = terminal_ref };
+    }
+
+    /// The focused pane's terminal, filtered to one a provider still vouches
+    /// for. Callers that route INPUT use this: a ref no provider owns must
+    /// not be treated as a live selection.
+    pub fn selectedTerminalRef(model: *const Model) ?TerminalRef {
+        const id = model.focusedTerminalRef() orelse return null;
+        return if (model.containsTerminal(id)) id else null;
+    }
+
+    pub fn selectedTerminalId(model: *const Model) ?TerminalRef {
+        return model.selectedTerminalRef();
+    }
+
+    /// Keyboard focus follows the selected tab's own focused pane. Selection
+    /// and focus were separate fields under the two-pane model and could
+    /// disagree; a tree has exactly one focused leaf. Unfiltered on purpose:
+    /// remote focus publication needs the ref the tree names even in the
+    /// instant before the provider's own bookkeeping catches up.
+    pub fn focusedTerminalRef(model: *const Model) ?TerminalRef {
+        const current = model.selectedTreeConst() orelse return null;
+        return current.focusedTerminal();
+    }
+
+    pub fn focusedTerminalId(model: *const Model) ?TerminalRef {
+        return model.focusedTerminalRef();
+    }
+
+    pub fn focusedPane(model: *Model) ?*Pane {
+        const id = model.focusedTerminalRef() orelse return null;
+        return model.provider.terminal(id);
+    }
+
+    /// The tab index whose tree holds `id` in any pane.
+    pub fn tabOfTerminal(model: *const Model, id: TerminalRef) ?usize {
+        for (model.tabs[0..model.tab_count], 0..) |candidate, index| {
+            if (candidate.find(id) != null) return index;
+        }
+        return null;
+    }
+
+    pub fn terminalOrderIndex(model: *const Model, id: TerminalRef) ?usize {
+        return model.tabOfTerminal(id);
+    }
+
+    /// The label identity of a tab: its focused pane's terminal.
+    pub fn tabTerminal(model: *const Model, index: usize) ?TerminalRef {
+        const current = model.treeConst(index) orelse return null;
+        return current.focusedTerminal();
+    }
+
+    /// Give `id` a tab of its own. Idempotent: a terminal already living in
+    /// some pane keeps the tab it is in.
+    pub fn admitTab(model: *Model, id: TerminalRef) bool {
+        if (model.tabOfTerminal(id) != null) return true;
+        if (model.tab_count >= max_tabs) return false;
+        model.tabs[model.tab_count] = layout.Tree.initLeaf(id);
+        model.tab_count += 1;
+        return true;
+    }
+
+    /// Backwards-compatible alias: admitting a terminal now means giving it
+    /// a tab.
+    pub fn admitToOrder(model: *Model, id: TerminalRef) bool {
+        return model.admitTab(id);
+    }
+
+    pub fn dropTab(model: *Model, index: usize) void {
+        if (index >= model.tab_count) return;
+        var cursor = index;
+        while (cursor + 1 < model.tab_count) : (cursor += 1) model.tabs[cursor] = model.tabs[cursor + 1];
+        model.tab_count -= 1;
+        model.tabs[model.tab_count] = .{};
+        if (model.tab_count == 0) {
+            model.selected_tab = 0;
+            return;
+        }
+        if (model.selected_tab >= model.tab_count) model.selected_tab = model.tab_count - 1;
+    }
+
+    pub fn dropFromOrder(model: *Model, index: usize) void {
+        model.dropTab(index);
+    }
+
+    pub fn selectTab(model: *Model, index: usize) bool {
+        if (index >= model.tab_count) return false;
+        model.selected_tab = index;
+        model.web_selected = false;
+        return true;
+    }
+
+    /// Select the tab holding `id` AND focus the pane that holds it. This is
+    /// what a tab click and cmd+N mean; it can never invent a pane.
+    pub fn selectTerminal(model: *Model, id: TerminalRef) bool {
+        const index = model.tabOfTerminal(id) orelse return false;
+        model.selected_tab = index;
+        model.web_selected = false;
+        _ = model.tabs[index].focusTerminal(id);
+        return true;
+    }
+
+    pub fn selectWeb(model: *Model) void {
+        model.web_selected = true;
+    }
+
+    pub fn moveTerminal(model: *Model, id: TerminalRef, delta: i8) bool {
+        const current = model.tabOfTerminal(id) orelse return false;
+        const target_signed = @as(isize, @intCast(current)) + delta;
+        if (target_signed < 0 or target_signed >= model.tab_count) return false;
+        const target: usize = @intCast(target_signed);
+        std.mem.swap(layout.Tree, &model.tabs[current], &model.tabs[target]);
+        if (model.selected_tab == current) {
+            model.selected_tab = target;
+        } else if (model.selected_tab == target) {
+            model.selected_tab = current;
+        }
+        return true;
+    }
+
+    /// Drop panes whose terminal no longer exists, then drop tabs that lost
+    /// every pane. Called after any provider publication.
+    pub fn normalizeTopology(model: *Model) void {
+        var index: usize = 0;
+        while (index < model.tab_count) {
+            var current = &model.tabs[index];
+            var refs: [layout.max_panes]TerminalRef = undefined;
+            const count = current.terminals(&refs);
+            for (refs[0..count]) |candidate| {
+                if (!model.containsTerminal(candidate)) _ = current.closeTerminal(candidate);
+            }
+            if (current.isEmpty()) model.dropTab(index) else index += 1;
+        }
+        if (model.tab_count == 0) {
+            model.web_selected = true;
+            model.selected_tab = 0;
+            return;
+        }
+        if (model.selected_tab >= model.tab_count) model.selected_tab = model.tab_count - 1;
+    }
+
     pub fn reconcileRemoteTerminals(model: *Model) void {
         const remote = model.phuxConst() orelse return;
         var refs: [max_remote_terminals]TerminalRef = undefined;
         const count = remote.terminalRefs(&refs);
-        var order_index: usize = 0;
-        while (order_index < model.terminal_count) {
-            const current = model.terminal_order[order_index];
-            if (support.providerKind(current) != .phux) {
-                order_index += 1;
-                continue;
-            }
-            var retained = false;
-            for (refs[0..count]) |candidate| if (current.eql(candidate)) {
-                retained = true;
-                break;
-            };
-            if (retained) order_index += 1 else model.dropFromOrder(order_index);
-        }
-        for (refs[0..count]) |candidate| _ = model.admitToOrder(candidate);
-        reconcileRemoteRefs(&model.attachments, model.terminal_order[0..model.terminal_count]);
+        // Remote panes whose terminal the coordinator retired leave the tree;
+        // `normalizeTopology` then collapses tabs that lost every pane.
+        model.normalizeTopology();
+        for (refs[0..count]) |candidate| _ = model.admitTab(candidate);
         for (&model.remote_ui) |*state| {
             const known = state.terminal_ref orelse continue;
             var retained = false;
@@ -253,257 +403,100 @@ pub const Model = struct {
             if (!retained) state.* = .{};
         }
         for (refs[0..count]) |terminal_ref| _ = model.remoteUi(terminal_ref);
-        model.normalizeTopology();
-        model.reconcileAttachmentFocus();
     }
 
-    pub fn terminalAt(model: *Model, placement: Placement) ?*Pane {
-        const id = model.attachments[placement.index()] orelse return null;
-        return model.provider.terminal(id);
-    }
-
-    pub fn terminalAtConst(model: *const Model, placement: Placement) ?*const Pane {
-        const id = model.attachments[placement.index()] orelse return null;
-        return model.provider.terminalConst(id);
-    }
-
-    pub fn focusedPane(model: *Model) *Pane {
-        return model.terminalAt(model.focus_placement) orelse unreachable;
-    }
-
-    pub fn focusedTerminalRef(model: *const Model) ?TerminalRef {
-        return model.attachments[model.focus_placement.index()];
-    }
-
-    pub fn focusedTerminalId(model: *const Model) ?TerminalRef {
-        return model.focusedTerminalRef();
-    }
-
-    pub fn selectedPlacement(model: *const Model) ?Placement {
-        const id = model.selectedTerminalRef() orelse return null;
-        for (model.attachments, 0..) |attached, index| {
-            if (attached != null and attached.?.eql(id)) return Placement.fromIndex(index).?;
-        }
-        return null;
-    }
-
-    pub fn selectedTerminalRef(model: *const Model) ?TerminalRef {
-        return switch (model.selected_surface) {
-            .terminal => |id| if (model.containsTerminal(id)) id else null,
-            .web => null,
-        };
-    }
-
-    pub fn selectedTerminalId(model: *const Model) ?TerminalRef {
-        return model.selectedTerminalRef();
-    }
-
-    pub fn selectedTerminalIndex(model: *const Model) ?u8 {
-        const placement = model.selectedPlacement() orelse return null;
-        return @intFromEnum(placement);
-    }
-
-    pub fn terminalOrderIndex(model: *const Model, id: TerminalRef) ?usize {
-        for (model.terminal_order[0..model.terminal_count], 0..) |candidate, index| if (candidate.eql(id)) return index;
-        return null;
-    }
-
-    pub fn admitToOrder(model: *Model, id: TerminalRef) bool {
-        if (model.terminalOrderIndex(id) != null) return true;
-        if (model.terminal_count >= max_terminal_count) return false;
-        model.terminal_order[model.terminal_count] = id;
-        model.terminal_count += 1;
-        return true;
-    }
-
-    pub fn dropFromOrder(model: *Model, index: usize) void {
-        if (index >= model.terminal_count) return;
-        var cursor = index;
-        while (cursor + 1 < model.terminal_count) : (cursor += 1) model.terminal_order[cursor] = model.terminal_order[cursor + 1];
-        model.terminal_count -= 1;
-    }
-
-    pub const AttachError = error{ UnknownTerminal, TerminalAlreadyAttached, PlacementOccupied };
-
-    pub fn reconcileAttachmentFocus(model: *Model) void {
-        var fallback: ?Placement = null;
-        for (model.attachments, 0..) |attached, index| if (attached != null) {
-            fallback = Placement.fromIndex(index).?;
-            break;
-        };
-        if (model.selectedTerminalRef() != null and model.selectedPlacement() == null) {
-            if (fallback) |replacement| model.selected_surface = .{ .terminal = model.attachments[replacement.index()].? };
-        }
-        if (model.attachments[model.focus_placement.index()] == null) {
-            if (model.selectedPlacement()) |placement| {
-                if (model.attachments[placement.index()] != null) {
-                    model.focus_placement = placement;
-                    return;
-                }
-            }
-            if (fallback) |replacement| model.focus_placement = replacement;
-        }
-    }
-
-    pub fn attach(model: *Model, placement: Placement, terminal_ref: TerminalRef) AttachError!void {
-        if (!model.containsTerminal(terminal_ref)) return error.UnknownTerminal;
-        for (model.attachments) |attached| if (attached != null and attached.?.eql(terminal_ref)) return error.TerminalAlreadyAttached;
-        if (model.attachments[placement.index()] != null) return error.PlacementOccupied;
-        model.attachments[placement.index()] = terminal_ref;
-        if (model.selectedPlacement() == placement) model.focus_placement = placement;
-        model.reconcileAttachmentFocus();
-    }
-
-    pub fn detach(model: *Model, placement: Placement) ?TerminalRef {
-        const index = placement.index();
-        const detached = model.attachments[index] orelse return null;
-        model.attachments[index] = null;
-        model.reconcileAttachmentFocus();
-        return detached;
-    }
-
-    fn attachForSelection(model: *Model, id: TerminalRef) void {
-        for (model.attachments, 0..) |attached, index| if (attached != null and attached.?.eql(id)) {
-            model.focus_placement = Placement.fromIndex(index).?;
-            return;
-        };
-        const target = if (model.layout == .single) Placement.primary else model.focus_placement;
-        model.attachments[target.index()] = id;
-        model.focus_placement = target;
-    }
-
-    pub fn selectTerminal(model: *Model, id: TerminalRef) bool {
-        if (!model.containsTerminal(id)) return false;
-        model.selected_surface = .{ .terminal = id };
-        model.attachForSelection(id);
-        return true;
-    }
-
-    pub fn normalizeTopology(model: *Model) void {
-        for (&model.attachments) |*attached| if (attached.* != null and !model.containsTerminal(attached.*.?)) {
-            attached.* = null;
-        };
-        if (model.terminal_count == 0) {
-            model.selected_surface = .web;
-            model.layout = .single;
-            model.attachments = .{ null, null };
-            return;
-        }
-        if (model.selected_surface == .web) {
-            model.layout = .single;
-            return;
-        }
-        const selected = model.selectedTerminalRef() orelse model.terminal_order[0];
-        model.selected_surface = .{ .terminal = selected };
-        model.attachForSelection(selected);
-        if (model.layout == .split) {
-            const other_index = 1 - model.focus_placement.index();
-            const other_stale = if (model.attachments[other_index]) |other| other.eql(selected) else true;
-            if (other_stale) {
-                model.attachments[other_index] = null;
-                for (model.terminal_order[0..model.terminal_count]) |candidate| if (!candidate.eql(selected)) {
-                    model.attachments[other_index] = candidate;
-                    break;
-                };
-            }
-            if (model.attachments[other_index] == null) model.layout = .single;
-        }
-    }
-
-    pub fn moveTerminal(model: *Model, id: TerminalRef, delta: i8) bool {
-        const current = model.terminalOrderIndex(id) orelse return false;
-        const target_signed = @as(isize, @intCast(current)) + delta;
-        if (target_signed < 0 or target_signed >= model.terminal_count) return false;
-        const target: usize = @intCast(target_signed);
-        std.mem.swap(TerminalRef, &model.terminal_order[current], &model.terminal_order[target]);
-        return true;
-    }
+    // ------------------------------------------------------ persistence
 
     pub fn topologySnapshot(model: *const Model) !TopologySnapshot {
-        var snapshot: TopologySnapshot = .{
-            .layout = model.layout,
-            .split_fraction = model.split_fraction,
-            .focused_attachment = model.focus_placement,
-            .tab_placement = model.tab_placement,
-        };
-        var count: u8 = 0;
-        for (model.terminal_order[0..model.terminal_count]) |id| {
-            const local_id = provider_contract.localId(id) orelse continue;
-            snapshot.terminal_order[count] = local_id;
-            count += 1;
+        var snapshot: TopologySnapshot = .{ .tab_placement = model.tab_placement };
+        var written: u8 = 0;
+        var selected: ?u8 = null;
+        for (model.tabs[0..model.tab_count], 0..) |current, index| {
+            const encoded = encodeTab(current) orelse continue;
+            snapshot.tabs[written] = encoded;
+            if (!model.web_selected and index == model.selected_tab) selected = written;
+            written += 1;
         }
-        snapshot.terminal_count = count;
-        for (model.attachments, 0..) |attached, index| snapshot.attachments[index] = if (attached) |id| provider_contract.localId(id) else null;
-        snapshot.selection = switch (model.selected_surface) {
-            .terminal => |id| if (provider_contract.localId(id)) |local_id| SnapshotSelection{ .terminal = local_id } else .web,
-            .web => .web,
-        };
-        if (snapshot.terminal_count == 0) {
-            snapshot.selection = .web;
-            snapshot.layout = .single;
-            snapshot.attachments = .{ null, null };
-            snapshot.focused_attachment = .primary;
-        } else {
-            if (snapshot.layout == .split and (snapshot.attachments[0] == null or snapshot.attachments[1] == null)) snapshot.layout = .single;
-            switch (snapshot.selection) {
-                .terminal => |id| {
-                    const focused = snapshot.attachments[snapshot.focused_attachment.index()];
-                    if (focused == null or focused.? != id) {
-                        for (snapshot.attachments, 0..) |attached, index| {
-                            if (attached != null and attached.? == id) {
-                                snapshot.focused_attachment = Placement.fromIndex(index).?;
-                                break;
-                            }
-                        } else snapshot.selection = .web;
-                    }
-                },
-                .web => {},
-            }
-            if (snapshot.selection == .web and
-                (snapshot.attachments[0] != null or snapshot.attachments[1] != null) and
-                snapshot.attachments[snapshot.focused_attachment.index()] == null)
-            {
-                for (snapshot.attachments, 0..) |attached, index| if (attached != null) {
-                    snapshot.focused_attachment = Placement.fromIndex(index).?;
-                    break;
-                };
-            }
-        }
+        snapshot.tab_count = written;
+        snapshot.selection = if (selected) |value| .{ .tab = value } else .web;
         try snapshot.validate();
         return snapshot;
     }
 };
 
-pub fn reconcileRemoteRefs(attachments: *[pane_count]?TerminalRef, live_refs: []const TerminalRef) void {
-    for (attachments) |*attached| {
-        const current = attached.* orelse continue;
-        if (support.providerKind(current) != .phux) continue;
-        var retained = false;
-        for (live_refs) |candidate| if (current.eql(candidate)) {
-            retained = true;
-            break;
-        };
-        if (!retained) attached.* = null;
+/// Serialize one tree. A tab holding a REMOTE terminal is not persistable —
+/// a phux terminal exists because its coordinator says so, and restoring it
+/// locally would invent one — so such a tab is dropped from the snapshot.
+fn encodeTab(current: layout.Tree) ?topology.SnapshotTab {
+    if (current.isEmpty()) return null;
+    var tab: topology.SnapshotTab = .{ .root = current.root, .focus = current.focus };
+    for (current.nodes, 0..) |node, index| {
+        switch (node.kind) {
+            .free => continue,
+            .leaf => {
+                const held = node.terminal orelse return null;
+                const local_id = provider_contract.localId(held) orelse return null;
+                tab.nodes[index] = .{
+                    .kind = .leaf,
+                    .parent = node.parent,
+                    .terminal = local_id,
+                    .has_terminal = true,
+                };
+            },
+            .branch => tab.nodes[index] = .{
+                .kind = .branch,
+                .parent = node.parent,
+                .orientation = node.orientation,
+                .fraction = node.fraction,
+                .first = node.first,
+                .second = node.second,
+            },
+        }
     }
+    return tab;
 }
 
-pub fn initialModelWithPhux(sessions: [pane_count]*grid.Session, phux_provider: ?*PhuxProvider) Model {
-    const local_provider = LocalProvider.create(std.heap.page_allocator, sessions) catch @panic("failed to allocate local terminal provider");
+fn decodeTab(tab: topology.SnapshotTab) layout.Tree {
+    var current: layout.Tree = .{ .root = tab.root, .focus = tab.focus };
+    for (tab.nodes, 0..) |node, index| {
+        current.nodes[index] = switch (node.kind) {
+            .free => .{},
+            .leaf => .{
+                .kind = .leaf,
+                .parent = node.parent,
+                .terminal = local.localRef(node.terminal),
+            },
+            .branch => .{
+                .kind = .branch,
+                .parent = node.parent,
+                .orientation = node.orientation,
+                .fraction = node.fraction,
+                .first = node.first,
+                .second = node.second,
+            },
+        };
+    }
+    return current;
+}
+
+pub fn initialModelWithPhux(session: *grid.Session, phux_provider: ?*PhuxProvider) Model {
+    const local_provider = LocalProvider.create(std.heap.page_allocator, session) catch @panic("failed to allocate local terminal provider");
     var pointer_state: ?*PointerState = null;
     if (comptime support.phux_enabled) if (phux_provider != null) {
         pointer_state = std.heap.page_allocator.create(PointerState) catch @panic("failed to allocate pointer monitor state");
         pointer_state.?.* = .{};
     };
-    return .{
+    var model: Model = .{
         .provider = local_provider,
         .phux_provider = phux_provider,
         .pointer_state = pointer_state,
-        .panes = &local_provider.terminals,
     };
+    _ = model.admitTab(local.initialTerminalRef(0));
+    return model;
 }
 
-pub fn initialModel(sessions: [pane_count]*grid.Session) Model {
-    return initialModelWithPhux(sessions, null);
+pub fn initialModel(session: *grid.Session) Model {
+    return initialModelWithPhux(session, null);
 }
 
 pub fn attachPhuxProvider(model: *Model, phux_provider: ?*PhuxProvider) void {
@@ -516,65 +509,58 @@ pub fn attachPhuxProvider(model: *Model, phux_provider: ?*PhuxProvider) void {
     model.pointer_state = pointer_state;
 }
 
-pub fn initialModelWithIo(gpa: std.mem.Allocator, io: std.Io, sessions: [pane_count]*grid.Session) !Model {
-    const provider = try LocalProvider.createWithIo(gpa, io, sessions);
-    return .{ .provider = provider, .panes = &provider.terminals };
+pub fn initialModelWithIo(gpa: std.mem.Allocator, io: std.Io, session: *grid.Session) !Model {
+    const provider = try LocalProvider.createWithIo(gpa, io, session);
+    var model: Model = .{ .provider = provider };
+    _ = model.admitTab(local.initialTerminalRef(0));
+    return model;
 }
 
 pub fn initialProductionModelWithIo(gpa: std.mem.Allocator, io: std.Io, session: *grid.Session) !Model {
-    const provider = try LocalProvider.createSingleWithIo(gpa, io, session);
-    return .{
-        .provider = provider,
-        .panes = &provider.terminals,
-        .terminal_count = 1,
-        .attachments = .{ local.initialTerminalRef(0), null },
-    };
+    return initialModelWithIo(gpa, io, session);
 }
 
 pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopologySnapshot) !Model {
     const snapshot = try topology.migrateTopologySnapshot(persisted);
     const provider = try gpa.create(LocalProvider);
     errdefer gpa.destroy(provider);
-    provider.* = .{
-        .gpa = gpa,
-        .io = io,
-        .terminals = undefined,
-        .states = [_]local.RegistryState{.vacant} ** max_terminal_count,
-        .next_terminal_raw = local.first_terminal_raw,
-        .next_pty_key = 1,
-    };
-    var created: usize = 0;
-    errdefer for (0..created) |index| provider.slot(index).session.destroy();
-    while (created < snapshot.terminal_count) : (created += 1) {
-        const session = try grid.Session.create(gpa, io, 80, 24);
-        const local_id = snapshot.terminal_order[created];
-        const pane = provider.slot(created);
-        pane.* = .{
-            .id = local.localRef(local_id),
-            .session = session,
-            .pty_key = provider.next_pty_key,
-            .argv = local.paneArgv(0),
-        };
-        provider.states[created] = .active;
-        provider.next_pty_key += 1;
-        provider.next_terminal_raw = @max(provider.next_terminal_raw, @intFromEnum(local_id) + 1);
-    }
-    var result: Model = .{
+    provider.* = .{ .gpa = gpa, .io = io };
+
+    var model: Model = .{
         .provider = provider,
-        .panes = &provider.terminals,
-        .terminal_count = snapshot.terminal_count,
-        .layout = snapshot.layout,
-        .split_fraction = snapshot.split_fraction,
-        .focus_placement = snapshot.focused_attachment,
+        .tab_count = snapshot.tab_count,
         .tab_placement = snapshot.tab_placement,
-        .selected_surface = switch (snapshot.selection) {
-            .terminal => |id| .{ .terminal = local.localRef(id) },
-            .web => .web,
+        .web_selected = snapshot.selection == .web,
+        .selected_tab = switch (snapshot.selection) {
+            .tab => |index| index,
+            .web => 0,
         },
     };
-    for (snapshot.terminal_order, 0..) |id, index| result.terminal_order[index] = local.localRef(id);
-    for (snapshot.attachments, 0..) |attached, index| result.attachments[index] = if (attached) |id| local.localRef(id) else null;
-    return result;
+    errdefer provider.destroy();
+
+    // Every persisted leaf gets a FRESH session: process state is explicitly
+    // not restored (`process_restoration_supported`), only the shape.
+    for (snapshot.tabs[0..snapshot.tab_count], 0..) |tab, tab_index| {
+        model.tabs[tab_index] = decodeTab(tab);
+        for (tab.nodes) |node| {
+            if (node.kind != .leaf or !node.has_terminal) continue;
+            const session = try grid.Session.create(gpa, io, 80, 24);
+            errdefer session.destroy();
+            var index: usize = 0;
+            while (index < max_terminals and provider.states[index] != .vacant) : (index += 1) {}
+            if (index == max_terminals) return error.TerminalCapacityReached;
+            provider.slots[index] = .{
+                .id = local.localRef(node.terminal),
+                .session = session,
+                .pty_key = provider.next_pty_key,
+                .argv = local.paneArgv(0),
+            };
+            provider.states[index] = .active;
+            provider.next_pty_key += 1;
+            provider.next_terminal_raw = @max(provider.next_terminal_raw, @intFromEnum(node.terminal) + 1);
+        }
+    }
+    return model;
 }
 
 pub fn deinitModel(model: *Model) void {

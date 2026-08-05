@@ -13,8 +13,16 @@ pub fn createSession(cols: u16, rows: u16) !*grid.Session {
     return grid.Session.create(std.heap.page_allocator, testing.io, cols, rows);
 }
 
-pub fn createSessions(cols: u16, rows: u16) ![app.pane_count]*grid.Session {
-    var sessions: [app.pane_count]*grid.Session = undefined;
+/// The app now opens with exactly ONE terminal and mints the rest lazily, so
+/// the fixtures hand over one session and ask the model for more.
+pub fn createDefaultSession() !*grid.Session {
+    return grid.Session.create(testing.allocator, testing.io, 80, 24);
+}
+
+/// A bare pair of emulators for tests that paint or feed sessions directly,
+/// with no model or provider involved.
+pub fn createSessions(cols: u16, rows: u16) ![2]*grid.Session {
+    var sessions: [2]*grid.Session = undefined;
     var created: usize = 0;
     errdefer for (sessions[0..created]) |session| session.destroy();
     while (created < sessions.len) : (created += 1) {
@@ -23,14 +31,15 @@ pub fn createSessions(cols: u16, rows: u16) ![app.pane_count]*grid.Session {
     return sessions;
 }
 
-pub fn createDefaultSessions() ![app.pane_count]*grid.Session {
-    var sessions: [app.pane_count]*grid.Session = undefined;
-    var created: usize = 0;
-    errdefer for (sessions[0..created]) |session| session.destroy();
-    while (created < sessions.len) : (created += 1) {
-        sessions[created] = try grid.Session.create(testing.allocator, testing.io, 80, 24);
+/// The registry's live panes, as a slice. Valid only while no slot has been
+/// freed, which holds for fixtures that only ever ADD terminals — a closed
+/// terminal leaves a hole whose session is gone.
+pub fn activeSlots(model: *app.Model) []app.Pane {
+    var end: usize = 0;
+    for (model.provider.states, 0..) |state, index| {
+        if (state == .active) end = index + 1;
     }
-    return sessions;
+    return model.provider.slots[0..end];
 }
 
 pub fn remoteTerminalRef(id: u32) !app.TerminalRef {
@@ -60,12 +69,12 @@ pub fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*Terminal
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
-    const sessions = try createSessions(80, 24);
+    const session = try createSession(80, 24);
     const app_state = gpa.create(TerminalApp) catch |err| {
-        for (sessions) |session| session.destroy();
+        session.destroy();
         return err;
     };
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     errdefer {
         app_state.deinit();
         app.deinitModel(&app_state.model);
@@ -92,6 +101,9 @@ pub fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*Terminal
     return app_state;
 }
 
+/// Two TABS, each with one terminal — the shape most routing tests want.
+/// The second terminal is minted through the real `new_terminal` path, so
+/// the fixture exercises lazy session allocation instead of pre-seeding it.
 pub fn startTwoPaneCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     const app_state = try startFocusedTerminal(gpa, harness);
     errdefer {
@@ -100,6 +112,35 @@ pub fn startTwoPaneCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalA
         gpa.destroy(app_state);
     }
     const app_iface = app_state.app();
+    try app_state.dispatch(&harness.runtime, 1, .new_terminal);
+    try app_state.dispatch(&harness.runtime, 1, .{ .select_position = 0 });
+    try app_state.effects.feedPtyOutput(app.ptyKey(0), "PANEALPHA\r\n");
+    try app_state.effects.feedPtyOutput(app.ptyKey(1), "PANEBRAVO\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    // Land canvas widget focus on the selected terminal AFTER the tab list
+    // settled: a rebuild between the click and the assertion clears it.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .pointer_down,
+        .x = 200,
+        .y = 200,
+    } });
+    return app_state;
+}
+
+/// Two PANES in ONE tab, produced by a real split. `PANEALPHA` is the
+/// original (left/top), `PANEBRAVO` the pane the split created.
+pub fn startSplitCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
+    const app_state = try startFocusedTerminal(gpa, harness);
+    errdefer {
+        app_state.deinit();
+        app.deinitModel(&app_state.model);
+        gpa.destroy(app_state);
+    }
+    const app_iface = app_state.app();
+    try app_state.dispatch(&harness.runtime, 1, .split_right);
     try app_state.effects.feedPtyOutput(app.ptyKey(0), "PANEALPHA\r\n");
     try app_state.effects.feedPtyOutput(app.ptyKey(1), "PANEBRAVO\r\n");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
@@ -107,13 +148,22 @@ pub fn startTwoPaneCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalA
     return app_state;
 }
 
+/// The pane rects the painter, the hit targets, and the PTY pump all use.
+pub fn resolvedPanes(model: *const app.Model, size: geometry.SizeF, out: []app.LayoutPane) usize {
+    return app.resolvePanes(model, size, out);
+}
+
+pub fn paneRect(model: *const app.Model, size: geometry.SizeF, terminal_ref: app.TerminalRef) ?geometry.RectF {
+    return app.paneFrameFor(model, size, terminal_ref);
+}
+
 pub fn startCockpit(harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
-    const sessions = try createDefaultSessions();
-    const model = app.initialModelWithIo(testing.allocator, testing.io, sessions) catch |err| {
-        for (sessions) |session| session.destroy();
+    const session = try createDefaultSession();
+    const model = app.initialModelWithIo(testing.allocator, testing.io, session) catch |err| {
+        session.destroy();
         return err;
     };
     const state = testing.allocator.create(TerminalApp) catch |err| {

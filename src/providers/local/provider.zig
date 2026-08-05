@@ -10,8 +10,12 @@ pub const TerminalRef = provider_contract.TerminalRef;
 pub const ReplicaOwner = provider_contract.ReplicaOwner;
 pub const Phase = provider_contract.Phase;
 
-pub const pane_count: usize = 2;
-pub const max_terminal_count: usize = 4;
+/// The local registry ceiling. A tab owns a tree of at most
+/// `layout.max_panes` panes and there can be many tabs, so the registry is
+/// sized for the whole window rather than for one pane pair. 32 is far past
+/// what a person keeps alive and still leaves the registry a flat, scannable
+/// array.
+pub const max_terminals: usize = 32;
 pub const first_terminal_raw: u64 = @intFromEnum(LocalTerminalId.terminal_1);
 pub const clipboard_key: u64 = 100;
 pub const paste_clipboard_key: u64 = 101;
@@ -29,11 +33,11 @@ const default_shell_argv: []const []const u8 = if (builtin.os.tag == .windows)
 else
     &.{ default_shell, "-i" };
 
-const terminal_1_argv: []const []const u8 = if (builtin.os.tag == .macos)
-    &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -i" }
-else
-    default_shell_argv;
-const terminal_2_argv: []const []const u8 = if (builtin.os.tag == .macos)
+/// Every local terminal spawns the SAME login shell. There was never a
+/// per-slot argv distinction — the old `terminal_1_argv`/`terminal_2_argv`
+/// pair held identical text — and a registry of 32 uniform slots cannot
+/// carry a per-index table anyway.
+const shell_argv: []const []const u8 = if (builtin.os.tag == .macos)
     &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -i" }
 else
     default_shell_argv;
@@ -43,7 +47,7 @@ pub fn localRef(id: LocalTerminalId) TerminalRef {
 }
 
 pub fn initialTerminalId(index: usize) LocalTerminalId {
-    return if (index == 0) .terminal_1 else .terminal_2;
+    return @enumFromInt(first_terminal_raw + index);
 }
 
 pub fn initialTerminalRef(index: usize) TerminalRef {
@@ -54,8 +58,8 @@ pub fn ptyKey(index: usize) u64 {
     return 1 + index;
 }
 
-pub fn paneArgv(index: usize) []const []const u8 {
-    return if (index == 0) terminal_1_argv else terminal_2_argv;
+pub fn paneArgv(_: usize) []const []const u8 {
+    return shell_argv;
 }
 
 pub const Pane = struct {
@@ -95,7 +99,13 @@ pub const Pane = struct {
     }
 };
 
-pub const RegistryState = enum { vacant, active, closing };
+/// A slot is either free or holds a live terminal. There is no `.closing`
+/// tombstone: close destroys the session eagerly and frees the slot, because
+/// a tombstone waiting on a pty exit that may never arrive held both a
+/// registry slot and a whole emulator hostage. Identity never repeats
+/// (`next_terminal_raw` and `next_pty_key` only move forward), so a late
+/// event for a retired terminal resolves to no slot and is ignored.
+pub const RegistryState = enum { vacant, active };
 
 pub fn replicaOwnerForPane(pane: *const Pane) ReplicaOwner {
     return provider_contract.localReplicaOwner(pane.id, pane.session_generation);
@@ -104,63 +114,54 @@ pub fn replicaOwnerForPane(pane: *const Pane) ReplicaOwner {
 pub const LocalProvider = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    terminals: [pane_count]Pane,
-    overflow: [max_terminal_count - pane_count]Pane = undefined,
-    states: [max_terminal_count]RegistryState = .{ .active, .active, .vacant, .vacant },
-    next_terminal_raw: u64 = first_terminal_raw + pane_count,
-    next_pty_key: u64 = pane_count + 1,
+    /// ONE uniform array. The old split between an eager `terminals[2]` and
+    /// an `overflow` tail encoded the two-pane workspace in the registry and
+    /// forced every caller through an index-translating accessor.
+    slots: [max_terminals]Pane = undefined,
+    states: [max_terminals]RegistryState = @splat(.vacant),
+    next_terminal_raw: u64 = first_terminal_raw,
+    next_pty_key: u64 = 1,
 
-    pub fn create(gpa: std.mem.Allocator, sessions: [pane_count]*grid.Session) !*LocalProvider {
-        return createWithIo(gpa, std.Io.failing, sessions);
+    pub fn create(gpa: std.mem.Allocator, session: *grid.Session) !*LocalProvider {
+        return createWithIo(gpa, std.Io.failing, session);
     }
 
-    pub fn createWithIo(gpa: std.mem.Allocator, io: std.Io, sessions: [pane_count]*grid.Session) !*LocalProvider {
+    /// The window opens with exactly ONE terminal. Every further terminal is
+    /// minted by `createTerminal`, which allocates its session then — the app
+    /// no longer pre-allocates emulators for panes nobody asked for.
+    pub fn createWithIo(gpa: std.mem.Allocator, io: std.Io, session: *grid.Session) !*LocalProvider {
         const provider = try gpa.create(LocalProvider);
-        provider.* = .{ .gpa = gpa, .io = io, .terminals = undefined };
-        for (&provider.terminals, sessions, 0..) |*entry, session, index| {
-            entry.* = .{
-                .id = initialTerminalRef(index),
-                .session = session,
-                .pty_key = ptyKey(index),
-                .argv = paneArgv(index),
-            };
-        }
+        provider.* = .{ .gpa = gpa, .io = io };
+        provider.slots[0] = .{
+            .id = initialTerminalRef(0),
+            .session = session,
+            .pty_key = ptyKey(0),
+            .argv = shell_argv,
+        };
+        provider.states[0] = .active;
+        provider.next_terminal_raw = first_terminal_raw + 1;
+        provider.next_pty_key = 2;
         return provider;
     }
 
     pub fn createSingleWithIo(gpa: std.mem.Allocator, io: std.Io, session: *grid.Session) !*LocalProvider {
-        const provider = try gpa.create(LocalProvider);
-        provider.* = .{
-            .gpa = gpa,
-            .io = io,
-            .terminals = undefined,
-            .states = .{ .active, .vacant, .vacant, .vacant },
-            .next_terminal_raw = first_terminal_raw + 1,
-            .next_pty_key = 2,
-        };
-        provider.terminals[0] = .{
-            .id = initialTerminalRef(0),
-            .session = session,
-            .pty_key = ptyKey(0),
-            .argv = paneArgv(0),
-        };
-        return provider;
+        return createWithIo(gpa, io, session);
     }
 
     pub fn destroy(provider: *LocalProvider) void {
         const gpa = provider.gpa;
-        for (0..max_terminal_count) |index| {
-            if (provider.states[index] != .vacant) provider.slot(index).session.destroy();
+        for (0..max_terminals) |index| {
+            if (provider.states[index] == .active) provider.slots[index].session.destroy();
         }
         gpa.destroy(provider);
     }
 
     pub fn slot(provider: *LocalProvider, index: usize) *Pane {
-        return if (index < pane_count) &provider.terminals[index] else &provider.overflow[index - pane_count];
+        return &provider.slots[index];
     }
 
     pub fn slotConst(provider: *const LocalProvider, index: usize) *const Pane {
-        return if (index < pane_count) &provider.terminals[index] else &provider.overflow[index - pane_count];
+        return &provider.slots[index];
     }
 
     pub fn activeCount(provider: *const LocalProvider) usize {
@@ -171,49 +172,37 @@ pub const LocalProvider = struct {
         return count;
     }
 
+    /// Occupancy IS the active count now that closing frees eagerly. Kept as
+    /// its own name because callers ask two different questions of it.
     pub fn occupiedCount(provider: *const LocalProvider) usize {
-        var count: usize = 0;
-        for (provider.states) |state| if (state != .vacant) {
-            count += 1;
-        };
-        return count;
+        return provider.activeCount();
     }
 
     pub fn slotIndex(provider: *const LocalProvider, terminal_ref: TerminalRef) ?usize {
         if (!provider_contract.isLocal(terminal_ref)) return null;
-        for (0..max_terminal_count) |index| {
-            if (provider.states[index] == .vacant) continue;
-            if (provider.slotConst(index).id.eql(terminal_ref)) return index;
+        for (0..max_terminals) |index| {
+            if (provider.states[index] != .active) continue;
+            if (provider.slots[index].id.eql(terminal_ref)) return index;
         }
         return null;
     }
 
     pub fn terminal(provider: *LocalProvider, terminal_ref: TerminalRef) ?*Pane {
-        if (!provider_contract.isLocal(terminal_ref)) return null;
-        for (0..max_terminal_count) |index| {
-            if (provider.states[index] != .active) continue;
-            const candidate = provider.slot(index);
-            if (candidate.id.eql(terminal_ref)) return candidate;
-        }
-        return null;
+        const index = provider.slotIndex(terminal_ref) orelse return null;
+        return &provider.slots[index];
     }
 
     pub fn terminalConst(provider: *const LocalProvider, terminal_ref: TerminalRef) ?*const Pane {
-        if (!provider_contract.isLocal(terminal_ref)) return null;
-        for (0..max_terminal_count) |index| {
-            if (provider.states[index] != .active) continue;
-            const candidate = provider.slotConst(index);
-            if (candidate.id.eql(terminal_ref)) return candidate;
-        }
-        return null;
+        const index = provider.slotIndex(terminal_ref) orelse return null;
+        return &provider.slots[index];
     }
 
     pub fn terminalRefs(provider: *const LocalProvider, out: []TerminalRef) usize {
         var count: usize = 0;
-        for (0..max_terminal_count) |index| {
+        for (0..max_terminals) |index| {
             if (count == out.len) break;
             if (provider.states[index] != .active) continue;
-            out[count] = provider.slotConst(index).id;
+            out[count] = provider.slots[index].id;
             count += 1;
         }
         return count;
@@ -234,59 +223,51 @@ pub const LocalProvider = struct {
     }
 
     pub fn terminalForPty(provider: *LocalProvider, key: u64) ?*Pane {
-        for (0..max_terminal_count) |index| {
-            if (provider.states[index] == .vacant) continue;
-            const candidate = provider.slot(index);
-            if (candidate.pty_key == key) return candidate;
+        for (0..max_terminals) |index| {
+            if (provider.states[index] != .active) continue;
+            if (provider.slots[index].pty_key == key) return &provider.slots[index];
         }
         return null;
     }
 
     pub fn createTerminal(provider: *LocalProvider) !*Pane {
-        if (provider.occupiedCount() >= max_terminal_count) return error.TerminalCapacityReached;
+        if (provider.activeCount() >= max_terminals) return error.TerminalCapacityReached;
         if (provider.next_terminal_raw >= std.math.maxInt(u64) - 1 or provider.next_pty_key >= std.math.maxInt(u64) - 1) return error.TerminalIdentityExhausted;
         const next_ref = localRef(@enumFromInt(provider.next_terminal_raw));
-        for (0..max_terminal_count) |occupied| {
-            if (provider.states[occupied] == .vacant) continue;
-            const existing = provider.slotConst(occupied);
+        for (0..max_terminals) |occupied| {
+            if (provider.states[occupied] != .active) continue;
+            const existing = provider.slots[occupied];
             if (existing.id.eql(next_ref) or existing.pty_key == provider.next_pty_key) return error.TerminalIdentityCollision;
         }
         if (provider.next_pty_key == clipboard_key or provider.next_pty_key == paste_clipboard_key) return error.TerminalIdentityCollision;
         var index: usize = 0;
-        while (index < max_terminal_count and provider.states[index] != .vacant) : (index += 1) {}
-        if (index == max_terminal_count) return error.TerminalCapacityReached;
+        while (index < max_terminals and provider.states[index] != .vacant) : (index += 1) {}
+        if (index == max_terminals) return error.TerminalCapacityReached;
+        // The session is allocated HERE, at the moment a terminal is asked
+        // for, not eagerly at startup for panes that may never exist.
         const session = try grid.Session.create(provider.gpa, provider.io, 80, 24);
         errdefer session.destroy();
-        const pane = provider.slot(index);
-        pane.* = .{
+        provider.slots[index] = .{
             .id = next_ref,
             .session = session,
             .pty_key = provider.next_pty_key,
-            .argv = terminal_1_argv,
+            .argv = shell_argv,
         };
         provider.next_terminal_raw += 1;
         provider.next_pty_key += 1;
         provider.states[index] = .active;
-        return pane;
+        return &provider.slots[index];
     }
 
-    pub fn beginClose(provider: *LocalProvider, id: TerminalRef) ?*Pane {
-        const index = provider.slotIndex(id) orelse return null;
-        if (provider.states[index] != .active) return null;
-        provider.states[index] = .closing;
-        return provider.slot(index);
-    }
-
-    pub fn isClosing(provider: *const LocalProvider, id: TerminalRef) bool {
+    /// Retire a terminal for good: the emulator is freed immediately and the
+    /// slot returns to the pool. The caller is responsible for having already
+    /// killed the pty and ended any effect keyed to this terminal — nothing
+    /// here can be reached through the freed session afterwards.
+    pub fn destroyTerminal(provider: *LocalProvider, id: TerminalRef) bool {
         const index = provider.slotIndex(id) orelse return false;
-        return provider.states[index] == .closing;
-    }
-
-    pub fn retireClosing(provider: *LocalProvider, id: TerminalRef) void {
-        const index = provider.slotIndex(id) orelse return;
-        if (provider.states[index] != .closing) return;
-        provider.slot(index).session.destroy();
+        provider.slots[index].session.destroy();
         provider.states[index] = .vacant;
+        return true;
     }
 };
 

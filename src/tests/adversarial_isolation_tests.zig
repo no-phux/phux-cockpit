@@ -18,16 +18,18 @@ const testing = std.testing;
 
 const TerminalApp = native_sdk.UiApp(app.Model, app.Msg);
 
+const createSession = support.createSession;
 const createSessions = support.createSessions;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 
 fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
-    const sessions = try createSessions(80, 24);
+    const session = try createSession(80, 24);
     const app_state = try gpa.create(TerminalApp);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     app_state.effects.executor = .fake;
     const app_iface = app_state.app();
     try harness.start(app_iface);
@@ -38,6 +40,11 @@ fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
         .frame_index = 1,
         .timestamp_ns = 1_000_000,
     } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    // Two TABS. The app opens with one terminal and mints the rest lazily,
+    // so the second is created through the real message path.
+    try app_state.dispatch(&harness.runtime, 1, .new_terminal);
+    try app_state.dispatch(&harness.runtime, 1, .{ .select_position = 0 });
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -71,18 +78,18 @@ test "ADVERSARIAL: a torrent into pane 0 leaves pane 1's emulator bit-identical"
     const model = &app_state.model;
 
     // Distinct heap objects, distinct emulators, distinct pty keys.
-    try testing.expect(model.panes[0].session != model.panes[1].session);
-    try testing.expect(&model.panes[0].session.term != &model.panes[1].session.term);
-    try testing.expect(&model.panes[0].session.render != &model.panes[1].session.render);
-    try testing.expect(model.panes[0].pty_key != model.panes[1].pty_key);
-    try testing.expect(model.panes[0].session.response_buffer.ptr != model.panes[1].session.response_buffer.ptr);
+    try testing.expect(model.provider.slots[0].session != model.provider.slots[1].session);
+    try testing.expect(&model.provider.slots[0].session.term != &model.provider.slots[1].session.term);
+    try testing.expect(&model.provider.slots[0].session.render != &model.provider.slots[1].session.render);
+    try testing.expect(model.provider.slots[0].pty_key != model.provider.slots[1].pty_key);
+    try testing.expect(model.provider.slots[0].session.response_buffer.ptr != model.provider.slots[1].session.response_buffer.ptr);
 
-    const before_text = try model.panes[1].session.plainText(gpa);
+    const before_text = try model.provider.slots[1].session.plainText(gpa);
     defer gpa.free(before_text);
-    const before_offset = model.panes[1].session.scrollbar().offset;
-    const before_bytes = model.panes[1].output_bytes;
-    const before_cols = model.panes[1].session.cols();
-    const before_rows = model.panes[1].session.rows();
+    const before_offset = model.provider.slots[1].session.scrollbar().offset;
+    const before_bytes = model.provider.slots[1].output_bytes;
+    const before_cols = model.provider.slots[1].session.cols();
+    const before_rows = model.provider.slots[1].session.rows();
 
     var line: [64]u8 = undefined;
     for (0..300) |i| {
@@ -93,19 +100,19 @@ test "ADVERSARIAL: a torrent into pane 0 leaves pane 1's emulator bit-identical"
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     // Pane 0 really did move.
-    const alpha = try model.panes[0].session.plainText(gpa);
+    const alpha = try model.provider.slots[0].session.plainText(gpa);
     defer gpa.free(alpha);
     try testing.expect(std.mem.indexOf(u8, alpha, "torrent 299") != null);
-    try testing.expect(model.panes[0].session.scrollbar().offset > 0);
+    try testing.expect(model.provider.slots[0].session.scrollbar().offset > 0);
 
     // Pane 1 did not, in ANY observable dimension.
-    const after_text = try model.panes[1].session.plainText(gpa);
+    const after_text = try model.provider.slots[1].session.plainText(gpa);
     defer gpa.free(after_text);
     try testing.expectEqualStrings(before_text, after_text);
-    try testing.expectEqual(before_offset, model.panes[1].session.scrollbar().offset);
-    try testing.expectEqual(before_bytes, model.panes[1].output_bytes);
-    try testing.expectEqual(before_cols, model.panes[1].session.cols());
-    try testing.expectEqual(before_rows, model.panes[1].session.rows());
+    try testing.expectEqual(before_offset, model.provider.slots[1].session.scrollbar().offset);
+    try testing.expectEqual(before_bytes, model.provider.slots[1].output_bytes);
+    try testing.expectEqual(before_cols, model.provider.slots[1].session.cols());
+    try testing.expectEqual(before_rows, model.provider.slots[1].session.rows());
     try testing.expect(std.mem.indexOf(u8, after_text, "torrent") == null);
     try testing.expect(std.mem.indexOf(u8, after_text, "PANEBRAVO") != null);
     // ...and pane 0 never learned pane 1's content either.
@@ -135,34 +142,34 @@ test "ADVERSARIAL: scrollback search and selection remain terminal-local" {
     try app_state.effects.feedPtyOutput(app.ptyKey(1), "ONLY_BRAVO_NEEDLE\r\n");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
 
-    const bravo_offset = model.panes[1].session.scrollbar().offset;
-    model.panes[0].session.scrollLines(-6);
-    try testing.expect(model.panes[0].session.scrollbar().offset < bravo_offset);
-    try testing.expectEqual(bravo_offset, model.panes[1].session.scrollbar().offset);
+    const bravo_offset = model.provider.slots[1].session.scrollbar().offset;
+    model.provider.slots[0].session.scrollLines(-6);
+    try testing.expect(model.provider.slots[0].session.scrollbar().offset < bravo_offset);
+    try testing.expectEqual(bravo_offset, model.provider.slots[1].session.scrollbar().offset);
 
-    model.panes[0].session.beginSelection(false);
-    model.panes[0].session.moveSelection(-4, 0, true);
-    try testing.expect(model.panes[0].session.selectionActive());
-    try testing.expect(!model.panes[1].session.selectionActive());
+    model.provider.slots[0].session.beginSelection(false);
+    model.provider.slots[0].session.moveSelection(-4, 0, true);
+    try testing.expect(model.provider.slots[0].session.selectionActive());
+    try testing.expect(!model.provider.slots[1].session.selectionActive());
 
     var alpha_in_alpha = try vt.search.Active.init(gpa, "ONLY_ALPHA_NEEDLE");
     defer alpha_in_alpha.deinit();
-    _ = try alpha_in_alpha.update(&model.panes[0].session.term.screens.active.pages);
+    _ = try alpha_in_alpha.update(&model.provider.slots[0].session.term.screens.active.pages);
     try testing.expect(alpha_in_alpha.next() != null);
 
     var alpha_in_bravo = try vt.search.Active.init(gpa, "ONLY_ALPHA_NEEDLE");
     defer alpha_in_bravo.deinit();
-    _ = try alpha_in_bravo.update(&model.panes[1].session.term.screens.active.pages);
+    _ = try alpha_in_bravo.update(&model.provider.slots[1].session.term.screens.active.pages);
     try testing.expect(alpha_in_bravo.next() == null);
 
     var bravo_in_bravo = try vt.search.Active.init(gpa, "ONLY_BRAVO_NEEDLE");
     defer bravo_in_bravo.deinit();
-    _ = try bravo_in_bravo.update(&model.panes[1].session.term.screens.active.pages);
+    _ = try bravo_in_bravo.update(&model.provider.slots[1].session.term.screens.active.pages);
     try testing.expect(bravo_in_bravo.next() != null);
 
-    model.panes[0].session.clearSelection();
-    try testing.expect(!model.panes[0].session.selectionActive());
-    try testing.expect(!model.panes[1].session.selectionActive());
+    model.provider.slots[0].session.clearSelection();
+    try testing.expect(!model.provider.slots[0].session.selectionActive());
+    try testing.expect(!model.provider.slots[1].session.selectionActive());
 }
 
 test "ADVERSARIAL: a hard reset of pane 0 does not reset pane 1" {
@@ -178,17 +185,17 @@ test "ADVERSARIAL: a hard reset of pane 0 does not reset pane 1" {
     const app_iface = app_state.app();
     const model = &app_state.model;
 
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, model.panes[0].phase);
-    try testing.expectEqual(app.Phase.live, model.panes[1].phase);
+    try testing.expectEqual(app.Phase.ended, model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.live, model.provider.slots[1].phase);
 
     // cmd+R restarts the FOCUSED (ended) pane; `spawnPane` hard-resets
     // its emulator. A shared emulator would blank the neighbour too.
     try pressKey(harness, app_iface, "r", .{ .primary = true });
-    const alpha = try model.panes[0].session.plainText(gpa);
+    const alpha = try model.provider.slots[0].session.plainText(gpa);
     defer gpa.free(alpha);
-    const bravo = try model.panes[1].session.plainText(gpa);
+    const bravo = try model.provider.slots[1].session.plainText(gpa);
     defer gpa.free(bravo);
     try testing.expect(std.mem.indexOf(u8, alpha, "PANEALPHA") == null); // reset
     try testing.expect(std.mem.indexOf(u8, bravo, "PANEBRAVO") != null); // untouched
@@ -241,10 +248,10 @@ test "ADVERSARIAL: hostile terminal tab switches retain collision-free ids" {
         session.moveSelection(20, 3, true);
     }
 
-    var storage: [app.pane_count][]canvas.CanvasCommand = undefined;
+    var storage: [2][]canvas.CanvasCommand = undefined;
     var allocated: usize = 0;
     defer for (storage[0..allocated]) |commands| gpa.free(commands);
-    var lists: [app.pane_count]canvas.DisplayList = undefined;
+    var lists: [2]canvas.DisplayList = undefined;
     for (sessions, 0..) |session, index| {
         storage[index] = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
         allocated += 1;
@@ -322,23 +329,38 @@ test "ADVERSARIAL: split paints both hostile terminals inside one collision-free
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    feedHostileRows(app_state.model.panes[0].session, 58, 40);
+    feedHostileRows(app_state.model.provider.slots[0].session, 58, 40);
     for (0..40) |_| {
-        app_state.model.panes[1].session.feed("\u{256C}" ** 58);
-        app_state.model.panes[1].session.feed("\r\n");
+        app_state.model.provider.slots[1].session.feed("\u{256C}" ** 58);
+        app_state.model.provider.slots[1].session.feed("\r\n");
     }
+    // Cmd+D mints a THIRD terminal beside terminal 1 in the same tab. The id
+    // namespace is keyed by the REGISTRY SLOT, not by a pane index, so the
+    // check reads the slots the resolved panes actually occupy.
     try pressKey(harness, app_iface, "d", .{ .primary = true });
+    var resolved: [app.max_panes_per_tab]app.LayoutPane = undefined;
+    const resolved_count = app.resolvePanes(&app_state.model, geometry.SizeF.init(980, 640), &resolved);
+    try testing.expectEqual(@as(usize, 2), resolved_count);
+    // Feed the pane the split actually created. Pane 0 already carries the
+    // hostile rows; the new pane gets the dense box-glyph rows, so the two
+    // halves of the shared envelope are both genuinely exercised.
+    const created = app_state.model.provider.terminal(resolved[1].terminal) orelse return error.TestExpectedTerminal;
+    for (0..40) |_| {
+        try app_state.effects.feedPtyOutput(created.pty_key, "\u{256C}" ** 58 ++ "\r\n");
+    }
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     const list = harness.runtime.views[0].canvasDisplayList();
     try expectNoDuplicateIds(gpa, list.commands);
     try testing.expect(list.commands.len <= native_sdk.runtime.max_canvas_commands_per_view);
 
     const stride: u64 = 1 << 24;
-    var per_pane: [app.pane_count]usize = @splat(0);
+    var per_pane: [2]usize = @splat(0);
     for (list.commands) |command| {
         const id = command.objectId() orelse continue;
         for (&per_pane, 0..) |*count, index| {
-            const base = canvas.terminal_grid.paintIdBase(grid.paneIdBase(index));
+            const slot = app_state.model.provider.slotIndex(resolved[index].terminal) orelse continue;
+            const base = canvas.terminal_grid.paintIdBase(grid.paneIdBase(slot));
             if (id >= base and id < base + stride) count.* += 1;
         }
     }
@@ -380,6 +402,35 @@ fn feedHostileRows(session: *grid.Session, cols: usize, rows: usize) void {
     }
 }
 
+/// The true worst case for a display-list painter: a distinct truecolor
+/// foreground AND background on every cell, so no two neighbours can merge
+/// into one run and each cell costs its own background rect plus its own
+/// text run.
+///
+/// `feedHostileRows` alternates two ANSI colors, which used to overflow the
+/// envelope comfortably. Raising the SDK's per-view ceiling from 2048 to
+/// 4096 commands made that screen fit, which would have quietly turned this
+/// test into a tautology — it asserts a bound BINDS, and a screen that no
+/// longer overflows cannot demonstrate that. Density has to outrun the
+/// ceiling for the assertion to keep meaning what it says.
+fn feedTruecolorRows(session: *grid.Session, cols: usize, rows: usize) void {
+    var line: [8192]u8 = undefined;
+    for (0..rows) |row| {
+        var w: usize = 0;
+        for (0..cols) |col| {
+            const tint: u8 = @intCast((row * cols + col) % 251);
+            const seq = std.fmt.bufPrint(
+                line[w..],
+                "\x1b[38;2;{d};{d};{d}m\x1b[48;2;{d};{d};{d}mX",
+                .{ tint, 255 - tint, tint / 2, 255 - tint, tint, tint / 3 },
+            ) catch break;
+            w += seq.len;
+        }
+        session.feed(line[0..w]);
+        session.feed("\r\n");
+    }
+}
+
 test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
     // A budget that was secretly 0 (unbounded) would still pass a test
     // that only asserts `len <= budget` on a quiet screen. This compares
@@ -388,7 +439,7 @@ test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
     const gpa = testing.allocator;
     const session = try grid.Session.create(std.heap.page_allocator, testing.io, 60, 40);
     defer session.destroy();
-    feedHostileRows(session, 60, 40);
+    feedTruecolorRows(session, 60, 40);
 
     const big = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
     defer gpa.free(big);
@@ -426,29 +477,50 @@ test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
     try testing.expect(unbounded_len > app.chrome_command_envelope); // the screen CAN overflow
     try testing.expect(bounded_len < unbounded_len); // the bound truncated it
     try testing.expect(bounded_len <= app.chrome_command_envelope);
+
+    // Truncation must be LOUD. Rows dropped off the bottom of the glass used
+    // to be indistinguishable from a short screen: the frame presented
+    // successfully and the missing rows were bare background. The painter now
+    // records the loss on the builder, which is the only way a caller can
+    // tell "the shell printed 40 rows and you are seeing all of them" from
+    // "you are seeing the first 30".
+    const loss = bounded.degradation orelse return error.TruncationWentUnreported;
+    try testing.expect(loss.produced < loss.requested);
+
+    // ...and the unbounded paint of the same screen reports nothing, so the
+    // signal tracks real loss rather than firing on every dense frame.
+    try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), unbounded.degradation);
 }
 
-test "ADVERSARIAL: either selected terminal gets the same full hostile-content budget" {
+test "ADVERSARIAL: either selected tab gets the same full hostile-content budget" {
     const gpa = testing.allocator;
     const sessions = try createSessions(58, 40);
+    defer for (sessions) |each| each.destroy();
     for (sessions) |session| feedHostileRows(session, 58, 40);
 
-    var model = app.initialModel(sessions);
+    const own = try createSession(58, 40);
+    var model = app.initialModel(own);
     defer app.deinitModel(&model);
-    var painted: [app.pane_count]usize = @splat(0);
-    var used: [app.pane_count]usize = @splat(0);
+    // A second TAB, so selecting either one hands the whole content area to
+    // its single pane.
+    const second = try model.provider.createTerminal();
+    _ = model.admitTab(second.id);
+    var painted: [2]usize = @splat(0);
+    var used: [2]usize = @splat(0);
     for (sessions, 0..) |session, index| {
-        model.selected_surface = .{ .terminal = app.initialTerminalRef(index) };
+        try testing.expect(model.selectTab(index));
         const frames = app.paneFrames(&model, geometry.SizeF.init(980, 640));
-        try testing.expect(frames[index].width > 0);
-        try testing.expectEqual(@as(f32, 0), frames[1 - index].width);
+        // The SELECTED tab's only pane owns the full content area, whichever
+        // tab it is: the budget can never depend on which one you picked.
+        try testing.expect(frames[0].width > 0);
+        try testing.expectEqual(@as(f32, 0), frames[1].width);
 
         const storage = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
         defer gpa.free(storage);
         var builder = canvas.Builder.init(storage);
         try grid.paint(session, &builder, .{
-            .frame = frames[index],
-            .background_frame = geometry.RectF.init(0, 0, 980, 640),
+            .frame = frames[0],
+            .background_frame = frames[0],
             .tokens = .{},
             .running = true,
             .focused = true,
@@ -506,7 +578,7 @@ test "ADVERSARIAL: encoded KEYS (not just text) reach one pty only" {
 
     // Move focus and repeat: the bytes must switch streams entirely.
     try pressKey(harness, app_iface, "2", .{ .primary = true });
-    try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try pressKey(harness, app_iface, "arrowup", .{});
     try testing.expect(app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len > 0);
     // Pane 0's stream did not grow.
@@ -526,7 +598,7 @@ test "ADVERSARIAL: the focus chord itself never leaks a byte to either child" {
     // Press AND release under kitty release reporting. The release omits
     // Command to model the modifier coming up first; the model-level
     // physical-key latch must still recognize and swallow it.
-    for (app_state.model.panes) |*pane| pane.session.feed("\x1b[>11u");
+    for (activeSlots(&app_state.model)) |*pane| pane.session.feed("\x1b[>11u");
     try pressKey(harness, app_iface, "2", .{ .primary = true });
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -558,8 +630,8 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
     var line: [32]u8 = undefined;
     for (0..200) |i| {
         const bytes = std.fmt.bufPrint(&line, "history {d}\r\n", .{i}) catch unreachable;
-        model.panes[0].session.feed(bytes);
-        model.panes[1].session.feed(bytes);
+        model.provider.slots[0].session.feed(bytes);
+        model.provider.slots[1].session.feed(bytes);
     }
     for (2..8) |frame_index| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
@@ -572,11 +644,11 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
     }
     try testing.expect(model.surface_size.width > 0);
 
-    const bottom0 = model.panes[0].session.scrollbar().offset;
-    const bottom1 = model.panes[1].session.scrollbar().offset;
+    const bottom0 = model.provider.slots[0].session.scrollbar().offset;
+    const bottom1 = model.provider.slots[1].session.scrollbar().offset;
     try testing.expect(bottom0 > 0 and bottom1 > 0);
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
-    const cell_h = model.panes[0].session.cell_height;
+    const cell_h = model.provider.slots[0].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
@@ -589,10 +661,10 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
     }
     std.debug.print(
         "\nMEASURED rail wheel isolation: pane0 {d}->{d}  pane1 {d}->{d}\n",
-        .{ bottom0, model.panes[0].session.scrollbar().offset, bottom1, model.panes[1].session.scrollbar().offset },
+        .{ bottom0, model.provider.slots[0].session.scrollbar().offset, bottom1, model.provider.slots[1].session.scrollbar().offset },
     );
-    try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
-    try testing.expectEqual(bottom1, model.panes[1].session.scrollbar().offset);
+    try testing.expectEqual(bottom0, model.provider.slots[0].session.scrollbar().offset);
+    try testing.expectEqual(bottom1, model.provider.slots[1].session.scrollbar().offset);
 }
 
 test "ADVERSARIAL: split wheel routing scrolls only the pane under the pointer" {
@@ -607,7 +679,7 @@ test "ADVERSARIAL: split wheel routing scrolls only the pane under the pointer" 
     const app_iface = app_state.app();
     const model = &app_state.model;
 
-    for (model.panes) |*pane| {
+    for (activeSlots(model)) |*pane| {
         var line: [32]u8 = undefined;
         for (0..200) |i| pane.session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{i}) catch unreachable);
     }
@@ -621,9 +693,17 @@ test "ADVERSARIAL: split wheel routing scrolls only the pane under the pointer" 
             .timestamp_ns = @as(u64, frame_index) * 1_000_000,
         } });
     }
-    const frames = app.paneFrames(model, size);
-    const bottom0 = model.panes[0].session.scrollbar().offset;
-    const bottom1 = model.panes[1].session.scrollbar().offset;
+    // Cmd+D made a THIRD terminal beside terminal 1. Address the two panes
+    // by what `resolvePanes` says is there, not by registry slot.
+    var resolved: [app.max_panes_per_tab]app.LayoutPane = undefined;
+    const resolved_count = app.resolvePanes(model, size, &resolved);
+    try testing.expectEqual(@as(usize, 2), resolved_count);
+    const left = model.provider.terminal(resolved[0].terminal) orelse return error.TestExpectedTerminal;
+    const right = model.provider.terminal(resolved[1].terminal) orelse return error.TestExpectedTerminal;
+    var filler: [32]u8 = undefined;
+    for (0..200) |i| right.session.feed(std.fmt.bufPrint(&filler, "history {d}\r\n", .{i}) catch unreachable);
+    const bottom0 = left.session.scrollbar().offset;
+    const bottom1 = right.session.scrollbar().offset;
     try testing.expect(bottom0 > 0 and bottom1 > 0);
 
     for (0..4) |_| {
@@ -631,13 +711,13 @@ test "ADVERSARIAL: split wheel routing scrolls only the pane under the pointer" 
             .window_id = 1,
             .label = app.canvas_label,
             .kind = .scroll,
-            .x = frames[1].x + frames[1].width / 2,
-            .y = frames[1].y + frames[1].height / 2,
-            .delta_y = model.panes[1].session.cell_height,
+            .x = resolved[1].rect.x + resolved[1].rect.width / 2,
+            .y = resolved[1].rect.y + resolved[1].rect.height / 2,
+            .delta_y = right.session.cell_height,
         } });
     }
-    try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
-    try testing.expect(model.panes[1].session.scrollbar().offset < bottom1);
+    try testing.expectEqual(bottom0, left.session.scrollbar().offset);
+    try testing.expect(right.session.scrollbar().offset < bottom1);
 }
 
 test "REGRESSION: the selected Terminal 2 frame receives wheel input before the first frame" {
@@ -657,22 +737,24 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
     try testing.expectEqual(size.height, model.surface_size.height);
     try pressKey(harness, app_iface, "2", .{ .primary = true });
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
-    try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[0].width);
-    try testing.expect(app.paneFrames(model, model.surface_size)[1].width > 0);
+    // Only the SELECTED tab resolves a pane at all, and it is the whole
+    // content area — resolve order, not attachment slot.
+    try testing.expect(app.paneFrames(model, model.surface_size)[0].width > 0);
+    try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[1].width);
 
     var line: [32]u8 = undefined;
     for (0..200) |i| {
         const bytes = std.fmt.bufPrint(&line, "history {d}\r\n", .{i}) catch unreachable;
-        model.panes[0].session.feed(bytes);
-        model.panes[1].session.feed(bytes);
+        model.provider.slots[0].session.feed(bytes);
+        model.provider.slots[1].session.feed(bytes);
     }
-    const bottom0 = model.panes[0].session.scrollbar().offset;
-    const bottom1 = model.panes[1].session.scrollbar().offset;
+    const bottom0 = model.provider.slots[0].session.scrollbar().offset;
+    const bottom1 = model.provider.slots[1].session.scrollbar().offset;
 
     // Aim squarely at the selected Terminal 2 surface.
-    try testing.expectEqual(app.Placement.secondary, model.focus_placement);
-    const target = app.paneFrames(model, model.surface_size)[1];
-    const cell_h = model.panes[1].session.cell_height;
+    try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
+    const target = app.paneFrames(model, model.surface_size)[0];
+    const cell_h = model.provider.slots[1].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
@@ -684,8 +766,8 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
         } });
     }
     // Terminal 2 scrolled; hidden Terminal 1 did not.
-    try testing.expect(model.panes[1].session.scrollbar().offset < bottom1);
-    try testing.expectEqual(bottom0, model.panes[0].session.scrollbar().offset);
+    try testing.expect(model.provider.slots[1].session.scrollbar().offset < bottom1);
+    try testing.expectEqual(bottom0, model.provider.slots[0].session.scrollbar().offset);
 }
 
 // -------------------------------------------------- A7: the validator's eyes
@@ -737,8 +819,8 @@ test "ADVERSARIAL: native-split proof shot preserves both independent terminals 
 
     // Both streams landed on their own emulator while only one surface
     // was visible, and neither saw the other's marker.
-    const left = app_state.model.panes[0].session.screenText();
-    const right = app_state.model.panes[1].session.screenText();
+    const left = app_state.model.provider.slots[0].session.screenText();
+    const right = app_state.model.provider.slots[1].session.screenText();
     try testing.expect(std.mem.indexOf(u8, left, "build step 14/14") != null);
     try testing.expect(std.mem.indexOf(u8, left, "RIGHT") == null);
     try testing.expect(std.mem.indexOf(u8, right, "Tue Jul 27") != null);

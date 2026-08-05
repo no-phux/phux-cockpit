@@ -11,6 +11,7 @@ const testing = std.testing;
 
 const createSession = support.createSession;
 const createSessions = support.createSessions;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 const expectCursorPaintKind = support.expectCursorPaintKind;
 const expectPaneCursorPaintKind = support.expectPaneCursorPaintKind;
@@ -55,7 +56,7 @@ fn feedAdversarialRows(session: *grid.Session, cols: usize, rows: usize) void {
     }
 }
 
-test "the grid paints real text runs with theme-derived ANSI and exact truecolor" {
+test "the grid paints real text runs with the engine's ANSI palette and exact truecolor" {
     const session = try createSession(30, 4);
     defer session.destroy();
     session.feed("plain \x1b[31mred\x1b[0m \x1b[38;2;10;200;30mexact\x1b[0m\r\n");
@@ -84,9 +85,30 @@ test "the grid paints real text runs with theme-derived ANSI and exact truecolor
                 }
                 if (std.mem.eql(u8, text.text, "red")) {
                     saw_red = true;
-                    // ANSI red derives from the destructive token while
-                    // the emulator palette entry is untouched.
-                    try testing.expectApproxEqAbs(tokens.colors.destructive.r, text.color.r, 0.01);
+                    // ANSI 1 is the TERMINAL's red, not the UI's error color.
+                    // This used to resolve through `tokens.colors.destructive`,
+                    // which meant `\x1b[31m` painted whatever hue the design
+                    // system happened to use for destructive buttons — a
+                    // number with no relationship to what every other terminal
+                    // shows. It now comes from the emulator's own palette.
+                    const expected = vt.color.default[1];
+                    try testing.expectApproxEqAbs(
+                        @as(f32, @floatFromInt(expected.r)) / 255.0,
+                        text.color.r,
+                        0.01,
+                    );
+                    try testing.expectApproxEqAbs(
+                        @as(f32, @floatFromInt(expected.g)) / 255.0,
+                        text.color.g,
+                        0.01,
+                    );
+                    try testing.expectApproxEqAbs(
+                        @as(f32, @floatFromInt(expected.b)) / 255.0,
+                        text.color.b,
+                        0.01,
+                    );
+                    // And it is specifically NOT the design token any more.
+                    try testing.expect(@abs(tokens.colors.destructive.r - text.color.r) > 0.01);
                 }
                 if (std.mem.eql(u8, text.text, "exact")) {
                     saw_exact = true;
@@ -159,13 +181,17 @@ test "a styled wide character's background covers both of its cells" {
         .selecting = false,
     });
     const cell_w = session.cell_width;
+    // ANSI 41 is the engine's own red now, not the destructive design token,
+    // so the run is identified by the palette entry the emulator actually
+    // resolves. What is under test here is the GEOMETRY — that the spacer
+    // tail extends the run — not which red it is.
+    const ansi_red = vt.color.default[1];
+    const expected_r = @as(f32, @floatFromInt(ansi_red.r)) / 255.0;
     var saw_two_cell_bg = false;
     for (builder.displayList().commands) |command| {
         switch (command) {
             .fill_rect => |fill| {
-                // The ANSI-41 run: destructive-derived red, starting at
-                // the row origin — its width must span BOTH cells.
-                if (std.math.approxEqAbs(f32, fill.fill.color.r, tokens.colors.destructive.r, 0.01) and
+                if (std.math.approxEqAbs(f32, fill.fill.color.r, expected_r, 0.01) and
                     fill.rect.x == 0 and fill.rect.width > cell_w * 1.5)
                 {
                     saw_two_cell_bg = true;
@@ -484,7 +510,7 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     // (i) The prompt's cell band holds INK: pixels that differ from the
     // grid background. The first text row starts at the grid origin;
     // sample generously across the first cell row.
-    const session = app_state.model.panes[0].session;
+    const session = app_state.model.provider.slots[0].session;
     const cell_w: usize = @intFromFloat(@max(1, session.cell_width));
     const cell_h: usize = @intFromFloat(@max(1, session.cell_height));
     const pane_frame = app.paneFrames(&app_state.model, geometry.SizeF.init(@floatFromInt(width), @floatFromInt(height)))[0];
@@ -533,8 +559,8 @@ test "switching terminal Works retains distinct id namespaces the diff accepts" 
     sessions[0].feed("PANEALPHA\r\n");
     sessions[1].feed("PANEBRAVO\r\n");
 
-    var command_storage: [app.pane_count][1024]canvas.CanvasCommand = undefined;
-    var lists: [app.pane_count]canvas.DisplayList = undefined;
+    var command_storage: [2][1024]canvas.CanvasCommand = undefined;
+    var lists: [2]canvas.DisplayList = undefined;
     for (sessions, 0..) |session, index| {
         var builder = canvas.Builder.init(&command_storage[index]);
         try grid.paint(session, &builder, .{
@@ -564,7 +590,7 @@ test "each selected terminal receives the full chrome command envelope" {
     defer for (sessions) |each| each.destroy();
     for (sessions) |session| feedAdversarialRows(session, 40, 40);
 
-    var painted: [app.pane_count]usize = @splat(0);
+    var painted: [2]usize = @splat(0);
     for (sessions, 0..) |session, index| {
         var commands: [2048]canvas.CanvasCommand = undefined;
         var builder = canvas.Builder.init(&commands);

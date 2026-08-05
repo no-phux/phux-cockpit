@@ -1,3 +1,11 @@
+//! The local terminal registry under the tab/tree model.
+//!
+//! Detach/attach are gone — a terminal is a LEAF of a tab's tree, not the
+//! occupant of a placement slot — so these were rewritten to pin the
+//! invariants that actually survive: identity is stable and never reissued,
+//! a hidden terminal stays live, and closing FREES its emulator instead of
+//! parking a tombstone against capacity.
+
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const app = @import("../main.zig");
@@ -6,7 +14,8 @@ const support = @import("support.zig");
 const geometry = native_sdk.geometry;
 const testing = std.testing;
 
-const createDefaultSessions = support.createDefaultSessions;
+const createDefaultSession = support.createDefaultSession;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 const startTwoPaneCockpit = support.startTwoPaneCockpit;
 const startCockpit = support.startCockpit;
@@ -15,7 +24,7 @@ const typeCanvasText = support.typeCanvasText;
 const pressCanvasKey = support.pressCanvasKey;
 const releaseCanvasKey = support.releaseCanvasKey;
 
-test "detached terminal stays live and moved input and resize follow identity" {
+test "a hidden tab's terminal stays live and input and resize follow identity" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -27,17 +36,15 @@ test "detached terminal stays live and moved input and resize follow identity" {
     const terminal = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const original_session = terminal.session;
 
-    app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
-    try testing.expectEqual(@as(?app.TerminalRef, null), model.attachments[app.Placement.primary.index()]);
-    try app_state.effects.feedPtyOutput(app.ptyKey(0), "DETACHED LIVE\r\n");
+    app.update(model, .{ .select_position = 1 }, &app_state.effects);
+    try app_state.effects.feedPtyOutput(app.ptyKey(0), "HIDDEN LIVE\r\n");
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
     try testing.expectEqual(app.Phase.live, terminal.phase);
-    try testing.expect(std.mem.indexOf(u8, terminal.session.screenText(), "DETACHED LIVE") != null);
+    try testing.expect(std.mem.indexOf(u8, terminal.session.screenText(), "HIDDEN LIVE") != null);
 
-    app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
-    app.update(model, .{ .attach_terminal = .{ .placement = .secondary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
+    // Selecting it back reveals the SAME emulator; nothing is recreated.
     app.update(model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } }, &app_state.effects);
-    try testing.expect(model.terminalAt(.secondary).?.session == original_session);
+    try testing.expect(model.provider.terminal(app.initialTerminalRef(0)).?.session == original_session);
 
     try typeCanvasText(harness, app_state.app(), "moved");
     try testing.expect(std.mem.endsWith(u8, app_state.effects.ptyWrittenBytes(app.ptyKey(0)), "moved"));
@@ -58,7 +65,7 @@ test "detached terminal stays live and moved input and resize follow identity" {
     try testing.expectEqual(other_rows, other.rows);
 }
 
-test "attachment changes keep selected and focused placements routable" {
+test "leaving for Web leaves nothing routable, and returning restores the tab" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -68,39 +75,24 @@ test "attachment changes keep selected and focused placements routable" {
     defer app_state.deinit();
     const model = &app_state.model;
 
-    app.update(model, .{ .detach_terminal = .primary }, &app_state.effects);
+    app.update(model, .{ .select_position = 1 }, &app_state.effects);
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
-    try testing.expectEqual(app.Placement.secondary, model.focus_placement);
 
-    app.update(model, .{ .detach_terminal = .secondary }, &app_state.effects);
+    app.update(model, .{ .select_surface = .web }, &app_state.effects);
     try testing.expectEqual(@as(?app.TerminalRef, null), model.focusedTerminalRef());
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
     try releaseCanvasKey(harness, app_state.app(), "f1", .{});
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
-    try harness.runtime.dispatchPlatformEvent(app_state.app(), .frame_requested);
-    var saw_detached_semantics = false;
-    var saw_disabled_split = false;
-    for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.indexOf(u8, layout.widget.semantics.label, "Terminal 2, native terminal, detached") != null) {
-            saw_detached_semantics = true;
-        }
-        if (std.mem.eql(u8, layout.widget.text, "Split") and layout.widget.state.disabled) {
-            saw_disabled_split = true;
-        }
-    }
-    try testing.expect(saw_detached_semantics);
-    try testing.expect(saw_disabled_split);
 
-    app.update(model, .{ .attach_terminal = .{ .placement = .primary, .terminal_ref = app.initialTerminalRef(0) } }, &app_state.effects);
+    app.update(model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } }, &app_state.effects);
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
-    try testing.expectEqual(app.Placement.primary, model.focus_placement);
-    try typeCanvasText(harness, app_state.app(), "reattached");
-    try testing.expectEqualStrings("reattached", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
+    try typeCanvasText(harness, app_state.app(), "back");
+    try testing.expectEqualStrings("back", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-test "terminal key release follows its press across attachment focus changes" {
+test "terminal key release follows its press across tab focus changes" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -114,10 +106,12 @@ test "terminal key release follows its press across attachment focus changes" {
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
     const after_press = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
     try testing.expect(after_press > 0);
-    app.update(&app_state.model, .{ .detach_terminal = .primary }, &app_state.effects);
-    try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
+    app.update(&app_state.model, .{ .select_position = 1 }, &app_state.effects);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try releaseCanvasKey(harness, app_state.app(), "f1", .{});
 
+    // The release belongs to the terminal that saw the press, not to
+    // whatever holds focus when it arrives.
     try testing.expect(app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len > after_press);
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
@@ -134,9 +128,11 @@ test "terminal key release from an ended generation cannot reach its replacement
     pane.session.feed("\x1b[>11u");
 
     try pressCanvasKey(harness, app_state.app(), "f1", .{});
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    // An ABNORMAL exit, so the pane survives and can be restarted; a clean
+    // one would close the pane and take the terminal with it.
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 2, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
-    app.update(&app_state.model, .{ .restart = .primary }, &app_state.effects);
+    app.update(&app_state.model, .{ .restart = app.initialTerminalRef(0) }, &app_state.effects);
     const replacement_bytes = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
 
     try releaseCanvasKey(harness, app_state.app(), "f1", .{});
@@ -144,35 +140,54 @@ test "terminal key release from an ended generation cannot reach its replacement
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-test "topology registry creates four unique terminals and refuses a fifth" {
+test "the registry mints unique terminals up to its raised ceiling" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
     defer stopCockpit(state);
 
-    try testing.expectEqual(@as(usize, 2), state.model.terminal_count);
-    try testing.expectEqual(@as(usize, 2), state.effects.pendingPtyCount());
+    // One terminal at launch, not two: sessions are allocated when a
+    // terminal is asked for.
+    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .shortcut = .{
         .id = "terminal.new",
         .key = "t",
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, app.max_terminal_count), state.model.terminal_count);
-    try testing.expectEqual(@as(usize, app.max_terminal_count), state.model.provider.activeCount());
-    try testing.expectEqual(@as(usize, app.max_terminal_count), state.effects.pendingPtyCount());
+    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
 
-    for (state.model.terminal_order[0..state.model.terminal_count], 0..) |id, index| {
+    // Four terminals is what the fake pty executor can hold in flight, so
+    // that is where the identity checks run.
+    while (state.model.tab_count < 4) app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(@as(usize, 4), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 4), state.model.provider.activeCount());
+    try testing.expectEqual(@as(usize, 4), state.effects.pendingPtyCount());
+
+    var seen: [app.max_tabs]app.TerminalRef = undefined;
+    for (0..state.model.tab_count) |index| {
+        const id = state.model.tabTerminal(index) orelse return error.TestExpectedTerminal;
         const pane = state.model.provider.terminal(id) orelse return error.TestExpectedTerminal;
         try testing.expectEqual(@as(u64, index + 1), pane.pty_key);
         try testing.expectEqualSlices([]const u8, app.paneArgv(0), pane.argv);
-        for (state.model.terminal_order[0..index]) |prior| try testing.expect(!prior.eql(id));
+        for (seen[0..index]) |prior| try testing.expect(!prior.eql(id));
+        seen[index] = id;
     }
 
+    // The old ceiling was FOUR terminals for the whole app. Keep going: the
+    // registry now holds 32 and the tab list 16.
+    while (state.model.tab_count < app.max_tabs) app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(app.max_tabs, state.model.tab_count);
+    try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
+
+    // Past the tab ceiling nothing is minted, and no orphan terminal is left
+    // behind in the registry either.
     app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, app.max_terminal_count), state.model.terminal_count);
-    try testing.expectEqual(@as(usize, app.max_terminal_count), state.effects.pendingPtyCount());
+    try testing.expectEqual(app.max_tabs, state.model.tab_count);
+    try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
+
+    // Cmd+W over the Web surface owns no terminal, so it closes nothing.
     app.update(&state.model, .{ .select_surface = .web }, &state.effects);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .shortcut = .{
         .id = "terminal.close",
@@ -180,31 +195,33 @@ test "topology registry creates four unique terminals and refuses a fifth" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(state.model.selected_surface.eql(.web));
-    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        try testing.expect(!std.mem.eql(u8, node.widget.text, "Close"));
-    }
-    try testing.expectEqual(@as(usize, app.max_terminal_count), state.model.terminal_count);
+    try testing.expect(state.model.selectedSurface().eql(.web));
+    try testing.expectEqual(app.max_tabs, state.model.tab_count);
     try testing.expect(app.onCommand("terminal.new") != null);
     try testing.expect(app.onCommand("terminal.close") != null);
+    try testing.expect(app.onCommand("pane.split-right") != null);
+    try testing.expect(app.onCommand("pane.split-down") != null);
     try testing.expect(app.onCommand("tab.move-left") != null);
     try testing.expect(app.onCommand("tab.move-right") != null);
 }
 
-test "close tombstones one PTY and stale events cannot reach its replacement" {
+test "close frees the terminal eagerly and its slot is immediately reusable" {
+    // The `.closing` tombstone is gone. It held a registry slot and leaked a
+    // whole emulator until a pty exit that might never arrive.
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
     defer stopCockpit(state);
     app.update(&state.model, .new_terminal, &state.effects);
     app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
 
     const closed_id = state.model.selectedTerminalId() orelse return error.TestExpectedTerminal;
-    const closed = state.model.provider.terminal(closed_id) orelse return error.TestExpectedTerminal;
-    const closed_key = closed.pty_key;
-    var survivor_keys: [app.max_terminal_count - 1]u64 = undefined;
+    const closed_key = state.model.provider.terminal(closed_id).?.pty_key;
+    var survivor_keys: [app.max_tabs]u64 = undefined;
     var survivor_count: usize = 0;
-    for (state.model.terminal_order[0..state.model.terminal_count]) |id| {
+    for (0..state.model.tab_count) |index| {
+        const id = state.model.tabTerminal(index) orelse continue;
         if (id.eql(closed_id)) continue;
         survivor_keys[survivor_count] = state.model.provider.terminal(id).?.pty_key;
         survivor_count += 1;
@@ -216,33 +233,26 @@ test "close tombstones one PTY and stale events cannot reach its replacement" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(@as(usize, 3), state.model.terminal_count);
+    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
     try testing.expect(state.model.selectedTerminalId() != null);
-    try testing.expect(state.model.selectedPlacement() != null);
-    try testing.expect(state.model.focusedTerminalId() != null);
     try testing.expect(state.model.provider.terminal(state.model.focusedTerminalId().?) != null);
+    // Gone from the registry the moment it closed, not parked.
     try testing.expect(state.model.provider.terminal(closed_id) == null);
-    try testing.expect(state.model.provider.terminalForPty(closed_key) != null);
+    try testing.expect(state.model.provider.terminalForPty(closed_key) == null);
+    try testing.expectEqual(@as(usize, 2), state.model.provider.activeCount());
     try testing.expect(state.effects.ptyKillRequested(closed_key));
     for (survivor_keys[0..survivor_count]) |key| try testing.expect(!state.effects.ptyKillRequested(key));
 
-    // All four provider slots remain occupied until this exact kill exits.
+    // The freed slot is available RIGHT AWAY, with fresh identity.
     app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, 3), state.model.terminal_count);
-    try state.effects.feedPtyOutput(closed_key, "late but still owned");
-    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
-    try state.effects.feedPtyExit(closed_key, -1, 0, .cancelled, 0);
-    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
-    try testing.expect(state.model.provider.terminalForPty(closed_key) == null);
-
-    app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, 4), state.model.terminal_count);
+    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
     const replacement_id = state.model.selectedTerminalId() orelse return error.TestExpectedTerminal;
     const replacement = state.model.provider.terminal(replacement_id) orelse return error.TestExpectedTerminal;
     try testing.expect(!replacement_id.eql(closed_id));
     try testing.expect(replacement.pty_key > closed_key);
     const replacement_bytes = replacement.output_bytes;
 
+    // Late events for the retired key resolve to no slot and are dropped.
     app.update(&state.model, .{ .shell = .{
         .key = closed_key,
         .kind = .output,
@@ -250,9 +260,16 @@ test "close tombstones one PTY and stale events cannot reach its replacement" {
     } }, &state.effects);
     try testing.expectEqual(replacement_bytes, replacement.output_bytes);
     try testing.expectEqual(app.Phase.starting, replacement.phase);
+    app.update(&state.model, .{ .shell = .{
+        .key = closed_key,
+        .kind = .exit,
+        .code = -1,
+        .reason = .cancelled,
+    } }, &state.effects);
+    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
 }
 
-test "reordering preserves terminal identity process generation and attachments" {
+test "reordering preserves terminal identity, process generation, and pane structure" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
@@ -273,55 +290,56 @@ test "reordering preserves terminal identity process generation and attachments"
     } });
     app.update(&state.model, .{ .move_terminal = -1 }, &state.effects);
 
+    // Moving a tab moves the WHOLE tree, and selection rides along with it.
     try testing.expectEqual(selected, state.model.selectedTerminalId().?);
-    try testing.expectEqual(@as(usize, 1), state.model.terminalOrderIndex(selected).?);
+    try testing.expectEqual(@as(usize, 0), state.model.tabOfTerminal(selected).?);
+    try testing.expectEqual(@as(usize, 0), state.model.selected_tab);
     const moved = state.model.provider.terminal(selected) orelse return error.TestExpectedTerminal;
     try testing.expect(moved.session == session);
     try testing.expectEqual(key, moved.pty_key);
     try testing.expectEqual(generation, moved.session_generation);
-    try testing.expectEqual(@as(usize, 4), state.effects.pendingPtyCount());
-    try testing.expect(state.model.selectedPlacement() != null);
+    try testing.expectEqual(@as(usize, 3), state.effects.pendingPtyCount());
 
-    app.update(&state.model, .toggle_split, &state.effects);
-    try testing.expectEqual(app.LayoutMode.split, state.model.layout);
-    try testing.expect(state.model.attachments[0] != null);
-    try testing.expect(state.model.attachments[1] != null);
-    try testing.expect(!state.model.attachments[0].?.eql(state.model.attachments[1].?));
-    for (state.model.attachments) |attached| try testing.expect(state.model.provider.terminal(attached.?) != null);
+    // Splitting that tab adds a pane to the tab that moved, not a new tab.
+    app.update(&state.model, .split_right, &state.effects);
+    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 2), state.model.tabs[0].paneCount());
+    var refs: [app.max_panes_per_tab]app.TerminalRef = undefined;
+    const count = state.model.tabs[0].terminals(&refs);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(!refs[0].eql(refs[1]));
+    for (refs[0..count]) |id| try testing.expect(state.model.provider.terminal(id) != null);
 }
 
-test "closing terminal discards stale output and generated replies until its exact exit" {
+test "closing a live terminal kills its pty and stops accepting its output" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
     defer stopCockpit(state);
+    app.update(&state.model, .new_terminal, &state.effects);
 
     const closed_id = state.model.selectedTerminalId().?;
-    const closed = state.model.provider.terminal(closed_id).?;
-    const key = closed.pty_key;
-    const bytes_before = closed.output_bytes;
+    const key = state.model.provider.terminal(closed_id).?.pty_key;
     const writes_before = state.effects.ptyWrittenBytes(key).len;
     app.update(&state.model, .close_terminal, &state.effects);
-    try testing.expect(state.model.provider.isClosing(closed_id));
+    try testing.expect(state.model.provider.terminal(closed_id) == null);
+    try testing.expect(state.effects.ptyKillRequested(key));
 
-    // DSR would mutate the screen and enqueue a cursor-position reply if the
-    // closing resource were still allowed to ingest output.
+    // DSR would enqueue a cursor-position reply if the retired terminal
+    // could still ingest output. It resolves to no slot, so nothing happens.
     try state.effects.feedPtyOutput(key, "STALE\x1b[6n\r\n");
     try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
-    try testing.expectEqual(bytes_before, closed.output_bytes);
-    try testing.expectEqual(@as(usize, 0), closed.session.pendingResponses().len);
     try testing.expectEqual(writes_before, state.effects.ptyWrittenBytes(key).len);
-    try testing.expect(std.mem.indexOf(u8, closed.session.screenText(), "STALE") == null);
-    try testing.expect(state.model.provider.isClosing(closed_id));
 
     try state.effects.feedPtyExit(key, -1, 0, .cancelled, 0);
     try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
     try testing.expect(state.model.provider.terminalForPty(key) == null);
+    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
 }
 
 test "terminal identity allocation rejects exhaustion reserved keys and duplicates" {
-    const sessions = try createDefaultSessions();
-    var model = try app.initialModelWithIo(testing.allocator, testing.io, sessions);
+    const session = try createDefaultSession();
+    var model = try app.initialModelWithIo(testing.allocator, testing.io, session);
     defer app.deinitModel(&model);
 
     model.provider.next_terminal_raw = std.math.maxInt(u64) - 1;

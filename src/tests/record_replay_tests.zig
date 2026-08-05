@@ -8,7 +8,8 @@ const geometry = native_sdk.geometry;
 const testing = std.testing;
 const TerminalApp = support.TerminalApp;
 
-const createSessions = support.createSessions;
+const createSession = support.createSession;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 const startFocusedTerminal = support.startFocusedTerminal;
 
@@ -58,11 +59,10 @@ fn recordTerminalSession(
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.session_recorder = recorder;
 
-    const sessions = try createSessions(80, 24);
-    const session = sessions[0];
+    const session = try createSession(80, 24);
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     defer app.deinitModel(&app_state.model);
     defer app_state.deinit();
     app_state.effects.executor = .fake;
@@ -79,13 +79,13 @@ fn recordTerminalSession(
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     // init_fx spawned the shell against the fake pty.
-    try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
+    try testing.expectEqual(@as(usize, 1), app_state.effects.pendingPtyCount());
 
     // The scripted shell: prompt, then a typed command's echo + output.
     try app_state.effects.feedPtyOutput(1, "demo$ ");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
-    try testing.expectEqual(app.Phase.live, app_state.model.panes[0].phase);
+    try testing.expectEqual(app.Phase.live, app_state.model.provider.slots[0].phase);
 
     // Focus the surface with a click (a real session focuses on first
     // click/key), then type: committed text routes to the app as
@@ -109,10 +109,10 @@ fn recordTerminalSession(
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     // The session ends.
-    try app_state.effects.feedPtyExit(1, 0, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(1, 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
-    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
 
     recorder.finish();
     try testing.expect(!recorder.failed);
@@ -170,11 +170,10 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     defer harness.destroy(gpa);
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
-    const sessions = try createSessions(80, 24);
-    const session = sessions[0];
+    const session = try createSession(80, 24);
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     defer app.deinitModel(&app_state.model);
     defer app_state.deinit();
 
@@ -196,5 +195,5 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     const screen = try session.plainText(gpa);
     defer gpa.free(screen);
     try testing.expectEqualStrings(recorded.screen[0..recorded.screen_len], screen[0..recorded.screen_len]);
-    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
 }

@@ -3,6 +3,7 @@ const native_sdk = @import("native_sdk");
 const support = @import("../phux_support.zig");
 const provider_contract = @import("provider_contract");
 const model_module = @import("../model.zig");
+const layout = @import("../layout.zig");
 const app_types = @import("../app_types.zig");
 const pointer_input = @import("../pointer_input.zig");
 const update_module = @import("../update.zig");
@@ -14,6 +15,7 @@ const Model = model_module.Model;
 const Msg = app_types.Msg;
 const TerminalApp = app_types.TerminalApp;
 const LocalTerminalId = support.LocalTerminalId;
+const TerminalRef = support.TerminalRef;
 const canvas_label = scene_module.canvas_label;
 const webview_label = scene_module.webview_label;
 const localRef = support.localRef;
@@ -124,7 +126,7 @@ pub const CockpitHost = struct {
                 if (mask != 0 and (self.inner.model.consumed_shortcut_keys_held & mask) != 0) {
                     // Canvas handled key-down first. Do not execute the global
                     // copy, but own its eventual canvas release after focus.
-                    if (self.inner.model.selectedTerminalIndex() == null) {
+                    if (self.inner.model.selectedTerminalRef() == null) {
                         self.inner.model.consumed_shortcut_keys_held &= ~mask;
                     } else {
                         self.suppressed_canvas_shortcuts |= mask;
@@ -143,9 +145,9 @@ pub const CockpitHost = struct {
             },
             else => {},
         }
-        const selected_before = self.inner.model.selected_surface;
+        const selected_before = self.inner.model.selectedSurface();
         try self.inner_app.event(runtime, event_value);
-        if (!selected_before.eql(self.inner.model.selected_surface)) {
+        if (!selected_before.eql(self.inner.model.selectedSurface())) {
             const window_id = switch (event_value) {
                 .shortcut => |shortcut| shortcut.window_id,
                 .gpu_surface_input => |input| input.window_id,
@@ -160,7 +162,7 @@ pub const CockpitHost = struct {
                     !std.mem.startsWith(u8, shortcut.id, "layout.") and
                     !std.mem.startsWith(u8, shortcut.id, "pane.")) return;
                 try self.focusSelectedContent(runtime, shortcut.window_id);
-                if (self.inner.model.selectedTerminalIndex() != null) {
+                if (self.inner.model.selectedTerminalRef() != null) {
                     self.suppressed_canvas_shortcuts |= appShortcutKeyMask(shortcut.key);
                 }
             },
@@ -175,7 +177,7 @@ pub const CockpitHost = struct {
     }
 
     fn focusSelectedContent(self: *CockpitHost, runtime: *native_sdk.Runtime, window_id: native_sdk.platform.WindowId) !void {
-        const target = if (self.inner.model.selectedTerminalIndex() == null) webview_label else canvas_label;
+        const target = if (self.inner.model.selectedTerminalRef() == null) webview_label else canvas_label;
         try runtime.focusView(window_id, target);
         if (std.mem.eql(u8, target, canvas_label)) clearCanvasWidgetFocus(runtime, window_id);
     }
@@ -317,9 +319,16 @@ fn terminalInteractionWidgetId(id: LocalTerminalId) canvas.ObjectId {
 /// Routed widget pointer input reaches LOCAL terminals only: the remote path
 /// runs through the NSEvent monitor, which carries its own hit testing.
 fn terminalIdForInteractionWidget(model: *const Model, widget_id: canvas.ObjectId) ?LocalTerminalId {
-    for (model.terminal_order[0..model.terminal_count]) |id| {
-        const local = provider_contract.localId(id) orelse continue;
-        if (terminalInteractionWidgetId(local) == widget_id) return local;
+    // Every pane of every tab, not just one tab's: a widget id survives a tab
+    // switch, and routing must resolve it against the whole workspace.
+    for (0..model.tab_count) |tab_index| {
+        const tree = model.treeConst(tab_index) orelse continue;
+        var refs: [layout.max_panes]TerminalRef = undefined;
+        const count = tree.terminals(&refs);
+        for (refs[0..count]) |id| {
+            const local = provider_contract.localId(id) orelse continue;
+            if (terminalInteractionWidgetId(local) == widget_id) return local;
+        }
     }
     return null;
 }

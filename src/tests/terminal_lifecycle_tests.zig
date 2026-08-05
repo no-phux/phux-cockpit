@@ -29,8 +29,8 @@ test "restart during starting is a no-op - the original session is not duplicate
 
     // Still .starting (no output yet), one live pty. Cmd+R must not
     // respawn onto the occupied key.
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
-    try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
+    try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(@as(usize, 1), app_state.effects.pendingPtyCount());
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -38,8 +38,8 @@ test "restart during starting is a no-op - the original session is not duplicate
         .key = "r",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
-    try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
+    try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(@as(usize, 1), app_state.effects.pendingPtyCount());
 }
 
 test "restart resets every per-session counter and exit field" {
@@ -58,9 +58,9 @@ test "restart resets every per-session counter and exit field" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try app_state.effects.feedPtyExit(1, 0, 9, .signaled, 3);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
-    try testing.expectEqual(@as(u32, 3), app_state.model.panes[0].native_delivery_failures);
-    const pane = &app_state.model.panes[0];
+    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(@as(u32, 3), app_state.model.provider.slots[0].native_delivery_failures);
+    const pane = &app_state.model.provider.slots[0];
     const previous_generation = pane.session_generation;
     pane.selecting = true;
     pane.copied_bytes = 12;
@@ -128,31 +128,36 @@ test "healthy single-terminal mode omits lifecycle chrome" {
     }
 }
 
-test "split exposes lifecycle status for both visible terminals" {
+test "a split pane carries its lifecycle in accessibility, not in a pane header" {
+    // Rewritten: the 24pt `TERMINAL 2 / PHUX / RUNNING` per-pane header is
+    // gone (Ghostty has none, and it cost every split pane a row of grid).
+    // The detail it carried moved into the surface's accessibility label.
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
-    const app_state = try startTwoPaneCockpit(gpa, harness);
+    const app_state = try support.startSplitCockpit(gpa, harness);
     defer gpa.destroy(app_state);
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
-    try releaseCanvasKey(harness, app_iface, "d", .{});
     try app_state.effects.feedPtyExit(app.ptyKey(1), 9, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     const buffer = try gpa.alloc(u8, 128 * 1024);
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("split-status"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 1") != null);
-    // Visual split chrome shows only pane identity, while accessibility keeps
-    // the complete lifecycle detail available.
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 1 / RUNNING") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 2 / EXIT 9") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Restart Terminal 2") != null);
+    const snapshot = writer.buffered();
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1, native terminal, RUNNING") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 2, native terminal, EXIT 9") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Restart Terminal 2") != null);
+    // No pane header text of any kind is painted.
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        try testing.expect(std.mem.indexOf(u8, node.widget.text, "TERMINAL 1 /") == null);
+        try testing.expect(std.mem.indexOf(u8, node.widget.text, "TERMINAL 2 /") == null);
+    }
 }
 
 test "hidden terminal spawn failures mark tabs and distinguish failure reasons" {
@@ -169,10 +174,14 @@ test "hidden terminal spawn failures mark tabs and distinguish failure reasons" 
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
 
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    // Attention rides as a MARKER beside the tab, not as a `" !"` suffix
+    // welded onto the terminal's own name.
     var saw_hidden_marker = false;
     var saw_hidden_reason = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "Terminal 2 !")) saw_hidden_marker = true;
+        try testing.expect(!std.mem.eql(u8, layout.widget.text, "Terminal 2 !"));
+        if (std.mem.eql(u8, layout.widget.icon, "circle-dot")) saw_hidden_marker = true;
         if (std.mem.indexOf(u8, layout.widget.semantics.label, "SPAWN FAILED") != null) saw_hidden_reason = true;
     }
     try testing.expect(saw_hidden_marker);
@@ -180,9 +189,12 @@ test "hidden terminal spawn failures mark tabs and distinguish failure reasons" 
 
     try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .rejected, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    // The focused pane's own abnormal end is the ONE piece of lifecycle
+    // that stays as chrome, because Restart has to be reachable.
     var saw_rejected = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "TERMINAL 1 / SPAWN REJECTED")) saw_rejected = true;
+        if (std.mem.eql(u8, layout.widget.text, "SPAWN REJECTED")) saw_rejected = true;
     }
     try testing.expect(saw_rejected);
 }
@@ -199,7 +211,7 @@ test "lifecycle and loss diagnostics remain visible beside native delivery failu
 
     try app_state.effects.feedPtyExit(app.ptyKey(0), 23, 0, .exited, 4);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    const pane = &app_state.model.panes[0];
+    const pane = &app_state.model.provider.slots[0];
     pane.outbound_dropped = 7;
     pane.session.response_bytes_dropped = 2;
     pane.copy_failed = true;
@@ -210,50 +222,54 @@ test "lifecycle and loss diagnostics remain visible beside native delivery failu
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("terminal-diagnostics"), &writer);
     const snapshot = writer.buffered();
-    try testing.expect(std.mem.indexOf(u8, snapshot, "TERMINAL 1 / EXIT 23") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "OUTBOUND LOSS 7B") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "REPLY LOSS 2B") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "DELIVERY FAILURES 4") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "COPY FAILED") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "I/O LOSS") != null);
+    // Every number a screen reader needs is still there, in the one place
+    // that keeps it: the accessibility label.
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1, native terminal, EXIT 23") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "outbound loss 7 bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "reply loss 2 bytes") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "native delivery failures 4") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "copy failed") != null);
 }
 
-test "restart controls target their placement and Cmd+R targets focus" {
+test "restart targets the focused pane, and only an abnormal end offers it" {
+    // Rewritten for the tree model: a pane is not a placement slot, so
+    // Restart names a TERMINAL. And a CLEAN exit no longer leaves anything
+    // to restart — it closes its pane — so only abnormal ends reach here.
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
-    const app_state = try startTwoPaneCockpit(gpa, harness);
+    const app_state = try support.startSplitCockpit(gpa, harness);
     defer gpa.destroy(app_state);
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
-    try releaseCanvasKey(harness, app_iface, "d", .{});
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 3, 0, .exited, 0);
     try app_state.effects.feedPtyExit(app.ptyKey(1), 9, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    // Both panes survive an abnormal end.
+    try testing.expectEqual(@as(usize, 2), app_state.model.tabs[0].paneCount());
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
-    const secondary_restart = widgetFrameBySemantics(harness, "Restart Terminal 2") orelse return error.TestExpectedRestart;
-    const secondary_generation = app_state.model.panes[1].session_generation;
-    const secondary_target = rectCenter(secondary_restart);
-    try clickCanvas(harness, app_iface, secondary_target.x, secondary_target.y);
-    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[1].phase);
-    try testing.expect(app_state.model.panes[1].session_generation != secondary_generation);
+    // The split focused the pane it created — terminal 2 — so the band
+    // offers exactly that pane's Restart.
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
+    const second_restart = widgetFrameBySemantics(harness, "Restart Terminal 2") orelse return error.TestExpectedRestart;
+    const second_generation = app_state.model.provider.slots[1].session_generation;
+    const second_target = rectCenter(second_restart);
+    try clickCanvas(harness, app_iface, second_target.x, second_target.y);
+    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[1].phase);
+    try testing.expect(app_state.model.provider.slots[1].session_generation != second_generation);
 
-    const primary_restart = widgetFrameBySemantics(harness, "Restart Terminal 1") orelse return error.TestExpectedRestart;
-    const primary_target = rectCenter(primary_restart);
-    try clickCanvas(harness, app_iface, primary_target.x, primary_target.y);
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
-
-    try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .exited, 0);
-    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    app.update(&app_state.model, .{ .focus_pane = .secondary }, &app_state.effects);
-    const cmd_generation = app_state.model.panes[1].session_generation;
+    // Cycling focus to the other pane brings ITS Restart into the band, and
+    // Cmd+R hits the same pane.
+    app.update(&app_state.model, .{ .cycle_pane = -1 }, &app_state.effects);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
+    const cmd_generation = app_state.model.provider.slots[0].session_generation;
     try pressCanvasKey(harness, app_iface, "r", .{ .primary = true });
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[1].phase);
-    try testing.expect(app_state.model.panes[1].session_generation != cmd_generation);
+    try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[0].phase);
+    try testing.expect(app_state.model.provider.slots[0].session_generation != cmd_generation);
 }
 
 test "terminal exit and selection mode are actionable in native chrome" {
@@ -268,23 +284,24 @@ test "terminal exit and selection mode are actionable in native chrome" {
 
     try app_state.effects.feedPtyExit(app.ptyKey(0), 127, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     var saw_missing = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "TERMINAL 1 / EXIT 127")) {
+        if (std.mem.eql(u8, layout.widget.text, "EXIT 127")) {
             saw_missing = true;
             try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
         }
     }
     try testing.expect(saw_missing);
 
-    // The second terminal remains usable and exposes selection state without
-    // turning the command band into a permanent shortcut legend.
+    // The second terminal remains usable, and arming a selection is NOT an
+    // occasion to paint a badge: the state rides in accessibility.
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
     try pressCanvasKey(harness, app_iface, "space", .{ .primary = true, .shift = true });
-    var saw_selecting = false;
+    try testing.expect(app_state.model.provider.slots[1].selecting);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "SELECTING")) saw_selecting = true;
+        try testing.expect(!std.mem.eql(u8, layout.widget.text, "SELECTING"));
         try testing.expect(!std.mem.eql(u8, layout.widget.text, "Arrows move | Shift extends | Enter copies | Esc cancels"));
     }
-    try testing.expect(saw_selecting);
 }

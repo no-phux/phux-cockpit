@@ -72,14 +72,22 @@ pub const Session = struct {
     response_buffer: []u8 = &.{},
     response_len: usize = 0,
     response_bytes_dropped: u64 = 0,
-    /// Cached viewport plain text (see `refreshScreenText`): the grid's
+    /// Cached viewport plain text (see `screenText`): the grid's
     /// accessibility surface and the fingerprint's cell-state coverage.
-    /// Heap-owned and EXACT — each refresh keeps the renderer's whole
-    /// allocation, so the semantic text is never truncated (or cut
-    /// mid-scalar) by an intermediate buffer: what paints is what
-    /// assistive tech reads and what the fingerprint hashes. Empty
-    /// means "unknown", never "same as before".
-    screen_text: []const u8 = &.{},
+    /// Heap-owned, GROWN TO FIT, and reused across refreshes — the
+    /// serialization is O(viewport) and used to run on every pty output
+    /// batch, for background tabs nobody paints, reallocating each time.
+    /// It is now computed LAZILY: writers mark `screen_text_dirty` and
+    /// only `screenText` pays, so a session that is never read never
+    /// serializes. The stored text is EXACT (never truncated or cut
+    /// mid-scalar): what paints is what assistive tech reads and what
+    /// the fingerprint hashes. A zero length means "unknown", never
+    /// "same as before".
+    screen_text_buf: []u8 = &.{},
+    screen_text_len: usize = 0,
+    /// The screen changed since the cached text was produced. Starts set
+    /// so a session read before any feed still serializes once.
+    screen_text_dirty: bool = true,
     /// Keyboard-selection state: the anchor stays put, the head moves.
     select_anchor: ?CellPos = null,
     select_head: CellPos = .{},
@@ -132,15 +140,28 @@ pub const Session = struct {
 
     /// The app feeds output in sub-slices no larger than this, draining
     /// answers after each, so a burst of pipelined query replies cannot
-    /// outrun the response buffer within one feed. A reply can be several
-    /// times its triggering query (XTVERSION and the primary DA answer a
-    /// ~4-byte request with ~25 bytes), so the slice is the buffer scaled
-    /// down by a generous worst-case expansion factor: even an unbroken
-    /// run of the shortest high-expansion query across a full slice
-    /// produces fewer reply bytes than the buffer holds. That keeps the
-    /// write-back lossless; `response_bytes_dropped` stays the honest fallback
-    /// count should a reply ever overflow anyway.
-    pub const feed_slice_bytes: usize = response_capacity / 16;
+    /// outrun the response buffer within one feed.
+    ///
+    /// Matched to the response buffer rather than a fraction of it: the
+    /// slice size is a PARSER-THROUGHPUT knob, and a 1 KiB slice split a
+    /// routine 64 KiB pty batch into 64 parser entries, each followed by
+    /// a full response drain and outbound flush — 64x the per-slice
+    /// overhead on the hottest path in the app. The response buffer no
+    /// longer needs the safety factor a fixed-capacity buffer did: it
+    /// GROWS TO FIT up to `response_capacity_max` (see `writePtyResponse`),
+    /// so a slice that does out-answer the initial capacity reallocates
+    /// instead of dropping, and `response_bytes_dropped` stays the honest
+    /// count should a reply ever overflow the ceiling anyway.
+    pub const feed_slice_bytes: usize = response_capacity;
+
+    /// Scrollback ceiling in BYTES (what libghostty's PageList takes),
+    /// not lines. The previous 1 MB was roughly a couple of PageList
+    /// pages — a few hundred rows — which is not scrollback, it is a
+    /// slightly taller screen. 50 MB is Ghostty's own default and holds
+    /// the hundreds of thousands of rows a build log or a `git log`
+    /// actually produces. The pages are allocated on demand, so an idle
+    /// session still costs one page.
+    pub const max_scrollback: usize = 50_000_000;
 
     pub fn create(gpa: std.mem.Allocator, io: std.Io, initial_cols: u16, initial_rows: u16) !*Session {
         const session = try gpa.create(Session);
@@ -150,7 +171,7 @@ pub const Session = struct {
             .term = try vt.Terminal.init(io, gpa, .{
                 .cols = @intCast(@min(initial_cols, max_cols)),
                 .rows = @intCast(@min(initial_rows, max_rows)),
-                .max_scrollback = 1_000_000,
+                .max_scrollback = max_scrollback,
             }),
             .stream = undefined,
             .render = .empty,
@@ -193,6 +214,15 @@ pub const Session = struct {
         // overrides) so ghostty itself composes the final foreground,
         // background, and cursor. Unchanged from the forked painter:
         // one color policy, owned by the emulator.
+        //
+        // The ANSI-16 palette is deliberately NOT pushed from here. It is
+        // the emulator's own (`vt.color.default`, installed by
+        // `Terminal.init`) and the projection reads it back verbatim: a
+        // terminal red must be a terminal red, not the UI's destructive
+        // token. Theming the palette is a `DynamicPalette.changeDefault`
+        // call away (it preserves OSC 4 overrides) whenever a real
+        // terminal color scheme exists to install; design tokens are not
+        // one.
         session.term.colors.foreground.default = themeRgb(tokens.colors.text);
         session.term.colors.background.default = themeRgb(tokens.colors.background);
         session.term.colors.cursor.default = themeRgb(tokens.colors.accent);
@@ -223,6 +253,20 @@ pub const Session = struct {
                 const bg = cellBackground(cell, &palette);
                 if (cp != 0 and cell.raw.style_id != 0) {
                     const style = cell.style;
+                    // `resolveFg` folds every attribute the painter can
+                    // actually carry into the resolved color: inverse
+                    // (fg/bg swap), faint (blend toward the background),
+                    // and bold-as-bright over the ANSI-8 range.
+                    //
+                    // `canvas.TerminalCell` carries a code point, a
+                    // cluster, two colors, ONE boolean underline, and a
+                    // wide flag — so italic, strikethrough, overline, the
+                    // underline STYLE (double/curly/dotted/dashed), the
+                    // underline COLOR, and a real bold weight have nowhere
+                    // to go and are dropped here rather than faked. Every
+                    // underline style collapses to the single line the
+                    // painter draws, which is the honest degradation:
+                    // "underlined" survives, its flavor does not.
                     fg = palette.resolveFg(style, bg);
                     underline = style.flags.underline != .none;
                     // An invisible cell resolves to "no ink" HERE so the
@@ -302,16 +346,29 @@ pub const Session = struct {
         // directly: `rs.cursor.viewport` is null when the cursor sits
         // outside the visible viewport (scrolled into history), which is
         // exactly the painter's "no cursor" case.
+        //
+        // Not projected, because `canvas.TerminalCursor` has nowhere to
+        // put them: the DECSCUSR blink bit (`rs.cursor.blinking`) and the
+        // two-column extent of a cursor sitting on a wide cell. Ghostty's
+        // custom hollow-block style collapses onto `.block` — the painter
+        // reserves hollow for the UNFOCUSED cue, which it drives itself
+        // from `TerminalPaintOptions.focused`.
         const cursor: ?canvas.TerminalCursor = blk: {
             if (!rs.cursor.visible) break :blk null;
             const vp = rs.cursor.viewport orelse break :blk null;
+            const x: u16 = @intCast(vp.x);
             break :blk .{
-                .x = @intCast(vp.x),
+                // A cursor whose left neighbor is a wide cell is sitting
+                // on that cell's SPACER tail — the half with no ink. Draw
+                // it on the primary instead, or a block cursor covers the
+                // blank half of a CJK character and the glyph itself
+                // stays unmarked.
+                .x = if (vp.wide_tail and x > 0) x - 1 else x,
                 .y = @intCast(vp.y),
                 .shape = switch (rs.cursor.visual_style) {
                     .bar => .bar,
                     .underline => .underline,
-                    else => .block,
+                    .block, .block_hollow => .block,
                 },
             };
         };
@@ -333,7 +390,7 @@ pub const Session = struct {
                 .len = @intCast(bar.len),
                 .total = @intCast(bar.total),
             },
-            .screen_text = session.screen_text,
+            .screen_text = session.screenText(),
         };
     }
 
@@ -366,7 +423,7 @@ pub const Session = struct {
         gpa.free(session.snap_rows);
         gpa.free(session.snap_cells);
         gpa.free(session.snap_text);
-        if (session.screen_text.len > 0) gpa.free(session.screen_text);
+        if (session.screen_text_buf.len > 0) gpa.free(session.screen_text_buf);
         gpa.destroy(session);
     }
 
@@ -375,6 +432,10 @@ pub const Session = struct {
     /// boundary keep parsing).
     pub fn feed(session: *Session, bytes: []const u8) void {
         session.stream.nextSlice(bytes);
+        // Output is the overwhelmingly common screen change; marking here
+        // (rather than serializing here) is what keeps the semantic text
+        // off the hot path entirely for panes nobody reads.
+        session.screen_text_dirty = true;
     }
 
     /// Hard-reset the emulator for a fresh session (a RIS): clears the
@@ -404,6 +465,7 @@ pub const Session = struct {
         session.clearSelection();
         session.select_head = .{};
         session.select_block = false;
+        session.screen_text_dirty = true;
     }
 
     /// Terminal query answers accumulated by the last feeds; the caller
@@ -462,6 +524,9 @@ pub const Session = struct {
         const r: vt.size.CellCountInt = @intCast(std.math.clamp(@as(usize, new_rows), 2, max_rows));
         if (c == session.term.cols and r == session.term.rows) return true;
         session.term.resize(session.gpa, .{ .cols = c, .rows = r }) catch return false;
+        // Reflow rewrites the viewport: the cached semantic text describes
+        // a grid that no longer exists.
+        session.screen_text_dirty = true;
         // Reflow moves every cell, so keyboard-selection coordinates
         // into the OLD grid are meaningless (and a caret past the new
         // edge would strand Shift+Arrow and copy on cells that no
@@ -505,11 +570,11 @@ pub const Session = struct {
 
     /// Every scroll goes through here: a scroll that actually MOVED the
     /// viewport changes what the screen shows, so the cached semantic
-    /// text refreshes with it — scrollback browsing must read (to
+    /// text is invalidated with it — scrollback browsing must read (to
     /// assistive tech) and fingerprint as the rows it paints, never the
     /// bottom viewport it left. The offset compare keeps the common
     /// no-op (`scrollToBottom` before typing while already pinned) from
-    /// re-rendering the screen text every keystroke.
+    /// invalidating the screen text every keystroke.
     fn scrollTracked(session: *Session, behavior: vt.PageList.Scroll) void {
         const before = session.scrollbar().offset;
         session.term.screens.active.pages.scroll(behavior);
@@ -780,31 +845,54 @@ pub const Session = struct {
         return session.term.plainString(gpa);
     }
 
-    /// Refresh the cached viewport text — the grid's ACCESSIBILITY
+    /// INVALIDATE the cached viewport text — the grid's ACCESSIBILITY
     /// surface (a terminal's semantic content IS its text) and, through
     /// the a11y tree, the session-fingerprint coverage of real cell
     /// state: two screens with identical byte counters but different
-    /// cells must never fingerprint alike. Called wherever the visible
-    /// screen changes (output feeds, resizes, the restart reset, and
-    /// scrolls that moved the viewport).
+    /// cells must never fingerprint alike.
+    ///
+    /// This used to SERIALIZE the whole viewport, and it is called from
+    /// every path that changes the screen — every pty output batch
+    /// included, for every session, painted or not. That put an
+    /// O(viewport) walk plus a fresh heap allocation on the hot path for
+    /// terminals nobody was looking at. It now only sets a flag;
+    /// `screenText` pays, once, and only when something actually reads.
     pub fn refreshScreenText(session: *Session) void {
-        const text = session.term.plainString(session.gpa) catch {
-            // Unknown beats stale: a screen we could not render must
-            // not keep reading (to assistive tech) or fingerprinting as
-            // the previous one — the emulator and the painted grid have
-            // already advanced. Empty is the loud degraded state (the
-            // view falls back to its static label, and any checkpoint
-            // over it diverges rather than false-verifying).
-            if (session.screen_text.len > 0) session.gpa.free(session.screen_text);
-            session.screen_text = &.{};
-            return;
-        };
-        if (session.screen_text.len > 0) session.gpa.free(session.screen_text);
-        session.screen_text = text;
+        session.screen_text_dirty = true;
     }
 
-    /// The cached viewport text (see `refreshScreenText`).
-    pub fn screenText(session: *const Session) []const u8 {
-        return session.screen_text;
+    /// The cached viewport text, recomputed on demand when the screen
+    /// moved under it (see `refreshScreenText`).
+    pub fn screenText(session: *Session) []const u8 {
+        if (session.screen_text_dirty) session.renderScreenText();
+        return session.screen_text_buf[0..session.screen_text_len];
+    }
+
+    /// Serialize the viewport into the reused, grown-to-fit text buffer.
+    /// `Writer.Allocating` keeps the previous frame's allocation and only
+    /// grows when a screen needs more than it already holds, so a steady
+    /// terminal serializes without touching the allocator at all.
+    fn renderScreenText(session: *Session) void {
+        const screen = session.term.screens.active;
+        var writer: std.Io.Writer.Allocating = .initOwnedSlice(session.gpa, session.screen_text_buf);
+        // The buffer is reclaimed on EVERY exit path — the allocating
+        // writer owns it while it runs and would free it on `deinit`.
+        defer session.screen_text_buf = writer.writer.buffer;
+        session.screen_text_dirty = false;
+        session.screen_text_len = 0;
+        const br = screen.pages.getBottomRight(.viewport) orelse return;
+        // Unknown beats stale: a screen we could not render must not keep
+        // reading (to assistive tech) or fingerprinting as the previous
+        // one — the emulator and the painted grid have already advanced.
+        // Empty is the loud degraded state (the view falls back to its
+        // static label, and any checkpoint over it diverges rather than
+        // false-verifying), and it persists until the next invalidation
+        // rather than retrying on every read.
+        screen.dumpString(&writer.writer, .{
+            .tl = screen.pages.getTopLeft(.viewport),
+            .br = br,
+            .unwrap = false,
+        }) catch return;
+        session.screen_text_len = writer.writer.end;
     }
 };

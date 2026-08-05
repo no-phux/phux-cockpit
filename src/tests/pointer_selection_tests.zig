@@ -66,7 +66,7 @@ test "pointer ownership survives focus and reorder but never crosses close gener
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const app_iface = host.app();
-    try host.inner.dispatch(&harness.runtime, 1, .toggle_split);
+    try host.inner.dispatch(&harness.runtime, 1, .split_right);
     const first = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const second = host.inner.model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(first.pty_key, "\x1b[?1002h\x1b[?1006h");
@@ -78,14 +78,14 @@ test "pointer ownership survives focus and reorder but never crosses close gener
 
     try pointerInput(harness, app_iface, .pointer_down, start, 0, .{}, 0);
     try testing.expectEqual(app.LocalTerminalId.terminal_1, activePointerCapture(&host.inner.model, 7).?.terminal_id);
-    try host.inner.dispatch(&harness.runtime, 1, .{ .focus_pane = .secondary });
+    try host.inner.dispatch(&harness.runtime, 1, .{ .cycle_pane = 1 });
     try host.inner.dispatch(&harness.runtime, 1, .{ .move_terminal = -1 });
     try pointerInput(harness, app_iface, .pointer_drag, across, 0, .{}, 0);
     try pointerInput(harness, app_iface, .pointer_up, across, 0, .{}, 0);
     try testing.expect(host.inner.effects.ptyWrittenBytes(first.pty_key).len > 0);
     try testing.expectEqualStrings("", host.inner.effects.ptyWrittenBytes(second.pty_key));
 
-    try host.inner.dispatch(&harness.runtime, 1, .{ .focus_pane = .primary });
+    try host.inner.dispatch(&harness.runtime, 1, .{ .cycle_pane = -1 });
     try pointerInput(harness, app_iface, .pointer_down, start, 0, .{}, 0);
     const before_close = host.inner.effects.ptyWrittenBytes(first.pty_key).len;
     try host.inner.dispatch(&harness.runtime, 1, .close_terminal);
@@ -185,13 +185,14 @@ test "pointer lifecycle matrix releases live owners once and fences restart gene
     frame = terminalInteractionFrame(harness, "MATRIX") orelse return error.TestExpectedTerminalInteractionSurface;
     point = terminalCellPoint(pane, frame, 1, 0);
 
-    // Detach and deactivation each release once while the owner is live.
+    // Hiding the pane behind the web surface, and deactivation, each release
+    // the capture exactly once while the owner is still live. (Detach/attach
+    // no longer exist: a pane belongs to a tree, not to a placement slot.)
     try pointerInput(harness, iface, .pointer_down, point, 0, .{}, 0);
     before_fence = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
-    try host.inner.dispatch(&harness.runtime, 1, .{ .detach_terminal = .primary });
+    try host.inner.dispatch(&harness.runtime, 1, .{ .select_surface = .web });
     after_fence = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
     try testing.expect(after_fence > before_fence);
-    try host.inner.dispatch(&harness.runtime, 1, .{ .attach_terminal = .{ .placement = .primary, .terminal_ref = pane.id } });
     try host.inner.dispatch(&harness.runtime, 1, .{ .select_surface = .{ .terminal = pane.id } });
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     frame = terminalInteractionFrame(harness, "MATRIX") orelse return error.TestExpectedTerminalInteractionSurface;
@@ -221,12 +222,17 @@ test "pointer lifecycle matrix releases live owners once and fences restart gene
 
     // An ended session can still be selected locally; restart cancels that
     // gesture and stale motion cannot select in the replacement generation.
-    try host.inner.effects.feedPtyExit(pane.pty_key, 0, 0, .exited, 0);
+    try host.inner.effects.feedPtyExit(pane.pty_key, 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    // The abnormal end pulls the band back, which moves the content area
+    // down: re-read the pane's rect before aiming at it again.
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    frame = terminalInteractionFrame(harness, "MATRIX") orelse return error.TestExpectedTerminalInteractionSurface;
+    point = terminalCellPoint(pane, frame, 1, 0);
     const old_generation = pane.session_generation;
     try pointerInputAdvanced(harness, iface, .pointer_down, point, .{});
     try testing.expectEqual(@as(usize, 1), activePointerCaptureCount(&host.inner.model));
-    try host.inner.dispatch(&harness.runtime, 1, .{ .restart = .primary });
+    try host.inner.dispatch(&harness.runtime, 1, .{ .restart = pane.id });
     try testing.expect(pane.session_generation != old_generation);
     try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
     try pointerInputAdvanced(harness, iface, .pointer_drag, terminalCellPoint(pane, frame, 4, 0), .{});
@@ -253,7 +259,7 @@ test "multiple pointer captures are isolated and hostile wheel values stay bound
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     const iface = host.app();
-    try host.inner.dispatch(&harness.runtime, 1, .toggle_split);
+    try host.inner.dispatch(&harness.runtime, 1, .split_right);
     const left = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const right = host.inner.model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
     try host.inner.effects.feedPtyOutput(left.pty_key, "\x1b[?1002h\x1b[?1006h");
@@ -527,7 +533,7 @@ test "secondary report gesture survives process exit cancel without menu takeove
     try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
     try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
 
-    try host.inner.effects.feedPtyExit(pane.pty_key, 0, 0, .exited, 0);
+    try host.inner.effects.feedPtyExit(pane.pty_key, 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     try testing.expectEqual(.ended, pane.phase);
     try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));

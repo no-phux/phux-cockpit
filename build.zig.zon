@@ -5,10 +5,16 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Native v0.8.1 plus Cockpit's terminal context-menu, full-viewport,
-        // paint-budget, and complete terminal-font fixes.
+        // paint-budget, and complete terminal-font fixes, plus the render
+        // cliff work on `fix/terminal-render-cliff`: the per-view command
+        // ceiling 2048 -> 4096 and text store 32 KiB -> 64 KiB (a realistic
+        // 200x60 styled screen painted 34 of 60 rows and lost the rest to
+        // bare background), row truncation reported instead of silent, and
+        // the growing-clip dirty region that left stale glyphs in columns a
+        // widening pane newly exposed.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/bfb8a4f0a5aa208e4b87b8bbcbd50600416db563.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQvnp3wFshwlSkBgy6HuXm2nvKyReV5DQReVqltfi",
+            .url = "https://github.com/phall1/native/archive/9703b8cea0c3eaaefb93928adf541ae1041de77b.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQlOX4AFYqdVuhsuBxWf3KBGuTL8SCBtk5nYgA4Fn",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

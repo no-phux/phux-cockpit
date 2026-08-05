@@ -4,6 +4,7 @@ const support = @import("../phux_support.zig");
 const local = @import("../../providers/local/provider.zig");
 const model_module = @import("../model.zig");
 const topology = @import("../topology.zig");
+const layout = @import("../layout.zig");
 const scene = @import("scene.zig");
 
 const canvas = native_sdk.canvas;
@@ -13,13 +14,18 @@ const Pane = local.Pane;
 const TerminalRef = support.TerminalRef;
 
 pub const grid_inset: f32 = 8;
-pub const header_height: f32 = 40;
+/// The tab band's height. It must be at least the register's own trigger
+/// height, or the strip overflows the band and paints its hairline and
+/// underline indicator down into the terminal's first row. The Geist pack
+/// computes 50 at the default control size (`metrics.tabs_trigger_height`),
+/// and `headerHeightCoversTriggers` pins the two together.
+pub const header_height: f32 = 50;
 pub const side_rail_width: f32 = 184;
 pub const side_rail_gap: f32 = 8;
 pub const side_tab_height: f32 = 34;
 pub const split_divider_width: f32 = 9;
 pub const split_pane_min_width: f32 = 240;
-pub const split_pane_header_height: f32 = 24;
+pub const split_pane_min_height: f32 = 80;
 pub const webkit_parking_extent = scene.webkit_parking_extent;
 const widget_command_reserve: usize = canvas.terminal_grid.widget_command_reserve;
 pub const chrome_command_envelope: usize = native_sdk.runtime.max_canvas_commands_per_view - widget_command_reserve;
@@ -44,6 +50,14 @@ pub fn cockpitTokens(_: *const Model) canvas.DesignTokens {
     return tokens;
 }
 
+/// The band must be able to contain the tab triggers it hosts. The register
+/// sizes an underline trigger from `metrics.tabs_trigger_height`, scaled by
+/// density and the widget's size rung; the strip declares no size rung, so
+/// the metric IS the height.
+pub fn tabTriggerHeight(model: *const Model) f32 {
+    return cockpitTokens(model).metrics.tabs_trigger_height;
+}
+
 pub fn paneLifecycleFailed(pane: *const Pane) bool {
     return pane.phase == .failed or (pane.phase == .ended and (pane.exit_reason != .exited or pane.exit_code != 0));
 }
@@ -64,28 +78,30 @@ pub fn terminalNeedsAttention(model: *const Model, id: TerminalRef) bool {
     return presentation.phase == .failed or presentation.phase == .tombstoned;
 }
 
-pub fn splitAvailable(model: *const Model) bool {
-    if (model.layout == .split) return true;
-    return model.terminal_count >= 2 and model.selectedPlacement() != null;
-}
-
 pub fn selectedTerminalCanClose(model: *const Model) bool {
     const terminal_ref = model.selectedTerminalRef() orelse return false;
     return support.providerKind(terminal_ref) == .local;
 }
 
 pub fn chromeRevealed(model: *const Model) bool {
-    if (model.terminal_count > 1) return true;
+    if (model.tab_count > 1) return true;
     if (model.selectedTerminalRef() == null) return true;
-    if (model.layout == .split) return true;
-    for (model.terminal_order[0..model.terminal_count]) |id| {
-        if (terminalNeedsAttention(model, id)) return true;
+    for (model.tabs[0..model.tab_count], 0..) |_, index| {
+        const current = model.treeConst(index) orelse continue;
+        var refs: [layout.max_panes]TerminalRef = undefined;
+        const count = current.terminals(&refs);
+        for (refs[0..count]) |id| {
+            if (terminalNeedsAttention(model, id)) return true;
+        }
     }
     return false;
 }
 
 pub const WorkspaceChrome = struct {
     titlebar_height: f32,
+    /// The band's own rect, so the header ground and its separator paint
+    /// exactly where the strip is laid out. Zero-height when at rest.
+    header: geometry.RectF,
     content: geometry.RectF,
 };
 
@@ -96,6 +112,12 @@ pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrom
     const top_extent = if (revealed and model.tab_placement == .top) header_height else 0;
     return .{
         .titlebar_height = titlebar,
+        .header = geometry.RectF.init(
+            grid_inset,
+            titlebar,
+            @max(0, size.width - grid_inset * 2),
+            top_extent,
+        ),
         .content = geometry.RectF.init(
             grid_inset + side_extent,
             titlebar + top_extent,
@@ -105,31 +127,50 @@ pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrom
     };
 }
 
-pub fn paneFrames(model: *const Model, size: geometry.SizeF) [local.pane_count]geometry.RectF {
-    const content = workspaceChrome(model, size).content;
-    var frames = [_]geometry.RectF{.{}} ** local.pane_count;
-    if (model.selectedTerminalIndex()) |selected| {
-        if (model.layout == .single) {
-            frames[selected] = content;
-        } else {
-            const available = @max(0, content.width - split_divider_width);
-            const fraction = canvas.splitEffectiveFraction(
-                model.split_fraction,
-                available,
-                split_pane_min_width,
-                split_pane_min_width,
-            );
-            const first_width = available * fraction;
-            const terminal_top = content.y + split_pane_header_height;
-            const terminal_height = @max(0, content.height - split_pane_header_height);
-            frames[0] = geometry.RectF.init(content.x, terminal_top, first_width, terminal_height);
-            frames[1] = geometry.RectF.init(
-                content.x + first_width + split_divider_width,
-                terminal_top,
-                @max(0, available - first_width),
-                terminal_height,
-            );
-        }
-    }
+/// THE geometry derivation. The painter, the widget tree that carries the hit
+/// targets, and the PTY sizing pump all call this — three independent
+/// derivations is what left a 294pt zone of painted text with no hit target
+/// behind it.
+pub fn resolvePanes(model: *const Model, size: geometry.SizeF, out: []layout.Pane) usize {
+    const current = model.selectedTreeConst() orelse return 0;
+    return current.resolve(
+        workspaceChrome(model, size).content,
+        split_divider_width,
+        split_pane_min_width,
+        split_pane_min_height,
+        out,
+    );
+}
+
+/// The pane under a view point, or null over the band, a divider, or a
+/// gutter. Same bounds and same clamps as `resolvePanes` by construction.
+pub fn paneAtPoint(model: *const Model, size: geometry.SizeF, x: f32, y: f32) ?layout.Pane {
+    const current = model.selectedTreeConst() orelse return null;
+    return current.paneAt(
+        workspaceChrome(model, size).content,
+        split_divider_width,
+        split_pane_min_width,
+        split_pane_min_height,
+        x,
+        y,
+    );
+}
+
+/// The resolved pane rects in LAYOUT order, zero-filled past the live count.
+/// A convenience over `resolvePanes` for callers that only want geometry.
+pub fn paneFrames(model: *const Model, size: geometry.SizeF) [layout.max_panes]geometry.RectF {
+    var frames = [_]geometry.RectF{.{}} ** layout.max_panes;
+    var panes: [layout.max_panes]layout.Pane = undefined;
+    const count = resolvePanes(model, size, &panes);
+    for (panes[0..count], 0..) |pane, index| frames[index] = pane.rect;
     return frames;
+}
+
+pub fn paneFrameFor(model: *const Model, size: geometry.SizeF, id: TerminalRef) ?geometry.RectF {
+    var panes: [layout.max_panes]layout.Pane = undefined;
+    const count = resolvePanes(model, size, &panes);
+    for (panes[0..count]) |pane| {
+        if (pane.terminal.eql(id)) return pane.rect;
+    }
+    return null;
 }

@@ -11,6 +11,7 @@ const testing = std.testing;
 
 const createSession = support.createSession;
 const createSessions = support.createSessions;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 const startFocusedTerminal = support.startFocusedTerminal;
 
@@ -90,10 +91,19 @@ test "grid clamping preserves the full bounded viewport" {
 }
 
 test "a full multibyte viewport retains clusters beyond the paint text budget" {
-    const session = try createSession(120, grid.max_rows);
+    // The point of this test is that the SESSION's projection store is not
+    // bounded by the PAINTER's text budget: the bottom of the screen must
+    // still exist in the projection even when the display list cannot carry
+    // every byte of it. That only means something while the screen actually
+    // outgrows the budget, so this uses the widest, tallest grid the session
+    // supports filled with 3-byte clusters — the densest viewport reachable
+    // (320 * 96 * 3 = 92,160 bytes). Sizing it to a fixed 120 columns made
+    // the test silently vacuous the moment the SDK's text store grew from
+    // 32 KiB to 64 KiB.
+    const session = try createSession(grid.max_cols, grid.max_rows);
     defer session.destroy();
-    const dense_row = ("\xe2\x82\xac" ** 119) ++ "\r\n";
-    for (0..92) |_| session.feed(dense_row);
+    const dense_row = ("\xe2\x82\xac" ** (grid.max_cols - 1)) ++ "\r\n";
+    for (0..grid.max_rows - 4) |_| session.feed(dense_row);
     session.feed("BOTTOM");
 
     const snapshot = try session.snapshot(.{}, true, false);
@@ -106,11 +116,12 @@ test "a full multibyte viewport retains clusters beyond the paint text budget" {
 }
 
 test "local terminals keep scrollback and selection state independent" {
-    const sessions = try createSessions(20, 4);
-    var model = app.initialModel(sessions);
+    const session = try createSession(20, 4);
+    var model = app.initialModel(session);
     defer app.deinitModel(&model);
     const first = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
-    const second = model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
+    // The app opens with ONE terminal; a second is minted on demand.
+    const second = try model.provider.createTerminal();
 
     for (0..20) |index| {
         var line: [24]u8 = undefined;
@@ -150,6 +161,180 @@ test "resize re-anchors an armed selection inside the new grid" {
     session.moveSelection(1, 0, true);
     try testing.expect(session.selectionActive());
     try testing.expect(session.select_head.x < 40);
+}
+
+test "scrollback holds a real session's history, not a couple of pages" {
+    // `max_scrollback` is a BYTE budget, not a line count. At 1 MB it was
+    // roughly two PageList pages — a few hundred rows — so anything longer
+    // than a `git log` page scrolled straight off the top. Ghostty's own
+    // default is 50 MB; this pins that the budget actually retains the
+    // thousands of rows a build log produces.
+    const session = try createSession(80, 24);
+    defer session.destroy();
+    const line_count: usize = 5000;
+    var line: [96]u8 = undefined;
+    for (0..line_count) |index| {
+        session.feed(std.fmt.bufPrint(
+            &line,
+            "history line {d} ------------------------------------------------\r\n",
+            .{index},
+        ) catch unreachable);
+    }
+
+    // `total` is every retained row (history plus the visible viewport).
+    const bar = session.scrollbar();
+    try testing.expect(bar.total >= line_count);
+
+    // And the OLDEST line is still there to scroll back to — a total that
+    // counted rows the emulator had already evicted would not be history.
+    session.scrollToTop();
+    try testing.expect(std.mem.indexOf(u8, session.screenText(), "history line 0 ") != null);
+}
+
+test "ANSI-16 is the terminal's own palette, not the UI design tokens" {
+    const session = try createSession(20, 4);
+    defer session.destroy();
+    // `\x1b[31m` means the terminal's red — the color every prompt theme,
+    // `ls` colorization, and diff tool is calibrated against. It used to
+    // resolve to the UI's `destructive` token, which is why colored output
+    // looked wrong.
+    session.feed("\x1b[31mR\x1b[0m\x1b[34mB\x1b[0m");
+    const snap = try session.snapshot(.{}, true, false);
+    const expected_red = vt.color.default[1];
+    const expected_blue = vt.color.default[4];
+    try testing.expectEqual(
+        canvas.Color.rgb8(expected_red.r, expected_red.g, expected_red.b),
+        snap.rows[0].cells[0].fg,
+    );
+    try testing.expectEqual(
+        canvas.Color.rgb8(expected_blue.r, expected_blue.g, expected_blue.b),
+        snap.rows[0].cells[1].fg,
+    );
+}
+
+test "bold over the ANSI-8 range resolves to the bright entry" {
+    const session = try createSession(20, 4);
+    defer session.destroy();
+    // The painter draws one mono face, so color is the only channel bold
+    // has. `\x1b[1;31m` is bright red in every terminal; without this a
+    // bold-red prompt and a plain-red error are indistinguishable.
+    session.feed("\x1b[31mp\x1b[1;31mb\x1b[0m");
+    const snap = try session.snapshot(.{}, true, false);
+    const plain = vt.color.default[1];
+    const bright = vt.color.default[9];
+    try testing.expectEqual(
+        canvas.Color.rgb8(plain.r, plain.g, plain.b),
+        snap.rows[0].cells[0].fg,
+    );
+    try testing.expectEqual(
+        canvas.Color.rgb8(bright.r, bright.g, bright.b),
+        snap.rows[0].cells[1].fg,
+    );
+}
+
+test "an OSC 4 palette override still wins over the terminal default" {
+    const session = try createSession(20, 4);
+    defer session.destroy();
+    // Reading the emulator's palette rather than a theme-derived copy must
+    // not cost the application its own programmed colors.
+    session.feed("\x1b]4;1;rgb:12/34/56\x07");
+    session.feed("\x1b[31mR\x1b[0m");
+    const snap = try session.snapshot(.{}, true, false);
+    try testing.expectEqual(canvas.Color.rgb8(0x12, 0x34, 0x56), snap.rows[0].cells[0].fg);
+}
+
+test "the cursor sits on a wide cell's glyph, not its blank spacer tail" {
+    const session = try createSession(20, 4);
+    defer session.destroy();
+    session.feed("\xe4\xbd\xa0"); // 你 — occupies columns 0 and 1
+
+    // Parked past the pair, the cursor is on its own cell and stays put.
+    var snap = try session.snapshot(.{}, true, false);
+    try testing.expect(snap.cursor != null);
+    try testing.expectEqual(@as(u16, 2), snap.cursor.?.x);
+
+    // Addressed ONTO the spacer tail (column 2 in 1-based CUP), the cursor
+    // sits on the blank half of the glyph. The emulator reports that as
+    // `wide_tail`; the projection moves the cursor back onto the primary so
+    // a block covers the character instead of the empty column beside it.
+    session.feed("\x1b[1;2H");
+    snap = try session.snapshot(.{}, true, false);
+    try testing.expect(snap.cursor != null);
+    try testing.expectEqual(@as(u16, 0), snap.cursor.?.x);
+    try testing.expectEqual(@as(u16, 0), snap.cursor.?.y);
+}
+
+test "DECSCUSR shape reaches the painter" {
+    const session = try createSession(20, 4);
+    defer session.destroy();
+    session.feed("\x1b[5 q"); // blinking bar
+    var snap = try session.snapshot(.{}, true, false);
+    try testing.expectEqual(canvas.TerminalCursorShape.bar, snap.cursor.?.shape);
+    session.feed("\x1b[3 q"); // blinking underline
+    snap = try session.snapshot(.{}, true, false);
+    try testing.expectEqual(canvas.TerminalCursorShape.underline, snap.cursor.?.shape);
+    session.feed("\x1b[2 q"); // steady block
+    snap = try session.snapshot(.{}, true, false);
+    try testing.expectEqual(canvas.TerminalCursorShape.block, snap.cursor.?.shape);
+}
+
+test "the semantic viewport text is produced on demand, into one reused buffer" {
+    const session = try createSession(20, 4);
+    defer session.destroy();
+    // Feeding output no longer serializes the viewport — it only marks the
+    // cache stale. A reader still sees the CURRENT screen, with no explicit
+    // refresh call anywhere on the output path.
+    session.feed("alpha\r\n");
+    try testing.expect(std.mem.indexOf(u8, session.screenText(), "alpha") != null);
+
+    // The buffer is grown to fit and reused: a second screen of the same
+    // shape re-serializes in place rather than reallocating.
+    const first_ptr = session.screenText().ptr;
+    session.feed("bravo\r\n");
+    const second = session.screenText();
+    try testing.expect(std.mem.indexOf(u8, second, "bravo") != null);
+    try testing.expectEqual(first_ptr, second.ptr);
+
+    // A clean session does not re-serialize: the same read returns the same
+    // bytes without touching the emulator.
+    try testing.expectEqual(second.ptr, session.screenText().ptr);
+    try testing.expectEqual(second.len, session.screenText().len);
+}
+
+test "a widening resize exposes blank columns, never the pre-split glyphs" {
+    // A split collapsing back to full width grows the emulator. Every cell
+    // the wider grid exposes must come from the reflow, not from whatever
+    // the buffer held before the pane was ever narrowed.
+    const session = try createSession(80, 6);
+    defer session.destroy();
+    session.feed("phalls-Mac-mini:~ phall$ ls -la /usr/local/share/a/very/long/path/x\r\n");
+    session.feed("phalls-Mac-mini:~ phall$ ");
+    try testing.expect(session.resize(40, 6));
+
+    // While narrow, the shell repaints a short screen.
+    session.feed("\x1b[H\x1b[2J");
+    session.feed("$ ");
+    try testing.expect(session.resize(80, 6));
+
+    const snap = try session.snapshot(.{}, true, false);
+    try testing.expectEqual(@as(usize, 80), snap.rows[0].cells.len);
+    for (snap.rows, 0..) |row, y| {
+        for (row.cells, 0..) |cell, x| {
+            // Only the two prompt cells carry ink; the columns the widening
+            // exposed (and every row below) must be empty.
+            if (y == 0 and x < 2) continue;
+            try testing.expectEqual(@as(u21, 0), cell.cp);
+        }
+    }
+}
+
+test "the feed slice matches the response buffer it protects" {
+    // The pty batch used to be cut into 1 KiB slices, each followed by a
+    // full response drain and outbound flush — 64 parser entries and 64
+    // drains for one routine 64 KiB read. The response buffer grows to fit
+    // (see `writePtyResponse`), so the slice no longer needs to be a
+    // fraction of it.
+    try testing.expectEqual(grid.Session.response_capacity, grid.Session.feed_slice_bytes);
 }
 
 test "reset clears the previous session's palette and dynamic color overrides" {
@@ -233,9 +418,9 @@ test "wheel scrolling over the grid scrolls history" {
 
     var line: [16]u8 = undefined;
     for (0..120) |index| {
-        app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
+        app_state.model.provider.slots[0].session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
     }
-    const bottom_offset = app_state.model.panes[0].session.scrollbar().offset;
+    const bottom_offset = app_state.model.provider.slots[0].session.scrollbar().offset;
     try testing.expect(bottom_offset > 0);
 
     // Native tab chrome is outside every terminal hit target.
@@ -244,14 +429,17 @@ test "wheel scrolling over the grid scrolls history" {
         .label = app.canvas_label,
         .kind = .scroll,
         .x = 100,
-        .y = 30,
-        .delta_y = app_state.model.panes[0].session.cell_height * 4,
+        // Inside the titlebar inset, above the content area: with one calm
+        // terminal there is no band at all, so the old y=30 would now land
+        // in the grid itself.
+        .y = 4,
+        .delta_y = app_state.model.provider.slots[0].session.cell_height * 4,
     } });
-    try testing.expectEqual(bottom_offset, app_state.model.panes[0].session.scrollbar().offset);
+    try testing.expectEqual(bottom_offset, app_state.model.provider.slots[0].session.scrollbar().offset);
 
     // A trackpad swipe (several fractional deltas accumulating past one
     // cell) scrolls into history, like every terminal.
-    const cell_h = app_state.model.panes[0].session.cell_height;
+    const cell_h = app_state.model.provider.slots[0].session.cell_height;
     const frame = app.paneFrames(&app_state.model, app_state.model.surface_size)[0];
     for (0..4) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -263,7 +451,7 @@ test "wheel scrolling over the grid scrolls history" {
             .delta_y = cell_h,
         } });
     }
-    try testing.expect(app_state.model.panes[0].session.scrollbar().offset < bottom_offset);
+    try testing.expect(app_state.model.provider.slots[0].session.scrollbar().offset < bottom_offset);
 
     // Typing returns the viewport to the live screen.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -272,7 +460,7 @@ test "wheel scrolling over the grid scrolls history" {
         .kind = .text_input,
         .text = "x",
     } });
-    try testing.expectEqual(bottom_offset, app_state.model.panes[0].session.scrollbar().offset);
+    try testing.expectEqual(bottom_offset, app_state.model.provider.slots[0].session.scrollbar().offset);
 }
 
 test "scrollback chords pause while a selection is armed" {
@@ -288,7 +476,7 @@ test "scrollback chords pause while a selection is armed" {
     // Scrollback to move through, then arm a selection.
     var line: [16]u8 = undefined;
     for (0..120) |index| {
-        app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
+        app_state.model.provider.slots[0].session.feed(std.fmt.bufPrint(&line, "line {d}\r\n", .{index}) catch unreachable);
     }
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -297,12 +485,12 @@ test "scrollback chords pause while a selection is armed" {
         .key = "space",
         .modifiers = .{ .primary = true, .shift = true },
     } });
-    try testing.expect(app_state.model.panes[0].selecting);
+    try testing.expect(app_state.model.provider.slots[0].selecting);
 
     // The selection's coordinates are viewport-relative and the
     // emulator range is absolute: scrolling under it would desync the
     // painted caret from the copyable text, so the chord is inert.
-    const before = app_state.model.panes[0].session.scrollbar().offset;
+    const before = app_state.model.provider.slots[0].session.scrollbar().offset;
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -310,7 +498,7 @@ test "scrollback chords pause while a selection is armed" {
         .key = "home",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(before, app_state.model.panes[0].session.scrollbar().offset);
+    try testing.expectEqual(before, app_state.model.provider.slots[0].session.scrollbar().offset);
 
     // Selection dismissed, the same chord scrolls again.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
@@ -326,7 +514,7 @@ test "scrollback chords pause while a selection is armed" {
         .key = "home",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(app_state.model.panes[0].session.scrollbar().offset != before);
+    try testing.expect(app_state.model.provider.slots[0].session.scrollbar().offset != before);
 }
 
 test "an armed selection follows its text when output scrolls the screen" {

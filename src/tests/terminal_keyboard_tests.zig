@@ -8,7 +8,8 @@ const geometry = native_sdk.geometry;
 const testing = std.testing;
 const TerminalApp = support.TerminalApp;
 
-const createSessions = support.createSessions;
+const createSession = support.createSession;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 const expectCursorPaintKind = support.expectCursorPaintKind;
 const startFocusedTerminal = support.startFocusedTerminal;
@@ -23,10 +24,10 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
 
-    const sessions = try createSessions(80, 24);
+    const session = try createSession(80, 24);
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     defer app.deinitModel(&app_state.model);
     defer app_state.deinit();
     app_state.effects.executor = .fake;
@@ -44,7 +45,7 @@ test "typing reaches the pty before the first output batch (empty-prompt shell)"
 
     // The shell spawned (init_fx) but produced NO output — phase is
     // still .starting, never .live. Typing must still reach the pty.
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[0].phase);
+    try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[0].phase);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -272,7 +273,7 @@ test "kitty report-all encodes committed text as CSI-u, and legacy passes it raw
     // The TUI pushes kitty "report all keys as escape codes": the same
     // committed "a" must now encode as CSI 97 u — raw bytes would
     // desynchronize the application's key decoding.
-    app_state.model.panes[0].session.feed("\x1b[>8u");
+    app_state.model.provider.slots[0].session.feed("\x1b[>8u");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -305,7 +306,7 @@ test "kitty event reporting hears key releases; legacy modes never do" {
     // The TUI enables kitty event reporting (with report-all): the
     // release of a printable now reaches the child as a CSI-u release
     // event (`:3` event type) — without it, key-driven state sticks.
-    app_state.model.panes[0].session.feed("\x1b[>11u");
+    app_state.model.provider.slots[0].session.feed("\x1b[>11u");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -332,13 +333,16 @@ test "consumed app shortcut releases never leak under kitty reporting" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
     const app_iface = app_state.app();
+    // A second TAB, so cmd+2 has somewhere to go.
+    try app_state.dispatch(&harness.runtime, 1, .new_terminal);
+    try app_state.dispatch(&harness.runtime, 1, .{ .select_position = 0 });
 
     // Both children request key-release reports. Releases deliberately
     // omit Command to model the modifier coming up before the key.
-    for (app_state.model.panes) |*pane| pane.session.feed("\x1b[>11u");
+    for (activeSlots(&app_state.model)) |*pane| pane.session.feed("\x1b[>11u");
 
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true, .command = true });
-    try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try releaseCanvasKey(harness, app_iface, "2", .{});
     try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
@@ -351,12 +355,12 @@ test "consumed app shortcut releases never leak under kitty reporting" {
         try releaseCanvasKey(harness, app_iface, "space", .{});
         try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
     }
-    try testing.expect(!app_state.model.panes[1].selecting);
+    try testing.expect(!app_state.model.provider.slots[1].selecting);
 
     // An emulator selection can be copied without keyboard-selection mode.
     // That keeps the release path otherwise open and proves copy is latched.
-    app_state.model.panes[1].session.feed("copy");
-    app_state.model.panes[1].session.beginSelection(false);
+    app_state.model.provider.slots[1].session.feed("copy");
+    app_state.model.provider.slots[1].session.beginSelection(false);
     try pressCanvasKey(harness, app_iface, "c", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try releaseCanvasKey(harness, app_iface, "c", .{});
@@ -370,26 +374,26 @@ test "consumed app shortcut releases never leak under kitty reporting" {
     // Escape turns selection off immediately, and Enter may turn it off
     // before key-up when clipboard completion is fast. Both releases still
     // belong to the app action rather than the kitty-reporting child.
-    app_state.model.panes[1].session.feed("select me");
-    app_state.model.panes[1].selecting = true;
-    app_state.model.panes[1].session.beginSelection(false);
+    app_state.model.provider.slots[1].session.feed("select me");
+    app_state.model.provider.slots[1].selecting = true;
+    app_state.model.provider.slots[1].session.beginSelection(false);
     try pressCanvasKey(harness, app_iface, "escape", .{});
-    try testing.expect(!app_state.model.panes[1].selecting);
+    try testing.expect(!app_state.model.provider.slots[1].selecting);
     try releaseCanvasKey(harness, app_iface, "escape", .{});
 
-    app_state.model.panes[1].selecting = true;
-    app_state.model.panes[1].session.beginSelection(false);
-    app_state.model.panes[1].session.moveSelection(-1, 0, true);
+    app_state.model.provider.slots[1].selecting = true;
+    app_state.model.provider.slots[1].session.beginSelection(false);
+    app_state.model.provider.slots[1].session.moveSelection(-1, 0, true);
     try pressCanvasKey(harness, app_iface, "enter", .{});
     try app_state.effects.feedClipboardResult(app.clipboard_key, .ok, "");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expect(!app_state.model.panes[1].selecting);
+    try testing.expect(!app_state.model.provider.slots[1].selecting);
     try releaseCanvasKey(harness, app_iface, "enter", .{});
 
-    try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
-    try testing.expectEqual(app.Phase.starting, app_state.model.panes[1].phase);
+    try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[1].phase);
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
     try releaseCanvasKey(harness, app_iface, "r", .{});
     try testing.expectEqual(@as(u32, 0), app_state.model.consumed_shortcut_keys_held);
@@ -408,7 +412,7 @@ test "a non-shortcut re-press supersedes a stranded app shortcut latch" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    app_state.model.panes[0].session.feed("\x1b[>11u");
+    app_state.model.provider.slots[0].session.feed("\x1b[>11u");
     try pressCanvasKey(harness, app_iface, "arrowup", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.consumed_shortcut_keys_held != 0);
 
@@ -507,7 +511,7 @@ test "macOS natural text arrow gestures use shell editing bindings" {
     // event reporting: Option moves by words (Esc-b/f), Command moves to
     // line boundaries (Ctrl-A/E), Command+Delete clears to the start
     // (Ctrl-U), and a bound release emits nothing.
-    app_state.model.panes[0].session.feed("\x1b[>11u");
+    app_state.model.provider.slots[0].session.feed("\x1b[>11u");
     const events = [_]native_sdk.platform.GpuSurfaceInputEvent{
         .{
             .window_id = 1,

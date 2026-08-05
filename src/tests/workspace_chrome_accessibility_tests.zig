@@ -10,7 +10,8 @@ const testing = std.testing;
 const automation = native_sdk.automation;
 const TerminalApp = support.TerminalApp;
 
-const createDefaultSessions = support.createDefaultSessions;
+const createDefaultSession = support.createDefaultSession;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 const startTwoPaneCockpit = support.startTwoPaneCockpit;
 const startCockpit = support.startCockpit;
@@ -32,25 +33,26 @@ test "only the selected terminal paints and hidden terminal state remains live" 
     defer app_state.deinit();
 
     const size = geometry.SizeF.init(980, 640);
+    // Two TABS: only the selected tab's tree resolves any pane at all.
     var frames = app.paneFrames(&app_state.model, size);
     try testing.expect(frames[0].width > 0);
     try testing.expectEqual(@as(f32, 0), frames[1].width);
     try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEALPHA", frames[0]);
     try expectDisplayListMissingMarker(harness.runtime.views[0].canvasDisplayList(), "PANEBRAVO");
 
-    // Pane 1 accepted output while hidden. Selecting Terminal 2 reveals its
-    // existing emulator rather than creating or resetting a surface.
+    // Tab 2 accepted output while hidden. Selecting it reveals its existing
+    // emulator rather than creating or resetting a surface.
     try app_state.effects.feedPtyOutput(app.ptyKey(1), "HIDDEN STATE\r\n");
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .wake);
-    const hidden_bytes = app_state.model.panes[1].output_bytes;
+    const hidden_bytes = app_state.model.provider.slots[1].output_bytes;
     try pressCanvasKey(harness, app_state.app(), "2", .{ .primary = true });
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .frame_requested);
     frames = app.paneFrames(&app_state.model, size);
-    try testing.expectEqual(@as(f32, 0), frames[0].width);
-    try testing.expect(frames[1].width > 0);
-    try testing.expectEqual(hidden_bytes, app_state.model.panes[1].output_bytes);
-    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEBRAVO", frames[1]);
-    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "HIDDEN STATE", frames[1]);
+    try testing.expect(frames[0].width > 0);
+    try testing.expectEqual(@as(f32, 0), frames[1].width);
+    try testing.expectEqual(hidden_bytes, app_state.model.provider.slots[1].output_bytes);
+    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "PANEBRAVO", frames[0]);
+    try expectDisplayListMarker(harness.runtime.views[0].canvasDisplayList(), "HIDDEN STATE", frames[0]);
     try expectDisplayListMissingMarker(harness.runtime.views[0].canvasDisplayList(), "PANEALPHA");
 }
 
@@ -63,9 +65,9 @@ test "native tabs and only the selected terminal surface reach accessibility" {
     defer destroyModelSessions(&app_state.model);
     defer app_state.deinit();
 
-    app_state.model.panes[0].copy_failed = true;
-    app_state.model.panes[0].outbound_dropped = 7;
-    app_state.model.panes[0].session.response_bytes_dropped = 2;
+    app_state.model.provider.slots[0].copy_failed = true;
+    app_state.model.provider.slots[0].outbound_dropped = 7;
+    app_state.model.provider.slots[0].session.response_bytes_dropped = 2;
     try harness.runtime.dispatchPlatformEvent(app_state.app(), .app_deactivated);
 
     const buffer = try gpa.alloc(u8, 128 * 1024);
@@ -97,14 +99,20 @@ test "native tabs and only the selected terminal surface reach accessibility" {
     }
     try testing.expectEqual(@as(usize, 1), terminal_nodes);
 
-    var saw_loss = false;
+    // The diagnostic telemetry lives in the accessibility label ONLY. A
+    // screen reader keeps everything; the eye keeps nothing. These badges
+    // used to be painted as product chrome.
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "I/O LOSS")) {
-            saw_loss = true;
-            try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
+        for ([_][]const u8{ "I/O LOSS", "DELIVERY FAILED", "INPUT STALLED", "PASTE FAILED", "SELECTING", "PASTING" }) |badge| {
+            try testing.expect(!std.mem.eql(u8, layout.widget.text, badge));
         }
+        try testing.expect(std.mem.indexOf(u8, layout.widget.text, "COPIED ") == null);
+        // The old compaction turned tabs into `T1`/`PHX`, and attention was
+        // spelled by appending " !" to the terminal's own name.
+        try testing.expect(!std.mem.eql(u8, layout.widget.text, "T1"));
+        try testing.expect(!std.mem.eql(u8, layout.widget.text, "PHX"));
+        try testing.expect(!std.mem.endsWith(u8, layout.widget.text, " !"));
     }
-    try testing.expect(saw_loss);
 }
 
 test "cockpit native-tab proof shot (env-gated)" {
@@ -147,9 +155,10 @@ const one_terminal_shot_path = "zig-out/cockpit-one-terminal.png";
 const four_terminal_shot_path = "zig-out/cockpit-four-terminals.png";
 const side_tabs_shot_path = "zig-out/cockpit-side-tabs.png";
 
+/// Four TABS, made through the real `new_terminal` path. The fixture used
+/// to start with two eager terminals; the app now starts with one.
 fn fillTerminalCapacity(harness: anytype, state: *TerminalApp) !void {
-    try state.dispatch(&harness.runtime, 1, .new_terminal);
-    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    while (state.model.tab_count < 4) try state.dispatch(&harness.runtime, 1, .new_terminal);
 }
 
 test "production launch owns exactly one terminal and New spawns the second child" {
@@ -158,24 +167,23 @@ test "production launch owns exactly one terminal and New spawns the second chil
     const state = try startProductionCockpit(harness);
     defer stopCockpit(state);
 
-    try testing.expectEqual(@as(usize, 1), state.model.terminal_count);
+    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.tabs[0].paneCount());
     try testing.expectEqual(@as(usize, 1), state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 1), state.model.provider.occupiedCount());
     try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
-    try testing.expect(state.model.terminal_order[0].eql(app.initialTerminalRef(0)));
+    try testing.expect(state.model.tabTerminal(0).?.eql(app.initialTerminalRef(0)));
     try testing.expect(state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
-    try testing.expect(state.model.attachments[0].?.eql(app.initialTerminalRef(0)));
-    try testing.expectEqual(@as(?app.TerminalRef, null), state.model.attachments[1]);
     try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(app.initialTerminalRef(0)).?.pty_key);
     try testing.expectEqual(@as(u64, 1), state.model.provider.terminal(app.initialTerminalRef(0)).?.session_generation);
 
     const initial_snapshot = try state.model.topologySnapshot();
     try initial_snapshot.validate();
-    try testing.expectEqual(@as(u8, 1), initial_snapshot.terminal_count);
-    try testing.expectEqualDeep([app.pane_count]?app.LocalTerminalId{ .terminal_1, null }, initial_snapshot.attachments);
+    try testing.expectEqual(@as(u8, 1), initial_snapshot.tab_count);
+    try testing.expect(initial_snapshot.selection.eql(.{ .tab = 0 }));
 
     try state.dispatch(&harness.runtime, 1, .new_terminal);
-    try testing.expectEqual(@as(usize, 2), state.model.terminal_count);
+    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
     try testing.expectEqual(@as(usize, 2), state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 2), state.effects.pendingPtyCount());
     const second = state.model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
@@ -183,7 +191,10 @@ test "production launch owns exactly one terminal and New spawns the second chil
     try testing.expectEqual(@as(u64, 1), second.session_generation);
 }
 
-test "one terminal shows no control band and leaves Cmd+D unconsumed until New" {
+test "one terminal shows no control band, and Cmd+D still splits it" {
+    // Rewritten: the old gate refused to split until a SECOND tab existed,
+    // which is exactly the bug — a fresh window's single terminal is the
+    // most ordinary thing there is to split.
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startProductionCockpit(harness);
@@ -197,9 +208,6 @@ test "one terminal shows no control band and leaves Cmd+D unconsumed until New" 
         try testing.expect(!std.mem.eql(u8, node.widget.text, "New"));
         try testing.expect(node.widget.kind != .segmented_control);
     }
-    for (app.cockpit_shortcuts) |shortcut| try testing.expect(!std.mem.eql(u8, shortcut.id, "layout.split"));
-    app.update(&state.model, .toggle_split, &state.effects);
-    try testing.expectEqual(app.LayoutMode.single, state.model.layout);
 
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -208,8 +216,8 @@ test "one terminal shows no control band and leaves Cmd+D unconsumed until New" 
         .key = "d",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(app.LayoutMode.single, state.model.layout);
-    try testing.expectEqual(@as(u32, 0), state.model.consumed_shortcut_keys_held);
+    try testing.expectEqual(@as(usize, 2), state.model.tabs[0].paneCount());
+    try testing.expect(state.model.consumed_shortcut_keys_held != 0);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -217,23 +225,20 @@ test "one terminal shows no control band and leaves Cmd+D unconsumed until New" 
         .key = "d",
     } });
 
-    // A second terminal is real structure, so the band emerges with it.
+    // Splitting alone does not summon the band: one tab is still one tab.
+    try testing.expect(!app.chromeRevealed(&state.model));
+
+    // A second TAB is real structure, so the band emerges with it — with a
+    // tab strip and nothing else. No New/Close/Split/Side-tabs buttons and
+    // no hardcoded bookmark buttons.
     try state.dispatch(&harness.runtime, 1, .new_terminal);
     try testing.expect(app.chromeRevealed(&state.model));
-    var split_enabled = false;
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (std.mem.eql(u8, node.widget.text, "Split")) split_enabled = !node.widget.state.disabled;
+        for ([_][]const u8{ "New", "Close", "Split", "Side tabs", "Top tabs", "GitHub", "Superlogical", "Mitchell" }) |gone| {
+            try testing.expect(!std.mem.eql(u8, node.widget.text, gone));
+        }
     }
-    try testing.expect(split_enabled);
-    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
-        .window_id = 1,
-        .label = app.canvas_label,
-        .kind = .key_down,
-        .key = "d",
-        .modifiers = .{ .primary = true },
-    } });
-    try testing.expectEqual(app.LayoutMode.split, state.model.layout);
-    try testing.expect(state.model.consumed_shortcut_keys_held != 0);
 }
 
 test "one-terminal production accessibility is the terminal alone, and the band emerges with the second" {
@@ -306,20 +311,21 @@ test "a terminal that needs attention pulls the band back even when it is alone"
 }
 
 test "revealing the band is the only thing that resizes the content area" {
-    const sessions = try createDefaultSessions();
-    var model = app.initialModel(sessions);
+    const session = try createDefaultSession();
+    var model = app.initialModel(session);
     defer app.deinitModel(&model);
     const size = native_sdk.geometry.SizeF.init(980, 640);
 
-    // Two terminals: revealed.
+    // A second TAB reveals the band.
+    const second = try model.provider.createTerminal();
+    _ = model.admitTab(second.id);
     try testing.expect(app.chromeRevealed(&model));
     const revealed = app.paneFrames(&model, size)[0];
 
     // Collapse to one healthy terminal and the content area reclaims exactly
     // the band's height — no more, no less.
-    model.terminal_count = 1;
-    model.attachments = .{ app.initialTerminalRef(0), null };
-    model.selected_surface = .{ .terminal = app.initialTerminalRef(0) };
+    model.dropTab(1);
+    _ = model.provider.destroyTerminal(second.id);
     try testing.expect(!app.chromeRevealed(&model));
     const bare = app.paneFrames(&model, size)[0];
 
@@ -380,8 +386,10 @@ test "four-terminal accessibility is compact ordered and keyboard-complete" {
         try testing.expect(std.mem.indexOf(u8, a11y, label) != null);
     }
     try testing.expect(std.mem.indexOf(u8, a11y, "Web, system WebKit, shortcut CMD+5") != null);
-    try testing.expect(std.mem.indexOf(u8, a11y, "New Terminal, Command T") != null);
-    try testing.expect(std.mem.indexOf(u8, a11y, "Close Terminal, Command W") != null);
+    // The band carries the tab strip and nothing else: New/Close/Split and
+    // the bookmark buttons are gone, and each remains reachable by chord.
+    try testing.expect(std.mem.indexOf(u8, a11y, "New Terminal, Command T") == null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "Close Terminal, Command W") == null);
     try testing.expect(std.mem.indexOf(u8, a11y, "Move terminal tab left") == null);
     try testing.expect(std.mem.indexOf(u8, a11y, "DETACHED") == null);
 
@@ -392,7 +400,7 @@ test "four-terminal accessibility is compact ordered and keyboard-complete" {
         .key = "5",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(state.model.selected_surface.eql(.web));
+    try testing.expect(state.model.selectedSurface().eql(.web));
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -406,7 +414,7 @@ test "four-terminal accessibility is compact ordered and keyboard-complete" {
         .key = "4",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(state.model.terminal_order[3], state.model.selectedTerminalId().?);
+    try testing.expectEqual(state.model.tabTerminal(3).?, state.model.selectedTerminalId().?);
     try testing.expect(app.onCommand("surface.5") != null);
 }
 
@@ -418,8 +426,8 @@ test "four-terminal tab layout stays inside the minimum window with Web last" {
     try fillTerminalCapacity(harness, state);
     try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
 
-    var tab_frames: [app.max_terminal_count + 1]native_sdk.geometry.RectF = undefined;
-    var tab_labels: [app.max_terminal_count + 1][]const u8 = undefined;
+    var tab_frames: [app.max_tabs + 1]native_sdk.geometry.RectF = undefined;
+    var tab_labels: [app.max_tabs + 1][]const u8 = undefined;
     var tab_count: usize = 0;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (node.widget.kind != .segmented_control) continue;
@@ -433,8 +441,10 @@ test "four-terminal tab layout stays inside the minimum window with Web last" {
         try testing.expect(frame.x >= 0 and frame.x + frame.width <= app.window_min_width);
         if (index > 0) try testing.expect(frame.x >= tab_frames[index - 1].x + tab_frames[index - 1].width);
     }
-    try testing.expectEqualStrings("T1", tab_labels[0]);
-    try testing.expectEqualStrings("T4", tab_labels[3]);
+    // Labels stay WHOLE. The old compaction turned every tab into `T1`/`PHX`
+    // as soon as a fourth surface existed, which is not a tab strip.
+    try testing.expectEqualStrings("Terminal 1", tab_labels[0]);
+    try testing.expectEqualStrings("Terminal 4", tab_labels[3]);
     try testing.expectEqualStrings("Web", tab_labels[4]);
 }
 
@@ -471,7 +481,7 @@ test "side tabs remain accessible and bounded at the minimum window" {
         tab_count += 1;
     }
     try testing.expect(saw_scroll_region);
-    try testing.expectEqual(@as(usize, app.max_terminal_count + 1), tab_count);
+    try testing.expectEqual(@as(usize, 5), tab_count);
 }
 
 test "four-terminal compact chrome screenshot (env-gated)" {

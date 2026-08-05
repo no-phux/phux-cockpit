@@ -23,45 +23,31 @@ const ModifierMask = support.ModifierMask;
 const PointerCapture = model_module.PointerCapture;
 const PointerModifiers = model_module.PointerModifiers;
 const TerminalPointerEvent = model_module.TerminalPointerEvent;
-const Placement = topology.Placement;
 const max_mouse_reports_per_event: usize = 64;
 const max_mouse_coordinate: f32 = 1_000_000;
 const phux_enabled = support.phux_enabled;
 const providerKind = support.providerKind;
 const localRef = support.localRef;
-const paneFrames = projection.paneFrames;
 const cockpitTokens = projection.cockpitTokens;
 const enqueueTransient = runtime.enqueueTransient;
+
 pub fn paneFrameForTerminal(model: *const Model, id: TerminalRef) ?geometry.RectF {
-    const frames = paneFrames(model, model.surface_size);
-    for (model.attachments, 0..) |attached, index| {
-        if (attached != null and attached.?.eql(id) and !frames[index].isEmpty()) return frames[index];
-    }
-    return null;
+    const frame = projection.paneFrameFor(model, model.surface_size, id) orelse return null;
+    return if (frame.isEmpty()) null else frame;
 }
 
 /// The provider-qualified terminal whose rect contains a view point, or null
-/// when the point stands over chrome, a gutter, or outside the panes.
+/// when the point stands over chrome, a gutter, or outside the panes. This is
+/// `tree.paneAt` — the SAME resolve the painter and the widget tree consume,
+/// so a hit target can never sit somewhere text does not.
 pub fn terminalRefAtPoint(model: *const Model, x: f32, y: f32) ?TerminalRef {
-    const frames = paneFrames(model, model.surface_size);
-    for (frames, 0..) |frame, index| {
-        if (frame.width <= 0 or frame.height <= 0) continue;
-        if (x >= frame.x and x < frame.x + frame.width and
-            y >= frame.y and y < frame.y + frame.height)
-        {
-            return model.attachments[Placement.fromIndex(index).?.index()];
-        }
-    }
-    return null;
+    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
+    const pane = projection.paneAtPoint(model, model.surface_size, x, y) orelse return null;
+    return pane.terminal;
 }
+
 fn terminalFrame(model: *const Model, terminal_ref: TerminalRef) ?geometry.RectF {
-    const frames = paneFrames(model, model.surface_size);
-    for (model.attachments, 0..) |attached, index| {
-        if (attached) |value| {
-            if (value.eql(terminal_ref)) return frames[index];
-        }
-    }
-    return null;
+    return projection.paneFrameFor(model, model.surface_size, terminal_ref);
 }
 
 pub fn pointerButton(button: u32) MouseButton {
@@ -198,16 +184,6 @@ pub fn drainPointerEvents(model: *Model) void {
     if (pointer_state.queue.takeOverflow()) releasePointerCapture(model);
 }
 
-fn paneAtPoint(model: *Model, x: f32, y: f32) ?*Pane {
-    if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
-    const frames = paneFrames(model, model.surface_size);
-    for (frames, 0..) |frame, index| {
-        if (!frame.normalized().containsPoint(geometry.PointF.init(x, y))) continue;
-        return model.terminalAt(Placement.fromIndex(index).?);
-    }
-    return null;
-}
-
 fn pointerCaptureIndex(model: *const Model, window_id: native_sdk.platform.WindowId, pointer_id: u64) ?usize {
     for (model.pointer_captures, 0..) |capture, index| {
         if (capture.active and capture.window_id == window_id and capture.pointer_id == pointer_id) return index;
@@ -225,11 +201,11 @@ fn freePointerCaptureIndex(model: *const Model) ?usize {
     return null;
 }
 
+/// A terminal is visible when it holds a pane of the SELECTED tab. Panes of
+/// other tabs, and every terminal while the web surface is up, are hidden.
 fn terminalVisible(model: *const Model, id: TerminalRef) bool {
-    const selected = model.selectedTerminalRef() orelse return false;
-    if (model.layout == .single) return selected.eql(id);
-    for (model.attachments) |attached| if (attached != null and attached.?.eql(id)) return true;
-    return false;
+    const current = model.selectedTreeConst() orelse return false;
+    return current.find(id) != null;
 }
 
 pub fn paneReportsMouse(pane: *const Pane) bool {
@@ -253,14 +229,10 @@ pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent
             if (pane.session_generation != event.generation or !terminalVisible(model, pane.id)) return;
             if (!validPointerGeometry(event)) return;
             syncMouseProtocol(pane);
+            // A press moves pane focus inside the selected tab. There is no
+            // second selection to update: the tree's focus IS the selection.
             if (event.button == 0 or event.button == 1) {
-                for (model.attachments, 0..) |attached, index| {
-                    if (attached != null and attached.?.eql(pane.id)) {
-                        model.focus_placement = Placement.fromIndex(index).?;
-                        model.selected_surface = .{ .terminal = pane.id };
-                        break;
-                    }
-                }
+                if (model.selectedTree()) |current| _ = current.focusTerminal(pane.id);
             }
 
             const slot = freePointerCaptureIndex(model) orelse return;

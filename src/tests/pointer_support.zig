@@ -10,12 +10,12 @@ pub fn startPointerHost(gpa: std.mem.Allocator, harness: anytype, size: geometry
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
-    const sessions = try support.createSessions(80, 24);
+    const session = try support.createSession(80, 24);
     const host = gpa.create(app.CockpitHost) catch |err| {
-        for (sessions) |session| session.destroy();
+        session.destroy();
         return err;
     };
-    host.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    host.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     errdefer {
         host.deinit();
         app.deinitModel(&host.inner.model);

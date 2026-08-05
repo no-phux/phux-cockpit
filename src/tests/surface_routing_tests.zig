@@ -10,8 +10,9 @@ const testing = std.testing;
 const automation = native_sdk.automation;
 const TerminalApp = support.TerminalApp;
 
-const createSessions = support.createSessions;
-const createDefaultSessions = support.createDefaultSessions;
+const createSession = support.createSession;
+const createDefaultSession = support.createDefaultSession;
+const activeSlots = support.activeSlots;
 const destroyModelSessions = app.deinitModel;
 const startTwoPaneCockpit = support.startTwoPaneCockpit;
 const startProductionCockpit = support.startProductionCockpit;
@@ -29,30 +30,30 @@ const activePointerCaptureCount = pointer_support.activePointerCaptureCount;
 const remoteRef = support.remoteTerminalRef;
 
 test "stable surface IDs and browser messages make focused model transitions" {
-    const sessions = try createSessions(80, 24);
-    var app_state = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    const session = try createSession(80, 24);
+    var app_state = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     defer app.deinitModel(&app_state.model);
     defer app_state.deinit();
     app_state.effects.executor = .fake;
+    // A second TAB, minted the real way — the app opens with one terminal.
+    app.update(&app_state.model, .new_terminal, &app_state.effects);
+    app.update(&app_state.model, .{ .select_position = 0 }, &app_state.effects);
 
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try testing.expectEqual(app.BrowserPage.github, app_state.model.browser_page);
-    try testing.expectEqual(@as(?u8, 0), app_state.model.selectedTerminalIndex());
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
 
     app.update(&app_state.model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(1) } }, &app_state.effects);
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
-    try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
-    try testing.expectEqual(@as(?u8, 1), app_state.model.selectedTerminalIndex());
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
 
     app.update(&app_state.model, .{ .browser_page = .article }, &app_state.effects);
-    try testing.expect(app_state.model.selected_surface.eql(.web));
+    try testing.expect(app_state.model.selectedSurface().eql(.web));
     try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
-    try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
-    try testing.expectEqual(app.Placement.secondary, app_state.model.focus_placement);
+    try testing.expectEqual(@as(?app.TerminalRef, null), app_state.model.selectedTerminalRef());
 
     try testing.expectEqual(@as(u64, 1), app_state.model.browser_navigation_token);
     app.update(&app_state.model, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } }, &app_state.effects);
-    try testing.expectEqual(app.Placement.primary, app_state.model.focus_placement);
     try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
 }
 
@@ -67,15 +68,17 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
     const app_iface = app_state.app();
 
     var line: [24]u8 = undefined;
-    for (0..80) |index| app_state.model.panes[0].session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{index}) catch unreachable);
-    const bottom = app_state.model.panes[0].session.scrollbar().offset;
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
+    for (0..80) |index| app_state.model.provider.slots[0].session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{index}) catch unreachable);
+    const bottom = app_state.model.provider.slots[0].session.scrollbar().offset;
+    // An ABNORMAL end, so the pane survives: a clean exit closes its pane
+    // now, and this test needs the dead terminal to still be there.
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 1, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
 
     try pressCanvasKey(harness, app_iface, "3", .{ .primary = true });
-    try testing.expect(app_state.model.selected_surface.eql(.web));
-    try testing.expectEqual(@as(?u8, null), app_state.model.selectedTerminalIndex());
+    try testing.expect(app_state.model.selectedSurface().eql(.web));
+    try testing.expectEqual(@as(?app.TerminalRef, null), app_state.model.selectedTerminalRef());
     try testing.expectEqual(@as(usize, 0), app_state.effects.pendingClipboardCount());
 
     const before0 = app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
@@ -91,14 +94,14 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
             .kind = .scroll,
             .x = x,
             .y = 300,
-            .delta_y = app_state.model.panes[0].session.cell_height * 4,
+            .delta_y = app_state.model.provider.slots[0].session.cell_height * 4,
         } });
     }
     try testing.expectEqual(before0, app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len);
     try testing.expectEqual(before1, app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len);
     try testing.expectEqual(@as(usize, 0), app_state.effects.pendingClipboardCount());
-    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
-    try testing.expectEqual(bottom, app_state.model.panes[0].session.scrollbar().offset);
+    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(bottom, app_state.model.provider.slots[0].session.scrollbar().offset);
 
     const buffer = try gpa.alloc(u8, 128 * 1024);
     defer gpa.free(buffer);
@@ -106,8 +109,10 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("web"), &writer);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, system WebKit") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), app.webview_anchor) != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "GitHub") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "GitHub") != null);
+    // The web surface stays a product surface, but its three hardcoded
+    // bookmark buttons came out of the band.
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "GitHub") == null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Superlogical") == null);
 
     // The platform shortcut path, not a synthetic canvas key, escapes native
     // WebKit focus. Its later physical release is latched and cannot leak to
@@ -150,7 +155,7 @@ test "web pane root-navigation bindings are exact" {
     try testing.expect(harness.null_platform.webviews[0].frame.height <= app.webkit_parking_extent);
     const navigations = harness.null_platform.webview_navigate_count;
     try app_state.dispatch(&harness.runtime, 1, .{ .browser_page = .superlogical });
-    try testing.expect(app_state.model.selected_surface.eql(.web));
+    try testing.expect(app_state.model.selectedSurface().eql(.web));
     try testing.expectEqualStrings(app.BrowserPage.superlogical.url(), harness.null_platform.webviews[0].url);
     try testing.expectEqual(navigations + 1, harness.null_platform.webview_navigate_count);
     try testing.expectEqual(@as(u64, 1), app_state.model.browser_navigation_token);
@@ -176,15 +181,18 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
 
-    const sessions = try createSessions(80, 24);
+    const session = try createSession(80, 24);
     const host = try gpa.create(app.CockpitHost);
     defer gpa.destroy(host);
-    host.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    host.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     host.inner.effects.executor = .fake;
     const app_iface = host.app();
     try harness.start(app_iface);
+    // Two tabs, so the Web surface sits at cmd+3.
+    try host.inner.dispatch(&harness.runtime, 1, .new_terminal);
+    try host.inner.dispatch(&harness.runtime, 1, .{ .select_position = 0 });
 
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
         .id = "surface.3",
@@ -192,7 +200,7 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(host.inner.model.selected_surface.eql(.web));
+    try testing.expect(host.inner.model.selectedSurface().eql(.web));
     var views_buffer: [4]native_sdk.ViewInfo = undefined;
     var views = harness.runtime.listViews(1, &views_buffer);
     var canvas_focused = false;
@@ -228,7 +236,7 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(host.inner.model.selected_surface.eql(.web));
+    try testing.expect(host.inner.model.selectedSurface().eql(.web));
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
         .id = "surface.2",
         .key = "2",
@@ -247,10 +255,10 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
     harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
 
-    const sessions = try createSessions(80, 24);
+    const session = try createSession(80, 24);
     const host = try gpa.create(app.CockpitHost);
     defer gpa.destroy(host);
-    host.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    host.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
     defer destroyModelSessions(&host.inner.model);
     defer host.deinit();
     host.inner.effects.executor = .fake;
@@ -263,16 +271,23 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
         .frame_index = 1,
         .timestamp_ns = 1_000_000,
     } });
+    // A second TAB is what makes the band appear at all. The band carries no
+    // New/Close/Split/Side-tabs buttons any more — those are cmd+T, cmd+W,
+    // cmd+D and a placement setting — so the strip is all there is to click.
+    try host.inner.dispatch(&harness.runtime, 1, .new_terminal);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     var terminal_2_frame: ?geometry.RectF = null;
     var web_frame: ?geometry.RectF = null;
-    var split_frame: ?geometry.RectF = null;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (node.widget.kind == .segmented_control and
             std.mem.indexOf(u8, node.widget.semantics.label, "Terminal 2, native terminal") != null) terminal_2_frame = node.frame;
         if (std.mem.indexOf(u8, node.widget.semantics.label, "Web, system WebKit") != null) web_frame = node.frame;
-        if (std.mem.eql(u8, node.widget.text, "Split")) split_frame = node.frame;
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "Split"));
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "New"));
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "Close"));
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "Side tabs"));
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "GitHub"));
     }
     var terminal_1_id: ?canvas.ObjectId = null;
     var web_id: ?canvas.ObjectId = null;
@@ -283,15 +298,9 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
             std.mem.indexOf(u8, node.label, "shortcut CMD+") != null) terminal_1_id = node.id;
         if (std.mem.indexOf(u8, node.label, "Web, system WebKit") != null) web_id = node.id;
     }
-    var target = rectCenter(split_frame orelse return error.TestExpectedSplitControl);
-    try clickCanvas(harness, app_iface, target.x, target.y);
-    try testing.expectEqual(app.LayoutMode.split, host.inner.model.layout);
-    try clickCanvas(harness, app_iface, target.x, target.y);
-    try testing.expectEqual(app.LayoutMode.single, host.inner.model.layout);
 
-    target = rectCenter(terminal_2_frame orelse return error.TestExpectedTab);
+    var target = rectCenter(terminal_2_frame orelse return error.TestExpectedTab);
     try clickCanvas(harness, app_iface, target.x, target.y);
-    try testing.expectEqual(app.Placement.secondary, host.inner.model.focus_placement);
     try testing.expect(host.inner.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqual(@as(canvas.ObjectId, 0), harness.runtime.views[0].canvas_widget_focused_id);
 
@@ -303,7 +312,7 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
 
     target = rectCenter(web_frame orelse return error.TestExpectedTab);
     try clickCanvas(harness, app_iface, target.x, target.y);
-    try testing.expect(host.inner.model.selected_surface.eql(.web));
+    try testing.expect(host.inner.model.selectedSurface().eql(.web));
     var views_buffer: [4]native_sdk.ViewInfo = undefined;
     var views = harness.runtime.listViews(1, &views_buffer);
     for (views) |item| {
@@ -326,7 +335,7 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
         .id = web_id orelse return error.TestExpectedTab,
         .action = .press,
     });
-    try testing.expect(host.inner.model.selected_surface.eql(.web));
+    try testing.expect(host.inner.model.selectedSurface().eql(.web));
     views = harness.runtime.listViews(1, &views_buffer);
     for (views) |item| if (std.mem.eql(u8, item.label, app.webview_label)) try testing.expect(item.focused);
 
@@ -376,9 +385,9 @@ test "terminal overlays are stable identity-keyed and isolate chrome divider and
     defer host.deinit();
     const app_iface = host.app();
 
-    try host.inner.dispatch(&harness.runtime, 1, .toggle_split);
+    try host.inner.dispatch(&harness.runtime, 1, .split_right);
     const expected = app.paneFrames(&host.inner.model, size);
-    var overlays: [app.pane_count]geometry.RectF = @splat(.{});
+    var overlays: [2]geometry.RectF = @splat(.{});
     var overlay_count: usize = 0;
     var divider: geometry.RectF = .{};
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
@@ -399,8 +408,8 @@ test "terminal overlays are stable identity-keyed and isolate chrome divider and
         }
         if (node.widget.kind == .split_divider) divider = node.frame;
     }
-    try testing.expectEqual(app.pane_count, overlay_count);
-    for (overlays, expected) |actual, frame| try testing.expectEqualDeep(frame, actual);
+    try testing.expectEqual(@as(usize, 2), overlay_count);
+    for (overlays, expected[0..2]) |actual, frame| try testing.expectEqualDeep(frame, actual);
 
     const header_point = geometry.PointF.init(size.width / 2, expected[0].y - 8);
     try pointerInput(harness, app_iface, .pointer_down, header_point, 0, .{}, 0);
@@ -418,24 +427,27 @@ test "terminal overlays are stable identity-keyed and isolate chrome divider and
     try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
 }
 
-test "remote focus is derived from selection, attachment, and window key state" {
-    const sessions = try createDefaultSessions();
-    var model = app.initialModel(sessions);
+test "remote focus is derived from the selected tab, its focused pane, and window key state" {
+    const session = try createDefaultSession();
+    var model = app.initialModel(session);
     defer app.deinitModel(&model);
 
+    // The remote terminal gets a tab of its own; selecting that tab is what
+    // makes it the focus target. There is no separate attachment to set.
     const remote = try remoteRef(71);
-    model.attachments[0] = remote;
-    model.focus_placement = .primary;
-    model.selected_surface = .{ .terminal = remote };
+    model.tabs[1] = app.Tree.initLeaf(remote);
+    model.tab_count = 2;
+    model.selected_tab = 1;
+    model.web_selected = false;
     model.focused = true;
     try testing.expect(app.remoteFocusTarget(&model).?.eql(remote));
 
     // Leaving for Web must retract remote focus, and RETURNING to the very
-    // same attachment must restore it. Publishing per message arm missed the
-    // return, because the attachment never changed.
-    model.selected_surface = .web;
+    // same tab must restore it. Publishing per message arm missed the
+    // return, because the tab never changed.
+    model.selectWeb();
     try testing.expectEqual(@as(?app.TerminalRef, null), app.remoteFocusTarget(&model));
-    model.selected_surface = .{ .terminal = remote };
+    model.web_selected = false;
     try testing.expect(app.remoteFocusTarget(&model).?.eql(remote));
 
     // The window losing key retracts it too.
@@ -444,8 +456,7 @@ test "remote focus is derived from selection, attachment, and window key state" 
     model.focused = true;
 
     // A local terminal is not a remote focus target at all.
-    model.attachments[0] = app.initialTerminalRef(0);
-    model.selected_surface = .{ .terminal = app.initialTerminalRef(0) };
+    try testing.expect(model.selectTab(0));
     try testing.expectEqual(@as(?app.TerminalRef, null), app.remoteFocusTarget(&model));
 }
 
@@ -461,7 +472,7 @@ test "a local grid resize preserves the surface scale factor" {
     // `.viewport` arm commits whatever arrives and the field's `= 1` default
     // would silently drop a Retina surface to 1x.
     var frame_index: u64 = 2;
-    while (frame_index < 8 and state.model.provider.terminals[0].cols == 80) : (frame_index += 1) {
+    while (frame_index < 8 and state.model.provider.slots[0].cols == 80) : (frame_index += 1) {
         try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_frame = .{
             .label = app.canvas_label,
             .size = native_sdk.geometry.SizeF.init(700, 420),
@@ -471,6 +482,6 @@ test "a local grid resize preserves the surface scale factor" {
         } });
         try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
     }
-    try testing.expect(state.model.provider.terminals[0].cols != 80);
+    try testing.expect(state.model.provider.slots[0].cols != 80);
     try testing.expectApproxEqAbs(@as(f32, 2), state.model.surface_scale_factor, 0.0001);
 }

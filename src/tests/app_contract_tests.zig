@@ -8,7 +8,8 @@ const support = @import("support.zig");
 const canvas = native_sdk.canvas;
 const testing = std.testing;
 
-const createSessions = support.createSessions;
+const createSession = support.createSession;
+const activeSlots = support.activeSlots;
 
 test "Phux Cockpit identity and macOS pane commands are exact" {
     try testing.expectEqualStrings("Phux Cockpit", app.app_name);
@@ -25,8 +26,8 @@ test "Phux Cockpit identity and macOS pane commands are exact" {
 }
 
 test "Phux Cockpit owns its dark graphite and lime visual register" {
-    const sessions = try createSessions(80, 24);
-    var model = app.initialModel(sessions);
+    const session = try createSession(80, 24);
+    var model = app.initialModel(session);
     defer app.deinitModel(&model);
     const tokens = app.cockpitTokens(&model);
     try testing.expectEqual(canvas.Color.rgb8(9, 11, 15), tokens.colors.background);

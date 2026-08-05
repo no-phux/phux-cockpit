@@ -34,6 +34,12 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
     .{ .id = "terminal.close", .key = "w", .modifiers = .{ .primary = true } },
+    // Splitting is unconditional now: one terminal on a fresh window is a
+    // perfectly good thing to split, so the chord registers globally.
+    .{ .id = "pane.split-right", .key = "d", .modifiers = .{ .primary = true } },
+    .{ .id = "pane.split-down", .key = "d", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .id = "pane.previous", .key = "[", .modifiers = .{ .primary = true } },
+    .{ .id = "pane.next", .key = "]", .modifiers = .{ .primary = true } },
     .{ .id = "tab.move-left", .key = "arrowleft", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.move-right", .key = "arrowright", .modifiers = .{ .primary = true, .shift = true } },
 };
@@ -42,8 +48,12 @@ const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Phux Cockpit canvas", .accessibility_label = "Phux Cockpit", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
     .{ .label = webview_label, .kind = .webview, .parent = canvas_label, .url = model_module.BrowserPage.github.url(), .x = 0, .y = 0, .width = webkit_parking_extent, .height = webkit_parking_extent, .layer = 20 },
 };
+/// The window's declared label. `fx.closeWindow` addresses a window by this
+/// name, and closing the last tab is how the app exits.
+pub const main_window_label = "main";
+
 const shell_windows = [_]native_sdk.ShellWindow{.{
-    .label = "main",
+    .label = main_window_label,
     .title = app_name,
     .width = window_width,
     .height = window_height,

@@ -1,4 +1,4 @@
-//! Theme and emulator-color resolution for terminal grid projection.
+//! Emulator-color resolution for terminal grid projection.
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
@@ -19,25 +19,33 @@ fn rgbToColor(rgb: vt.color.RGB) canvas.Color {
     return canvas.Color.rgb8(rgb.r, rgb.g, rgb.b);
 }
 
-/// The theme mapping, stated honestly: where the emulator's palette entry
-/// still holds its default value, ANSI-16 derives from active theme tokens.
-/// Programmed colors, the cube, grayscale ramp, and truecolor pass through.
+/// The emulator's color state, resolved for the painter.
+///
+/// The whole 256-entry palette comes from the EMULATOR, not the UI theme.
+/// ANSI-16 used to be derived from `destructive`/`success`/`warning` design
+/// tokens plus three hardcoded Tailwind hexes, which is why colored terminal
+/// output looked wrong: `\x1b[31m` is a terminal red with a fixed, decades-old
+/// meaning that `ls`, diff coloring, and every prompt theme are calibrated
+/// against — it is not the UI's "something went wrong" accent. libghostty ships
+/// the real defaults (`vt.color.default`, installed by `Terminal.init`), so the
+/// projection reads them back verbatim. The cube, grayscale ramp, truecolor,
+/// and OSC 4 overrides pass through the same single lookup.
+///
+/// Only foreground, background, and cursor stay theme-derived, and those the
+/// EMULATOR composes: the session pushes tokens into `colors.*.default` so an
+/// application's OSC 10/11/12 override still wins.
 pub const Palette = struct {
     background: canvas.Color,
     foreground: canvas.Color,
     cursor: canvas.Color,
     selection: canvas.Color,
-    ansi: [16]canvas.Color,
     terminal: *const vt.RenderState.Colors,
-    /// The emulator's live palette with its override mask, so OSC 4 wins even
-    /// when the programmed value happens to equal the default RGB.
+    /// The emulator's live 256-color palette, overrides applied. Read directly
+    /// (rather than mirrored into a local array) so OSC 4 lands the same frame.
     dynamic: *const vt.color.DynamicPalette,
 
     pub fn init(tokens: canvas.DesignTokens, terminal_colors: *const vt.RenderState.Colors, dynamic: *const vt.color.DynamicPalette) Palette {
         const colors = tokens.colors;
-        const dark = colors.background.r + colors.background.g + colors.background.b < 1.5;
-        const dim: f32 = if (dark) 0.85 else 1.0;
-        const bright: f32 = if (dark) 1.0 else 0.8;
         // Resolved render colors already include theme defaults, OSC overrides,
         // and DECSCNM reverse swap.
         return .{
@@ -47,29 +55,10 @@ pub const Palette = struct {
             .selection = colors.accent,
             .terminal = terminal_colors,
             .dynamic = dynamic,
-            .ansi = .{
-                blend(colors.text, colors.background, if (dark) 0.35 else 0.95),
-                scale(colors.destructive, dim),
-                scale(colors.success, dim),
-                scale(colors.warning, dim),
-                scale(canvas.Color.rgb8(37, 99, 235), dim),
-                scale(canvas.Color.rgb8(147, 51, 234), dim),
-                scale(canvas.Color.rgb8(8, 145, 178), dim),
-                blend(colors.text, colors.background, if (dark) 0.75 else 0.35),
-                blend(colors.text, colors.background, if (dark) 0.5 else 0.75),
-                scale(colors.destructive, bright),
-                scale(colors.success, bright),
-                scale(colors.warning, bright),
-                scale(canvas.Color.rgb8(59, 130, 246), bright),
-                scale(canvas.Color.rgb8(168, 85, 247), bright),
-                scale(canvas.Color.rgb8(34, 211, 238), bright),
-                colors.text,
-            },
         };
     }
 
     pub fn indexed(palette: *const Palette, index: u8) canvas.Color {
-        if (index < 16 and !palette.dynamic.mask.isSet(index)) return palette.ansi[index];
         const live = palette.dynamic.current[index];
         return canvas.Color.rgb8(live.r, live.g, live.b);
     }
@@ -85,7 +74,17 @@ pub const Palette = struct {
     pub fn resolveFgRaw(palette: *const Palette, style: vt.Style) canvas.Color {
         return switch (style.fg_color) {
             .none => palette.foreground,
-            .palette => |index| palette.indexed(index),
+            // Bold-as-bright over the ANSI-8 range, the convention every
+            // terminal ships and every prompt theme assumes: `\x1b[1;31m` is
+            // bright red. It is the ONLY channel bold has here — the painter
+            // draws one mono face and cannot carry a weight axis — so without
+            // it a bold-red prompt and a plain-red error render identically.
+            // Deliberately NOT applied to the bright range (8-15, already
+            // bright), the cube, or truecolor, where the application named an
+            // exact color.
+            .palette => |index| palette.indexed(
+                if (style.flags.bold and index < 8) index + 8 else index,
+            ),
             .rgb => |rgb| canvas.Color.rgb8(rgb.r, rgb.g, rgb.b),
         };
     }

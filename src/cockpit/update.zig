@@ -5,6 +5,7 @@ const provider_contract = @import("provider_contract");
 const support = @import("phux_support.zig");
 const local = @import("../providers/local/provider.zig");
 const topology = @import("topology.zig");
+const layout = @import("layout.zig");
 const model_module = @import("model.zig");
 const app_types = @import("app_types.zig");
 const runtime = @import("terminal_runtime.zig");
@@ -19,7 +20,6 @@ const RemoteUiState = model_module.RemoteUiState;
 const Msg = app_types.Msg;
 const Fx = app_types.Fx;
 const Pane = local.Pane;
-const Placement = topology.Placement;
 const TerminalRef = support.TerminalRef;
 const ReplicaOwner = support.ReplicaOwner;
 const PhysicalKey = support.PhysicalKey;
@@ -33,8 +33,8 @@ const pointer_module = support.pointer_module;
 const providerKind = support.providerKind;
 const optRefEql = support.optRefEql;
 const optOwnerEql = support.optOwnerEql;
-const max_terminal_count = local.max_terminal_count;
-const pane_count = local.pane_count;
+const max_terminals = local.max_terminals;
+const max_tabs = topology.max_tabs;
 const clipboard_key = local.clipboard_key;
 const paste_clipboard_key = local.paste_clipboard_key;
 const max_held_terminal_keys = model_module.max_held_terminal_keys;
@@ -62,10 +62,9 @@ const validScale = pointer_input.validScale;
 const syncMouseProtocol = pointer_input.syncMouseProtocol;
 const cockpit_shortcuts = scene.cockpit_shortcuts;
 const cockpitTokens = projection.cockpitTokens;
-const splitAvailable = projection.splitAvailable;
 const selectedTerminalCanClose = projection.selectedTerminalCanClose;
 pub fn initFx(model: *Model, fx: *Fx) void {
-    for (0..max_terminal_count) |index| {
+    for (0..max_terminals) |index| {
         if (model.provider.states[index] == .active) spawnPane(model.provider.slot(index), fx);
     }
     openPhuxChannel(model, fx, false);
@@ -123,7 +122,7 @@ fn openPointerMonitor(model: *Model, fx: *Fx) void {
 /// re-selected a terminal that had been told it was blurred.
 pub fn remoteFocusTarget(model: *const Model) ?TerminalRef {
     if (!model.focused) return null;
-    if (model.selected_surface == .web) return null;
+    if (model.web_selected) return null;
     const terminal_ref = model.focusedTerminalRef() orelse return null;
     if (providerKind(terminal_ref) != .phux) return null;
     return terminal_ref;
@@ -154,11 +153,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
 fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
     switch (msg) {
         .shell => |event| {
+            // A retired terminal's slot is already vacant and its pty key is
+            // never reissued, so a late event resolves to nothing.
             const pane = paneForKey(model, event.key) orelse return;
-            if (model.provider.isClosing(pane.id)) {
-                if (event.kind == .exit) model.provider.retireClosing(pane.id);
-                return;
-            }
             switch (event.kind) {
                 .output => {
                     pane.phase = .live;
@@ -190,6 +187,11 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                     pane.outbound_head = 0;
                     pane.outbound_len = 0;
                     pane.session.clearResponses();
+                    // Typing `exit` means the pane is DONE. Leaving a dead
+                    // grid behind an "EXIT 0" badge is the zombie the owner
+                    // kept hitting; only an ABNORMAL end earns the tombstone
+                    // and its Restart affordance.
+                    if (!projection.paneLifecycleFailed(pane)) closePaneForTerminal(model, fx, pane.id, false);
                 },
                 .write => unreachable,
             }
@@ -286,7 +288,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             if (validScale(surface.scale_factor)) model.surface_scale_factor = surface.scale_factor;
         },
         .flush_outbound => {
-            for (0..max_terminal_count) |index| {
+            for (0..max_terminals) |index| {
                 if (model.provider.states[index] != .active) continue;
                 const pane = model.provider.slot(index);
                 flushOutbound(pane, fx);
@@ -306,8 +308,8 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // only the focused one's.
             if (!focused) {
                 endAllCaptures(model, fx);
-                for (0..max_terminal_count) |index| {
-                    if (model.provider.states[index] != .vacant) model.provider.slot(index).macos_natural_keys_held = 0;
+                for (0..max_terminals) |index| {
+                    if (model.provider.states[index] == .active) model.provider.slot(index).macos_natural_keys_held = 0;
                 }
                 model.consumed_shortcut_keys_held = 0;
                 for (&model.held_terminal_keys) |*held| held.* = .{};
@@ -346,8 +348,8 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             }
         },
         .copy_selection => {
-            if (model.selectedTerminalId() == null) return;
-            copySelection(model, fx, model.focusedPane().id);
+            const id = model.selectedTerminalId() orelse return;
+            copySelection(model, fx, id);
         },
         .copy_terminal => |id| copySelection(model, fx, id),
         .paste_terminal => |id| requestPaste(model, fx, id),
@@ -399,13 +401,13 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             };
             model.paste_failed = false;
         },
-        .restart => |placement| {
+        .restart => |terminal_ref| {
             // Restart ONLY a genuinely finished session. During
             // `.starting` (spawned, no output yet) or `.live` the pty
             // still holds the key, so respawning would collide on the
             // same key — a rejected exit that strands the running
             // original with no input.
-            const pane = model.terminalAt(placement) orelse return;
+            const pane = model.provider.terminal(terminal_ref) orelse return;
             if (pane.phase != .ended and pane.phase != .failed) return;
             // Keep the clipboard key occupied until cancellation delivers;
             // the generation check above discards the stale result.
@@ -420,51 +422,50 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             endCapturesForTerminal(model, fx, pane.id);
             spawnPane(pane, fx);
         },
-        .focus_pane => |requested| {
-            if (model.attachments[requested.index()] == null) return;
-            if (requested == model.focus_placement) return;
-            model.focus_placement = requested;
-            model.selected_surface = .{ .terminal = model.attachments[requested.index()].? };
+        .focus_pane => |node| {
+            const current = model.selectedTree() orelse return;
+            if (node >= layout.max_nodes or current.node(node).kind != .leaf) return;
+            if (current.focus == node) return;
+            current.focus = node;
             endHiddenCaptures(model, fx);
         },
         .select_surface => |surface| {
-            if (surface.eql(model.selected_surface)) return;
+            if (surface.eql(model.selectedSurface())) return;
             switch (surface) {
                 .terminal => |id| {
                     if (!model.selectTerminal(id)) return;
                 },
-                .web => model.selected_surface = .web,
+                .web => model.selectWeb(),
             }
             endHiddenCaptures(model, fx);
         },
         .select_position => |position| {
-            if (position < model.terminal_count) {
-                _ = model.selectTerminal(model.terminal_order[position]);
-            } else if (position == model.terminal_count) {
-                model.selected_surface = .web;
+            if (position < model.tab_count) {
+                _ = model.selectTab(position);
+            } else if (position == model.tab_count) {
+                model.selectWeb();
             }
             endHiddenCaptures(model, fx);
         },
         .cycle_tab => |delta| {
-            const count: i8 = @intCast(model.terminal_count + 1);
-            const current: i8 = if (model.selectedTerminalId()) |id|
-                @intCast(model.terminalOrderIndex(id) orelse 0)
+            const count: i8 = @intCast(model.tab_count + 1);
+            const current: i8 = if (model.web_selected)
+                @intCast(model.tab_count)
             else
-                @intCast(model.terminal_count);
+                @intCast(model.selected_tab);
             const next: usize = @intCast(@mod(current + delta, count));
-            if (next == model.terminal_count) {
-                model.selected_surface = .web;
-            } else {
-                _ = model.selectTerminal(model.terminal_order[next]);
-            }
+            if (next == model.tab_count) model.selectWeb() else _ = model.selectTab(next);
             endHiddenCaptures(model, fx);
         },
         .new_terminal => {
-            // Tab order is the binding capacity, not the local registry:
-            // remote terminals occupy the same bounded order.
-            if (model.terminal_count >= max_terminal_count) return;
+            // A new terminal is a new TAB. Capacity is bounded on both ends:
+            // tab slots and registry slots.
+            if (model.tab_count >= max_tabs) return;
             const pane = model.provider.createTerminal() catch return;
-            _ = model.admitToOrder(pane.id);
+            if (!model.admitTab(pane.id)) {
+                _ = model.provider.destroyTerminal(pane.id);
+                return;
+            }
             _ = model.selectTerminal(pane.id);
             endHiddenCaptures(model, fx);
             spawnPane(pane, fx);
@@ -474,33 +475,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // Close owns LOCAL lifetime only. A Phux terminal exists because
             // its coordinator says so; cmd+W must not pretend to end it.
             if (providerKind(id) != .local) return;
-            const order_index = model.terminalOrderIndex(id) orelse return;
-            endCapturesForTerminal(model, fx, id);
-            const pane = model.provider.beginClose(id) orelse return;
-            const had_live_pty = pane.phase == .starting or pane.phase == .live;
-            if (model.copy_inflight and model.copy_owner.terminal_ref.eql(id)) fx.cancel(clipboard_key);
-            if (model.paste_inflight and model.paste_owner.terminal_ref.eql(id)) fx.cancel(paste_clipboard_key);
-            model.dropFromOrder(order_index);
-            for (&model.attachments) |*attached| {
-                if (attached.* != null and attached.*.?.eql(id)) attached.* = null;
-            }
-            if (model.terminal_count == 0) {
-                model.selected_surface = .web;
-                model.layout = .single;
-                model.attachments = .{ null, null };
-                model.focus_placement = .primary;
-            } else {
-                const next_index = @min(order_index, model.terminal_count - 1);
-                model.selected_surface = .{ .terminal = model.terminal_order[next_index] };
-                model.normalizeTopology();
-                model.reconcileAttachmentFocus();
-            }
-            endHiddenCaptures(model, fx);
-            if (had_live_pty) {
-                fx.ptyKill(pane.pty_key);
-            } else {
-                model.provider.retireClosing(id);
-            }
+            closePaneForTerminal(model, fx, id, true);
         },
         .move_terminal => |delta| {
             const id = model.selectedTerminalId() orelse return;
@@ -510,37 +485,92 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             model.tab_placement = if (model.tab_placement == .top) .side else .top;
             endHiddenCaptures(model, fx);
         },
-        .toggle_split => {
-            if (!splitAvailable(model)) return;
-            model.layout = if (model.layout == .single) .split else .single;
-            model.normalizeTopology();
-            endHiddenCaptures(model, fx);
-        },
-        .split_resized => |fraction| {
-            if (!std.math.isFinite(fraction)) return;
-            model.split_fraction = std.math.clamp(fraction, 0.05, 0.95);
+        .split_right => splitFocusedPane(model, fx, .horizontal),
+        .split_down => splitFocusedPane(model, fx, .vertical),
+        .split_resized => |resize| {
+            const current = model.selectedTree() orelse return;
+            current.setFraction(resize.node, resize.value);
         },
         .cycle_pane => |delta| {
-            if (model.layout != .split or model.selectedTerminalId() == null) return;
-            const current: i8 = @intCast(@intFromEnum(model.focus_placement));
-            const next = @mod(current + delta, @as(i8, @intCast(pane_count)));
-            const placement = Placement.fromIndex(@intCast(next)).?;
-            if (model.attachments[placement.index()] != null) updateModel(model, .{ .focus_pane = placement }, fx);
+            const current = model.selectedTree() orelse return;
+            const next = current.cycleFocus(delta) orelse return;
+            updateModel(model, .{ .focus_pane = next }, fx);
+        },
+        .focus_direction => |direction| {
+            const current = model.selectedTreeConst() orelse return;
+            const chrome = projection.workspaceChrome(model, model.surface_size);
+            const next = current.focusDirection(
+                chrome.content,
+                projection.split_divider_width,
+                projection.split_pane_min_width,
+                projection.split_pane_min_height,
+                direction,
+            ) orelse return;
+            updateModel(model, .{ .focus_pane = next }, fx);
         },
         .browser_page => |page| {
             model.browser_page = page;
             model.browser_navigation_token +%= 1;
-            model.selected_surface = .web;
+            model.selectWeb();
             endHiddenCaptures(model, fx);
         },
-        .attach_terminal => |attachment| {
-            model.attach(attachment.placement, attachment.terminal_ref) catch return;
-        },
-        .detach_terminal => |placement| {
-            if (model.attachments[placement.index()]) |id| endCapturesForTerminal(model, fx, id);
-            _ = model.detach(placement);
-            endHiddenCaptures(model, fx);
-        },
+    }
+}
+
+/// A real split: mint a NEW terminal and divide the focused pane with it.
+/// The old `toggle_split` only flipped a flag and dragged an existing tab
+/// into the second slot — which is why splitting "opened up like a different
+/// thing" instead of giving a second shell beside the first.
+fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) void {
+    const current = model.selectedTree() orelse return;
+    const target = current.focus;
+    if (target == layout.none or current.node(target).kind != .leaf) return;
+    const pane = model.provider.createTerminal() catch return;
+    _ = current.split(target, orientation, pane.id) catch {
+        // The tree refused (at its pane ceiling): the terminal minted for it
+        // has no home, so it goes back rather than leaking a live shell.
+        _ = model.provider.destroyTerminal(pane.id);
+        return;
+    };
+    endHiddenCaptures(model, fx);
+    spawnPane(pane, fx);
+}
+
+/// Close the pane holding `terminal_ref`, then cascade: the tab goes when it
+/// loses its last pane, and the window goes when it loses its last tab.
+///
+/// `kill_pty` is false when the shell already exited on its own — there is
+/// no child left to signal, and the session is freed here either way.
+fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_pty: bool) void {
+    const tab_index = model.tabOfTerminal(terminal_ref) orelse return;
+    var current = &model.tabs[tab_index];
+
+    endCapturesForTerminal(model, fx, terminal_ref);
+    if (model.copy_inflight and model.copy_owner.terminal_ref.eql(terminal_ref)) fx.cancel(clipboard_key);
+    if (model.paste_inflight and model.paste_owner.terminal_ref.eql(terminal_ref)) fx.cancel(paste_clipboard_key);
+
+    // The tree promotes the sibling into the parent's rect; nothing else
+    // needs to reshape.
+    _ = current.closeTerminal(terminal_ref);
+
+    if (model.provider.terminal(terminal_ref)) |pane| {
+        const had_live_pty = pane.phase == .starting or pane.phase == .live;
+        const pty_key = pane.pty_key;
+        // Free the emulator NOW. The old `.closing` tombstone waited on a
+        // pty exit that could never arrive, holding a registry slot and a
+        // whole session hostage against capacity.
+        _ = model.provider.destroyTerminal(terminal_ref);
+        if (kill_pty and had_live_pty) fx.ptyKill(pty_key);
+    }
+
+    if (current.isEmpty()) model.dropTab(tab_index);
+    endHiddenCaptures(model, fx);
+
+    if (model.tab_count == 0) {
+        // The last tab was the window's whole reason to exist. This is the
+        // real OS close, with the platform's own last-window semantics.
+        model.web_selected = true;
+        fx.closeWindow(scene.main_window_label);
     }
 }
 /// ONE copy in flight: the clipboard write reuses a fixed key, so a second
@@ -750,9 +780,29 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         updateModel(model, .{ .cycle_tab = 1 }, fx);
         return;
     }
-    if (splitAvailable(model) and primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "d")) {
+    // cmd+D splits right, cmd+shift+D splits down — both always available,
+    // including on a fresh window with exactly one terminal. The old gate
+    // required two tabs to exist first, which is why the very first split
+    // never worked.
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "d")) {
         latchAppShortcut(model, event.key);
-        updateModel(model, .toggle_split, fx);
+        updateModel(model, .split_right, fx);
+        return;
+    }
+    if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "d")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .split_down, fx);
+        return;
+    }
+    // cmd+[ / cmd+] cycle PANES within the tab; cmd+shift+[ / ] cycle tabs.
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "[")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .{ .cycle_pane = -1 }, fx);
+        return;
+    }
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "]")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .{ .cycle_pane = 1 }, fx);
         return;
     }
     if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "t")) {
@@ -776,15 +826,16 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         updateModel(model, .{ .move_terminal = 1 }, fx);
         return;
     }
-    if (model.layout == .split and model.selectedTerminalId() != null and primary and mods.alt and !mods.shift and !mods.control and keyIs(event.key, "arrowleft")) {
-        latchAppShortcut(model, event.key);
-        updateModel(model, .{ .cycle_pane = -1 }, fx);
-        return;
-    }
-    if (model.layout == .split and model.selectedTerminalId() != null and primary and mods.alt and !mods.shift and !mods.control and keyIs(event.key, "arrowright")) {
-        latchAppShortcut(model, event.key);
-        updateModel(model, .{ .cycle_pane = 1 }, fx);
-        return;
+    // cmd+opt+arrows move focus GEOMETRICALLY, the way Ghostty does — the
+    // pane that actually lies that way, not the next index in a list.
+    if (model.selectedTerminalId() != null and primary and mods.alt and !mods.shift and !mods.control) {
+        const direction: ?layout.Direction =
+            if (keyIs(event.key, "arrowleft")) .left else if (keyIs(event.key, "arrowright")) .right else if (keyIs(event.key, "arrowup")) .up else if (keyIs(event.key, "arrowdown")) .down else null;
+        if (direction) |value| {
+            latchAppShortcut(model, event.key);
+            updateModel(model, .{ .focus_direction = value }, fx);
+            return;
+        }
     }
 
     // A webview is a real native input surface. Unclaimed canvas events
@@ -825,7 +876,7 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     }
     if (primary and keyIs(event.key, "r") and (pane.phase == .ended or pane.phase == .failed)) {
         latchAppShortcut(model, event.key);
-        update(model, .{ .restart = model.focus_placement }, fx);
+        update(model, .{ .restart = pane.id }, fx);
         return;
     }
     // Scrollback chords pause while a keyboard selection is armed: the
@@ -1179,10 +1230,6 @@ pub fn appShortcutKeyMask(key: []const u8) u32 {
 }
 
 pub fn commandShortcutKeyMask(name: []const u8) u32 {
-    // Split is intentionally not globally registered while one terminal may
-    // be active, but injected/menu shortcut events still need duplicate-edge
-    // suppression once they reach this host.
-    if (std.mem.eql(u8, name, "layout.split")) return appShortcutKeyMask("d");
     for (cockpit_shortcuts) |shortcut| {
         if (std.mem.eql(u8, name, shortcut.id)) return appShortcutKeyMask(shortcut.key);
     }
