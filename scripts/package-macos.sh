@@ -65,16 +65,47 @@ for tool in zig codesign ditto hdiutil lipo plutil shasum unzip; do
     fi
 done
 
+PHUX_ENABLED="${PHUX_ENABLED:-true}"
+case "${PHUX_ENABLED}" in
+    true|false) ;;
+    *)
+        printf 'error: PHUX_ENABLED must be true or false\n' >&2
+        exit 1
+        ;;
+esac
+if [[ "${PHUX_ENABLED}" == "true" ]]; then
+    : "${PHUX_CLIENT_FFI_INCLUDE_DIR:?set PHUX_CLIENT_FFI_INCLUDE_DIR to the directory containing phux/client.h}"
+    : "${PHUX_CLIENT_FFI_LIB_DIR:?set PHUX_CLIENT_FFI_LIB_DIR to the directory containing libphux_client_ffi.a}"
+    [[ -f "${PHUX_CLIENT_FFI_INCLUDE_DIR}/phux/client.h" ]] || {
+        printf 'error: phux/client.h is missing from %s\n' "${PHUX_CLIENT_FFI_INCLUDE_DIR}" >&2
+        exit 1
+    }
+    [[ -f "${PHUX_CLIENT_FFI_LIB_DIR}/libphux_client_ffi.a" ]] || {
+        printf 'error: libphux_client_ffi.a is missing from %s\n' "${PHUX_CLIENT_FFI_LIB_DIR}" >&2
+        exit 1
+    }
+fi
+
 rm -rf -- "${PACKAGE_APP}" "${APP}" "${STAGING}" "${ZIP_VERIFY}" "${DMG_MOUNT}"
 rm -f -- "${ZIP}" "${DMG}" "${CHECKSUMS}" "${NOTARY_ZIP}"
 mkdir -p -- "${OUT_DIR}"
 
 (
     cd "${ROOT}"
-    zig build package \
-        -Dtarget="${TARGET}" \
-        -Doptimize="${OPTIMIZE}" \
-        --summary all
+    if [[ "${PHUX_ENABLED}" == "true" ]]; then
+        zig build package \
+            -Dtarget="${TARGET}" \
+            -Doptimize="${OPTIMIZE}" \
+            -Dphux-enabled=true \
+            -Dphux-client-ffi-include-dir="${PHUX_CLIENT_FFI_INCLUDE_DIR}" \
+            -Dphux-client-ffi-lib-dir="${PHUX_CLIENT_FFI_LIB_DIR}" \
+            --summary all
+    else
+        zig build package \
+            -Dtarget="${TARGET}" \
+            -Doptimize="${OPTIMIZE}" \
+            --summary all
+    fi
 )
 
 if [[ ! -d "${PACKAGE_APP}" ]]; then
@@ -86,6 +117,8 @@ mv -- "${PACKAGE_APP}" "${APP}"
 RESOURCES="${APP}/Contents/Resources"
 /bin/cp "${ROOT}/LICENSE" "${RESOURCES}/LICENSE.txt"
 /bin/cp "${ROOT}/THIRD_PARTY_NOTICES.md" "${RESOURCES}/THIRD_PARTY_NOTICES.md"
+/bin/cp "${ROOT}/assets/fonts/JetBrainsMono-OFL.txt" "${RESOURCES}/JetBrainsMono-OFL.txt"
+/bin/cp "${ROOT}/assets/licenses/Phux-FFI-THIRD-PARTY.html" "${RESOURCES}/Phux-FFI-THIRD-PARTY.html"
 rm -f -- "${RESOURCES}/package-manifest.zon"
 cat > "${RESOURCES}/README.txt" <<'EOF'
 Phux Cockpit
@@ -152,7 +185,7 @@ EOF
         printf 'error: executable or application icon is missing from %s\n' "${bundle}" >&2
         return 1
     }
-    for resource in LICENSE.txt README.txt THIRD_PARTY_NOTICES.md signing-plan.txt; do
+    for resource in LICENSE.txt README.txt THIRD_PARTY_NOTICES.md JetBrainsMono-OFL.txt Phux-FFI-THIRD-PARTY.html signing-plan.txt; do
         [[ -s "${resources}/${resource}" ]] || {
             printf 'error: required resource %s is missing from %s\n' "${resource}" "${bundle}" >&2
             return 1

@@ -23,12 +23,32 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: phall1/phux
+          ref: 5b5c67a90f9501352bc9b7063c0611480f0fa2a6 # v0.12.0
+          path: .phux
+          persist-credentials: false
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+      - name: Build the pinned Phux client FFI
+        working-directory: .phux
+        run: cargo build --locked --profile ffi-release -p phux-client-ffi
       - name: Test with the null platform
         run: zig build test -Dplatform=null --summary all
+      - name: Test the production Phux provider
+        run: |
+          zig build test \
+            -Dplatform=null \
+            -Dphux-enabled=true \
+            -Dphux-client-ffi-include-dir="$PWD/.phux/crates/phux-client-ffi/include" \
+            -Dphux-client-ffi-lib-dir="$PWD/.phux/target/ffi-release" \
+            --summary all
       - name: Package and verify the arm64 macOS app
+        env:
+          PHUX_CLIENT_FFI_INCLUDE_DIR: ${{ github.workspace }}/.phux/crates/phux-client-ffi/include
+          PHUX_CLIENT_FFI_LIB_DIR: ${{ github.workspace }}/.phux/target/ffi-release
         run: |
           set -euo pipefail
           VERSION="$(awk -F '"' '/^[[:space:]]*\.version = / { print $2; exit }' app.zon)"

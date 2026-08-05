@@ -430,6 +430,7 @@ test "versioned snapshot restores topology into fresh sessions without process s
     app.update(&state.model, .{ .move_terminal = -1 }, &state.effects);
     app.update(&state.model, .toggle_split, &state.effects);
     state.model.split_fraction = 0.63;
+    state.model.tab_placement = .side;
     const live_id = state.model.selectedTerminalId().?;
     const live_session = state.model.provider.terminal(live_id).?.session;
     live_session.feed("runtime state is intentionally not persisted");
@@ -443,6 +444,7 @@ test "versioned snapshot restores topology into fresh sessions without process s
     for (state.model.terminal_order[0..state.model.terminal_count], restored.terminal_order[0..restored.terminal_count]) |expected, actual| try testing.expect(expected.eql(actual));
     try testing.expect(state.model.selectedTerminalRef().?.eql(restored.selectedTerminalRef().?));
     try testing.expectEqual(state.model.layout, restored.layout);
+    try testing.expectEqual(state.model.tab_placement, restored.tab_placement);
     try testing.expectApproxEqAbs(state.model.split_fraction, restored.split_fraction, 0.0001);
     try testing.expectEqualDeep(state.model.attachments, restored.attachments);
     const fresh = restored.provider.terminal(live_id) orelse return error.TestExpectedTerminal;
@@ -654,7 +656,44 @@ test "four-terminal tab layout stays inside the minimum window with Web last" {
     try testing.expectEqualStrings("Web", tab_labels[4]);
 }
 
+test "side tabs remain accessible and bounded at the minimum window" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    try fillTerminalCapacity(harness, state);
+    try state.dispatch(&harness.runtime, 1, .toggle_tab_placement);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = native_sdk.geometry.SizeF.init(app.window_min_width, app.window_min_height),
+        .scale_factor = 2,
+        .frame_index = 2,
+        .timestamp_ns = 2_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    var previous_y: f32 = -1;
+    var tab_count: usize = 0;
+    var saw_scroll_region = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind == .scroll_view and std.mem.eql(u8, node.widget.semantics.label, "Workspace controls")) {
+            saw_scroll_region = true;
+            try testing.expect(node.frame.y >= 0);
+            try testing.expect(node.frame.y + node.frame.height <= app.window_min_height);
+        }
+        if (node.widget.kind != .list_item) continue;
+        try testing.expectEqual(canvas.WidgetRole.tab, node.widget.semantics.role);
+        try testing.expect(node.frame.x >= 0 and node.frame.x + node.frame.width <= app.side_rail_width + 8);
+        try testing.expect(node.frame.y > previous_y);
+        previous_y = node.frame.y;
+        tab_count += 1;
+    }
+    try testing.expect(saw_scroll_region);
+    try testing.expectEqual(@as(usize, app.max_terminal_count + 1), tab_count);
+}
+
 const four_terminal_shot_path = "zig-out/cockpit-four-terminals.png";
+const side_tabs_shot_path = "zig-out/cockpit-side-tabs.png";
 
 test "four-terminal compact chrome screenshot (env-gated)" {
     if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
@@ -678,6 +717,35 @@ test "four-terminal compact chrome screenshot (env-gated)" {
     try canvas.png.writeRgba8(&writer, shot.width, shot.height, shot.rgba8);
     try std.Io.Dir.cwd().createDirPath(testing.io, "zig-out");
     try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = four_terminal_shot_path, .data = writer.buffered() });
+}
+
+test "side tabs and bundled terminal glyphs screenshot (env-gated)" {
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    try fillTerminalCapacity(harness, state);
+    try state.dispatch(&harness.runtime, 1, .toggle_tab_placement);
+    try state.dispatch(&harness.runtime, 1, .{ .select_surface = .{ .terminal = app.initialTerminalRef(0) } });
+    const pane = state.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+    try state.effects.feedPtyOutput(pane.pty_key, "\x1b[38;2;190;242;100m\u{f120}  PHUX COCKPIT\x1b[0m\r\n\u{e0a0} main   \u{f013} native agent terminal\r\n");
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    const pixel_size = try harness.runtime.canvasScreenshotPixelSize(1, app.canvas_label, null);
+    const pixels = try testing.allocator.alloc(u8, pixel_size.byte_len);
+    defer testing.allocator.free(pixels);
+    const scratch = try testing.allocator.alloc(u8, pixel_size.byte_len);
+    defer testing.allocator.free(scratch);
+    const shot = try harness.runtime.renderCanvasScreenshot(1, app.canvas_label, null, pixels, scratch);
+    const encoded = try testing.allocator.alloc(u8, try canvas.png.encodedRgba8ByteLen(shot.width, shot.height));
+    defer testing.allocator.free(encoded);
+    var writer = std.Io.Writer.fixed(encoded);
+    try canvas.png.writeRgba8(&writer, shot.width, shot.height, shot.rgba8);
+    try std.Io.Dir.cwd().createDirPath(testing.io, "zig-out");
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = side_tabs_shot_path, .data = writer.buffered() });
 }
 
 fn remoteRef(id: u32) !app.TerminalRef {

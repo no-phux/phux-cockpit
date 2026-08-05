@@ -55,6 +55,9 @@ const grid_inset: f32 = 8;
 /// live PTY, and a terminal that reflows under the cursor is the exact jank
 /// this design exists to remove.
 pub const header_height: f32 = 40;
+pub const side_rail_width: f32 = 184;
+pub const side_rail_gap: f32 = 8;
+pub const side_tab_height: f32 = 34;
 pub const split_divider_width: f32 = 9;
 pub const split_pane_min_width: f32 = 240;
 pub const split_pane_header_height: f32 = 24;
@@ -190,6 +193,10 @@ pub const max_remote_terminals: usize = 64;
 
 pub const ProviderKind = enum { local, phux };
 
+/// Tab placement changes presentation only, never terminal identity, provider
+/// ownership, attachments, or process lifetime.
+pub const TabPlacement = enum { top, side };
+
 pub fn providerKind(terminal_ref: TerminalRef) ProviderKind {
     return if (terminal_ref.provider_id == .local) .local else .phux;
 }
@@ -212,6 +219,11 @@ pub fn refEql(a: TerminalRef, b: TerminalRef) bool {
 }
 
 fn optRefEql(a: ?TerminalRef, b: ?TerminalRef) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
+}
+
+fn optOwnerEql(a: ?ReplicaOwner, b: ?ReplicaOwner) bool {
     if (a == null or b == null) return a == null and b == null;
     return a.?.eql(b.?);
 }
@@ -801,6 +813,7 @@ pub const Model = struct {
     /// Placement is independent from execution identity. Split mode projects
     /// both existing terminal surfaces without respawning either process.
     layout: LayoutMode = .single,
+    tab_placement: TabPlacement = .top,
     split_fraction: f32 = 0.5,
     browser_page: BrowserPage = .github,
     /// Forces an app-owned root navigation even when the chosen root did not
@@ -1174,6 +1187,7 @@ pub const Model = struct {
             .layout = model.layout,
             .split_fraction = model.split_fraction,
             .focused_attachment = model.focus_placement,
+            .tab_placement = model.tab_placement,
         };
 
         var count: u8 = 0;
@@ -1367,6 +1381,7 @@ pub const TopologySnapshot = struct {
     split_fraction: f32 = 0.5,
     attachments: [pane_count]?LocalTerminalId = .{ null, null },
     focused_attachment: Placement = .primary,
+    tab_placement: TabPlacement = .top,
 
     pub fn validate(snapshot: TopologySnapshot) !void {
         if (snapshot.version != topology_snapshot_version) return error.UnsupportedTopologyVersion;
@@ -1500,6 +1515,7 @@ pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopo
         .layout = snapshot.layout,
         .split_fraction = snapshot.split_fraction,
         .focus_placement = snapshot.focused_attachment,
+        .tab_placement = snapshot.tab_placement,
         .selected_surface = switch (snapshot.selection) {
             .terminal => |id| .{ .terminal = localRef(id) },
             .web => .web,
@@ -1553,6 +1569,7 @@ pub const Msg = union(enum) {
     new_terminal,
     close_terminal,
     move_terminal: i8,
+    toggle_tab_placement,
     toggle_split,
     split_resized: f32,
     cycle_pane: i8,
@@ -2001,15 +2018,6 @@ fn paneForKey(model: *Model, key: u64) ?*Pane {
     return model.provider.terminalForPty(key);
 }
 
-fn remoteStateNeedsFocusReplay(
-    ready_published: bool,
-    added_count: usize,
-    removed_count: usize,
-    generation_changed: bool,
-) bool {
-    return ready_published or added_count != 0 or removed_count != 0 or generation_changed;
-}
-
 /// The terminal that should currently believe it holds keyboard focus, or
 /// null when nothing remote should.
 ///
@@ -2028,15 +2036,26 @@ pub fn remoteFocusTarget(model: *const Model) ?TerminalRef {
     return terminal_ref;
 }
 
+fn remoteFocusOwner(model: *const Model) ?ReplicaOwner {
+    const terminal_ref = remoteFocusTarget(model) orelse return null;
+    return model.terminalOwner(terminal_ref);
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const focus_before = remoteFocusTarget(model);
+    const owner_before = remoteFocusOwner(model);
     updateModel(model, msg, fx);
     const focus_after = remoteFocusTarget(model);
-    if (optRefEql(focus_before, focus_after)) return;
-    // Blur first, then focus: a provider that sees two focused terminals for
-    // even one message would have to guess which one owns the keyboard.
-    if (focus_before) |terminal_ref| sendRemoteFocus(model, terminal_ref, false);
-    if (focus_after) |terminal_ref| sendRemoteFocus(model, terminal_ref, true);
+    const owner_after = remoteFocusOwner(model);
+    if (!optRefEql(focus_before, focus_after)) {
+        // Blur first, then focus: a provider that sees two focused terminals
+        // for even one message would have to guess which owns the keyboard.
+        if (focus_before) |terminal_ref| sendRemoteFocus(model, terminal_ref, false);
+        if (focus_after) |terminal_ref| sendRemoteFocus(model, terminal_ref, true);
+    } else if (!optOwnerEql(owner_before, owner_after)) {
+        // Same identity, new replica: it has never received current focus.
+        if (focus_after) |terminal_ref| sendRemoteFocus(model, terminal_ref, true);
+    }
 }
 
 fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
@@ -2129,19 +2148,6 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                     const terminal_set_changed =
                         delta.ready_published or delta.added_count != 0 or delta.removed_count != 0;
                     if (terminal_set_changed) model.reconcileRemoteTerminals();
-                    if (remoteStateNeedsFocusReplay(
-                        delta.ready_published,
-                        delta.added_count,
-                        delta.removed_count,
-                        delta.generation_changed,
-                    )) {
-                        // This replay is NOT redundant with the derived delta
-                        // in `update`. Here the focused identity did not
-                        // change — the replica behind it did. A new generation
-                        // has never been told anything, so it must be told
-                        // again even though `remoteFocusTarget` is unmoved.
-                        sendRemoteFocus(model, remoteFocusTarget(model), model.focused);
-                    }
                 },
                 .closed, .rejected => {
                     remote.stop();
@@ -2417,10 +2423,13 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             if (model.terminal_count == 0) {
                 model.selected_surface = .web;
                 model.layout = .single;
+                model.attachments = .{ null, null };
+                model.focus_placement = .primary;
             } else {
                 const next_index = @min(order_index, model.terminal_count - 1);
                 model.selected_surface = .{ .terminal = model.terminal_order[next_index] };
                 model.normalizeTopology();
+                model.reconcileAttachmentFocus();
             }
             endHiddenCaptures(model, fx);
             if (had_live_pty) {
@@ -2432,6 +2441,10 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .move_terminal => |delta| {
             const id = model.selectedTerminalId() orelse return;
             _ = model.moveTerminal(id, delta);
+        },
+        .toggle_tab_placement => {
+            model.tab_placement = if (model.tab_placement == .top) .side else .top;
+            endHiddenCaptures(model, fx);
         },
         .toggle_split => {
             if (!splitAvailable(model)) return;
@@ -2448,7 +2461,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             const current: i8 = @intCast(@intFromEnum(model.focus_placement));
             const next = @mod(current + delta, @as(i8, @intCast(pane_count)));
             const placement = Placement.fromIndex(@intCast(next)).?;
-            if (model.attachments[placement.index()] != null) update(model, .{ .focus_pane = placement }, fx);
+            if (model.attachments[placement.index()] != null) updateModel(model, .{ .focus_pane = placement }, fx);
         },
         .browser_page => |page| {
             model.browser_page = page;
@@ -3444,53 +3457,53 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // owns the content surface. Releases are latched by physical key above.
     if (primary and !mods.shift and !mods.alt and !mods.control and event.key.len == 1 and event.key[0] >= '1' and event.key[0] <= '5') {
         latchAppShortcut(model, event.key);
-        update(model, .{ .select_position = event.key[0] - '1' }, fx);
+        updateModel(model, .{ .select_position = event.key[0] - '1' }, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "[")) {
         latchAppShortcut(model, event.key);
-        update(model, .{ .cycle_tab = -1 }, fx);
+        updateModel(model, .{ .cycle_tab = -1 }, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "]")) {
         latchAppShortcut(model, event.key);
-        update(model, .{ .cycle_tab = 1 }, fx);
+        updateModel(model, .{ .cycle_tab = 1 }, fx);
         return;
     }
     if (splitAvailable(model) and primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "d")) {
         latchAppShortcut(model, event.key);
-        update(model, .toggle_split, fx);
+        updateModel(model, .toggle_split, fx);
         return;
     }
     if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "t")) {
         latchAppShortcut(model, event.key);
-        update(model, .new_terminal, fx);
+        updateModel(model, .new_terminal, fx);
         return;
     }
     if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "w")) {
-        if (model.selectedTerminalId() == null) return;
+        if (!selectedTerminalCanClose(model)) return;
         latchAppShortcut(model, event.key);
-        update(model, .close_terminal, fx);
+        updateModel(model, .close_terminal, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "arrowleft")) {
         latchAppShortcut(model, event.key);
-        update(model, .{ .move_terminal = -1 }, fx);
+        updateModel(model, .{ .move_terminal = -1 }, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "arrowright")) {
         latchAppShortcut(model, event.key);
-        update(model, .{ .move_terminal = 1 }, fx);
+        updateModel(model, .{ .move_terminal = 1 }, fx);
         return;
     }
     if (model.layout == .split and model.selectedTerminalId() != null and primary and mods.alt and !mods.shift and !mods.control and keyIs(event.key, "arrowleft")) {
         latchAppShortcut(model, event.key);
-        update(model, .{ .cycle_pane = -1 }, fx);
+        updateModel(model, .{ .cycle_pane = -1 }, fx);
         return;
     }
     if (model.layout == .split and model.selectedTerminalId() != null and primary and mods.alt and !mods.shift and !mods.control and keyIs(event.key, "arrowright")) {
         latchAppShortcut(model, event.key);
-        update(model, .{ .cycle_pane = 1 }, fx);
+        updateModel(model, .{ .cycle_pane = 1 }, fx);
         return;
     }
 
@@ -4155,6 +4168,12 @@ fn mapKey(event: canvas.WidgetKeyboardEvent) ?MappedKey {
 // ------------------------------------------------------------------ view
 
 const TerminalUi = TerminalApp.Ui;
+const terminal_font_id: canvas.FontId = canvas.min_registered_font_id;
+const cockpit_fonts = [_]TerminalApp.FontRegistration{.{
+    .id = terminal_font_id,
+    .name = "JetBrainsMonoNL Nerd Font Mono Regular",
+    .ttf = @embedFile("fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf"),
+}};
 
 /// Phux has one visual register regardless of the system appearance: deep
 /// graphite surfaces, porcelain text, and lime reserved for focus/action.
@@ -4176,6 +4195,7 @@ pub fn cockpitTokens(_: *const Model) canvas.DesignTokens {
     tokens.colors.accent_text = canvas.Color.rgb8(9, 11, 15);
     tokens.colors.warning = canvas.Color.rgb8(253, 224, 71);
     tokens.colors.destructive = canvas.Color.rgb8(248, 113, 113);
+    tokens.typography.mono_font_id = terminal_font_id;
     return tokens;
 }
 
@@ -4377,7 +4397,7 @@ fn terminalNeedsAttention(model: *const Model, id: TerminalRef) bool {
     return presentation.phase == .failed or presentation.phase == .tombstoned;
 }
 
-fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, id: TerminalRef, index: usize) TerminalUi.Node {
+fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, id: TerminalRef, index: usize, placement: TabPlacement) TerminalUi.Node {
     const selected = if (model.selectedTerminalRef()) |current| current.eql(id) else false;
     var attached = false;
     for (model.attachments) |candidate| {
@@ -4385,17 +4405,15 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, id: TerminalRef, ind
     }
     const title = terminalTitle(ui, model, id);
     const compact = model.terminal_count + 1 > 3;
-    const visible_title = if (compact)
+    const visible_title = if (placement == .top and compact)
         if (provider_contract.localId(id)) |local| ui.fmt("T{d}", .{terminalNumber(local)}) else "PHX"
     else
         title;
     const shortcut = ui.fmt("CMD+{d}", .{index + 1});
     const text = if (terminalNeedsAttention(model, id))
-        if (compact) ui.fmt("{s} !", .{visible_title}) else ui.fmt("{s} !  {s}", .{ visible_title, shortcut })
-    else if (compact)
-        visible_title
+        ui.fmt("{s} !", .{visible_title})
     else
-        ui.fmt("{s}  {s}", .{ visible_title, shortcut });
+        visible_title;
 
     const kind_label = if (provider_contract.isLocal(id)) "native terminal" else "phux terminal";
     const semantics = if (model.provider.terminalConst(id)) |terminal|
@@ -4424,25 +4442,52 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, id: TerminalRef, ind
             if (selected) ", selected" else "",
         });
 
-    return ui.el(.segmented_control, .{
-        .key = .{ .index = terminalPaintIndex(model, id) },
-        .text = text,
-        .selected = selected,
-        .on_press = .{ .select_surface = .{ .terminal = id } },
-        .semantics = .{ .label = semantics },
-    }, .{});
+    const trigger_key: canvas.UiKey = .{ .index = terminalPaintIndex(model, id) };
+    return if (placement == .top)
+        ui.el(.segmented_control, .{
+            .global_key = trigger_key,
+            .size = .sm,
+            .text = text,
+            .selected = selected,
+            .on_press = .{ .select_surface = .{ .terminal = id } },
+            .semantics = .{ .label = semantics },
+        }, .{})
+    else
+        ui.listItem(.{
+            .global_key = trigger_key,
+            .size = .sm,
+            .height = side_tab_height,
+            .width = side_rail_width,
+            .selected = selected,
+            .on_press = .{ .select_surface = .{ .terminal = id } },
+            .semantics = .{ .role = .tab, .label = semantics },
+        }, text);
 }
 
-fn webTabTrigger(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+fn webTabTrigger(ui: *TerminalUi, model: *const Model, placement: TabPlacement) TerminalUi.Node {
     const selected = model.selected_surface.eql(.web);
     const shortcut = ui.fmt("CMD+{d}", .{model.terminal_count + 1});
-    return ui.el(.segmented_control, .{
-        .key = .{ .index = std.math.maxInt(usize) },
-        .text = if (model.terminal_count + 1 > 3) "Web" else ui.fmt("Web  {s}", .{shortcut}),
-        .selected = selected,
-        .on_press = .{ .select_surface = .web },
-        .semantics = .{ .label = ui.fmt("Web, system WebKit, shortcut {s}{s}", .{ shortcut, if (selected) ", selected" else "" }) },
-    }, .{});
+    const semantics = ui.fmt("Web, system WebKit, shortcut {s}{s}", .{ shortcut, if (selected) ", selected" else "" });
+    const trigger_key: canvas.UiKey = .{ .index = std.math.maxInt(usize) };
+    return if (placement == .top)
+        ui.el(.segmented_control, .{
+            .global_key = trigger_key,
+            .size = .sm,
+            .text = "Web",
+            .selected = selected,
+            .on_press = .{ .select_surface = .web },
+            .semantics = .{ .label = semantics },
+        }, .{})
+    else
+        ui.listItem(.{
+            .global_key = trigger_key,
+            .size = .sm,
+            .height = side_tab_height,
+            .width = side_rail_width,
+            .selected = selected,
+            .on_press = .{ .select_surface = .web },
+            .semantics = .{ .role = .tab, .label = semantics },
+        }, "Web");
 }
 
 /// The spoken identity of a terminal SURFACE.
@@ -4540,7 +4585,15 @@ fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
 }
 
 fn splitAvailable(model: *const Model) bool {
-    return model.provider.activeCount() >= 2 and model.selectedPlacement() != null;
+    // An existing split must always be collapsible, including while a close is
+    // waiting for its exact PTY exit or when one surface belongs to Phux.
+    if (model.layout == .split) return true;
+    return model.terminal_count >= 2 and model.selectedPlacement() != null;
+}
+
+fn selectedTerminalCanClose(model: *const Model) bool {
+    const terminal_ref = model.selectedTerminalRef() orelse return false;
+    return providerKind(terminal_ref) == .local;
 }
 
 /// Whether the tab and control band is part of the layout this frame.
@@ -4567,23 +4620,41 @@ pub fn chromeRevealed(model: *const Model) bool {
     return false;
 }
 
-/// The top of the content area: the hidden-inset titlebar band, plus the
-/// control band when it is revealed.
-fn contentTop(model: *const Model) f32 {
+const WorkspaceChrome = struct {
+    titlebar_height: f32,
+    content: geometry.RectF,
+};
+
+/// One geometry policy feeds retained layout, custom terminal painting, PTY
+/// sizing, pointer hit-testing, wheel routing, and WebKit anchoring. Placement
+/// changes are discrete: the PTY receives one final size, never animated
+/// intermediate geometry.
+fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrome {
     const titlebar = @max(grid_inset, model.chrome_top + 4);
-    return titlebar + if (chromeRevealed(model)) header_height else 0;
+    const revealed = chromeRevealed(model);
+    const side_extent = if (revealed and model.tab_placement == .side) side_rail_width + side_rail_gap else 0;
+    const top_extent = if (revealed and model.tab_placement == .top) header_height else 0;
+    return .{
+        .titlebar_height = titlebar,
+        .content = geometry.RectF.init(
+            grid_inset + side_extent,
+            titlebar + top_extent,
+            @max(0, size.width - grid_inset * 2 - side_extent),
+            @max(0, size.height - titlebar - top_extent - grid_inset),
+        ),
+    };
 }
 
 pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     var triggers: [max_terminal_count + 1]TerminalUi.Node = undefined;
     for (&triggers) |*node| node.* = ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
     for (model.terminal_order[0..model.terminal_count], 0..) |id, index| {
-        triggers[index] = terminalTabTrigger(ui, model, id, index);
+        triggers[index] = terminalTabTrigger(ui, model, id, index, model.tab_placement);
     }
-    triggers[model.terminal_count] = webTabTrigger(ui, model);
+    triggers[model.terminal_count] = webTabTrigger(ui, model, model.tab_placement);
 
     const terminal_index = model.selectedTerminalIndex();
-    const context_controls = if (terminal_index) |index|
+    const top_context_controls = if (terminal_index) |index|
         if (model.layout == .single)
             paneStatus(ui, model, index, false)
         else
@@ -4595,7 +4666,8 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
             ui.button(.{ .size = .sm, .variant = .secondary, .on_press = .{ .browser_page = .article } }, "Mitchell"),
         });
 
-    const topology_controls = ui.row(.{ .gap = 4, .cross = .center }, .{
+    const close_available = selectedTerminalCanClose(model);
+    const top_topology_controls = ui.row(.{ .gap = 4, .cross = .center }, .{
         ui.button(.{
             .size = .sm,
             .variant = .secondary,
@@ -4603,7 +4675,7 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
             .on_press = .new_terminal,
             .semantics = .{ .label = "New Terminal, Command T" },
         }, "New"),
-        if (model.selectedTerminalId() != null) ui.button(.{
+        if (close_available) ui.button(.{
             .size = .sm,
             .variant = .secondary,
             .on_press = .close_terminal,
@@ -4612,8 +4684,8 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     });
 
     const revealed = chromeRevealed(model);
-    const header = if (revealed) ui.row(.{ .height = header_height, .gap = 8, .cross = .center, .window_drag = true }, .{
-        ui.el(.tabs, .{ .gap = 4, .semantics = .{ .label = "Surfaces" } }, .{
+    const top_header = if (revealed and model.tab_placement == .top) ui.row(.{ .height = header_height, .gap = 12, .cross = .center, .window_drag = true }, .{
+        ui.el(.tabs, .{ .gap = 2, .semantics = .{ .label = "Surfaces" } }, .{
             triggers[0],
             triggers[1],
             triggers[2],
@@ -4621,8 +4693,8 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
             triggers[4],
         }),
         ui.spacer(1),
-        context_controls,
-        topology_controls,
+        top_context_controls,
+        top_topology_controls,
         ui.el(.toggle_button, .{
             .size = .sm,
             .text = "Split",
@@ -4631,6 +4703,12 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
             .on_press = .toggle_split,
             .semantics = .{ .label = "Toggle terminal split, Command D" },
         }, .{}),
+        ui.button(.{
+            .size = .sm,
+            .variant = .secondary,
+            .on_press = .toggle_tab_placement,
+            .semantics = .{ .label = "Move tabs to the side" },
+        }, "Side tabs"),
     })
         // At rest there is no band at all. Every control it carried stays
         // reachable: New is cmd+T, Close cmd+W, Split cmd+D, and the surfaces
@@ -4663,6 +4741,76 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         .semantics = .{ .label = webview_anchor },
     }, .{});
 
+    const side_context_controls = if (terminal_index) |index|
+        if (model.layout == .single)
+            paneStatus(ui, model, index, false)
+        else
+            emptyStatusNode(ui)
+    else
+        ui.column(.{ .gap = 4 }, .{
+            ui.button(.{ .width = side_rail_width, .size = .sm, .variant = .secondary, .on_press = .{ .browser_page = .github } }, "GitHub"),
+            ui.button(.{ .width = side_rail_width, .size = .sm, .variant = .secondary, .on_press = .{ .browser_page = .superlogical } }, "Superlogical"),
+            ui.button(.{ .width = side_rail_width, .size = .sm, .variant = .secondary, .on_press = .{ .browser_page = .article } }, "Mitchell"),
+        });
+    const side_topology_controls = ui.row(.{ .width = side_rail_width, .gap = 4, .cross = .center }, .{
+        ui.button(.{
+            .grow = 1,
+            .size = .sm,
+            .variant = .secondary,
+            .disabled = model.terminal_count >= max_terminal_count or model.provider.occupiedCount() >= max_terminal_count,
+            .on_press = .new_terminal,
+            .semantics = .{ .label = "New Terminal, Command T" },
+        }, "New"),
+        if (close_available) ui.button(.{
+            .grow = 1,
+            .size = .sm,
+            .variant = .secondary,
+            .on_press = .close_terminal,
+            .semantics = .{ .label = "Close Terminal, Command W" },
+        }, "Close") else emptyStatusNode(ui),
+    });
+    const side_rail_content = ui.column(.{ .width = side_rail_width, .gap = 8 }, .{
+        ui.list(.{ .width = side_rail_width, .gap = 3, .semantics = .{ .label = "Surfaces" } }, .{
+            triggers[0],
+            triggers[1],
+            triggers[2],
+            triggers[3],
+            triggers[4],
+        }),
+        ui.spacer(1),
+        side_context_controls,
+        side_topology_controls,
+        ui.el(.toggle_button, .{
+            .width = side_rail_width,
+            .size = .sm,
+            .text = "Split",
+            .selected = model.layout == .split,
+            .disabled = !splitAvailable(model),
+            .on_press = .toggle_split,
+            .semantics = .{ .label = "Toggle terminal split, Command D" },
+        }, .{}),
+        ui.button(.{
+            .width = side_rail_width,
+            .size = .sm,
+            .variant = .secondary,
+            .on_press = .toggle_tab_placement,
+            .semantics = .{ .label = "Move tabs to the top" },
+        }, "Top tabs"),
+    });
+    const side_rail = if (revealed and model.tab_placement == .side)
+        ui.scroll(.{
+            .width = side_rail_width,
+            .grow = 1,
+            .semantics = .{ .label = "Workspace controls" },
+        }, side_rail_content)
+    else
+        ui.el(.stack, .{ .width = 0, .semantics = .{ .hidden = true } }, .{});
+
+    const workspace = if (revealed and model.tab_placement == .side)
+        ui.row(.{ .grow = 1, .gap = side_rail_gap }, .{ side_rail, content })
+    else
+        ui.column(.{ .grow = 1 }, .{ top_header, content });
+
     // The hidden-inset titlebar band. It carries `window_drag` UNCONDITIONALLY,
     // because it is the only element that can: the SDK has no
     // movable-by-background fallback, so a frame where nothing declares
@@ -4671,15 +4819,14 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     // there — this one is. It sits entirely within the titlebar inset, above
     // the first terminal row, so claiming presses here never costs the
     // terminal a click.
-    const titlebar_band = @max(0, @max(grid_inset, model.chrome_top + 4) - grid_inset);
+    const titlebar_band = @max(0, workspaceChrome(model, model.surface_size).titlebar_height - grid_inset);
     return ui.column(.{ .padding = grid_inset }, .{
         ui.el(.stack, .{
             .height = titlebar_band,
             .window_drag = true,
             .semantics = .{ .label = "Phux Cockpit window" },
         }, .{}),
-        header,
-        content,
+        workspace,
     });
 }
 
@@ -4741,27 +4888,23 @@ fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.Siz
     }
 }
 
-/// Terminal placement below the hidden-inset titlebar and, when revealed, the
-/// control band. Single mode gives the selected terminal the content frame;
-/// split mode projects both live sessions around the same divider geometry as
-/// `ui.split`.
+/// Terminal placement inside the shared top/side workspace content frame.
+/// Single mode gives the selected terminal the content frame; split mode
+/// projects both live sessions around the same divider geometry as `ui.split`.
 ///
 /// This is the SECOND derivation of these rectangles — `view()` is the
 /// first, and the layout engine owns that one. `ChromeOptions.build`
 /// never receives the laid-out tree, so the two cannot share a result;
 /// the layout-agreement test is what keeps them honest. Both sides now read
-/// `contentTop`, so the reveal rule cannot drift between them.
+/// `workspaceChrome`, so placement and reveal cannot drift between them.
 pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometry.RectF {
-    const top = contentTop(model);
-    const x = grid_inset;
-    const width = @max(0, size.width - grid_inset * 2);
-    const height = @max(0, size.height - top - grid_inset);
+    const content = workspaceChrome(model, size).content;
     var frames = [_]geometry.RectF{.{}} ** pane_count;
     if (model.selectedTerminalIndex()) |selected| {
         if (model.layout == .single) {
-            frames[selected] = geometry.RectF.init(x, top, width, height);
+            frames[selected] = content;
         } else {
-            const available = @max(0, width - split_divider_width);
+            const available = @max(0, content.width - split_divider_width);
             const fraction = canvas.splitEffectiveFraction(
                 model.split_fraction,
                 available,
@@ -4769,11 +4912,11 @@ pub fn paneFrames(model: *const Model, size: geometry.SizeF) [pane_count]geometr
                 split_pane_min_width,
             );
             const first_width = available * fraction;
-            const terminal_top = top + split_pane_header_height;
-            const terminal_height = @max(0, height - split_pane_header_height);
-            frames[0] = geometry.RectF.init(x, terminal_top, first_width, terminal_height);
+            const terminal_top = content.y + split_pane_header_height;
+            const terminal_height = @max(0, content.height - split_pane_header_height);
+            frames[0] = geometry.RectF.init(content.x, terminal_top, first_width, terminal_height);
             frames[1] = geometry.RectF.init(
-                x + first_width + split_divider_width,
+                content.x + first_width + split_divider_width,
                 terminal_top,
                 @max(0, available - first_width),
                 terminal_height,
@@ -4807,7 +4950,6 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
                 const proposed = grid.Session.clampGrid(
                     @intFromFloat(@max(2, inner.width / session.cell_width)),
                     @intFromFloat(@max(2, inner.height / session.cell_height)),
-                    if (model.layout == .split) grid.max_cells / pane_count else grid.max_cells,
                 );
                 if (proposed.x != pane.cols or proposed.y != pane.rows) {
                     return .{
@@ -4832,7 +4974,6 @@ fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
             const proposed = grid.Session.clampGrid(
                 @intFromFloat(@max(2, inner.width / metrics.width)),
                 @intFromFloat(@max(2, inner.height / metrics.height)),
-                if (model.layout == .split) grid.max_cells / pane_count else grid.max_cells,
             );
             const viewport: Viewport = .{ .cols = proposed.x, .rows = proposed.y };
             if (remote.lastViewport(terminal_ref) == null or !remote.lastViewport(terminal_ref).?.eql(viewport)) {
@@ -4878,8 +5019,15 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "terminal.close")) return .close_terminal;
     if (std.mem.eql(u8, name, "tab.move-left")) return .{ .move_terminal = -1 };
     if (std.mem.eql(u8, name, "tab.move-right")) return .{ .move_terminal = 1 };
+    if (std.mem.eql(u8, name, "tabs.toggle-placement")) return .toggle_tab_placement;
     if (std.mem.eql(u8, name, "pane.previous")) return .{ .cycle_pane = -1 };
     if (std.mem.eql(u8, name, "pane.next")) return .{ .cycle_pane = 1 };
+    return null;
+}
+
+pub fn tabPlacementFromText(value: []const u8) ?TabPlacement {
+    if (std.ascii.eqlIgnoreCase(value, "top")) return .top;
+    if (std.ascii.eqlIgnoreCase(value, "side") or std.ascii.eqlIgnoreCase(value, "sidebar")) return .side;
     return null;
 }
 
@@ -4895,6 +5043,7 @@ pub fn appOptions() TerminalApp.Options {
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .tokens_fn = cockpitTokens,
+        .fonts = &cockpit_fonts,
         .init_fx = initFx,
         .update_fx = update,
         .view = view,
@@ -4954,6 +5103,9 @@ pub fn main(init: std.process.Init) !void {
         if (remote_provider) |remote| remote.destroy();
         return err;
     };
+    if (init.environ_map.get("PHUX_COCKPIT_TABS")) |value| {
+        if (tabPlacementFromText(value)) |placement| model.tab_placement = placement;
+    }
     attachPhuxProvider(&model, remote_provider);
     defer deinitModel(&model);
     const app_state = try std.heap.page_allocator.create(CockpitHost);
@@ -4978,12 +5130,22 @@ pub fn main(init: std.process.Init) !void {
         },
     }, init);
 }
-test "remote focus replays after publication and generation changes" {
-    try std.testing.expect(remoteStateNeedsFocusReplay(true, 0, 0, false));
-    try std.testing.expect(remoteStateNeedsFocusReplay(false, 1, 0, false));
-    try std.testing.expect(remoteStateNeedsFocusReplay(false, 0, 1, false));
-    try std.testing.expect(remoteStateNeedsFocusReplay(false, 0, 0, true));
-    try std.testing.expect(!remoteStateNeedsFocusReplay(false, 0, 0, false));
+test "tab placement configuration accepts only documented values" {
+    try std.testing.expectEqual(TabPlacement.top, tabPlacementFromText("top").?);
+    try std.testing.expectEqual(TabPlacement.side, tabPlacementFromText("side").?);
+    try std.testing.expectEqual(TabPlacement.side, tabPlacementFromText("SIDEBAR").?);
+    try std.testing.expectEqual(@as(?TabPlacement, null), tabPlacementFromText("left"));
+}
+
+test "the terminal face is bundled and selected by the design tokens" {
+    const options = appOptions();
+    try std.testing.expectEqual(@as(usize, 1), options.fonts.len);
+    try std.testing.expectEqual(terminal_font_id, options.fonts[0].id);
+    try std.testing.expectEqualStrings("JetBrainsMonoNL Nerd Font Mono Regular", options.fonts[0].name);
+    try std.testing.expect(options.fonts[0].ttf.len > 4);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, options.fonts[0].ttf[0..4]);
+    var unused_model: Model = undefined;
+    try std.testing.expectEqual(terminal_font_id, cockpitTokens(&unused_model).typography.mono_font_id);
 }
 test "AppKit pointer buttons map to provider mouse buttons" {
     try std.testing.expectEqual(MouseButton.left, pointerButton(0));
