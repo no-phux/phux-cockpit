@@ -4,11 +4,11 @@
     .version = "0.4.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Temporary fork pin carrying upstream-ready terminal context-menu,
-        // full-viewport, paint-budget, and complete terminal-font fixes.
+        // Native v0.8.1 plus Cockpit's terminal context-menu, full-viewport,
+        // paint-budget, and complete terminal-font fixes.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/49bedbb794f2d86e74e004f0c00cca5f91b24ff0.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQsbx6AEvy4VLM-Vjq6xBtreVZkY7WyZpfoOXPUAG",
+            .url = "https://github.com/phall1/native/archive/bfb8a4f0a5aa208e4b87b8bbcbd50600416db563.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQvnp3wFshwlSkBgy6HuXm2nvKyReV5DQReVqltfi",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

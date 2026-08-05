@@ -128,7 +128,7 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Internet access on the first source build to fetch pinned dependencies
 
 native-sdk is temporarily pinned to
-[`phall1/native@49bedbb`](https://github.com/phall1/native/commit/49bedbb794f2d86e74e004f0c00cca5f91b24ff0),
+[`phall1/native@bfb8a4f`](https://github.com/phall1/native/commit/bfb8a4f0a5aa208e4b87b8bbcbd50600416db563),
 an upstream-ready terminal interaction, viewport, paint-budget, and font seam
 over v0.7.1. libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing

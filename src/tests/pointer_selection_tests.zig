@@ -387,7 +387,7 @@ test "secondary click ownership transitions between TUI reports and native menu"
     try testing.expectEqual(canvas.WidgetKind.terminal, hit.kind);
     try testing.expectEqual(canvas.WidgetCursor.text, layout.cursorForHit(hit));
     const reporting_node = layout.findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
-    try testing.expectEqual(canvas.WidgetContextMenuPolicy.disabled, reporting_node.widget.context_menu_policy);
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.disabled, reporting_node.widget.semantics.context_menu_policy);
     var reporting_semantics = false;
     for (harness.runtime.views[0].widgetSemantics()) |node| {
         if (node.id != hit.id) continue;
@@ -438,7 +438,7 @@ test "secondary click ownership transitions between TUI reports and native menu"
     hit = layout.hitTest(terminalCellPoint(pane, frame, 0, 0)) orelse return error.TestExpectedTerminalInteractionSurface;
     try testing.expectEqual(canvas.WidgetKind.terminal, hit.kind);
     const local_node = layout.findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
-    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, local_node.widget.context_menu_policy);
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, local_node.widget.semantics.context_menu_policy);
     const before_local = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
     try pointerInputAdvanced(harness, iface, .pointer_down, point, .{ .button = 1 });
     try testing.expectEqual(@as(usize, 1), harness.null_platform.context_menu_request_count);
@@ -489,7 +489,7 @@ test "secondary report gesture survives protocol disable without menu takeover" 
     try testing.expectEqualStrings("\x1b[<2;3;3M", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     const rebuilt = harness.runtime.views[0].widgetLayoutTree().findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
-    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, rebuilt.widget.context_menu_policy);
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, rebuilt.widget.semantics.context_menu_policy);
     try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
     try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
 
@@ -537,7 +537,7 @@ test "secondary report gesture survives process exit cancel without menu takeove
     try testing.expectEqual(@as(u64, 0), pane.outbound_dropped);
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     const rebuilt = harness.runtime.views[0].widgetLayoutTree().findById(hit.id) orelse return error.TestExpectedTerminalInteractionSurface;
-    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, rebuilt.widget.context_menu_policy);
+    try testing.expectEqual(canvas.WidgetContextMenuPolicy.automatic, rebuilt.widget.semantics.context_menu_policy);
     try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
     try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
 

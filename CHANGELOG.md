@@ -22,6 +22,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CI and release packaging now compile and link the pinned Phux `v0.12.0`
   client FFI instead of silently shipping the local-only provider fallback.
 
+### Changed
+
+- Production code is organized by Cockpit, native presentation, terminal, and
+  provider ownership; tests are split by behavior instead of accumulating in
+  executable-root omnibus files.
+- Native SDK is updated to the `v0.8.1` line while retaining Cockpit's terminal
+  viewport, font, context-menu, gesture-ownership, and rendering-budget fixes.
+
 ## [0.4.0] - 2026-08-04
 
 ### Changed
