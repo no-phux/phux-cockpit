@@ -5,6 +5,23 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Tabs can be placed above the workspace or in a bounded, scroll-safe side rail;
+  `PHUX_COCKPIT_TABS=top|side` selects the startup placement and topology
+  snapshots preserve the current presentation.
+- The bundled JetBrains Mono Nerd Font provides a consistent terminal face and
+  icon glyph coverage without relying on machine-specific font installation.
+
+### Fixed
+
+- Tall, sparse TUIs retain the full bounded PTY viewport and paint rows against
+  merged-run costs instead of a pessimistic per-cell estimate.
+- Terminal close, pane cycling, and remote focus now settle through one
+  provider-neutral update boundary without duplicate focus transitions.
+- CI and release packaging now compile and link the pinned Phux `v0.12.0`
+  client FFI instead of silently shipping the local-only provider fallback.
+
 ## [0.4.0] - 2026-08-04
 
 ### Changed

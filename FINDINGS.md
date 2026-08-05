@@ -182,10 +182,9 @@ powerline in the other — on a live run.
 The policy above is written in terms of `pane_count` and divides cleanly, but the
 ceilings are absolute and will bind well before a large fleet:
 
-- `pane_cell_ceiling = grid.max_cells / pane_count` — `max_cells` is 7168, so 2 panes
-  get 3584 cells each, 8 panes get 896. That is a 32x28 grid per pane. A fleet of 8
-  readable terminals does not fit under the example painter's ceiling.
-- `max_cols` 320 / `max_rows` 96 are per-grid and not the binding constraint.
+- `max_cells` now matches the full bounded grid (`320 * 96 = 30,720`) rather
+  than imposing a second 7,168-cell shape cap. Command, text, glyph, and path
+  budgets still bind well before a large fleet can paint full-fidelity grids.
 - The command envelope divides, but the measured two-pane adversarial load already
   consumed 1488 of 1792. Eight panes of comparable content do not fit.
 - The glyph atlas is shared per view and is the least understood ceiling.
@@ -402,6 +401,7 @@ fleet of panes is all producing at once.
 - Section 3's "the tests fail at HEAD" claim was wrong when first reported. The suite
   exits 0; a stray `failed command:` line on stderr coexists with all steps green, and
   that line misled the orchestrator once. The section as written above is correct.
-- Section 6's fleet ceilings are unchanged by the port: `max_cols` 320 / `max_rows` 96 /
-  `max_cells` 7168 are identical in the first-party painter. The "eight panes get 896
-  cells each" problem is a framework constant, not an artifact of the forked example.
+- Section 6's old 7,168-cell framework ceiling was removed after tall PTYs
+  demonstrated that shape-clamping truncated valid viewports. The first-party
+  painter now admits the full `320 * 96` bound and degrades on actual paint
+  budgets instead.

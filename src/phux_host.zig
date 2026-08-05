@@ -20,7 +20,11 @@ pub const max_notices: usize = 64;
 pub const max_search_results: usize = 256;
 pub const max_title_bytes: usize = 4096;
 pub const max_notice_bytes: usize = 64 * 1024;
-pub const max_grid_utf8_bytes: usize = canvas.max_display_list_text_bytes;
+/// Admission is bounded independently from one frame's text budget. The
+/// painter degrades rows atomically; the provider retains the complete valid
+/// viewport instead of disconnecting on ordinary dense Unicode content.
+pub const max_cell_utf8_bytes: usize = 64;
+pub const max_grid_utf8_bytes: usize = canvas.max_terminal_cells * max_cell_utf8_bytes;
 
 pub const State = enum { new, hello_queued, negotiated, attached, detached, failed };
 pub const SyncDelta = struct {
@@ -86,32 +90,34 @@ const CanvasStore = struct {
         const rows: usize = view.rows;
         if (cols > canvas.max_terminal_cols or rows > canvas.max_terminal_rows) return error.Protocol;
         if (view.cell_count > canvas.max_terminal_cells or view.cell_count != cols * rows) return error.Protocol;
-        if (view.utf8.len > max_grid_utf8_bytes) return error.Protocol;
         if (view.cell_count != 0 and view.cells == null) return error.Protocol;
         if (view.utf8.len != 0 and view.utf8.data == null) return error.Protocol;
         const source_cells: []const c.PhuxTerminalCell = if (view.cell_count == 0)
             &.{}
         else
             view.cells[0..view.cell_count];
-        const source_utf8: []const u8 = if (view.utf8.len == 0) &.{} else view.utf8.data[0..view.utf8.len];
+        const source_utf8 = view.utf8.data;
+        var visible_utf8_len: usize = 0;
         const screen_text_limit = max_grid_utf8_bytes + canvas.max_terminal_rows;
         var screen_text_len: usize = if (rows == 0) 0 else rows - 1;
         for (source_cells) |raw| {
             const start: usize = raw.utf8_offset;
             const len: usize = raw.utf8_len;
-            if (start > source_utf8.len or len > source_utf8.len - start) return error.Protocol;
-            const cluster = source_utf8[start .. start + len];
+            if (start > view.utf8.len or len > view.utf8.len - start) return error.Protocol;
+            const cluster: []const u8 = if (len == 0) &.{} else source_utf8[start..][0..len];
             if (cluster.len != 0) {
                 _ = std.unicode.Utf8View.init(cluster) catch return error.Protocol;
             }
+            if (visible_utf8_len > max_grid_utf8_bytes or len > max_grid_utf8_bytes - visible_utf8_len)
+                return error.Protocol;
+            visible_utf8_len += len;
             if (screen_text_len > screen_text_limit or len > screen_text_limit - screen_text_len)
                 return error.Protocol;
             screen_text_len += len;
         }
         if (screen_text_len > screen_text_limit) return error.Protocol;
         try store.reserve(gpa);
-        store.utf8.items.len = view.utf8.len;
-        if (view.utf8.len != 0) @memcpy(store.utf8.items, view.utf8.data[0..view.utf8.len]);
+        store.utf8.clearRetainingCapacity();
         store.cells.items.len = view.cell_count;
         store.rows.items.len = rows;
         store.screen_text.clearRetainingCapacity();
@@ -121,8 +127,10 @@ const CanvasStore = struct {
             const raw = source_cells[index];
             const start: usize = raw.utf8_offset;
             const len: usize = raw.utf8_len;
-            if (start > store.utf8.items.len or len > store.utf8.items.len - start) return error.Protocol;
-            const cluster = store.utf8.items[start .. start + len];
+            const source_cluster: []const u8 = if (len == 0) &.{} else source_utf8[start..][0..len];
+            const compact_start = store.utf8.items.len;
+            store.utf8.appendSliceAssumeCapacity(source_cluster);
+            const cluster = store.utf8.items[compact_start..][0..len];
             const decoded: u21 = if (cluster.len == 0) 0 else firstCodepoint(cluster) catch return error.Protocol;
             var fg = canvas.Color.rgb8(raw.foreground_r, raw.foreground_g, raw.foreground_b);
             var bg = canvas.Color.rgb8(raw.background_r, raw.background_g, raw.background_b);
@@ -157,7 +165,8 @@ const CanvasStore = struct {
                 }
                 const start: usize = raw.utf8_offset;
                 const len: usize = raw.utf8_len;
-                store.screen_text.appendSliceAssumeCapacity(store.utf8.items[start .. start + len]);
+                const source_cluster: []const u8 = if (len == 0) &.{} else source_utf8[start..][0..len];
+                store.screen_text.appendSliceAssumeCapacity(source_cluster);
             }
             if (selected_first) |first_selected| row.selection = .{ first_selected, selected_last };
             if (row_index + 1 < rows) store.screen_text.appendAssumeCapacity('\n');
@@ -1132,4 +1141,41 @@ test "reordered remote enumeration retains stable refs and lookup" {
     try std.testing.expect(host.contains(initial[0]));
     try std.testing.expect(host.contains(initial[1]));
     try std.testing.expect(!initial[0].eql(initial[1]));
+}
+
+test "dense text is compacted from a hyperlink-heavy remote UTF-8 arena" {
+    const cols: usize = 120;
+    const rows: usize = 96;
+    const cell_count = cols * rows;
+    const cells = try std.testing.allocator.alloc(c.PhuxTerminalCell, cell_count);
+    defer std.testing.allocator.free(cells);
+    const visible_len = cell_count * 3;
+    const utf8 = try std.testing.allocator.alloc(u8, 65 * 1024 * 1024);
+    defer std.testing.allocator.free(utf8);
+    @memset(cells, std.mem.zeroes(c.PhuxTerminalCell));
+    for (cells, 0..) |*cell, index| {
+        const start = index * 3;
+        @memcpy(utf8[start..][0..3], "\xe2\x82\xac");
+        cell.utf8_offset = @intCast(start);
+        cell.utf8_len = 3;
+        cell.hyperlink_offset = @intCast(visible_len);
+        cell.hyperlink_len = @intCast(utf8.len - visible_len);
+    }
+    @memcpy(utf8[0..3], "\xe2\x94\x80");
+    try std.testing.expect(visible_len > canvas.max_display_list_text_bytes);
+    try std.testing.expect(utf8.len > max_grid_utf8_bytes);
+
+    var view = std.mem.zeroes(c.PhuxTerminalGridView);
+    view.cols = cols;
+    view.rows = rows;
+    view.cells = cells.ptr;
+    view.cell_count = cell_count;
+    view.utf8 = .{ .data = utf8.ptr, .len = utf8.len };
+    var store: CanvasStore = .{};
+    defer store.deinit(std.testing.allocator);
+    try store.copyBorrowed(std.testing.allocator, &view);
+    try std.testing.expectEqual(visible_len, store.utf8.items.len);
+    try std.testing.expectEqualStrings("", store.rows.items[0].cells[0].cluster);
+    try std.testing.expect(std.mem.startsWith(u8, store.screen_text.items, "\xe2\x94\x80"));
+    try std.testing.expectEqualStrings("\xe2\x82\xac", store.rows.items[rows - 1].cells[cols - 1].cluster);
 }

@@ -124,6 +124,19 @@ fn addPhuxModules(
         }
         root.linkFramework("AppKit", .{});
         root.linkSystemLibrary("c", .{});
+
+        // Zig runs tests only from a compilation's root module. Exercise the
+        // production FFI adapter itself when that graph is enabled instead of
+        // merely proving that importing it compiles.
+        if (index == 1) {
+            const host_tests = b.addTest(.{
+                .name = "phux-host-tests",
+                .root_module = host_module,
+            });
+            if (b.top_level_steps.get("test")) |test_step| {
+                test_step.step.dependOn(&b.addRunArtifact(host_tests).step);
+            }
+        }
     }
 }
 

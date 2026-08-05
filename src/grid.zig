@@ -34,14 +34,18 @@ const pointer_word_boundaries = [_]u21{
     '}', '<', '>',  '$',
 };
 
-/// Grid ceilings, derived from the per-view canvas budgets: the glyph
-/// budget (8192) bounds how many cells can hold ink at once, and the
-/// command budget bounds per-row style runs. A viewport is clamped to
-/// these before it reaches the emulator, so a huge window degrades to a
-/// bounded grid instead of a budget error.
+/// Grid ceilings bound allocation and command-id geometry. Painter resources
+/// are content-dependent: a screen full of repeated ASCII does not consume one
+/// glyph-atlas entry per cell, so cell count must never shrink the PTY below its
+/// visible pane.
 pub const max_cols: usize = 320;
 pub const max_rows: usize = 96;
-pub const max_cells: usize = 7168;
+pub const max_cells: usize = max_cols * max_rows;
+/// Four bytes per cell preserves every primary Unicode scalar across the full
+/// viewport. Combining data that exceeds this bound becomes an atomic
+/// paint-budget stop rather than silently blank cells.
+pub const snapshot_text_capacity: usize = max_cells * 4;
+const snapshot_text_overflow_cluster = " " ** (canvas.max_display_list_text_bytes + 1);
 
 /// Our caller id for a grid painted with no explicit pane index. The
 /// first-party painter treats id 0 as the framework's ANONYMOUS
@@ -179,7 +183,7 @@ pub const Session = struct {
         session.response_buffer = try gpa.alloc(u8, response_capacity);
         session.snap_rows = try gpa.alloc(canvas.TerminalRow, max_rows);
         session.snap_cells = try gpa.alloc(canvas.TerminalCell, max_cells);
-        session.snap_text = try gpa.alloc(u8, canvas.max_display_list_text_bytes);
+        session.snap_text = try gpa.alloc(u8, snapshot_text_capacity);
         session.stream = .initAlloc(gpa, .init(&session.term));
         session.installStreamEffects();
         return session;
@@ -258,23 +262,38 @@ pub const Session = struct {
                 var cluster: []const u8 = "";
                 if (cp != 0 and !canvas.terminal_box.isBoxDrawing(cp)) {
                     const start = session.snap_text_len;
-                    session.snap_text_len += std.unicode.utf8Encode(
-                        cp,
-                        session.snap_text[session.snap_text_len..],
-                    ) catch 0;
-                    if (cell.raw.content_tag == .codepoint_grapheme) {
+                    var overflow = false;
+                    const primary_len = std.unicode.utf8CodepointSequenceLength(cp) catch 0;
+                    if (primary_len == 0 or primary_len > session.snap_text.len - session.snap_text_len) {
+                        overflow = true;
+                    } else {
+                        session.snap_text_len += std.unicode.utf8Encode(
+                            cp,
+                            session.snap_text[session.snap_text_len..],
+                        ) catch 0;
+                    }
+                    if (!overflow and cell.raw.content_tag == .codepoint_grapheme) {
                         for (cell.grapheme) |extra| {
-                            // Stop BETWEEN marks so the staged bytes are
-                            // always valid UTF-8. Defensive: the arena is
-                            // the painter's own text ceiling.
-                            if (session.snap_text_len + 8 > session.snap_text.len) break;
+                            const extra_len = std.unicode.utf8CodepointSequenceLength(extra) catch 0;
+                            if (extra_len == 0 or extra_len > session.snap_text.len - session.snap_text_len) {
+                                overflow = true;
+                                break;
+                            }
                             session.snap_text_len += std.unicode.utf8Encode(
                                 extra,
                                 session.snap_text[session.snap_text_len..],
                             ) catch 0;
                         }
                     }
-                    cluster = session.snap_text[start..session.snap_text_len];
+                    if (overflow) {
+                        // The valid UTF-8 sentinel exceeds the painter ceiling,
+                        // forcing this row to degrade whole. An empty cluster
+                        // would erase ink without charging any text budget.
+                        session.snap_text_len = start;
+                        cluster = snapshot_text_overflow_cluster;
+                    } else {
+                        cluster = session.snap_text[start..session.snap_text_len];
+                    }
                 }
 
                 out[x] = .{
@@ -484,19 +503,13 @@ pub const Session = struct {
         return true;
     }
 
-    /// Clamp a proposed grid to the canvas budgets: the glyph budget
-    /// bounds total cells, so very wide windows trade rows for columns
-    /// honestly instead of overflowing the frame. `cell_ceiling` is the
-    /// caller's share of `max_cells` — a single-grid window passes the
-    /// whole thing; a cockpit of N panes passes its per-pane slice, so
-    /// the panes together can never outgrow one view's budgets.
-    pub fn clampGrid(proposed_cols: usize, proposed_rows: usize, cell_ceiling: usize) Session.CellPos {
-        const cells = @max(4, @min(cell_ceiling, max_cells));
-        var c = std.math.clamp(proposed_cols, 2, max_cols);
-        var r = std.math.clamp(proposed_rows, 2, max_rows);
-        if (c * r > cells) r = @max(2, cells / c);
-        if (c * r > cells) c = @max(2, cells / r);
-        return .{ .x = @intCast(c), .y = @intCast(r) };
+    /// Clamp a proposed grid to allocation and command-id geometry bounds.
+    /// Distinct-glyph, text, path, and command budgets are fenced at paint.
+    pub fn clampGrid(proposed_cols: usize, proposed_rows: usize) Session.CellPos {
+        return .{
+            .x = @intCast(std.math.clamp(proposed_cols, 2, max_cols)),
+            .y = @intCast(std.math.clamp(proposed_rows, 2, max_rows)),
+        };
     }
 
     // ---------------------------------------------------- scrollback

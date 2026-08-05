@@ -4,11 +4,11 @@
     .version = "0.4.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        // Temporary fork pin carrying the upstream-ready terminal
-        // context-menu policy seam used for exclusive TUI mouse ownership.
+        // Temporary fork pin carrying upstream-ready terminal context-menu,
+        // full-viewport, paint-budget, and complete terminal-font fixes.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/992f9f59695d1a723559190caca94800820ae7be.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQibm6AHGTM6FbIGe9X3wrQqiLyB-BZ_nH-CNQ2Ty",
+            .url = "https://github.com/phall1/native/archive/49bedbb794f2d86e74e004f0c00cca5f91b24ff0.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQsbx6AEvy4VLM-Vjq6xBtreVZkY7WyZpfoOXPUAG",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

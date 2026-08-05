@@ -450,14 +450,58 @@ test "an OSC 4 palette override is honored even when it equals the default RGB" 
     try testing.expect(saw);
 }
 
-test "grid clamping trades rows for columns inside the cell budget" {
-    const clamped = grid.Session.clampGrid(4000, 4000, grid.max_cells);
-    try testing.expect(@as(usize, clamped.x) <= grid.max_cols);
-    try testing.expect(@as(usize, clamped.y) <= grid.max_rows);
-    try testing.expect(@as(usize, clamped.x) * @as(usize, clamped.y) <= grid.max_cells);
-    const tiny = grid.Session.clampGrid(1, 1, grid.max_cells);
+test "grid clamping preserves the full bounded viewport" {
+    const clamped = grid.Session.clampGrid(4000, 4000);
+    try testing.expectEqual(@as(u16, grid.max_cols), clamped.x);
+    try testing.expectEqual(@as(u16, grid.max_rows), clamped.y);
+    try testing.expectEqual(grid.max_cols * grid.max_rows, grid.max_cells);
+    const tiny = grid.Session.clampGrid(1, 1);
     try testing.expectEqual(@as(u16, 2), tiny.x);
     try testing.expectEqual(@as(u16, 2), tiny.y);
+}
+
+test "a tall sparse terminal paints its bottom row" {
+    const session = try createSession(60, grid.max_rows);
+    defer session.destroy();
+    for (0..grid.max_rows - 1) |row| {
+        if (row % 7 == 0) session.feed("\x1b[32m.\x1b[0m");
+        session.feed("\r\n");
+    }
+    session.feed("\x1b[92mBOTTOM\x1b[0m");
+
+    var commands: [2048]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try grid.paint(session, &builder, .{
+        .frame = geometry.RectF.init(0, 0, 1200, 2400),
+        .tokens = .{},
+        .running = true,
+        .selecting = false,
+        .command_budget = 1792,
+    });
+    var saw_bottom = false;
+    for (builder.displayList().commands) |command| switch (command) {
+        .draw_text => |text| if (std.mem.indexOf(u8, text.text, "BOTTOM") != null) {
+            saw_bottom = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_bottom);
+}
+
+test "a full multibyte viewport retains clusters beyond the paint text budget" {
+    const session = try createSession(120, grid.max_rows);
+    defer session.destroy();
+    const dense_row = ("\xe2\x82\xac" ** 119) ++ "\r\n";
+    for (0..92) |_| session.feed(dense_row);
+    session.feed("BOTTOM");
+
+    const snapshot = try session.snapshot(.{}, true, false);
+    try testing.expect(session.snap_text_len > canvas.max_display_list_text_bytes);
+    var saw_bottom = false;
+    for (snapshot.rows) |row| for (row.cells) |cell| {
+        if (std.mem.eql(u8, cell.cluster, "B")) saw_bottom = true;
+    };
+    try testing.expect(saw_bottom);
 }
 
 test "typed terminal attachments reject duplicates and preserve provider-owned state" {
@@ -2860,7 +2904,7 @@ test "hidden terminal spawn failures mark tabs and distinguish failure reasons" 
     var saw_hidden_marker = false;
     var saw_hidden_reason = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "Terminal 2 !  CMD+2")) saw_hidden_marker = true;
+        if (std.mem.eql(u8, layout.widget.text, "Terminal 2 !")) saw_hidden_marker = true;
         if (std.mem.indexOf(u8, layout.widget.semantics.label, "SPAWN FAILED") != null) saw_hidden_reason = true;
     }
     try testing.expect(saw_hidden_marker);
@@ -3345,7 +3389,6 @@ test "split divider keyboard resize stays in lockstep with terminal chrome and P
         const expected = grid.Session.clampGrid(
             @intFromFloat(@max(2, frame.width / pane.session.cell_width)),
             @intFromFloat(@max(2, frame.height / pane.session.cell_height)),
-            grid.max_cells / app.pane_count,
         );
         try testing.expectEqual(expected.x, pane.cols);
         try testing.expectEqual(expected.y, pane.rows);
@@ -3387,7 +3430,7 @@ test "sub-cell frame changes still update surface geometry" {
     try testing.expectEqual(rows, app_state.model.panes[0].rows);
 }
 
-test "split PTY grids share one cell-capacity budget" {
+test "split PTY grids preserve each pane's full bounded viewport" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -3398,7 +3441,7 @@ test "split PTY grids share one cell-capacity budget" {
     const app_iface = app_state.app();
     try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
 
-    const large = geometry.SizeF.init(4000, 1800);
+    const large = geometry.SizeF.init(4000, 2400);
     for (2..7) |frame_index| try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
         .label = app.canvas_label,
         .size = large,
@@ -3407,13 +3450,11 @@ test "split PTY grids share one cell-capacity budget" {
         .timestamp_ns = @as(u64, frame_index) * 1_000_000,
     } });
 
-    var total_cells: usize = 0;
     for (app_state.model.panes) |pane| {
         const cells = @as(usize, pane.cols) * @as(usize, pane.rows);
-        try testing.expect(cells <= grid.max_cells / app.pane_count);
-        total_cells += cells;
+        try testing.expect(cells <= grid.max_cells);
+        try testing.expectEqual(@as(u16, grid.max_rows), pane.rows);
     }
-    try testing.expect(total_cells <= grid.max_cells);
 }
 
 test "tab cycling crosses terminal and Web surfaces without sending terminal bytes" {

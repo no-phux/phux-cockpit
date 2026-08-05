@@ -219,8 +219,12 @@ check_plist_value CFBundleExecutable "${EXPECTED_EXECUTABLE}"
 check_plist_value LSMinimumSystemVersion "${EXPECTED_MINIMUM_OS}"
 
 EXECUTABLE="${APP}/Contents/MacOS/${EXPECTED_EXECUTABLE}"
+RESOURCES="${APP}/Contents/Resources"
 [[ -f "${EXECUTABLE}" && -x "${EXECUTABLE}" ]] ||
     fail "bundle executable is missing or not executable: ${EXECUTABLE}"
+for resource in LICENSE.txt README.txt THIRD_PARTY_NOTICES.md JetBrainsMono-OFL.txt Phux-FFI-THIRD-PARTY.html signing-plan.txt; do
+    [[ -s "${RESOURCES}/${resource}" ]] || fail "required resource is missing: ${resource}"
+done
 ARCHITECTURES="$(/usr/bin/lipo -archs "${EXECUTABLE}" 2>/dev/null)" ||
     fail 'could not inspect executable architectures'
 [[ "${ARCHITECTURES}" == 'arm64' ]] ||

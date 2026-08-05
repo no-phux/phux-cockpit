@@ -21,6 +21,8 @@ native control environment for large-scale directed machine work. See
 - **Tabs** are native canvas controls with tab accessibility semantics. They
   compact to `T1` through `T4` at full capacity; Web remains stable and pinned
   last. Direct selection and next/previous shortcuts preserve hidden state.
+  Tabs can sit above the workspace or in a scroll-safe side rail without
+  changing terminal identity, focus, or process state.
 - **Web** is a native WebKit surface for the explicitly allowed GitHub,
   Superlogical, and Mitchell Hashimoto top-level origins. It keeps its page
   process alive while another tab is selected. Native bridge commands are
@@ -126,8 +128,9 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Internet access on the first source build to fetch pinned dependencies
 
 native-sdk is temporarily pinned to
-[`phall1/native@992f9f5`](https://github.com/phall1/native/commit/992f9f59695d1a723559190caca94800820ae7be),
-an upstream-ready context-menu-policy seam over v0.7.1. libghostty-vt is pinned
+[`phall1/native@49bedbb`](https://github.com/phall1/native/commit/49bedbb794f2d86e74e004f0c00cca5f91b24ff0),
+an upstream-ready terminal interaction, viewport, paint-budget, and font seam
+over v0.7.1. libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
 Zig 0.16-compatible checkpoint.
 
@@ -139,6 +142,10 @@ zig build run
 zig build test -Dplatform=null --summary all
 ```
 
+Tabs start at the top by default. Set `PHUX_COCKPIT_TABS=side` (or `sidebar`)
+to start with the side rail; the in-app placement control switches the current
+workspace without restarting or resizing through intermediate states.
+
 The application is macOS-only. The null platform is used only for deterministic
 tests; it does not exercise Metal presentation.
 
@@ -147,8 +154,17 @@ tests; it does not exercise Metal presentation.
 Create an arm64 app, ZIP, DMG, and `SHA256SUMS` under `zig-out/release`:
 
 ```sh
-./scripts/package-macos.sh
+cargo build --locked --profile ffi-release -p phux-client-ffi \
+  --manifest-path ../phux/Cargo.toml
+PHUX_CLIENT_FFI_INCLUDE_DIR="$PWD/../phux/crates/phux-client-ffi/include" \
+PHUX_CLIENT_FFI_LIB_DIR="$PWD/../phux/target/ffi-release" \
+  ./scripts/package-macos.sh
 ```
+
+Release and CI builds pin that static FFI to Phux `v0.12.0`. Set
+`PHUX_ENABLED=false` only for an explicit local-terminal-only package; production
+packaging requires and verifies the FFI inputs instead of silently omitting the
+coordinator-backed provider.
 
 Verify a packaged or installed bundle and run a process-lifecycle soak with:
 
