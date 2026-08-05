@@ -3,6 +3,18 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/phall1/phux-cockpit/compare/v0.4.0...v0.5.0) (2026-08-05)
+
+
+### Features
+
+* **cockpit:** polish terminal workspace ([#11](https://github.com/phall1/phux-cockpit/issues/11)) ([431b67c](https://github.com/phall1/phux-cockpit/commit/431b67cae91541350e2dc7aeb2be485b5a33841c))
+
+
+### Refactors
+
+* **cockpit:** organize source by ownership ([#12](https://github.com/phall1/phux-cockpit/issues/12)) ([b77e0e1](https://github.com/phall1/phux-cockpit/commit/b77e0e1e3734709172eb6184f4a4e8a75b8f6bea))
+
 ## [0.4.0] - 2026-08-04
 
 ### Changed
