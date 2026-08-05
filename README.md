@@ -1,8 +1,8 @@
 # Phux Cockpit
 
 Phux Cockpit is a native macOS spatial runtime for terminal, web, and future
-control-plane surfaces. Version 0.4.0 brings native Phux terminals into the
-same bounded tabs and split-pane substrate as local terminal processes.
+control-plane surfaces. Native Phux terminals use the same bounded tabs and
+split-pane substrate as local terminal processes.
 
 The immediate goal is an exceptional native Phux terminal for terminal and
 TUI-agent work. Its stable execution and interaction primitives grow into a
@@ -82,9 +82,9 @@ Install with Homebrew:
 brew install --cask phall1/tap/phux-cockpit
 ```
 
-The cask places **Phux Cockpit** in Applications. Version 0.4.0 is ad-hoc
-signed; the cask clears its quarantine attribute and reports that fact in its
-caveat.
+The cask places **Phux Cockpit** in Applications. Releases without configured
+Developer ID credentials are ad-hoc signed; the cask clears the quarantine
+attribute and reports that fact in its caveat.
 
 ## Keybindings
 
@@ -169,9 +169,10 @@ coordinator-backed provider.
 Verify a packaged or installed bundle and run a process-lifecycle soak with:
 
 ```sh
+VERSION="$(tr -d '\n' < version.txt)"
 ./scripts/verify-macos-app.sh \
   --app "zig-out/release/Phux Cockpit.app" \
-  --version 0.4.0 \
+  --version "$VERSION" \
   --signature-mode adhoc \
   --quarantine absent
 ./scripts/soak-macos-app.sh \
@@ -180,8 +181,9 @@ Verify a packaged or installed bundle and run a process-lifecycle soak with:
   --artifacts zig-out/soak
 ```
 
-Local packaging ad-hoc signs the app. A release machine can provide a Developer
-ID identity and optional notarization credentials:
+Local packaging ad-hoc signs the app. The hosted release accepts either no
+Apple credentials or a Developer ID identity with notarization credentials;
+partial credentials fail closed:
 
 ```sh
 MACOS_SIGNING_IDENTITY="Developer ID Application: Example (TEAMID)" \
@@ -194,9 +196,14 @@ APPLE_NOTARY_ISSUER_ID="ISSUER-UUID" \
 `MACOS_ENTITLEMENTS` may point to an entitlements plist when one is required.
 The packaging script validates the bundle identifier, display name, version,
 executable, arm64 architecture, and code signature before producing archives.
-Tagged releases also regenerate `Casks/phux-cockpit.rb` in
-[`phall1/homebrew-tap`](https://github.com/phall1/homebrew-tap); the tap's
+Release Please maintains a draft version PR from conventional commits. Merging
+that PR creates the tag and a draft GitHub release; the release workflow builds,
+verifies, and attaches the macOS artifacts before publishing the release and
+regenerating `Casks/phux-cockpit.rb` in
+[`phall1/homebrew-tap`](https://github.com/phall1/homebrew-tap). The tap's
 scheduled updater independently repairs a missed release update.
+A failed artifact pass can be resumed by manually dispatching the **Release**
+workflow against the existing draft tag.
 
 ## Limitations
 
@@ -215,8 +222,9 @@ scheduled updater independently repairs a missed release update.
   Cockpit does not pretend to own general browser history.
 - Headless tests prove terminal and UI behavior but cannot prove live Metal
   presentation.
-- The 0.4.0 release is ad-hoc signed rather than Apple-notarized. Homebrew
-  performs the same explicit quarantine removal used by other apps in the tap.
+- Releases without configured Developer ID credentials are ad-hoc signed rather
+  than Apple-notarized. Homebrew performs the same explicit quarantine removal
+  used by other apps in the tap.
 
 ## Project background
 

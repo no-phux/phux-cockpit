@@ -1,9 +1,29 @@
+# Release Please owns tags, draft releases, and notes. This workflow owns only
+# verified artifacts, draft publication, and the Homebrew update.
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing Release Please tag to build and publish
+        required: true
+        type: string
+    secrets:
+      HOMEBREW_TAP_DEPLOY_KEY:
+        required: true
+      MACOS_CERTIFICATE:
+        required: false
+      MACOS_CERTIFICATE_PASSWORD:
+        required: false
+      MACOS_SIGNING_IDENTITY:
+        required: false
+      APPLE_NOTARY_KEY:
+        required: false
+      APPLE_NOTARY_KEY_ID:
+        required: false
+      APPLE_NOTARY_ISSUER_ID:
+        required: false
   workflow_dispatch:
     inputs:
       tag:
@@ -14,6 +34,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   # Keep packaging and publishing together so signing keys and signed artifacts
   # never need to cross a job boundary.
@@ -22,7 +46,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -42,6 +66,12 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "$(git rev-parse HEAD)" = "$(git rev-parse "$RELEASE_TAG^{commit}")"
           git merge-base --is-ancestor HEAD origin/main
+          ./scripts/check-release-version.sh "$RELEASE_TAG"
+
+      - name: Require the Release Please release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
 
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
@@ -100,11 +130,19 @@ jobs:
           [[ -n "${NOTARY_KEY_ID}" ]] && supplied=$((supplied + 1))
           [[ -n "${NOTARY_ISSUER_ID}" ]] && supplied=$((supplied + 1))
           if [[ "${supplied}" -eq 0 ]]; then
-            echo "No notarization secrets configured; the release will be marked unnotarized."
+            if [[ -n "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+              echo "::error::Hosted Developer ID releases require notarization credentials. Configure all APPLE_NOTARY_* secrets or remove all signing secrets."
+              exit 1
+            fi
+            echo "No Developer ID or notarization secrets configured; the release will be ad-hoc signed."
             exit 0
           fi
           if [[ "${supplied}" -ne 3 ]]; then
             echo "::error::Notarization secrets are incomplete; configure all three or none."
+            exit 1
+          fi
+          if [[ -z "${MACOS_SIGNING_IDENTITY:-}" ]]; then
+            echo "::error::Notarization credentials require all three Developer ID signing secrets."
             exit 1
           fi
 
@@ -151,71 +189,151 @@ jobs:
             exit 1
           fi
 
-      - name: Publish release
+      - name: Attach and verify release assets
         id: assets
         env:
           GH_TOKEN: ${{ github.token }}
-          SIGNING_MODE: ${{ steps.package.outputs.signing }}
-          NOTARIZED: ${{ steps.package.outputs.notarized }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          notes="$(mktemp)"
-          if [[ "${NOTARIZED}" == "true" ]]; then
-            cat > "${notes}" <<EOF
-          This release is Developer ID signed and Apple-notarized.
-          EOF
-          elif [[ "${SIGNING_MODE}" == "identity" ]]; then
-            cat > "${notes}" <<EOF
-          This release is Developer ID signed but not Apple-notarized because
-          notarization credentials are not configured.
-          EOF
-          else
-            cat > "${notes}" <<EOF
-          This release is ad-hoc signed because Developer ID credentials are
-          not configured. The Homebrew cask clears the app's quarantine
-          attribute and reports this in its installation caveat.
-          EOF
-          fi
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            existing="$(mktemp -d)"
-            gh release download "${RELEASE_TAG}" \
-              --dir "${existing}" \
-              --pattern '*.zip' \
-              --pattern '*.dmg' \
-              --pattern SHA256SUMS
-            (cd "${existing}" && shasum -a 256 -c SHA256SUMS)
-            mkdir "${existing}/extracted"
-            ditto -x -k "${existing}"/*.zip "${existing}/extracted"
-            existing_app="${existing}/extracted/Phux Cockpit.app"
-            if codesign -dv --verbose=4 "${existing_app}" 2>&1 | grep -q '^Signature=adhoc$'; then
-              asset_signature=adhoc
-              asset_notarized=false
-            elif xcrun stapler validate "${existing_app}" >/dev/null 2>&1 && \
-                spctl --assess --type execute "${existing_app}" >/dev/null 2>&1; then
-              asset_signature=developer-id-notarized
-              asset_notarized=true
-            else
-              asset_signature=developer-id-unnotarized
-              asset_notarized=false
-            fi
-            ./scripts/verify-macos-app.sh \
-              --app "${existing_app}" \
-              --version "${RELEASE_TAG#v}" \
-              --signature-mode "${asset_signature}" \
-              --quarantine ignore
-            rm -f -- zig-out/release/*.zip zig-out/release/*.dmg zig-out/release/SHA256SUMS
-            cp "${existing}"/*.zip "${existing}"/*.dmg "${existing}/SHA256SUMS" zig-out/release/
-          else
-            gh release create "${RELEASE_TAG}" \
-              zig-out/release/*.zip \
-              zig-out/release/*.dmg \
+          version="${RELEASE_TAG#v}"
+          archive="phux-cockpit-${version}-macos-arm64.zip"
+          image="phux-cockpit-${version}-macos-arm64.dmg"
+          expected_assets="$(printf '%s\n' SHA256SUMS "${archive}" "${image}" | LC_ALL=C sort)"
+          existing_assets="$(gh release view "${RELEASE_TAG}" \
+            --json assets --jq '.assets[].name' | LC_ALL=C sort)"
+          release_was_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)"
+
+          if [[ "${release_was_draft}" == "true" ]]; then
+            while IFS= read -r asset; do
+              [[ -z "${asset}" ]] && continue
+              if ! grep -Fxq "${asset}" <<< "${expected_assets}"; then
+                printf 'error: draft release %s has unexpected asset %s\n' \
+                  "${RELEASE_TAG}" "${asset}" >&2
+                exit 1
+              fi
+            done <<< "${existing_assets}"
+            gh release upload "${RELEASE_TAG}" \
+              "zig-out/release/${archive}" \
+              "zig-out/release/${image}" \
               zig-out/release/SHA256SUMS \
-              --verify-tag \
-              --title "Phux Cockpit ${RELEASE_TAG}" \
-              --notes-file "${notes}"
-            asset_notarized="${NOTARIZED}"
+              --clobber
+          elif [[ "${existing_assets}" != "${expected_assets}" ]]; then
+            printf 'error: published release %s has a partial or unexpected asset set\n' "${RELEASE_TAG}" >&2
+            printf 'expected:\n%s\nfound:\n%s\n' "${expected_assets}" "${existing_assets}" >&2
+            exit 1
           fi
-          echo "notarized=${asset_notarized}" >> "${GITHUB_OUTPUT}"
+
+          published_assets="$(gh release view "${RELEASE_TAG}" \
+            --json assets --jq '.assets[].name' | LC_ALL=C sort)"
+          if [[ "${published_assets}" != "${expected_assets}" ]]; then
+            printf 'error: release asset upload did not produce the exact expected set\n' >&2
+            exit 1
+          fi
+
+          existing="$(mktemp -d)"
+          gh release download "${RELEASE_TAG}" \
+            --dir "${existing}" \
+            --pattern "${archive}" \
+            --pattern "${image}" \
+            --pattern SHA256SUMS
+          if [[ "${release_was_draft}" == "true" ]]; then
+            cmp "zig-out/release/${archive}" "${existing}/${archive}"
+            cmp "zig-out/release/${image}" "${existing}/${image}"
+            cmp zig-out/release/SHA256SUMS "${existing}/SHA256SUMS"
+          fi
+          (cd "${existing}" && shasum -a 256 -c SHA256SUMS)
+          mkdir "${existing}/extracted"
+          ditto -x -k "${existing}/${archive}" "${existing}/extracted"
+          existing_app="${existing}/extracted/Phux Cockpit.app"
+          if codesign -dv --verbose=4 "${existing_app}" 2>&1 | grep -q '^Signature=adhoc$'; then
+            asset_signature=adhoc
+            asset_notarized=false
+          elif xcrun stapler validate "${existing_app}" >/dev/null 2>&1 && \
+              spctl --assess --type execute "${existing_app}" >/dev/null 2>&1; then
+            asset_signature=developer-id-notarized
+            asset_notarized=true
+          else
+            printf 'error: release asset is Developer ID signed but not notarized\n' >&2
+            exit 1
+          fi
+          ./scripts/verify-macos-app.sh \
+            --app "${existing_app}" \
+            --version "${version}" \
+            --signature-mode "${asset_signature}" \
+            --quarantine ignore
+          hdiutil verify -quiet "${existing}/${image}"
+          dmg_mount="${existing}/dmg-mount"
+          dmg_attached=false
+          cleanup_dmg() {
+            if [[ "${dmg_attached}" == "true" ]]; then
+              hdiutil detach -quiet "${dmg_mount}" || \
+                hdiutil detach -quiet -force "${dmg_mount}" || true
+            fi
+          }
+          trap cleanup_dmg EXIT
+          mkdir "${dmg_mount}"
+          hdiutil attach -quiet -readonly -nobrowse \
+            -mountpoint "${dmg_mount}" "${existing}/${image}"
+          dmg_attached=true
+          ./scripts/verify-macos-app.sh \
+            --app "${dmg_mount}/Phux Cockpit.app" \
+            --version "${version}" \
+            --signature-mode "${asset_signature}" \
+            --quarantine ignore
+          [[ -L "${dmg_mount}/Applications" ]]
+          [[ "$(readlink "${dmg_mount}/Applications")" == "/Applications" ]]
+          hdiutil detach -quiet "${dmg_mount}"
+          dmg_attached=false
+          trap - EXIT
+          rm -f -- zig-out/release/*.zip zig-out/release/*.dmg zig-out/release/SHA256SUMS
+          cp "${existing}/${archive}" "${existing}/${image}" "${existing}/SHA256SUMS" zig-out/release/
+          {
+            echo "notarized=${asset_notarized}"
+            echo "signature=${asset_signature}"
+            echo "draft=${release_was_draft}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Record signing status and publish verified draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SIGNATURE: ${{ steps.assets.outputs.signature }}
+          WAS_DRAFT: ${{ steps.assets.outputs.draft }}
+        run: |
+          set -euo pipefail
+          case "${SIGNATURE}" in
+            developer-id-notarized)
+              marker='This release is Developer ID signed and Apple-notarized.'
+              note="${marker}"
+              ;;
+            adhoc)
+              marker='This release is ad-hoc signed because Developer ID credentials are'
+              note="${marker} not configured. The Homebrew cask clears the app's quarantine attribute and reports this in its installation caveat."
+              ;;
+            *)
+              printf 'error: unsupported release signature status: %s\n' "${SIGNATURE}" >&2
+              exit 1
+              ;;
+          esac
+
+          notes="$(mktemp)"
+          gh release view "${RELEASE_TAG}" --json body --jq '.body // ""' > "${notes}"
+          if ! grep -Fq "${marker}" "${notes}"; then
+            if grep -Eq 'This release is (Developer ID signed|ad-hoc signed)' "${notes}"; then
+              printf 'error: release notes contain conflicting signing metadata\n' >&2
+              exit 1
+            fi
+            separator=''
+            if [[ -s "${notes}" ]]; then
+              separator=$'\n'
+            fi
+            printf '%s%s\n' "${separator}" "${note}" >> "${notes}"
+            gh release edit "${RELEASE_TAG}" --notes-file "${notes}"
+          fi
+          if [[ "${WAS_DRAFT}" == "true" ]]; then
+            gh release edit "${RELEASE_TAG}" --draft=false
+          fi
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
