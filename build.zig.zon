@@ -1,7 +1,7 @@
 .{
     .name = .phux_cockpit,
     .fingerprint = 0xa47a656ea288c810,
-    .version = "0.4.0",
+    .version = "0.4.0", // x-release-please-version
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // Native v0.8.1 plus Cockpit's terminal context-menu, full-viewport,
@@ -19,5 +19,5 @@
             .hash = "ghostty-1.3.2-dev-5UdBC-edJAVXTdYsgHOzIqgAI7hE8VqpmriEi8zgufw2",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "app.zon", "assets", "scripts", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "app.zon", "version.txt", "assets", "scripts", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md" },
 }

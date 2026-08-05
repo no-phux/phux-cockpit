@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/v17.6.0/schemas/config.json",
+  "draft": true,
+  "force-tag-creation": true,
+  "draft-pull-request": true,
+  "include-v-in-tag": true,
+  "include-component-in-tag": false,
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "refactor", "section": "Refactors" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "build", "section": "Build System" },
+    { "type": "ci", "section": "CI", "hidden": true },
+    { "type": "chore", "section": "Chores", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true }
+  ],
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "phux-cockpit",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        { "type": "generic", "path": "app.zon" },
+        { "type": "generic", "path": "build.zig.zon" }
+      ]
+    }
+  }
+}

@@ -3,33 +3,6 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-
-- Tabs can be placed above the workspace or in a bounded, scroll-safe side rail;
-  `PHUX_COCKPIT_TABS=top|side` selects the startup placement and topology
-  snapshots preserve the current presentation.
-- The bundled JetBrains Mono Nerd Font provides a consistent terminal face and
-  icon glyph coverage without relying on machine-specific font installation.
-
-### Fixed
-
-- Tall, sparse TUIs retain the full bounded PTY viewport and paint rows against
-  merged-run costs instead of a pessimistic per-cell estimate.
-- Terminal close, pane cycling, and remote focus now settle through one
-  provider-neutral update boundary without duplicate focus transitions.
-- CI and release packaging now compile and link the pinned Phux `v0.12.0`
-  client FFI instead of silently shipping the local-only provider fallback.
-
-### Changed
-
-- Production code is organized by Cockpit, native presentation, terminal, and
-  provider ownership; tests are split by behavior instead of accumulating in
-  executable-root omnibus files.
-- Native SDK is updated to the `v0.8.1` line while retaining Cockpit's terminal
-  viewport, font, context-menu, gesture-ownership, and rendering-budget fixes.
-
 ## [0.4.0] - 2026-08-04
 
 ### Changed
@@ -127,7 +100,6 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Local Shell is ephemeral and is not a durable phux session.
 - The release supports Apple silicon macOS only.
 
-[Unreleased]: https://github.com/phall1/phux-cockpit/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.4.0
 [0.3.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.3.0
 [0.2.0]: https://github.com/phall1/phux-cockpit/releases/tag/v0.2.0
