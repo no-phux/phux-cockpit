@@ -1,0 +1,200 @@
+const std = @import("std");
+const native_sdk = @import("native_sdk");
+const app = @import("../main.zig");
+const grid = @import("../terminal/grid.zig");
+const support = @import("support.zig");
+
+const geometry = native_sdk.geometry;
+const testing = std.testing;
+const TerminalApp = support.TerminalApp;
+
+const createSessions = support.createSessions;
+const destroyModelSessions = app.deinitModel;
+const startFocusedTerminal = support.startFocusedTerminal;
+
+const JournalBuffer = struct {
+    bytes: [512 * 1024]u8 = undefined,
+    len: usize = 0,
+
+    fn sink(self: *JournalBuffer) native_sdk.runtime.SessionRecorderSink {
+        return .{ .context = self, .write_fn = write };
+    }
+
+    fn write(context: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *JournalBuffer = @ptrCast(@alignCast(context));
+        if (self.len + bytes.len > self.bytes.len) return error.NoSpaceLeft;
+        @memcpy(self.bytes[self.len .. self.len + bytes.len], bytes);
+        self.len += bytes.len;
+    }
+
+    fn journalBytes(self: *const JournalBuffer) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// Drive one recorded terminal session against the scriptable fake pty:
+/// spawn (init_fx), a prompt, typed input (echoed by the script), and
+/// the exit. Returns the recorded model and the state fingerprint.
+const RecordedTerminalSession = struct {
+    fingerprint: u64,
+    screen: [256]u8 = undefined,
+    screen_len: usize = 0,
+};
+
+fn recordTerminalSession(
+    gpa: std.mem.Allocator,
+    buffer: *JournalBuffer,
+    store: *native_sdk.runtime.session_blobs.MemoryBlobStore,
+) !RecordedTerminalSession {
+    const recorder = try std.heap.page_allocator.create(native_sdk.runtime.SessionRecorder);
+    defer std.heap.page_allocator.destroy(recorder);
+    recorder.* = native_sdk.runtime.SessionRecorder.init(buffer.sink());
+    recorder.blob_sink = store.sink();
+    recorder.begin(.{ .platform_name = "test", .app_name = app.app_name, .window_width = 980, .window_height = 640 });
+
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.session_recorder = recorder;
+
+    const sessions = try createSessions(80, 24);
+    const session = sessions[0];
+    const app_state = try gpa.create(TerminalApp);
+    defer gpa.destroy(app_state);
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    defer app.deinitModel(&app_state.model);
+    defer app_state.deinit();
+    app_state.effects.executor = .fake;
+    const app_iface = app_state.app();
+
+    try harness.start(app_iface);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = geometry.SizeF.init(980, 640),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    // init_fx spawned the shell against the fake pty.
+    try testing.expectEqual(@as(usize, app.pane_count), app_state.effects.pendingPtyCount());
+
+    // The scripted shell: prompt, then a typed command's echo + output.
+    try app_state.effects.feedPtyOutput(1, "demo$ ");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    try testing.expectEqual(app.Phase.live, app_state.model.panes[0].phase);
+
+    // Focus the surface with a click (a real session focuses on first
+    // click/key), then type: committed text routes to the app as
+    // target-less text.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .pointer_down,
+        .x = 200,
+        .y = 200,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = app.canvas_label,
+        .kind = .text_input,
+        .text = "ls",
+    } });
+    try testing.expectEqualStrings("ls", app_state.effects.ptyWrittenBytes(1));
+    try app_state.effects.feedPtyOutput(1, "ls\r\nREADME.md  src\r\ndemo$ ");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    // The session ends.
+    try app_state.effects.feedPtyExit(1, 0, 0, .exited, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+
+    recorder.finish();
+    try testing.expect(!recorder.failed);
+
+    var result: RecordedTerminalSession = .{
+        .fingerprint = harness.runtime.sessionStateFingerprint(),
+    };
+    const screen = try session.plainText(gpa);
+    defer gpa.free(screen);
+    result.screen_len = @min(screen.len, result.screen.len);
+    @memcpy(result.screen[0..result.screen_len], screen[0..result.screen_len]);
+    return result;
+}
+
+test "the session fingerprint covers real cells, not just byte counters" {
+    const gpa = testing.allocator;
+    // Two sessions fed the SAME number of output bytes with different
+    // contents: identical counters, different screens. The grid's
+    // accessibility surface carries the viewport text, so the state
+    // fingerprint (the a11y-tree hash) must differ — a VT regression
+    // that garbles cells while preserving lengths can never verify.
+    var fingerprints: [2]u64 = undefined;
+    const outputs = [2][]const u8{ "demo$ AB", "demo$ BA" };
+    for (outputs, 0..) |output, index| {
+        const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+        defer harness.destroy(gpa);
+        const app_state = try startFocusedTerminal(gpa, harness);
+        defer gpa.destroy(app_state);
+        defer destroyModelSessions(&app_state.model);
+        defer app_state.deinit();
+        const app_iface = app_state.app();
+        try app_state.effects.feedPtyOutput(1, output);
+        try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+        try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+        fingerprints[index] = harness.runtime.sessionStateFingerprint();
+        try testing.expect(fingerprints[index] != 0);
+    }
+    try testing.expect(fingerprints[0] != fingerprints[1]);
+}
+
+test "a recorded terminal session replays byte-identical offline - no shell present" {
+    const gpa = testing.allocator;
+    const buffer = try std.heap.page_allocator.create(JournalBuffer);
+    defer std.heap.page_allocator.destroy(buffer);
+    buffer.len = 0;
+    var store = native_sdk.runtime.session_blobs.MemoryBlobStore.init(gpa);
+    defer store.deinit();
+
+    const recorded = try recordTerminalSession(gpa, buffer, &store);
+    try testing.expect(std.mem.indexOf(u8, recorded.screen[0..recorded.screen_len], "README.md") != null);
+
+    // Replay into a FRESH emulator and app: the journal (events) plus
+    // the blob store (output bytes) are the whole world.
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    const sessions = try createSessions(80, 24);
+    const session = sessions[0];
+    const app_state = try gpa.create(TerminalApp);
+    defer gpa.destroy(app_state);
+    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(sessions), app.appOptions());
+    defer app.deinitModel(&app_state.model);
+    defer app_state.deinit();
+
+    const report = try native_sdk.runtime.replaySession(&harness.runtime, app_state.app(), buffer.journalBytes(), .{
+        .verify = true,
+        .require_same_platform = false,
+        .blobs = store.source(),
+    });
+    try testing.expect(report.ok());
+    try testing.expect(report.checkpoints_verified > 0);
+    // No process ran: the replayed spawn parked, four journaled
+    // results fed (two output batches, the typed input's write-admission
+    // verdict, one exit).
+    try testing.expectEqual(@as(u64, 4), report.effects_fed);
+    try testing.expectEqual(recorded.fingerprint, harness.runtime.sessionStateFingerprint());
+
+    // The replayed emulator rebuilt the identical screen from the
+    // blob-store bytes — byte-identical, offline.
+    const screen = try session.plainText(gpa);
+    defer gpa.free(screen);
+    try testing.expectEqualStrings(recorded.screen[0..recorded.screen_len], screen[0..recorded.screen_len]);
+    try testing.expectEqual(app.Phase.ended, app_state.model.panes[0].phase);
+}

@@ -127,10 +127,10 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Zig 0.16.0 and Xcode Command Line Tools for source builds
 - Internet access on the first source build to fetch pinned dependencies
 
-native-sdk is temporarily pinned to
-[`phall1/native@49bedbb`](https://github.com/phall1/native/commit/49bedbb794f2d86e74e004f0c00cca5f91b24ff0),
-an upstream-ready terminal interaction, viewport, paint-budget, and font seam
-over v0.7.1. libghostty-vt is pinned
+native-sdk is pinned to the v0.8.1-based merge
+[`phall1/native@bfb8a4f`](https://github.com/phall1/native/commit/bfb8a4f0a5aa208e4b87b8bbcbd50600416db563),
+which includes Cockpit's terminal interaction, viewport, paint-budget, and font
+seams. libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
 Zig 0.16-compatible checkpoint.
 
@@ -206,11 +206,11 @@ scheduled updater independently repairs a missed release update.
   not yet choose a filesystem persistence policy; restoring always starts fresh
   processes. `process_restoration_supported` is explicitly `false`; filesystem
   persistence remains outside this slice.
-- Detachable terminal windows are intentionally not faked. native-sdk v0.7.1
-  needs per-secondary-window custom chrome and focus hooks before the same
-  terminal surface can attach to another native window correctly.
+- Detachable terminal windows are intentionally not faked. Cockpit does not yet
+  project a stable terminal identity into native-sdk's model-declared secondary
+  window trees with the same chrome and lifecycle guarantees as the main window.
 - Web allowlists top-level navigation; it is not a content firewall for
-  subframes or page resources. native-sdk v0.7.1 does not expose page title,
+  subframes or page resources. native-sdk v0.8.1 does not expose page title,
   committed-navigation, load-state, or native back/forward events to Zig, so
   Cockpit does not pretend to own general browser history.
 - Headless tests prove terminal and UI behavior but cannot prove live Metal
@@ -231,7 +231,7 @@ cockpit, and was then ported to the framework's first-party
 `canvas.terminal_grid` painter. The old forked painter remains in history at
 `git show d4ccb84^:src/box.zig`.
 
-The rendering seam remains deliberately small (`src/grid.zig`):
+The rendering seam remains deliberately small (`src/terminal/grid.zig`):
 
 ```zig
 pub fn feed(session: *Session, bytes: []const u8) void {

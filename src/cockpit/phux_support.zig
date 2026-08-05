@@ -1,0 +1,148 @@
+const std = @import("std");
+const native_sdk = @import("native_sdk");
+const provider_contract = @import("provider_contract");
+const phux_options = @import("phux_options");
+
+pub const ProviderId = provider_contract.ProviderId;
+pub const LocalTerminalId = provider_contract.LocalTerminalId;
+pub const RemoteTerminalId = provider_contract.RemoteTerminalId;
+pub const TerminalId = provider_contract.TerminalId;
+pub const TerminalRef = provider_contract.TerminalRef;
+pub const Generation = provider_contract.Generation;
+pub const ReplicaOwner = provider_contract.ReplicaOwner;
+pub const PixelSize = provider_contract.PixelSize;
+pub const Viewport = provider_contract.Viewport;
+pub const KeyAction = provider_contract.KeyAction;
+pub const PhysicalKey = provider_contract.PhysicalKey;
+pub const ModifierMask = provider_contract.ModifierMask;
+pub const KeyInput = provider_contract.KeyInput;
+pub const MouseAction = provider_contract.MouseAction;
+pub const MouseButton = provider_contract.MouseButton;
+pub const MouseInput = provider_contract.MouseInput;
+pub const ScrollKind = provider_contract.ScrollKind;
+pub const Scroll = provider_contract.Scroll;
+pub const Presentation = provider_contract.Presentation;
+pub const Phase = provider_contract.Phase;
+
+pub const phux_enabled = phux_options.enabled;
+
+const DisabledPhuxProvider = struct {
+    const State = enum { new };
+    const Anchor = struct { opaque_id: u64 = 0 };
+    const SyncDelta = struct {
+        ready_published: bool = false,
+        generation_changed: bool = false,
+        detached: bool = false,
+        added_count: usize = 0,
+        removed_count: usize = 0,
+    };
+
+    pub fn create(
+        _: std.mem.Allocator,
+        _: std.Io,
+        _: anytype,
+        _: []const u8,
+        _: []const u8,
+    ) error{Disabled}!*DisabledPhuxProvider {
+        return error.Disabled;
+    }
+    pub fn destroy(_: *DisabledPhuxProvider) void {}
+    pub fn open(_: *DisabledPhuxProvider, _: native_sdk.ChannelHandle) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn reconnect(_: *DisabledPhuxProvider, _: native_sdk.ChannelHandle) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn stop(_: *DisabledPhuxProvider) void {}
+    pub fn state(_: *const DisabledPhuxProvider) State {
+        return .new;
+    }
+    pub fn drainReadiness(_: *DisabledPhuxProvider) error{Disabled}!SyncDelta {
+        return error.Disabled;
+    }
+    pub fn terminalRefs(_: *const DisabledPhuxProvider, _: []TerminalRef) usize {
+        return 0;
+    }
+    pub fn contains(_: *const DisabledPhuxProvider, _: TerminalRef) bool {
+        return false;
+    }
+    pub fn owner(_: *const DisabledPhuxProvider, _: TerminalRef) ?ReplicaOwner {
+        return null;
+    }
+    pub fn ownerIsCurrent(_: *const DisabledPhuxProvider, _: ReplicaOwner) bool {
+        return false;
+    }
+    pub fn presentation(_: *const DisabledPhuxProvider, _: TerminalRef) ?Presentation {
+        return null;
+    }
+    pub fn lastViewport(_: *const DisabledPhuxProvider, _: TerminalRef) ?Viewport {
+        return null;
+    }
+    pub fn viewportResize(_: *DisabledPhuxProvider, _: TerminalRef, _: Viewport) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn sendKey(_: *DisabledPhuxProvider, _: ReplicaOwner, _: *const KeyInput) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn sendFocus(_: *DisabledPhuxProvider, _: ReplicaOwner, _: bool) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn sendPaste(_: *DisabledPhuxProvider, _: ReplicaOwner, _: []const u8, _: bool) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn scrollViewport(_: *DisabledPhuxProvider, _: ReplicaOwner, _: Scroll) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn createAnchor(_: *DisabledPhuxProvider, _: ReplicaOwner, _: anytype) error{Disabled}!Anchor {
+        return error.Disabled;
+    }
+    pub fn releaseAnchor(_: *DisabledPhuxProvider, _: ReplicaOwner, _: Anchor) void {}
+    pub fn setSelection(_: *DisabledPhuxProvider, _: ReplicaOwner, _: Anchor, _: Anchor, _: bool) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn clearSelection(_: *DisabledPhuxProvider, _: ReplicaOwner) error{Disabled}!void {
+        return error.Disabled;
+    }
+    pub fn selectionText(_: *DisabledPhuxProvider, _: ReplicaOwner, _: std.mem.Allocator) error{Disabled}![]u8 {
+        return error.Disabled;
+    }
+};
+
+pub const PhuxProvider = if (phux_enabled)
+    @import("phux_provider").PhuxProvider
+else
+    DisabledPhuxProvider;
+
+const DisabledPointerModule = struct {
+    pub const EventQueue = struct {};
+    pub const Monitor = struct {};
+};
+pub const pointer_module = if (phux_enabled) @import("phux_pointer") else DisabledPointerModule;
+
+pub const phux_channel_key: u64 = 102;
+pub const pointer_channel_key: u64 = 103;
+pub const max_remote_terminals: usize = 64;
+
+pub const ProviderKind = enum { local, phux };
+
+pub fn providerKind(terminal_ref: TerminalRef) ProviderKind {
+    return if (terminal_ref.provider_id == .local) .local else .phux;
+}
+
+pub fn localRef(id: LocalTerminalId) TerminalRef {
+    return provider_contract.localTerminalRef(id);
+}
+
+pub fn refEql(a: TerminalRef, b: TerminalRef) bool {
+    return a.eql(b);
+}
+
+pub fn optRefEql(a: ?TerminalRef, b: ?TerminalRef) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
+}
+
+pub fn optOwnerEql(a: ?ReplicaOwner, b: ?ReplicaOwner) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return a.?.eql(b.?);
+}

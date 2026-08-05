@@ -7,9 +7,10 @@
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
-const app = @import("main.zig");
-const grid = @import("grid.zig");
+const app = @import("../main.zig");
+const grid = @import("../terminal/grid.zig");
 const vt = @import("ghostty-vt");
+const support = @import("support.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -17,15 +18,8 @@ const testing = std.testing;
 
 const TerminalApp = native_sdk.UiApp(app.Model, app.Msg);
 
-fn createSessions(cols: u16, rows: u16) ![app.pane_count]*grid.Session {
-    var sessions: [app.pane_count]*grid.Session = undefined;
-    for (&sessions) |*slot| slot.* = try grid.Session.create(std.heap.page_allocator, testing.io, cols, rows);
-    return sessions;
-}
-
-fn destroyModelSessions(model: *app.Model) void {
-    app.deinitModel(model);
-}
+const createSessions = support.createSessions;
+const destroyModelSessions = app.deinitModel;
 
 fn startCockpit(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
