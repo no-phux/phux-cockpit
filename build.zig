@@ -25,7 +25,7 @@ fn addProviderContractModules(
     for (roots, 0..) |root, index| {
         if (index == 1 and root == artifacts.exe.root_module) continue;
         const contract = b.createModule(.{
-            .root_source_file = b.path("src/provider.zig"),
+            .root_source_file = b.path("src/providers/contract.zig"),
             .target = root.resolved_target.?,
             .optimize = root.optimize.?,
         });
@@ -65,12 +65,12 @@ fn addPhuxModules(
             @panic("cockpit graph did not expose its provider contract module");
 
         const transport_module = b.createModule(.{
-            .root_source_file = b.path("src/phux_transport.zig"),
+            .root_source_file = b.path("src/providers/phux/transport.zig"),
             .target = target,
             .optimize = optimize,
         });
         const extension_module = b.createModule(.{
-            .root_source_file = b.path("src/phux_extension.zig"),
+            .root_source_file = b.path("src/providers/phux/extension.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -78,7 +78,7 @@ fn addPhuxModules(
         extension_module.addImport("phux_transport", transport_module);
 
         const host_module = b.createModule(.{
-            .root_source_file = b.path("src/phux_host.zig"),
+            .root_source_file = b.path("src/providers/phux/host.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -92,7 +92,7 @@ fn addPhuxModules(
         host_module.linkSystemLibrary("c", .{});
 
         const provider_module = b.createModule(.{
-            .root_source_file = b.path("src/phux_provider.zig"),
+            .root_source_file = b.path("src/providers/phux/provider.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -103,18 +103,16 @@ fn addPhuxModules(
         provider_module.addImport("phux_extension", extension_module);
 
         const pointer_module = b.createModule(.{
-            .root_source_file = b.path("src/phux_pointer.zig"),
+            .root_source_file = b.path("src/providers/phux/pointer.zig"),
             .target = target,
             .optimize = optimize,
         });
         pointer_module.addImport("native_sdk", sdk_module);
 
-        root.addImport("phux_transport", transport_module);
-        root.addImport("phux_extension", extension_module);
         root.addImport("phux_provider", provider_module);
         root.addImport("phux_pointer", pointer_module);
         root.addCSourceFile(.{
-            .file = b.path("src/phux_pointer_macos.m"),
+            .file = b.path("src/providers/phux/pointer_macos.m"),
             .flags = &.{ "-fobjc-arc", "-fblocks" },
         });
         if (b.sysroot) |sysroot| {

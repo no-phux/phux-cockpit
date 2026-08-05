@@ -231,7 +231,7 @@ cockpit, and was then ported to the framework's first-party
 `canvas.terminal_grid` painter. The old forked painter remains in history at
 `git show d4ccb84^:src/box.zig`.
 
-The rendering seam remains deliberately small (`src/grid.zig`):
+The rendering seam remains deliberately small (`src/terminal/grid.zig`):
 
 ```zig
 pub fn feed(session: *Session, bytes: []const u8) void {
