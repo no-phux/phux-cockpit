@@ -21,9 +21,9 @@ test "a terminal occupies exactly one pane, and admitting it twice is a no-op" {
     const terminal = model.provider.terminal(id) orelse return error.TestExpectedTerminal;
     terminal.session.feed("durable state");
 
-    try testing.expectEqual(@as(usize, 1), model.tab_count);
+    try testing.expectEqual(@as(usize, 1), model.ws().tab_count);
     try testing.expect(model.admitTab(id));
-    try testing.expectEqual(@as(usize, 1), model.tab_count);
+    try testing.expectEqual(@as(usize, 1), model.ws().tab_count);
     try testing.expectEqual(@as(usize, 0), model.tabOfTerminal(id).?);
 
     // Selecting is not creating: the emulator behind the pane is the same one.
@@ -46,7 +46,7 @@ test "discovering a remote terminal gives it a tab and never disturbs a live pan
     const second = try remoteTerminalRef(12);
     try testing.expect(model.admitTab(first));
     try testing.expect(model.admitTab(second));
-    try testing.expectEqual(@as(usize, 3), model.tab_count);
+    try testing.expectEqual(@as(usize, 3), model.ws().tab_count);
     try testing.expectEqual(@as(usize, 0), model.tabOfTerminal(local).?);
     try testing.expectEqual(@as(usize, 1), model.tabOfTerminal(first).?);
     try testing.expectEqual(@as(usize, 2), model.tabOfTerminal(second).?);
@@ -66,12 +66,12 @@ test "a terminal that disappears loses its pane and the local ones stay put" {
     const local = app.initialTerminalRef(0);
     const remote = try remoteTerminalRef(31);
     try testing.expect(model.admitTab(remote));
-    try testing.expectEqual(@as(usize, 2), model.tab_count);
+    try testing.expectEqual(@as(usize, 2), model.ws().tab_count);
 
     // No provider vouches for the remote terminal, so normalization takes
     // its pane, and with it the tab that held nothing else.
     model.normalizeTopology();
-    try testing.expectEqual(@as(usize, 1), model.tab_count);
+    try testing.expectEqual(@as(usize, 1), model.ws().tab_count);
     try testing.expectEqual(@as(?usize, null), model.tabOfTerminal(remote));
     try testing.expectEqual(@as(usize, 0), model.tabOfTerminal(local).?);
     try testing.expect(model.selectedTerminalRef().?.eql(local));

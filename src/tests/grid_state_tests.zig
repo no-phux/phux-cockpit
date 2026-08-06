@@ -440,7 +440,7 @@ test "wheel scrolling over the grid scrolls history" {
     // A trackpad swipe (several fractional deltas accumulating past one
     // cell) scrolls into history, like every terminal.
     const cell_h = app_state.model.provider.slots[0].session.cell_height;
-    const frame = app.paneFrames(&app_state.model, app_state.model.surface_size)[0];
+    const frame = app.paneFrames(&app_state.model, app_state.model.ws().surface_size)[0];
     for (0..4) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,

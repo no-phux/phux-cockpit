@@ -1,3 +1,4 @@
+const std = @import("std");
 const native_sdk = @import("native_sdk");
 const support = @import("phux_support.zig");
 const model_module = @import("model.zig");
@@ -27,8 +28,21 @@ pub const Msg = union(enum) {
         rows: u16,
         size: geometry.SizeF,
         scale_factor: f32 = 1,
+        /// Which window's surface was measured. The frame pump runs per
+        /// window slot, so a resize from the window behind must not commit
+        /// its geometry onto the window in front.
+        window: u8 = 0,
+        /// The platform id behind that window, learned from the frame event.
+        /// It is how a later shortcut — which carries a window id and no
+        /// label — resolves back to a workspace.
+        window_id: native_sdk.platform.WindowId = 1,
     },
-    surface_resized: struct { size: geometry.SizeF, scale_factor: f32 },
+    surface_resized: struct {
+        size: geometry.SizeF,
+        scale_factor: f32,
+        window: u8 = 0,
+        window_id: native_sdk.platform.WindowId = 1,
+    },
     clipboard: native_sdk.EffectClipboardResult,
     paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
@@ -45,6 +59,22 @@ pub const Msg = union(enum) {
     select_position: u8,
     cycle_tab: i8,
     new_terminal,
+    /// cmd+N: a whole new WINDOW, with its own workspace and one terminal in
+    /// it. Refused visibly at the ceiling rather than silently — see
+    /// `Model.window_limit_refused`.
+    new_window,
+    /// Input arrived from a window, so that window owns the next messages.
+    /// The one seam through which `Model.active_window` moves: the host
+    /// resolves a canvas label or a platform window id to an index and
+    /// dispatches this, so `update` stays the only mutator.
+    focus_window: u8,
+    /// The user closed a window through the OS (the red button, cmd+W on the
+    /// title bar, the Window menu) rather than through the last tab. The
+    /// dismissal precedent: the window is already gone, and this is the model
+    /// catching up.
+    window_closed: u8,
+    /// ctrl+cmd+F, or View > Enter Full Screen: flip the FOCUSED window.
+    toggle_fullscreen,
     /// cmd+W: close the FOCUSED PANE. The tab goes when its last pane does,
     /// and the window goes when its last tab does.
     close_terminal,
@@ -95,6 +125,11 @@ pub const Msg = union(enum) {
     pointer: TerminalPointerEvent,
     wheel_fallback: struct { x: f32, y: f32, delta: f32 },
     chrome_changed: native_sdk.platform.WindowChrome,
+    /// A window's titlebar inset, addressed to that window. `on_chrome` has
+    /// no window identity of its own, so the plain `chrome_changed` above
+    /// lands on the active window; this arm is what a test and a future
+    /// per-window chrome event use.
+    window_chrome_changed: struct { window: u8, top: f32 },
     focus_changed: bool,
     /// The layout-snapshot debounce expired: write the workspace shape now.
     /// Arriving as a Msg rather than as a direct write inside every topology
@@ -112,3 +147,12 @@ pub const Msg = union(enum) {
 
 pub const TerminalApp = native_sdk.UiApp(Model, Msg);
 pub const Fx = TerminalApp.Effects;
+
+comptime {
+    // `Model` cannot name `TerminalApp` — the app type is parameterized on the
+    // model — so the secondary-window ceiling is restated there and pinned
+    // here, where the toolkit's own budget is finally in scope. A drift means
+    // either windows the model can declare and the runtime will drop, or slots
+    // the model refuses to use.
+    std.debug.assert(model_module.max_secondary_windows == TerminalApp.max_ui_windows);
+}

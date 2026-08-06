@@ -42,7 +42,7 @@ fn hasSemanticsPrefix(harness: anytype, prefix: []const u8) bool {
 
 test "the visible tab window shrinks tabs before it hides any" {
     var model: app.Model = .{ .provider = undefined };
-    model.tab_count = 4;
+    model.ws().tab_count = 4;
     // A 900pt window: four tabs at full width would not fit, so they shrink
     // rather than the fourth disappearing.
     const four = app.visibleTabWindow(&model, 900);
@@ -52,22 +52,22 @@ test "the visible tab window shrinks tabs before it hides any" {
     try testing.expect(four.extent <= app.tab_extent);
 
     // Two tabs in a wide window get the full width, not a stretched one.
-    model.tab_count = 2;
+    model.ws().tab_count = 2;
     try testing.expectEqual(app.tab_extent, app.visibleTabWindow(&model, 1600).extent);
 }
 
 test "every tab is reachable: the window follows the selection past the edge" {
     var model: app.Model = .{ .provider = undefined };
-    model.tab_count = app.max_tabs;
+    model.ws().tab_count = app.max_tabs;
 
-    model.selected_tab = 0;
+    model.ws().selected_tab = 0;
     const head = app.visibleTabWindow(&model, 900);
     try testing.expect(head.count < app.max_tabs);
     try testing.expect(head.contains(0));
 
     // The tab the old strip could never draw. It is the LAST visible one, and
     // the window is still contiguous and inside the tab list.
-    model.selected_tab = app.max_tabs - 1;
+    model.ws().selected_tab = app.max_tabs - 1;
     const tail = app.visibleTabWindow(&model, 900);
     try testing.expect(tail.contains(app.max_tabs - 1));
     try testing.expectEqual(tail.first + tail.count, app.max_tabs);
@@ -75,7 +75,7 @@ test "every tab is reachable: the window follows the selection past the edge" {
 
     // Every index is inside SOME window, which is what "reachable" means.
     for (0..app.max_tabs) |index| {
-        model.selected_tab = index;
+        model.ws().selected_tab = index;
         try testing.expect(app.visibleTabWindow(&model, 900).contains(index));
     }
 }
@@ -106,7 +106,7 @@ test "the strip shows terminals only and still reaches the web surface" {
     try testing.expect(app.onCommand("surface.web") != null);
 
     try pressCanvasKey(harness, state.app(), "b", .{ .primary = true, .shift = true });
-    try testing.expect(state.model.web_selected);
+    try testing.expect(state.model.ws().web_selected);
 }
 
 test "a tab carries a close affordance and the strip ends in a new-tab button" {
@@ -124,11 +124,11 @@ test "a tab carries a close affordance and the strip ends in a new-tab button" {
     // The `x` closes the WHOLE tab, panes and all — that is what a tab's
     // close means, as distinct from cmd+W closing one pane.
     try state.dispatch(&harness.runtime, 1, .split_right);
-    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
-    try testing.expectEqual(@as(usize, 2), state.model.treeConst(state.model.selected_tab).?.paneCount());
-    const doomed = state.model.selected_tab;
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 2), state.model.treeConst(state.model.ws().selected_tab).?.paneCount());
+    const doomed = state.model.ws().selected_tab;
     try state.dispatch(&harness.runtime, 1, .{ .close_tab = @intCast(doomed) });
-    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
 }
 
 test "the new-tab button mints a tab through the same path as cmd+T" {
@@ -138,10 +138,10 @@ test "the new-tab button mints a tab through the same path as cmd+T" {
     const state = try startCockpit(harness);
     defer stopCockpit(state);
 
-    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
     try state.dispatch(&harness.runtime, 1, .new_terminal);
-    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
-    try testing.expectEqual(@as(usize, 1), state.model.selected_tab);
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.ws().selected_tab);
 }
 
 test "the close affordance appears on the selected tab and on the hovered one" {

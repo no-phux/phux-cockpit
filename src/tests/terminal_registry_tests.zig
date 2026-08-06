@@ -148,7 +148,7 @@ test "the registry mints unique terminals up to its raised ceiling" {
 
     // One terminal at launch, not two: sessions are allocated when a
     // terminal is asked for.
-    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .shortcut = .{
         .id = "terminal.new",
@@ -156,17 +156,17 @@ test "the registry mints unique terminals up to its raised ceiling" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
 
     // Four terminals is what the fake pty executor can hold in flight, so
     // that is where the identity checks run.
-    while (state.model.tab_count < 4) app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, 4), state.model.tab_count);
+    while (state.model.ws().tab_count < 4) app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 4), state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 4), state.effects.pendingPtyCount());
 
     var seen: [app.max_tabs]app.TerminalRef = undefined;
-    for (0..state.model.tab_count) |index| {
+    for (0..state.model.ws().tab_count) |index| {
         const id = state.model.tabTerminal(index) orelse return error.TestExpectedTerminal;
         const pane = state.model.provider.terminal(id) orelse return error.TestExpectedTerminal;
         try testing.expectEqual(@as(u64, index + 1), pane.pty_key);
@@ -177,14 +177,14 @@ test "the registry mints unique terminals up to its raised ceiling" {
 
     // The old ceiling was FOUR terminals for the whole app. Keep going: the
     // registry now holds 32 and the tab list 16.
-    while (state.model.tab_count < app.max_tabs) app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(app.max_tabs, state.model.tab_count);
+    while (state.model.ws().tab_count < app.max_tabs) app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
     try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
 
     // Past the tab ceiling nothing is minted, and no orphan terminal is left
     // behind in the registry either.
     app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(app.max_tabs, state.model.tab_count);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
     try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
 
     // Cmd+W over the Web surface owns no terminal, so it closes nothing.
@@ -196,7 +196,7 @@ test "the registry mints unique terminals up to its raised ceiling" {
         .modifiers = .{ .primary = true },
     } });
     try testing.expect(state.model.selectedSurface().eql(.web));
-    try testing.expectEqual(app.max_tabs, state.model.tab_count);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
     try testing.expect(app.onCommand("terminal.new") != null);
     try testing.expect(app.onCommand("terminal.close") != null);
     try testing.expect(app.onCommand("pane.split-right") != null);
@@ -214,13 +214,13 @@ test "close frees the terminal eagerly and its slot is immediately reusable" {
     defer stopCockpit(state);
     app.update(&state.model, .new_terminal, &state.effects);
     app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 3), state.model.ws().tab_count);
 
     const closed_id = state.model.selectedTerminalId() orelse return error.TestExpectedTerminal;
     const closed_key = state.model.provider.terminal(closed_id).?.pty_key;
     var survivor_keys: [app.max_tabs]u64 = undefined;
     var survivor_count: usize = 0;
-    for (0..state.model.tab_count) |index| {
+    for (0..state.model.ws().tab_count) |index| {
         const id = state.model.tabTerminal(index) orelse continue;
         if (id.eql(closed_id)) continue;
         survivor_keys[survivor_count] = state.model.provider.terminal(id).?.pty_key;
@@ -233,7 +233,7 @@ test "close frees the terminal eagerly and its slot is immediately reusable" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
     try testing.expect(state.model.selectedTerminalId() != null);
     try testing.expect(state.model.provider.terminal(state.model.focusedTerminalId().?) != null);
     // Gone from the registry the moment it closed, not parked.
@@ -245,7 +245,7 @@ test "close frees the terminal eagerly and its slot is immediately reusable" {
 
     // The freed slot is available RIGHT AWAY, with fresh identity.
     app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 3), state.model.ws().tab_count);
     const replacement_id = state.model.selectedTerminalId() orelse return error.TestExpectedTerminal;
     const replacement = state.model.provider.terminal(replacement_id) orelse return error.TestExpectedTerminal;
     try testing.expect(!replacement_id.eql(closed_id));
@@ -266,7 +266,7 @@ test "close frees the terminal eagerly and its slot is immediately reusable" {
         .code = -1,
         .reason = .cancelled,
     } }, &state.effects);
-    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 3), state.model.ws().tab_count);
 }
 
 test "reordering preserves terminal identity, process generation, and pane structure" {
@@ -293,7 +293,7 @@ test "reordering preserves terminal identity, process generation, and pane struc
     // Moving a tab moves the WHOLE tree, and selection rides along with it.
     try testing.expectEqual(selected, state.model.selectedTerminalId().?);
     try testing.expectEqual(@as(usize, 0), state.model.tabOfTerminal(selected).?);
-    try testing.expectEqual(@as(usize, 0), state.model.selected_tab);
+    try testing.expectEqual(@as(usize, 0), state.model.ws().selected_tab);
     const moved = state.model.provider.terminal(selected) orelse return error.TestExpectedTerminal;
     try testing.expect(moved.session == session);
     try testing.expectEqual(key, moved.pty_key);
@@ -302,10 +302,10 @@ test "reordering preserves terminal identity, process generation, and pane struc
 
     // Splitting that tab adds a pane to the tab that moved, not a new tab.
     app.update(&state.model, .split_right, &state.effects);
-    try testing.expectEqual(@as(usize, 3), state.model.tab_count);
-    try testing.expectEqual(@as(usize, 2), state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 3), state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tabs[0].paneCount());
     var refs: [app.max_panes_per_tab]app.TerminalRef = undefined;
-    const count = state.model.tabs[0].terminals(&refs);
+    const count = state.model.ws().tabs[0].terminals(&refs);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expect(!refs[0].eql(refs[1]));
     for (refs[0..count]) |id| try testing.expect(state.model.provider.terminal(id) != null);
@@ -334,7 +334,7 @@ test "closing a live terminal kills its pty and stops accepting its output" {
     try state.effects.feedPtyExit(key, -1, 0, .cancelled, 0);
     try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
     try testing.expect(state.model.provider.terminalForPty(key) == null);
-    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
 }
 
 test "terminal identity allocation rejects exhaustion reserved keys and duplicates" {

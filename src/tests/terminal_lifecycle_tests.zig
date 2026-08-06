@@ -248,7 +248,7 @@ test "restart targets the focused pane, and only an abnormal end offers it" {
     try app_state.effects.feedPtyExit(app.ptyKey(1), 9, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     // Both panes survive an abnormal end.
-    try testing.expectEqual(@as(usize, 2), app_state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 2), app_state.model.ws().tabs[0].paneCount());
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     // The split focused the pane it created — terminal 2 — so the band

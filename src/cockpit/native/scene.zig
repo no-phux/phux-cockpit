@@ -1,3 +1,4 @@
+const std = @import("std");
 const native_sdk = @import("native_sdk");
 const model_module = @import("../model.zig");
 const app_types = @import("../app_types.zig");
@@ -34,7 +35,14 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
+    // cmd+N opens a WINDOW, the way every Mac app spells it — and the reason
+    // cmd+T is the tab chord rather than this one.
+    .{ .id = "window.new", .key = "n", .modifiers = .{ .primary = true } },
     .{ .id = "terminal.close", .key = "w", .modifiers = .{ .primary = true } },
+    // The platform's own Enter Full Screen chord. Registering it is what stops
+    // AppKit beeping at a key the app answers, and it addresses the FOCUSED
+    // window rather than the main one.
+    .{ .id = "window.fullscreen", .key = "f", .modifiers = .{ .primary = true, .control = true } },
     // Splitting is unconditional now: one terminal on a fresh window is a
     // perfectly good thing to split, so the chord registers globally.
     .{ .id = "pane.split-right", .key = "d", .modifiers = .{ .primary = true } },
@@ -80,6 +88,7 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
 /// physical key, so one edge executes once regardless of which channel
 /// delivered it.
 const shell_menu_items = [_]native_sdk.MenuItem{
+    .{ .label = "New Window", .command = "window.new", .key = "n", .modifiers = .{ .primary = true } },
     .{ .label = "New Tab", .command = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
     .{ .label = "Split Right", .command = "pane.split-right", .key = "d", .modifiers = .{ .primary = true } },
     .{ .label = "Split Down", .command = "pane.split-down", .key = "d", .modifiers = .{ .primary = true, .shift = true } },
@@ -99,26 +108,19 @@ const edit_menu_items = [_]native_sdk.MenuItem{
     .{ .label = "Find Previous", .command = "terminal.find-previous", .key = "g", .modifiers = .{ .primary = true, .shift = true } },
 };
 
-/// There is no "Enter Full Screen" item here, and it is not an oversight.
+/// "Enter Full Screen" is back, and it works.
 ///
-/// The toolkit's stock View menu carries one (`appkit_host.m`, ctrl+cmd+F on
-/// `toggleFullScreen:`), but supplying ANY custom menu replaces the whole bar
-/// and every item in a custom menu is built by `commandMenuItem:` — an
-/// `NSMenuItem` whose action is always `menuCommandItemClicked:`, routed back
-/// through `on_command`. So an item can be DECLARED and its chord registered,
-/// and then the app has nothing to perform with: `PlatformServices` exposes
-/// `focus`/`close`/`minimize`/`show` window verbs and reports
-/// `WindowInfo.fullscreen`, but has no verb that ENTERS or leaves it, and
-/// `Effects` mirrors exactly that set. A menu item wired to a command the app
-/// cannot answer is worse than no item.
-///
-/// The window itself is titled and resizable, so AppKit's green button still
-/// enters fullscreen, and the reflow that follows is sound — a fullscreen
-/// transition is a surface resize plus a chrome re-query, and the grid, the
-/// hit targets, and the pty all follow it (verified by driving a resize
-/// against the running app). Only the trigger is missing. See the handoff
-/// note for the SDK verb this needs.
+/// Supplying ANY custom menu replaces the whole bar, and every item in a
+/// custom menu is built by `commandMenuItem:` — an `NSMenuItem` whose action
+/// is always `menuCommandItemClicked:`, routed back through `on_command`. So
+/// the item was declarable all along and the app had nothing to PERFORM with:
+/// `PlatformServices` reported `WindowInfo.fullscreen` and exposed no verb
+/// that entered or left it. `Effects.setWindowFullscreen` /
+/// `toggleFullscreenWindow` are that verb, so the item names a command the app
+/// can now answer, against the FOCUSED window rather than always the main one.
 const view_menu_items = [_]native_sdk.MenuItem{
+    .{ .label = "Enter Full Screen", .command = "window.fullscreen", .key = "f", .modifiers = .{ .primary = true, .control = true } },
+    .{ .separator = true },
     .{ .label = "Increase Font Size", .command = "view.font-larger", .key = "=", .modifiers = .{ .primary = true } },
     .{ .label = "Decrease Font Size", .command = "view.font-smaller", .key = "-", .modifiers = .{ .primary = true } },
     .{ .label = "Reset Font Size", .command = "view.font-reset", .key = "0", .modifiers = .{ .primary = true } },
@@ -159,24 +161,76 @@ const shell_views = [_]native_sdk.ShellView{
 /// the workspace layout still runs.
 pub const main_window_label = "main";
 
-/// The whole window ceiling this toolkit affords, and why there is no
-/// `cmd+N` yet.
+/// The whole window ceiling this toolkit affords.
 ///
 /// A second window can only be a MODEL-DECLARED one (`UiApp.Options.
 /// windows_fn` + `window_view`); the SDK budgets four of those on top of the
 /// scene's own, so five is the ceiling and it is the toolkit's, not this
-/// app's. That part works — five windows really do open. What does NOT work
-/// is painting a terminal in any of them: every cell this app draws comes out
-/// of `UiApp.Options.chrome.build` (`view.buildChrome`), and the runtime
-/// installs an app-owned chrome display list for the MAIN canvas only
-/// (`ui_app.zig` `rebuild` calls `installChromeDisplayList`;
-/// `rebuildWindowSlot` publishes the widget layout and emits a widget-only
-/// list). A declared second window therefore renders the tab strip, the split
-/// divider, and empty terminal rectangles — verified in the running app.
+/// app's.
 ///
-/// So the constant is documented rather than used: shipping the chord would
-/// ship a blank terminal. See the handoff note for the SDK change this needs.
-pub const max_windows: usize = 5;
+/// Painting one used to be the blocker: every cell this app draws comes out of
+/// the chrome builder, and the runtime installed an app-owned chrome display
+/// list for the MAIN canvas only — a declared second window rendered its tab
+/// strip, its dividers, and empty terminal rectangles. `ChromeOptions.
+/// build_window` closed that: `rebuildWindowSlot` now takes the same
+/// `installChromeDisplayList` path with the slot's own canvas label, so a
+/// secondary window's terminals paint. See `view.buildChromeWindow`.
+pub const max_windows: usize = model_module.max_windows;
+pub const max_secondary_windows: usize = model_module.max_secondary_windows;
+
+/// The declared identity of window 1..N. Window 0 is the scene's own `main`.
+///
+/// Two parallel tables rather than one derived name, because both sides are
+/// LABELS the platform and the automation harness address by string: a
+/// generated name would be a name no snapshot, no screenshot verb, and no
+/// `fx.closeWindow` call site could be written against.
+pub const secondary_window_labels = [max_secondary_windows][]const u8{
+    "phux-window-1",
+    "phux-window-2",
+    "phux-window-3",
+    "phux-window-4",
+};
+
+/// Each secondary window's own `gpu_surface` view label. Distinct from
+/// `canvas_label` and from each other — the SDK routes input, automation
+/// verbs, and per-window chrome by this string, so a collision would merge two
+/// windows' surfaces.
+pub const secondary_canvas_labels = [max_secondary_windows][]const u8{
+    "phux-cockpit-canvas-1",
+    "phux-cockpit-canvas-2",
+    "phux-cockpit-canvas-3",
+    "phux-cockpit-canvas-4",
+};
+
+/// The window index a canvas label names, or null for a label this app does
+/// not own. THE discriminator: `build_window`, `window_view`, and the frame
+/// pump all arrive holding a canvas label and nothing else.
+pub fn windowIndexForCanvas(label: []const u8) ?usize {
+    if (std.mem.eql(u8, label, canvas_label)) return 0;
+    for (secondary_canvas_labels, 0..) |candidate, offset| {
+        if (std.mem.eql(u8, label, candidate)) return offset + 1;
+    }
+    return null;
+}
+
+/// The window index a WINDOW label names. `window_view` is keyed by this one.
+pub fn windowIndexForWindow(label: []const u8) ?usize {
+    if (std.mem.eql(u8, label, main_window_label)) return 0;
+    for (secondary_window_labels, 0..) |candidate, offset| {
+        if (std.mem.eql(u8, label, candidate)) return offset + 1;
+    }
+    return null;
+}
+
+pub fn windowLabelFor(index: usize) []const u8 {
+    if (index == 0 or index > max_secondary_windows) return main_window_label;
+    return secondary_window_labels[index - 1];
+}
+
+pub fn canvasLabelFor(index: usize) []const u8 {
+    if (index == 0 or index > max_secondary_windows) return canvas_label;
+    return secondary_canvas_labels[index - 1];
+}
 
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = main_window_label,

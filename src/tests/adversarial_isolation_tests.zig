@@ -828,7 +828,7 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
             .timestamp_ns = @as(u64, frame_index) * 1_000_000,
         } });
     }
-    try testing.expect(model.surface_size.width > 0);
+    try testing.expect(model.ws().surface_size.width > 0);
 
     const bottom0 = model.provider.slots[0].session.scrollbar().offset;
     const bottom1 = model.provider.slots[1].session.scrollbar().offset;
@@ -919,14 +919,14 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
     const model = &app_state.model;
 
     // The mirror is live before any frame, and the rects it yields are real.
-    try testing.expectEqual(size.width, model.surface_size.width);
-    try testing.expectEqual(size.height, model.surface_size.height);
+    try testing.expectEqual(size.width, model.ws().surface_size.width);
+    try testing.expectEqual(size.height, model.ws().surface_size.height);
     try pressKey(harness, app_iface, "2", .{ .primary = true });
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     // Only the SELECTED tab resolves a pane at all, and it is the whole
     // content area — resolve order, not attachment slot.
-    try testing.expect(app.paneFrames(model, model.surface_size)[0].width > 0);
-    try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.surface_size)[1].width);
+    try testing.expect(app.paneFrames(model, model.ws().surface_size)[0].width > 0);
+    try testing.expectEqual(@as(f32, 0), app.paneFrames(model, model.ws().surface_size)[1].width);
 
     var line: [32]u8 = undefined;
     for (0..200) |i| {
@@ -939,7 +939,7 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
 
     // Aim squarely at the selected Terminal 2 surface.
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
-    const target = app.paneFrames(model, model.surface_size)[0];
+    const target = app.paneFrames(model, model.ws().surface_size)[0];
     const cell_h = model.provider.slots[1].session.cell_height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{

@@ -32,7 +32,7 @@ const cockpitTokens = projection.cockpitTokens;
 const enqueueTransient = runtime.enqueueTransient;
 
 pub fn paneFrameForTerminal(model: *const Model, id: TerminalRef) ?geometry.RectF {
-    const frame = projection.paneFrameFor(model, model.surface_size, id) orelse return null;
+    const frame = projection.paneFrameFor(model, model.wsConst().surface_size, id) orelse return null;
     return if (frame.isEmpty()) null else frame;
 }
 
@@ -42,12 +42,12 @@ pub fn paneFrameForTerminal(model: *const Model, id: TerminalRef) ?geometry.Rect
 /// so a hit target can never sit somewhere text does not.
 pub fn terminalRefAtPoint(model: *const Model, x: f32, y: f32) ?TerminalRef {
     if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
-    const pane = projection.paneAtPoint(model, model.surface_size, x, y) orelse return null;
+    const pane = projection.paneAtPoint(model, model.wsConst().surface_size, x, y) orelse return null;
     return pane.terminal;
 }
 
 fn terminalFrame(model: *const Model, terminal_ref: TerminalRef) ?geometry.RectF {
-    return projection.paneFrameFor(model, model.surface_size, terminal_ref);
+    return projection.paneFrameFor(model, model.ws().surface_size, terminal_ref);
 }
 
 pub fn pointerButton(button: u32) MouseButton {
@@ -500,16 +500,16 @@ fn encodeMouseReport(
 ) bool {
     const session = pane.session;
     syncMouseProtocol(pane);
-    if (session.term.flags.mouse_event == .none or !validScale(model.surface_scale_factor) or
+    if (session.term.flags.mouse_event == .none or !validScale(model.wsConst().surface_scale_factor) or
         !std.math.isFinite(local.x) or !std.math.isFinite(local.y) or
         !std.math.isFinite(frame.width) or !std.math.isFinite(frame.height) or
         frame.width <= 0 or frame.height <= 0) return false;
 
     const pixel_protocol = session.term.flags.mouse_format == .sgr_pixels;
-    const scaled_width = frame.width * model.surface_scale_factor;
-    const scaled_height = frame.height * model.surface_scale_factor;
-    const scaled_x = local.x * model.surface_scale_factor;
-    const scaled_y = local.y * model.surface_scale_factor;
+    const scaled_width = frame.width * model.wsConst().surface_scale_factor;
+    const scaled_height = frame.height * model.wsConst().surface_scale_factor;
+    const scaled_x = local.x * model.wsConst().surface_scale_factor;
+    const scaled_y = local.y * model.wsConst().surface_scale_factor;
     if (pixel_protocol and (!std.math.isFinite(scaled_width) or !std.math.isFinite(scaled_height) or
         !std.math.isFinite(scaled_x) or !std.math.isFinite(scaled_y))) return false;
     const screen_width: u32 = if (pixel_protocol)

@@ -152,7 +152,7 @@ fn openPointerMonitor(model: *Model, fx: *Fx) void {
 /// re-selected a terminal that had been told it was blurred.
 pub fn remoteFocusTarget(model: *const Model) ?TerminalRef {
     if (!model.focused) return null;
-    if (model.web_selected) return null;
+    if (model.wsConst().web_selected) return null;
     const terminal_ref = model.focusedTerminalRef() orelse return null;
     if (providerKind(terminal_ref) != .phux) return null;
     return terminal_ref;
@@ -378,9 +378,15 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .viewport => |size| {
             // Remember the surface the frame pump measured against, so
-            // the wheel hit test has rectangles to resolve into.
-            model.surface_size = size.size;
-            if (validScale(size.scale_factor)) model.surface_scale_factor = size.scale_factor;
+            // the wheel hit test has rectangles to resolve into. Addressed to
+            // the window the frame came from, NOT to the active one: a
+            // background window's frames must not rewrite the geometry the
+            // front window's hit tests resolve against.
+            if (model.wsAt(size.window)) |workspace| {
+                workspace.surface_size = size.size;
+                workspace.window_id = size.window_id;
+                if (validScale(size.scale_factor)) workspace.surface_scale_factor = size.scale_factor;
+            }
             if (model.provider.terminal(size.terminal_ref)) |pane| {
                 // Commit the new size only once the emulator actually took
                 // it: on an allocation failure the model keeps its old
@@ -401,8 +407,10 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             }) catch {};
         },
         .surface_resized => |surface| {
-            model.surface_size = surface.size;
-            if (validScale(surface.scale_factor)) model.surface_scale_factor = surface.scale_factor;
+            const workspace = model.wsAt(surface.window) orelse return;
+            workspace.surface_size = surface.size;
+            workspace.window_id = surface.window_id;
+            if (validScale(surface.scale_factor)) workspace.surface_scale_factor = surface.scale_factor;
         },
         .flush_outbound => {
             for (0..max_terminals) |index| {
@@ -415,8 +423,17 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             }
         },
         .selection_autoscroll => handleSelectionAutoscroll(model, fx),
+        // `on_chrome` carries no window identity, so it lands on the window
+        // input is currently in. That is right for the case it exists for —
+        // the user dragged the front window onto a screen with a different
+        // menu bar — and the `window_chrome_changed` arm below is the
+        // addressed form for everything else.
         .chrome_changed => |chrome| {
-            model.chrome_top = chrome.insets.top;
+            model.ws().chrome_top = chrome.insets.top;
+        },
+        .window_chrome_changed => |chrome| {
+            const workspace = model.wsAt(chrome.window) orelse return;
+            workspace.chrome_top = chrome.top;
         },
         .focus_changed => |focused| {
             if (model.focused == focused) return;
@@ -565,25 +582,25 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         // given terminal moved every time a tab opened or closed; it has its
         // own chord (cmd+shift+B) and its own menu item now.
         .select_position => |position| {
-            if (position >= model.tab_count) return;
+            if (position >= model.ws().tab_count) return;
             _ = model.selectTab(position);
             endHiddenCaptures(model, fx);
         },
         .cycle_tab => |delta| {
-            if (model.tab_count == 0) return;
-            const count: i8 = @intCast(model.tab_count);
+            if (model.ws().tab_count == 0) return;
+            const count: i8 = @intCast(model.ws().tab_count);
             // Cycling from the web surface re-enters the tab list at the tab
             // that was there, rather than stranding the user on a surface the
             // strip no longer shows.
-            const current: i8 = @intCast(model.selected_tab);
-            const next: usize = @intCast(@mod(current + if (model.web_selected) 0 else delta, count));
+            const current: i8 = @intCast(model.ws().selected_tab);
+            const next: usize = @intCast(@mod(current + if (model.ws().web_selected) 0 else delta, count));
             _ = model.selectTab(next);
             endHiddenCaptures(model, fx);
         },
         .new_terminal => {
             // A new terminal is a new TAB. Capacity is bounded on both ends:
             // tab slots and registry slots.
-            if (model.tab_count >= max_tabs) return;
+            if (model.ws().tab_count >= max_tabs) return;
             const origin = model.selectedTerminalRef();
             const pane = model.provider.createTerminal() catch return;
             adoptWorkingDirectory(model, origin, pane);
@@ -595,6 +612,68 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             endHiddenCaptures(model, fx);
             spawnConfiguredPane(model, pane, fx);
         },
+        // cmd+N: a WINDOW, with a workspace of its own and one shell in it.
+        //
+        // The order matters. The slot is minted and made active BEFORE the
+        // terminal, because `createTerminal` hands back a pane that
+        // `admitTab` then files into whichever window is active — filing it
+        // first and switching after would put the new window's shell in the
+        // old window's tab strip.
+        .new_window => {
+            const index = model.freeWindowIndex() orelse {
+                // Refused, visibly. See `view.windowLimitNotice`.
+                model.window_limit_refused = true;
+                return;
+            };
+            const workspace = model.openWindow(index) orelse {
+                model.window_limit_refused = true;
+                return;
+            };
+            const origin = model.selectedTerminalRef();
+            const previous = model.active_window;
+            model.active_window = index;
+            const pane = model.provider.createTerminal() catch {
+                // No registry slot left: the window would open empty and
+                // immediately close itself, so it never opens at all.
+                model.closeWindow(index);
+                model.active_window = previous;
+                return;
+            };
+            adoptWorkingDirectory(model, origin, pane);
+            if (!workspace.admitTab(pane.id)) {
+                _ = model.provider.destroyTerminal(pane.id);
+                model.closeWindow(index);
+                model.active_window = previous;
+                return;
+            }
+            _ = workspace.selectTerminal(pane.id);
+            model.window_limit_refused = false;
+            endHiddenCaptures(model, fx);
+            spawnConfiguredPane(model, pane, fx);
+        },
+        // The host resolves a canvas label or a platform window id to an
+        // index and sends this; `update` is the only thing that moves
+        // `active_window`, so there is exactly one writer.
+        .focus_window => |index| {
+            if (!model.windowOpen(index)) return;
+            if (model.active_window == index) return;
+            model.active_window = index;
+            endHiddenCaptures(model, fx);
+        },
+        // The OS closed a window out from under the model (red button, the
+        // Window menu). The dismissal precedent: the window is already gone,
+        // so this drains its terminals and retires the slot rather than
+        // trying to close anything.
+        .window_closed => |index| {
+            if (!model.windowOpen(index)) return;
+            closeWholeWindow(model, fx, index);
+        },
+        // Addressed to the FOCUSED window's declared label, not the main
+        // one. `toggleFullscreenWindow` reads the OS's own answer for that
+        // window and SETS the other, so a window the user put into fullscreen
+        // from the green button flips back out of it here — no parity state
+        // for this app to mirror and get wrong.
+        .toggle_fullscreen => fx.toggleFullscreenWindow(scene.windowLabelFor(model.active_window)),
         .close_terminal => {
             const id = model.selectedTerminalRef() orelse return;
             // Close owns LOCAL lifetime only. A Phux terminal exists because
@@ -638,8 +717,8 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             _ = pane.session.searchStep(delta >= 0);
         },
         .close_tab => |index| closeTab(model, fx, index),
-        .hover_tab => |index| model.hovered_tab = index,
-        .unhover_tab => model.hovered_tab = model_module.no_hovered_tab,
+        .hover_tab => |index| model.ws().hovered_tab = index,
+        .unhover_tab => model.ws().hovered_tab = model_module.no_hovered_tab,
         .split_right => splitFocusedPane(model, fx, .horizontal),
         .split_down => splitFocusedPane(model, fx, .vertical),
         .split_resized => |resize| {
@@ -653,7 +732,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .focus_direction => |direction| {
             const current = model.selectedTreeConst() orelse return;
-            const chrome = projection.workspaceChrome(model, model.surface_size);
+            const chrome = projection.workspaceChrome(model, model.ws().surface_size);
             const next = current.focusDirection(
                 chrome.content,
                 projection.split_divider_width,
@@ -724,7 +803,14 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
 /// A Phux pane cannot be closed locally (its coordinator owns it), so a tab
 /// holding one keeps that pane and survives — the same rule cmd+W follows.
 fn closeTab(model: *Model, fx: *Fx, index: u8) void {
-    const current = model.treeConst(index) orelse return;
+    closeTabIn(model, fx, model.active_window, index);
+}
+
+/// The same, addressed to a specific window — what the whole-window close
+/// walks with, and what keeps a background window's tabs closable at all.
+fn closeTabIn(model: *Model, fx: *Fx, window_index: usize, index: u8) void {
+    const workspace = model.wsAtConst(window_index) orelse return;
+    const current = workspace.treeConst(index) orelse return;
     var refs: [layout.max_panes]TerminalRef = undefined;
     const count = current.terminals(&refs);
     for (refs[0..count]) |id| {
@@ -789,8 +875,14 @@ fn clearFocusedTerminal(model: *Model, fx: *Fx) void {
 /// `kill_pty` is false when the shell already exited on its own — there is
 /// no child left to signal, and the session is freed here either way.
 fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_pty: bool) void {
-    const tab_index = model.tabOfTerminal(terminal_ref) orelse return;
-    var current = &model.tabs[tab_index];
+    // Located across EVERY window, not in the active one: a shell that exits
+    // on its own in a background window arrives here as a pty event carrying
+    // nothing but its terminal, and closing it against the front window's tab
+    // list would silently do nothing.
+    const where = model.locateTerminal(terminal_ref) orelse return;
+    const workspace = model.wsAt(where.window) orelse return;
+    const tab_index = where.tab;
+    var current = &workspace.tabs[tab_index];
 
     endCapturesForTerminal(model, fx, terminal_ref);
     if (model.copy_inflight and model.copy_owner.terminal_ref.eql(terminal_ref)) fx.cancel(clipboard_key);
@@ -810,26 +902,80 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
         if (kill_pty and had_live_pty) fx.ptyKill(pty_key);
     }
 
-    if (current.isEmpty()) model.dropTab(tab_index);
+    if (current.isEmpty()) workspace.dropTab(tab_index);
     endHiddenCaptures(model, fx);
 
-    if (model.tab_count == 0) {
-        // The last tab was the window's whole reason to exist.
-        //
-        // `closeWindow` alone is NOT enough, and the comment that used to sit
-        // here claiming it was "the real OS close with the platform's own
-        // last-window semantics" was wrong: AppKit does not terminate an app
-        // when its last window closes unless the delegate opts in, so this
-        // left a running process with no window and no way back to it. The
-        // user's word for that was that closing "doesn't actually close".
-        //
-        // Close the window AND quit. Both, in that order, so the window tears
-        // down through the normal path and the shutdown lifecycle — which is
-        // what flushes the workspace layout to disk — still runs.
-        model.web_selected = true;
-        fx.closeWindow(scene.main_window_label);
-        fx.quitApp();
+    if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
+}
+
+/// A window whose last tab just closed.
+///
+/// This is the arm that was wrong the moment a second window existed. It used
+/// to call `fx.quitApp()` as soon as ANY tab count reached zero, which is
+/// right with exactly one window and catastrophic with two: emptying the
+/// second window took the whole app down, live shells in the first window
+/// included.
+///
+/// The rule is one sentence. A window whose last tab closes goes away, and the
+/// APP goes away only when the last window does — which is true exactly when
+/// no secondary window is open AND the main window has no tabs left.
+///
+/// `closeWindow` is still not enough on its own for that final window: AppKit
+/// does not terminate an app when its last window closes unless the delegate
+/// opts in, which is what once left a running process with no window and no
+/// way back to it. So the close and the quit are both sent, in that order, so
+/// the window tears down through the normal path and the shutdown lifecycle
+/// that flushes the workspace layout still runs.
+fn retireEmptyWindow(model: *Model, fx: *Fx, window_index: usize) void {
+    if (window_index == 0) {
+        // The MAIN window has one more state than the others: its web surface
+        // is a real place to be, so an emptied main window that is not the
+        // last window stands there instead of closing.
+        model.primary.web_selected = true;
+    } else {
+        // A secondary window is retired DECLARATIVELY: `view.windows` stops
+        // naming it and the runtime reconciles it closed. Sending
+        // `fx.closeWindow` as well would be two closes for one window, the
+        // second against a label that no longer exists.
+        model.closeWindow(window_index);
     }
+    // A window closing frees a slot, so whatever the last cmd+N was told is
+    // no longer true.
+    model.window_limit_refused = false;
+
+    var secondaries: usize = 0;
+    for (model.secondary) |slot| {
+        if (slot != null) secondaries += 1;
+    }
+    if (secondaries > 0) return;
+    if (model.primary_open and model.primary.tab_count > 0) return;
+
+    model.primary_open = false;
+    fx.closeWindow(scene.main_window_label);
+    fx.quitApp();
+}
+
+/// Close a WHOLE window: every pane of every tab, through the ordinary
+/// pane-close path so each one's pty kill, capture teardown, and clipboard
+/// cancellation happen exactly as cmd+W would do them. The window itself is
+/// retired by the cascade when its last tab goes.
+///
+/// A Phux pane cannot be closed locally (its coordinator owns it), so a tab
+/// holding one survives — the same rule cmd+W and the tab `x` already follow.
+/// The loop stops the moment a pass fails to shrink the tab list, because a
+/// window made entirely of remote panes would otherwise spin here forever.
+fn closeWholeWindow(model: *Model, fx: *Fx, window_index: usize) void {
+    while (true) {
+        const workspace = model.wsAt(window_index) orelse break;
+        if (workspace.tab_count == 0) break;
+        const before = workspace.tab_count;
+        closeTabIn(model, fx, window_index, 0);
+        const after = if (model.wsAt(window_index)) |current| current.tab_count else 0;
+        if (after >= before) break;
+    }
+    // The platform window is already gone, so the slot has to go even when a
+    // remote pane kept a tab alive.
+    if (model.windowOpen(window_index)) retireEmptyWindow(model, fx, window_index);
 }
 /// ONE copy in flight: the clipboard write reuses a fixed key, so a second
 /// request before the first result drains would be rejected as a duplicate —
@@ -1087,6 +1233,20 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "t")) {
         latchAppShortcut(model, event.key);
         updateModel(model, .new_terminal, fx);
+        return;
+    }
+    // cmd+N is a WINDOW, cmd+T a tab — the split every Mac app makes.
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "n")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .new_window, fx);
+        return;
+    }
+    // ctrl+cmd+F, the platform's own fullscreen chord, against the FOCUSED
+    // window. It sits with the global chords because it is one: the window is
+    // the target whether a terminal, the web surface, or nothing is selected.
+    if (primary and mods.control and !mods.shift and !mods.alt and keyIs(event.key, "f")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .toggle_fullscreen, fx);
         return;
     }
     // cmd+F opens scrollback search over the focused terminal; cmd+G and
@@ -1635,6 +1795,7 @@ pub fn appShortcutKeyMask(key: []const u8) u64 {
     if (keyIs(key, "pagedown")) return 1 << 29;
     if (keyIs(key, "f")) return 1 << 30;
     if (keyIs(key, "g")) return 1 << 31;
+    if (keyIs(key, "n")) return 1 << 32;
     return 0;
 }
 

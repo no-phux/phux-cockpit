@@ -10,6 +10,7 @@ const scene = @import("scene.zig");
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 const Model = model_module.Model;
+const Workspace = model_module.Workspace;
 const Pane = local.Pane;
 const TerminalRef = support.TerminalRef;
 
@@ -69,15 +70,19 @@ pub const TabWindow = struct {
 /// A window that follows selection gives scroll-into-view without putting a
 /// keyboard trap above the terminal.
 pub fn visibleTabWindow(model: *const Model, band_width: f32) TabWindow {
-    if (model.tab_count == 0) return .{};
+    return visibleTabWindowIn(model.wsConst(), band_width);
+}
+
+pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindow {
+    if (workspace.tab_count == 0) return .{};
     const usable = @max(tab_min_extent, band_width - tab_strip_trailing_reserve);
     // Shrink first, window second. A strip that windowed at full tab width
     // would hide tab 4 in a 900pt window while leaving 200pt of gutter.
     const capacity: usize = @max(1, @as(usize, @intFromFloat(@floor(usable / tab_min_extent))));
-    const shown = @min(capacity, model.tab_count);
+    const shown = @min(capacity, workspace.tab_count);
     const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(shown)));
-    if (shown == model.tab_count) return .{ .first = 0, .count = shown, .extent = extent };
-    const selected = @min(model.selected_tab, model.tab_count - 1);
+    if (shown == workspace.tab_count) return .{ .first = 0, .count = shown, .extent = extent };
+    const selected = @min(workspace.selected_tab, workspace.tab_count - 1);
     // Anchor at the left until the selection walks past the right edge, then
     // keep the selection as the LAST visible tab. Recentering on every step
     // would make neighbouring tabs jump under the pointer.
@@ -198,13 +203,21 @@ pub fn selectedTerminalCanClose(model: *const Model) bool {
 }
 
 pub fn chromeRevealed(model: *const Model) bool {
+    return chromeRevealedIn(model, model.wsConst());
+}
+
+pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     // `hide-chrome-when-single = false` means "I want my tab strip", full
     // stop — the at-rest hide is a default, not a law.
     if (!model.config.hide_chrome_when_single) return true;
-    if (model.tab_count > 1) return true;
-    if (model.selectedTerminalRef() == null) return true;
-    for (model.tabs[0..model.tab_count], 0..) |_, index| {
-        const current = model.treeConst(index) orelse continue;
+    if (workspace.tab_count > 1) return true;
+    // A refusal has to be visible somewhere, and the band is the only chrome
+    // this app has: a cmd+N at the window ceiling reveals it rather than
+    // doing nothing at all.
+    if (model.window_limit_refused) return true;
+    if (workspaceTerminalRef(model, workspace) == null) return true;
+    for (0..workspace.tab_count) |index| {
+        const current = workspace.treeConst(index) orelse continue;
         var refs: [layout.max_panes]TerminalRef = undefined;
         const count = current.terminals(&refs);
         for (refs[0..count]) |id| {
@@ -212,6 +225,14 @@ pub fn chromeRevealed(model: *const Model) bool {
         }
     }
     return false;
+}
+
+/// The focused terminal of ONE workspace, filtered to a ref a provider still
+/// vouches for. `Model.selectedTerminalRef` is this over the ACTIVE window;
+/// the per-window painter and view need it over the window they are drawing.
+pub fn workspaceTerminalRef(model: *const Model, workspace: *const Workspace) ?TerminalRef {
+    const id = workspace.focusedTerminalRef() orelse return null;
+    return if (model.containsTerminal(id)) id else null;
 }
 
 /// The scrollback-search band's height.
@@ -227,7 +248,11 @@ pub const search_bar_height: f32 = 34;
 /// stored copy to drift: search state lives on the session, so a tab switch
 /// changes this answer without anything having to remember to update it.
 pub fn searchRevealed(model: *const Model) bool {
-    const terminal_ref = model.selectedTerminalRef() orelse return false;
+    return searchRevealedIn(model, model.wsConst());
+}
+
+pub fn searchRevealedIn(model: *const Model, workspace: *const Workspace) bool {
+    const terminal_ref = workspaceTerminalRef(model, workspace) orelse return false;
     const pane = model.provider.terminalConst(terminal_ref) orelse return false;
     return pane.session.search.open;
 }
@@ -267,12 +292,16 @@ pub const WorkspaceChrome = struct {
 /// band's own rect — because none of that moves `content`. Only the extent is
 /// load-bearing, and only the extent is forbidden to move gradually.
 pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrome {
+    return workspaceChromeIn(model, model.wsConst(), size);
+}
+
+pub fn workspaceChromeIn(model: *const Model, workspace: *const Workspace, size: geometry.SizeF) WorkspaceChrome {
     const inset = windowPadding(model);
-    const titlebar = @max(inset, model.chrome_top + 4);
-    const revealed = chromeRevealed(model);
+    const titlebar = @max(inset, workspace.chrome_top + 4);
+    const revealed = chromeRevealedIn(model, workspace);
     const side_extent = if (revealed and model.tab_placement == .side) side_rail_width + side_rail_gap else 0;
     const top_extent = if (revealed and model.tab_placement == .top) header_height else 0;
-    const search_extent = if (searchRevealed(model)) search_bar_height else 0;
+    const search_extent = if (searchRevealedIn(model, workspace)) search_bar_height else 0;
     const body_width = @max(0, size.width - inset * 2 - side_extent);
     return .{
         .titlebar_height = titlebar,
@@ -302,9 +331,13 @@ pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrom
 /// derivations is what left a 294pt zone of painted text with no hit target
 /// behind it.
 pub fn resolvePanes(model: *const Model, size: geometry.SizeF, out: []layout.Pane) usize {
-    const current = model.selectedTreeConst() orelse return 0;
+    return resolvePanesIn(model, model.wsConst(), size, out);
+}
+
+pub fn resolvePanesIn(model: *const Model, workspace: *const Workspace, size: geometry.SizeF, out: []layout.Pane) usize {
+    const current = workspace.selectedTreeConst() orelse return 0;
     return current.resolve(
-        workspaceChrome(model, size).content,
+        workspaceChromeIn(model, workspace, size).content,
         split_divider_width,
         split_pane_min_width,
         split_pane_min_height,

@@ -163,7 +163,7 @@ const side_tabs_shot_path = "zig-out/cockpit-side-tabs.png";
 /// Four TABS, made through the real `new_terminal` path. The fixture used
 /// to start with two eager terminals; the app now starts with one.
 fn fillTerminalCapacity(harness: anytype, state: *TerminalApp) !void {
-    while (state.model.tab_count < 4) try state.dispatch(&harness.runtime, 1, .new_terminal);
+    while (state.model.ws().tab_count < 4) try state.dispatch(&harness.runtime, 1, .new_terminal);
 }
 
 test "production launch owns exactly one terminal and New spawns the second child" {
@@ -172,8 +172,8 @@ test "production launch owns exactly one terminal and New spawns the second chil
     const state = try startProductionCockpit(harness);
     defer stopCockpit(state);
 
-    try testing.expectEqual(@as(usize, 1), state.model.tab_count);
-    try testing.expectEqual(@as(usize, 1), state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.ws().tabs[0].paneCount());
     try testing.expectEqual(@as(usize, 1), state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 1), state.model.provider.occupiedCount());
     try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
@@ -185,10 +185,10 @@ test "production launch owns exactly one terminal and New spawns the second chil
     const initial_snapshot = try state.model.topologySnapshot();
     try initial_snapshot.validate();
     try testing.expectEqual(@as(u8, 1), initial_snapshot.tab_count);
-    try testing.expect(initial_snapshot.selection.eql(.{ .tab = 0 }));
+    try testing.expect(app.primarySnapshotSelection(&initial_snapshot).eql(.{ .tab = 0 }));
 
     try state.dispatch(&harness.runtime, 1, .new_terminal);
-    try testing.expectEqual(@as(usize, 2), state.model.tab_count);
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 2), state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 2), state.effects.pendingPtyCount());
     const second = state.model.provider.terminal(app.initialTerminalRef(1)) orelse return error.TestExpectedTerminal;
@@ -221,7 +221,7 @@ test "one terminal shows no control band, and Cmd+D still splits it" {
         .key = "d",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(@as(usize, 2), state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tabs[0].paneCount());
     try testing.expect(state.model.consumed_shortcut_keys_held != 0);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -408,7 +408,7 @@ test "four-terminal accessibility is compact ordered and keyboard-complete" {
     // Four tabs, so cmd+5 addresses nothing. It used to fall through to the
     // Web surface, which meant the chord for a given terminal shifted every
     // time a tab opened; the selection is simply unchanged now.
-    try testing.expect(!state.model.web_selected);
+    try testing.expect(!state.model.ws().web_selected);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,

@@ -32,7 +32,7 @@ test "a fresh window is one tab of one pane filling the content area" {
     const session = try createSession(80, 24);
     var model = app.initialModel(session);
     defer app.deinitModel(&model);
-    try testing.expectEqual(@as(usize, 1), model.tab_count);
+    try testing.expectEqual(@as(usize, 1), model.ws().tab_count);
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
 
     var panes: [app.max_panes_per_tab]app.LayoutPane = undefined;
@@ -58,7 +58,7 @@ test "Cmd+D on a fresh window creates a NEW shell beside the first" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try testing.expectEqual(@as(usize, 1), app_state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 1), app_state.model.provider.activeCount());
     const first_session = app_state.model.provider.slots[0].session;
 
@@ -66,8 +66,8 @@ test "Cmd+D on a fresh window creates a NEW shell beside the first" {
     try releaseCanvasKey(harness, app_iface, "d", .{});
 
     // A second SHELL exists, in the SAME tab, and focus moved into it.
-    try testing.expectEqual(@as(usize, 1), app_state.model.tab_count);
-    try testing.expectEqual(@as(usize, 2), app_state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 2), app_state.model.ws().tabs[0].paneCount());
     try testing.expectEqual(@as(usize, 2), app_state.model.provider.activeCount());
     try testing.expectEqual(@as(usize, 2), app_state.effects.pendingPtyCount());
     try testing.expect(app_state.model.provider.slots[0].session == first_session);
@@ -82,7 +82,7 @@ test "Cmd+D on a fresh window creates a NEW shell beside the first" {
     // Cmd+Shift+D divides the focused pane the other way.
     try pressCanvasKey(harness, app_iface, "d", .{ .primary = true, .shift = true });
     try releaseCanvasKey(harness, app_iface, "d", .{});
-    try testing.expectEqual(@as(usize, 3), app_state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 3), app_state.model.ws().tabs[0].paneCount());
     const nested = app.resolvePanes(&app_state.model, surface, &panes);
     try testing.expectEqual(@as(usize, 3), nested);
     // The original pane still spans the full height; the right column stacks.
@@ -215,7 +215,7 @@ test "directional focus and pane cycling move between panes, not tabs" {
     // Cmd+[ / Cmd+] cycle panes; the tab count never moves.
     try pressCanvasKey(harness, app_iface, "[", .{ .primary = true });
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
-    try testing.expectEqual(@as(usize, 1), app_state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tab_count);
     try releaseCanvasKey(harness, app_iface, "[", .{});
     try pressCanvasKey(harness, app_iface, "]", .{ .primary = true });
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
@@ -237,8 +237,8 @@ test "Cmd+W closes the focused pane, then the tab, then the window" {
     // FREES the emulator — it does not sit there as a tombstone.
     try pressCanvasKey(harness, app_iface, "w", .{ .primary = true });
     try releaseCanvasKey(harness, app_iface, "w", .{});
-    try testing.expectEqual(@as(usize, 1), app_state.model.tab_count);
-    try testing.expectEqual(@as(usize, 1), app_state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tabs[0].paneCount());
     try testing.expectEqual(@as(usize, 1), app_state.model.provider.activeCount());
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     var panes: [app.max_panes_per_tab]app.LayoutPane = undefined;
@@ -249,7 +249,7 @@ test "Cmd+W closes the focused pane, then the tab, then the window" {
     // window through the platform's own verb.
     try testing.expectEqual(@as(u32, 0), app_state.effects.windowActionState().close_count);
     try pressCanvasKey(harness, app_iface, "w", .{ .primary = true });
-    try testing.expectEqual(@as(usize, 0), app_state.model.tab_count);
+    try testing.expectEqual(@as(usize, 0), app_state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 0), app_state.model.provider.activeCount());
     try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().close_count);
     try testing.expectEqualStrings(app.main_window_label, app_state.effects.windowActionState().lastLabel());
@@ -274,7 +274,7 @@ test "a clean shell exit closes its pane; an abnormal one keeps it for Restart" 
     // behind an "EXIT 0" badge.
     try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(@as(usize, 1), app_state.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tabs[0].paneCount());
     try testing.expectEqual(@as(usize, 1), app_state.model.provider.activeCount());
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
 
@@ -282,7 +282,7 @@ test "a clean shell exit closes its pane; an abnormal one keeps it for Restart" 
     // Restart remain reachable.
     try app_state.effects.feedPtyExit(app.ptyKey(0), 1, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(@as(usize, 1), app_state.model.tab_count);
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 1), app_state.model.provider.activeCount());
     try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
@@ -305,7 +305,7 @@ test "the last clean exit in the last tab closes the window" {
 
     try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(@as(usize, 0), app_state.model.tab_count);
+    try testing.expectEqual(@as(usize, 0), app_state.model.ws().tab_count);
     try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().close_count);
     try testing.expectEqualStrings(app.main_window_label, app_state.effects.windowActionState().lastLabel());
     // A shell that ends on its own has to end the app the same way cmd+W
@@ -325,16 +325,16 @@ test "split divider drag and keyboard resize stay in lockstep with the painted r
     const app_iface = app_state.app();
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
-    const branch = app_state.model.tabs[0].root;
+    const branch = app_state.model.ws().tabs[0].root;
     var divider: ?geometry.RectF = null;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (node.widget.kind == .split_divider) divider = node.frame;
     }
     const target = rectCenter(divider orelse return error.TestExpectedSplitDivider);
     try clickCanvas(harness, app_iface, target.x, target.y);
-    const before = app_state.model.tabs[0].node(branch).fraction;
+    const before = app_state.model.ws().tabs[0].node(branch).fraction;
     try pressCanvasKey(harness, app_iface, "arrowright", .{});
-    try testing.expect(app_state.model.tabs[0].node(branch).fraction > before);
+    try testing.expect(app_state.model.ws().tabs[0].node(branch).fraction > before);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     divider = null;
@@ -342,7 +342,7 @@ test "split divider drag and keyboard resize stay in lockstep with the painted r
         if (node.widget.kind == .split_divider) divider = node.frame;
     }
     const drag_start = rectCenter(divider orelse return error.TestExpectedSplitDivider);
-    const keyboard_fraction = app_state.model.tabs[0].node(branch).fraction;
+    const keyboard_fraction = app_state.model.ws().tabs[0].node(branch).fraction;
     for ([_]native_sdk.platform.GpuSurfaceInputKind{ .pointer_down, .pointer_drag, .pointer_up }, [_]f32{ 0, 60, 60 }) |kind, dx| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
@@ -352,7 +352,7 @@ test "split divider drag and keyboard resize stay in lockstep with the painted r
             .y = drag_start.y,
         } });
     }
-    try testing.expect(app_state.model.tabs[0].node(branch).fraction > keyboard_fraction);
+    try testing.expect(app_state.model.ws().tabs[0].node(branch).fraction > keyboard_fraction);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     // The painter's rects and the laid-out interaction surfaces still match.
@@ -419,8 +419,8 @@ test "sub-cell frame changes still update surface geometry" {
         .timestamp_ns = 4_000_000,
     } });
 
-    try testing.expectEqual(changed.width, app_state.model.surface_size.width);
-    try testing.expectEqual(changed.height, app_state.model.surface_size.height);
+    try testing.expectEqual(changed.width, app_state.model.ws().surface_size.width);
+    try testing.expectEqual(changed.height, app_state.model.ws().surface_size.height);
     try testing.expectEqual(cols, app_state.model.provider.slots[0].cols);
     try testing.expectEqual(rows, app_state.model.provider.slots[0].rows);
 }
@@ -503,10 +503,10 @@ test "spatial shortcut releases never leak into kitty-reporting terminals" {
         .window_id = 1,
         .modifiers = .{ .primary = true },
     } });
-    try testing.expectEqual(@as(usize, 2), host.inner.model.tabs[host.inner.model.selected_tab].paneCount());
+    try testing.expectEqual(@as(usize, 2), host.inner.model.ws().tabs[host.inner.model.ws().selected_tab].paneCount());
     // The duplicate canvas edge for the same physical press is consumed.
     try pressCanvasKey(harness, app_iface, "d", .{ .primary = true });
-    try testing.expectEqual(@as(usize, 2), host.inner.model.tabs[host.inner.model.selected_tab].paneCount());
+    try testing.expectEqual(@as(usize, 2), host.inner.model.ws().tabs[host.inner.model.ws().selected_tab].paneCount());
     try releaseCanvasKey(harness, app_iface, "d", .{});
 
     const cases = [_]struct {
@@ -554,15 +554,15 @@ test "repeated global shortcut callbacks are idempotent per physical edge" {
         .modifiers = .{ .primary = true },
     };
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = shortcut });
-    try testing.expectEqual(@as(usize, 2), host.inner.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 2), host.inner.model.ws().tabs[0].paneCount());
     try testing.expect(host.global_shortcut_keys_held != 0);
     // A repeated callback for the SAME physical edge must not split again.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = shortcut });
-    try testing.expectEqual(@as(usize, 2), host.inner.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 2), host.inner.model.ws().tabs[0].paneCount());
 
     try releaseCanvasKey(harness, app_iface, "d", .{});
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = shortcut });
-    try testing.expectEqual(@as(usize, 3), host.inner.model.tabs[0].paneCount());
+    try testing.expectEqual(@as(usize, 3), host.inner.model.ws().tabs[0].paneCount());
 
     for (activeSlots(&host.inner.model)) |*pane| pane.session.feed("\x1b[>11u");
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
@@ -588,21 +588,21 @@ test "Cmd+1 and Cmd+2 select TABS and route text only to that tab's focused pane
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try testing.expectEqual(@as(usize, 0), app_state.model.selected_tab);
+    try testing.expectEqual(@as(usize, 0), app_state.model.ws().selected_tab);
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try typeCanvasText(harness, app_iface, "alpha");
     try testing.expectEqualStrings("alpha", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 
     try pressCanvasKey(harness, app_iface, "2", .{ .primary = true });
-    try testing.expectEqual(@as(usize, 1), app_state.model.selected_tab);
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().selected_tab);
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try typeCanvasText(harness, app_iface, "bravo");
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
     try testing.expectEqualStrings("alpha", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
 
     try pressCanvasKey(harness, app_iface, "1", .{ .primary = true });
-    try testing.expectEqual(@as(usize, 0), app_state.model.selected_tab);
+    try testing.expectEqual(@as(usize, 0), app_state.model.ws().selected_tab);
     try typeCanvasText(harness, app_iface, "!");
     try testing.expectEqualStrings("alpha!", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("bravo", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));

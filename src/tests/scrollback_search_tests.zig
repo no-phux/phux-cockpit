@@ -601,7 +601,7 @@ test "closing a tab whose search is open tears the search down with it" {
     // the surviving terminal are the assertions.
     try state.dispatch(&harness.runtime, 1, .{ .close_tab = 0 });
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
-    try testing.expectEqual(@as(usize, 1), model.tab_count);
+    try testing.expectEqual(@as(usize, 1), model.ws().tab_count);
     try testing.expect(!app.searchRevealed(model));
     try testing.expect(searchBandLabel(harness) == null);
 }

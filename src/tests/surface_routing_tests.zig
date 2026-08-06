@@ -448,10 +448,10 @@ test "remote focus is derived from the selected tab, its focused pane, and windo
     // The remote terminal gets a tab of its own; selecting that tab is what
     // makes it the focus target. There is no separate attachment to set.
     const remote = try remoteRef(71);
-    model.tabs[1] = app.Tree.initLeaf(remote);
-    model.tab_count = 2;
-    model.selected_tab = 1;
-    model.web_selected = false;
+    model.ws().tabs[1] = app.Tree.initLeaf(remote);
+    model.ws().tab_count = 2;
+    model.ws().selected_tab = 1;
+    model.ws().web_selected = false;
     model.focused = true;
     try testing.expect(app.remoteFocusTarget(&model).?.eql(remote));
 
@@ -460,7 +460,7 @@ test "remote focus is derived from the selected tab, its focused pane, and windo
     // return, because the tab never changed.
     model.selectWeb();
     try testing.expectEqual(@as(?app.TerminalRef, null), app.remoteFocusTarget(&model));
-    model.web_selected = false;
+    model.ws().web_selected = false;
     try testing.expect(app.remoteFocusTarget(&model).?.eql(remote));
 
     // The window losing key retracts it too.
@@ -496,5 +496,5 @@ test "a local grid resize preserves the surface scale factor" {
         try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
     }
     try testing.expect(state.model.provider.slots[0].cols != 80);
-    try testing.expectApproxEqAbs(@as(f32, 2), state.model.surface_scale_factor, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 2), state.model.ws().surface_scale_factor, 0.0001);
 }

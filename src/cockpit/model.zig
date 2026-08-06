@@ -173,12 +173,165 @@ pub const BrowserPage = enum {
     }
 };
 
-/// The workspace: a list of TABS, each owning a `layout.Tree` of panes.
+/// Model-declared secondary windows the toolkit budgets
+/// (`canvas_limits.max_ui_app_windows`). Restated here rather than imported
+/// because `UiApp` is parameterized on this very model, so naming the app type
+/// from inside it is circular; `app_types.zig` carries the comptime assertion
+/// that the two agree, which is where the app type is actually in scope.
+pub const max_secondary_windows: usize = 4;
+
+/// Windows the app can have open at once: the scene's own plus the
+/// secondaries. The ceiling is the TOOLKIT's, not a policy of this app's.
+pub const max_windows: usize = 1 + max_secondary_windows;
+
+/// ONE window's workspace: a list of TABS, each owning a `layout.Tree` of
+/// panes, plus the surface geometry that window was last measured at.
 ///
 /// The selected tab plus that tree's own `focus` fully determine what is
 /// focused — there is no second focus variable to keep in sync. `web_selected`
 /// is the one thing outside the tab model: the WebKit surface takes over the
 /// content area without belonging to a tab.
+///
+/// Extracted out of `Model` so a second window is a second workspace rather
+/// than a second model: everything below is per-window by construction, and
+/// everything that stayed on `Model` (the provider, the config, the clipboard
+/// latches, the shortcut latch) is genuinely app-wide.
+pub const Workspace = struct {
+    tabs: [max_tabs]layout.Tree = [_]layout.Tree{.{}} ** max_tabs,
+    tab_count: usize = 0,
+    selected_tab: usize = 0,
+    /// The web surface owns the content area. Independent of `selected_tab`,
+    /// so returning from Web restores the tab that was there. Only the MAIN
+    /// window can raise it: the webview is a scene-declared view of window 0.
+    web_selected: bool = false,
+    /// The tab the pointer is over, or `no_hovered_tab`. Purely presentational
+    /// — it decides whether that tab shows its close `x` — but it lives here
+    /// because the view is a pure function of it.
+    hovered_tab: usize = no_hovered_tab,
+    /// This window's titlebar inset, from its own chrome event.
+    chrome_top: f32 = 0,
+    /// This window's canvas size and device scale. Per-window because two
+    /// windows can sit on different monitors at different densities, and every
+    /// geometric derivation (pane rects, hit tests, the PTY sizing pump) reads
+    /// them.
+    surface_size: geometry.SizeF = geometry.SizeF.init(1100, 640),
+    surface_scale_factor: f32 = 1,
+    /// The platform window id this workspace is currently rendered into,
+    /// learned from its own frame events. Zero until the first frame.
+    ///
+    /// Needed because a SHORTCUT event carries a window id and no label, so it
+    /// is the only way "cmd+W in the window I am looking at" resolves to a
+    /// workspace. The id is the platform's, not ours: it is not stable across
+    /// a close and reopen, which is exactly why it is learned per frame rather
+    /// than assigned.
+    window_id: native_sdk.platform.WindowId = 0,
+
+    pub fn tree(workspace: *Workspace, index: usize) ?*layout.Tree {
+        if (index >= workspace.tab_count) return null;
+        return &workspace.tabs[index];
+    }
+
+    pub fn treeConst(workspace: *const Workspace, index: usize) ?*const layout.Tree {
+        if (index >= workspace.tab_count) return null;
+        return &workspace.tabs[index];
+    }
+
+    pub fn selectedTree(workspace: *Workspace) ?*layout.Tree {
+        if (workspace.web_selected) return null;
+        return workspace.tree(workspace.selected_tab);
+    }
+
+    pub fn selectedTreeConst(workspace: *const Workspace) ?*const layout.Tree {
+        if (workspace.web_selected) return null;
+        return workspace.treeConst(workspace.selected_tab);
+    }
+
+    /// Keyboard focus follows the selected tab's own focused pane. Unfiltered
+    /// on purpose: remote focus publication needs the ref the tree names even
+    /// in the instant before the provider's bookkeeping catches up.
+    pub fn focusedTerminalRef(workspace: *const Workspace) ?TerminalRef {
+        const current = workspace.selectedTreeConst() orelse return null;
+        return current.focusedTerminal();
+    }
+
+    /// The tab index whose tree holds `id` in any pane.
+    pub fn tabOfTerminal(workspace: *const Workspace, id: TerminalRef) ?usize {
+        for (workspace.tabs[0..workspace.tab_count], 0..) |candidate, index| {
+            if (candidate.find(id) != null) return index;
+        }
+        return null;
+    }
+
+    /// The label identity of a tab: its focused pane's terminal.
+    pub fn tabTerminal(workspace: *const Workspace, index: usize) ?TerminalRef {
+        const current = workspace.treeConst(index) orelse return null;
+        return current.focusedTerminal();
+    }
+
+    /// Give `id` a tab of its own. Idempotent: a terminal already living in
+    /// some pane keeps the tab it is in.
+    pub fn admitTab(workspace: *Workspace, id: TerminalRef) bool {
+        if (workspace.tabOfTerminal(id) != null) return true;
+        if (workspace.tab_count >= max_tabs) return false;
+        workspace.tabs[workspace.tab_count] = layout.Tree.initLeaf(id);
+        workspace.tab_count += 1;
+        return true;
+    }
+
+    pub fn dropTab(workspace: *Workspace, index: usize) void {
+        if (index >= workspace.tab_count) return;
+        var cursor = index;
+        while (cursor + 1 < workspace.tab_count) : (cursor += 1) workspace.tabs[cursor] = workspace.tabs[cursor + 1];
+        workspace.tab_count -= 1;
+        workspace.tabs[workspace.tab_count] = .{};
+        if (workspace.tab_count == 0) {
+            workspace.selected_tab = 0;
+            return;
+        }
+        if (workspace.selected_tab >= workspace.tab_count) workspace.selected_tab = workspace.tab_count - 1;
+    }
+
+    pub fn selectTab(workspace: *Workspace, index: usize) bool {
+        if (index >= workspace.tab_count) return false;
+        workspace.selected_tab = index;
+        workspace.web_selected = false;
+        return true;
+    }
+
+    /// Select the tab holding `id` AND focus the pane that holds it. This is
+    /// what a tab click and cmd+T mean; it can never invent a pane.
+    pub fn selectTerminal(workspace: *Workspace, id: TerminalRef) bool {
+        const index = workspace.tabOfTerminal(id) orelse return false;
+        workspace.selected_tab = index;
+        workspace.web_selected = false;
+        _ = workspace.tabs[index].focusTerminal(id);
+        return true;
+    }
+
+    pub fn selectWeb(workspace: *Workspace) void {
+        workspace.web_selected = true;
+    }
+
+    pub fn moveTerminal(workspace: *Workspace, id: TerminalRef, delta: i8) bool {
+        const current = workspace.tabOfTerminal(id) orelse return false;
+        const target_signed = @as(isize, @intCast(current)) + delta;
+        if (target_signed < 0 or target_signed >= workspace.tab_count) return false;
+        const target: usize = @intCast(target_signed);
+        std.mem.swap(layout.Tree, &workspace.tabs[current], &workspace.tabs[target]);
+        if (workspace.selected_tab == current) {
+            workspace.selected_tab = target;
+        } else if (workspace.selected_tab == target) {
+            workspace.selected_tab = current;
+        }
+        return true;
+    }
+};
+
+/// A window and a tab inside it — what a terminal-to-topology lookup has to
+/// answer once there is more than one window, because a pty event names a
+/// terminal and nothing else.
+pub const TerminalLocation = struct { window: usize, tab: usize };
+
 pub const Model = struct {
     provider: *LocalProvider,
     /// The user's config, loaded once at startup and then MODEL STATE: the
@@ -201,17 +354,38 @@ pub const Model = struct {
     phux_provider: ?*PhuxProvider = null,
     remote_ui: [max_remote_terminals]RemoteUiState = [_]RemoteUiState{.{}} ** max_remote_terminals,
     pointer_state: ?*PointerState = null,
-    tabs: [max_tabs]layout.Tree = [_]layout.Tree{.{}} ** max_tabs,
-    tab_count: usize = 0,
-    selected_tab: usize = 0,
-    /// The web surface owns the content area. Independent of `selected_tab`,
-    /// so returning from Web restores the tab that was there.
-    web_selected: bool = false,
+    /// Window 0's workspace, INLINE.
+    ///
+    /// Deliberately not one of N by-value slots. A `layout.Tree` is 9,432
+    /// bytes and there are `max_tabs` of them, so a workspace is ~151 KB;
+    /// five of those inside a model that is itself passed by value through
+    /// `TerminalApp.init` would be three quarters of a megabyte of stack per
+    /// construction, and this repo has already taken a real main-thread stack
+    /// overflow from exactly that shape (see the comment on
+    /// `tests/support.zig:initTerminalApp`). Window 0 always exists, so it
+    /// costs nothing to keep here; windows 1..N are minted on demand.
+    primary: Workspace = .{},
+    /// Windows 1..`max_secondary_windows`, heap-allocated when cmd+N opens
+    /// them and freed when they close. A null slot IS a closed window: the
+    /// declared-window set the runtime reconciles is derived from this array,
+    /// so there is no second "is it open" flag to drift.
+    secondary: [max_secondary_windows]?*Workspace = @splat(null),
+    /// Which window input is currently addressed to. Every message that
+    /// reshapes a workspace acts on THIS one; the host moves it as input
+    /// arrives from a window, and `.focus_window` is the seam a test drives.
+    active_window: usize = 0,
+    /// Whether the scene's own window is still on screen. cmd+W through the
+    /// main window's last tab closes it while secondaries are still open, and
+    /// the app quits only once nothing is left.
+    primary_open: bool = true,
+    /// A cmd+N was refused because every window slot is taken.
+    ///
+    /// A latch rather than a transient, because the refusal has to be VISIBLE:
+    /// a chord that silently does nothing is indistinguishable from a chord
+    /// that is not bound. The chrome reads it, and the next successful window
+    /// open — or any other window closing — clears it.
+    window_limit_refused: bool = false,
     tab_placement: TabPlacement = .top,
-    /// The tab the pointer is over, or `no_hovered_tab`. Purely presentational
-    /// — it decides whether that tab shows its close `x` — but it lives on the
-    /// model because the view is a pure function of it.
-    hovered_tab: usize = no_hovered_tab,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
     focused: bool = true,
@@ -229,13 +403,117 @@ pub const Model = struct {
         .generation = .{},
     },
     paste_failed: bool = false,
-    chrome_top: f32 = 0,
-    surface_size: geometry.SizeF = geometry.SizeF.init(1100, 640),
-    surface_scale_factor: f32 = 1,
     /// Where the layout snapshot goes and what is owed to it. Disabled by
     /// default so every test and every fixture stays free of disk traffic
     /// until a composition root hands it a real path.
     state: StatePersistence = .{},
+
+    // -------------------------------------------------------- windows
+
+    /// The workspace of the window input is currently addressed to.
+    ///
+    /// Window 0 is the fallback for an `active_window` whose slot has since
+    /// closed: a message that arrives one dispatch after its window went away
+    /// must land somewhere real rather than reach through a null.
+    pub fn ws(model: *Model) *Workspace {
+        return model.wsAt(model.active_window) orelse &model.primary;
+    }
+
+    pub fn wsConst(model: *const Model) *const Workspace {
+        return model.wsAtConst(model.active_window) orelse &model.primary;
+    }
+
+    pub fn wsAt(model: *Model, index: usize) ?*Workspace {
+        if (index == 0) return &model.primary;
+        if (index > max_secondary_windows) return null;
+        return model.secondary[index - 1];
+    }
+
+    pub fn wsAtConst(model: *const Model, index: usize) ?*const Workspace {
+        if (index == 0) return &model.primary;
+        if (index > max_secondary_windows) return null;
+        return model.secondary[index - 1];
+    }
+
+    /// Whether window `index` is on screen. Window 0 answers `primary_open`
+    /// because its window is the SCENE's and is not declared by the model;
+    /// every other window's existence is its slot.
+    pub fn windowOpen(model: *const Model, index: usize) bool {
+        if (index == 0) return model.primary_open;
+        if (index > max_secondary_windows) return false;
+        return model.secondary[index - 1] != null;
+    }
+
+    pub fn openWindowCount(model: *const Model) usize {
+        var count: usize = 0;
+        for (0..max_windows) |index| {
+            if (model.windowOpen(index)) count += 1;
+        }
+        return count;
+    }
+
+    /// The lowest free secondary slot, or null at the ceiling. Lowest-first so
+    /// a closed-and-reopened window reuses its label and its declared canvas
+    /// rather than walking up the namespace until it runs out.
+    pub fn freeWindowIndex(model: *const Model) ?usize {
+        for (model.secondary, 0..) |slot, offset| {
+            if (slot == null) return offset + 1;
+        }
+        return null;
+    }
+
+    /// Mint window `index`'s workspace. The caller owns the decision that the
+    /// slot is free; a slot already taken is left exactly as it was.
+    pub fn openWindow(model: *Model, index: usize) ?*Workspace {
+        if (index == 0) {
+            model.primary_open = true;
+            return &model.primary;
+        }
+        if (index > max_secondary_windows) return null;
+        if (model.secondary[index - 1]) |existing| return existing;
+        const workspace = std.heap.page_allocator.create(Workspace) catch return null;
+        workspace.* = .{};
+        model.secondary[index - 1] = workspace;
+        return workspace;
+    }
+
+    /// Retire window `index`. The workspace's tabs are NOT torn down here —
+    /// every close path drains them through the ordinary pane-close cascade
+    /// first, so this only releases storage the model no longer names.
+    pub fn closeWindow(model: *Model, index: usize) void {
+        if (index == 0) {
+            model.primary_open = false;
+            model.primary = .{};
+        } else if (index <= max_secondary_windows) {
+            if (model.secondary[index - 1]) |workspace| {
+                std.heap.page_allocator.destroy(workspace);
+                model.secondary[index - 1] = null;
+            }
+        }
+        if (model.active_window == index) model.active_window = model.firstOpenWindow();
+    }
+
+    /// The lowest-numbered window still open, or 0 when none is. Used as the
+    /// landing place for input after the active window goes away.
+    pub fn firstOpenWindow(model: *const Model) usize {
+        for (0..max_windows) |index| {
+            if (model.windowOpen(index)) return index;
+        }
+        return 0;
+    }
+
+    /// Where a terminal lives, across EVERY window.
+    ///
+    /// A pty exit event names a terminal and nothing else, and the terminal
+    /// may belong to a window that is not the active one — so the close
+    /// cascade cannot ask the active workspace and take null for an answer.
+    pub fn locateTerminal(model: *const Model, id: TerminalRef) ?TerminalLocation {
+        for (0..max_windows) |index| {
+            const workspace = model.wsAtConst(index) orelse continue;
+            if (workspace.tabOfTerminal(id)) |tab| return .{ .window = index, .tab = tab };
+        }
+        return null;
+    }
 
     pub fn phux(model: *Model) ?*PhuxProvider {
         if (comptime !support.phux_enabled) return null;
@@ -298,25 +576,28 @@ pub const Model = struct {
     }
 
     // ------------------------------------------------------------ tabs
+    //
+    // Everything below addresses the ACTIVE window's workspace. These stayed
+    // on `Model` rather than being spelled `model.ws().x` at every call site
+    // because the two say the same thing and the shorter one keeps the ~120
+    // callers honest; the explicit `wsAt(index)` form is what a caller that
+    // means a SPECIFIC window (the per-window view, the per-window painter)
+    // reaches for, and the type system keeps the two apart.
 
     pub fn tree(model: *Model, index: usize) ?*layout.Tree {
-        if (index >= model.tab_count) return null;
-        return &model.tabs[index];
+        return model.ws().tree(index);
     }
 
     pub fn treeConst(model: *const Model, index: usize) ?*const layout.Tree {
-        if (index >= model.tab_count) return null;
-        return &model.tabs[index];
+        return model.wsConst().treeConst(index);
     }
 
     pub fn selectedTree(model: *Model) ?*layout.Tree {
-        if (model.web_selected) return null;
-        return model.tree(model.selected_tab);
+        return model.ws().selectedTree();
     }
 
     pub fn selectedTreeConst(model: *const Model) ?*const layout.Tree {
-        if (model.web_selected) return null;
-        return model.treeConst(model.selected_tab);
+        return model.wsConst().selectedTreeConst();
     }
 
     /// The surface the content area shows. Derived: there is no stored copy
@@ -344,8 +625,7 @@ pub const Model = struct {
     /// remote focus publication needs the ref the tree names even in the
     /// instant before the provider's own bookkeeping catches up.
     pub fn focusedTerminalRef(model: *const Model) ?TerminalRef {
-        const current = model.selectedTreeConst() orelse return null;
-        return current.focusedTerminal();
+        return model.wsConst().focusedTerminalRef();
     }
 
     pub fn focusedTerminalId(model: *const Model) ?TerminalRef {
@@ -357,12 +637,9 @@ pub const Model = struct {
         return model.provider.terminal(id);
     }
 
-    /// The tab index whose tree holds `id` in any pane.
+    /// The tab index whose tree holds `id` in any pane of the ACTIVE window.
     pub fn tabOfTerminal(model: *const Model, id: TerminalRef) ?usize {
-        for (model.tabs[0..model.tab_count], 0..) |candidate, index| {
-            if (candidate.find(id) != null) return index;
-        }
-        return null;
+        return model.wsConst().tabOfTerminal(id);
     }
 
     pub fn terminalOrderIndex(model: *const Model, id: TerminalRef) ?usize {
@@ -371,18 +648,19 @@ pub const Model = struct {
 
     /// The label identity of a tab: its focused pane's terminal.
     pub fn tabTerminal(model: *const Model, index: usize) ?TerminalRef {
-        const current = model.treeConst(index) orelse return null;
-        return current.focusedTerminal();
+        return model.wsConst().tabTerminal(index);
     }
 
-    /// Give `id` a tab of its own. Idempotent: a terminal already living in
-    /// some pane keeps the tab it is in.
+    /// Give `id` a tab of its own in the active window. Idempotent: a
+    /// terminal already living in some pane keeps the tab it is in.
+    ///
+    /// A terminal that belongs to ANOTHER window is refused rather than
+    /// duplicated: two windows holding one terminal would be two trees
+    /// driving one emulator, which is the exact invariant `validate` already
+    /// enforces within a window.
     pub fn admitTab(model: *Model, id: TerminalRef) bool {
-        if (model.tabOfTerminal(id) != null) return true;
-        if (model.tab_count >= max_tabs) return false;
-        model.tabs[model.tab_count] = layout.Tree.initLeaf(id);
-        model.tab_count += 1;
-        return true;
+        if (model.locateTerminal(id)) |where| return where.window == model.active_window;
+        return model.ws().admitTab(id);
     }
 
     /// Backwards-compatible alias: admitting a terminal now means giving it
@@ -392,16 +670,7 @@ pub const Model = struct {
     }
 
     pub fn dropTab(model: *Model, index: usize) void {
-        if (index >= model.tab_count) return;
-        var cursor = index;
-        while (cursor + 1 < model.tab_count) : (cursor += 1) model.tabs[cursor] = model.tabs[cursor + 1];
-        model.tab_count -= 1;
-        model.tabs[model.tab_count] = .{};
-        if (model.tab_count == 0) {
-            model.selected_tab = 0;
-            return;
-        }
-        if (model.selected_tab >= model.tab_count) model.selected_tab = model.tab_count - 1;
+        model.ws().dropTab(index);
     }
 
     pub fn dropFromOrder(model: *Model, index: usize) void {
@@ -409,59 +678,52 @@ pub const Model = struct {
     }
 
     pub fn selectTab(model: *Model, index: usize) bool {
-        if (index >= model.tab_count) return false;
-        model.selected_tab = index;
-        model.web_selected = false;
-        return true;
+        return model.ws().selectTab(index);
     }
 
     /// Select the tab holding `id` AND focus the pane that holds it. This is
-    /// what a tab click and cmd+N mean; it can never invent a pane.
+    /// what a tab click and cmd+T mean; it can never invent a pane.
     pub fn selectTerminal(model: *Model, id: TerminalRef) bool {
-        const index = model.tabOfTerminal(id) orelse return false;
-        model.selected_tab = index;
-        model.web_selected = false;
-        _ = model.tabs[index].focusTerminal(id);
-        return true;
+        return model.ws().selectTerminal(id);
     }
 
     pub fn selectWeb(model: *Model) void {
-        model.web_selected = true;
+        model.ws().selectWeb();
     }
 
     pub fn moveTerminal(model: *Model, id: TerminalRef, delta: i8) bool {
-        const current = model.tabOfTerminal(id) orelse return false;
-        const target_signed = @as(isize, @intCast(current)) + delta;
-        if (target_signed < 0 or target_signed >= model.tab_count) return false;
-        const target: usize = @intCast(target_signed);
-        std.mem.swap(layout.Tree, &model.tabs[current], &model.tabs[target]);
-        if (model.selected_tab == current) {
-            model.selected_tab = target;
-        } else if (model.selected_tab == target) {
-            model.selected_tab = current;
-        }
-        return true;
+        return model.ws().moveTerminal(id, delta);
     }
 
     /// Drop panes whose terminal no longer exists, then drop tabs that lost
     /// every pane. Called after any provider publication.
+    ///
+    /// Runs over EVERY window: a provider publication is app-wide, and a
+    /// retired terminal has to leave whichever window's tree happened to hold
+    /// it, not only the one that is in front.
     pub fn normalizeTopology(model: *Model) void {
-        var index: usize = 0;
-        while (index < model.tab_count) {
-            var current = &model.tabs[index];
-            var refs: [layout.max_panes]TerminalRef = undefined;
-            const count = current.terminals(&refs);
-            for (refs[0..count]) |candidate| {
-                if (!model.containsTerminal(candidate)) _ = current.closeTerminal(candidate);
+        for (0..max_windows) |window_index| {
+            const workspace = model.wsAt(window_index) orelse continue;
+            var index: usize = 0;
+            while (index < workspace.tab_count) {
+                var current = &workspace.tabs[index];
+                var refs: [layout.max_panes]TerminalRef = undefined;
+                const count = current.terminals(&refs);
+                for (refs[0..count]) |candidate| {
+                    if (!model.containsTerminal(candidate)) _ = current.closeTerminal(candidate);
+                }
+                if (current.isEmpty()) workspace.dropTab(index) else index += 1;
             }
-            if (current.isEmpty()) model.dropTab(index) else index += 1;
+            if (workspace.tab_count == 0) {
+                // Only the MAIN window has a web surface to fall back to; a
+                // secondary window with no tabs is a window with nothing in
+                // it, which the close cascade retires.
+                workspace.web_selected = window_index == 0;
+                workspace.selected_tab = 0;
+                continue;
+            }
+            if (workspace.selected_tab >= workspace.tab_count) workspace.selected_tab = workspace.tab_count - 1;
         }
-        if (model.tab_count == 0) {
-            model.web_selected = true;
-            model.selected_tab = 0;
-            return;
-        }
-        if (model.selected_tab >= model.tab_count) model.selected_tab = model.tab_count - 1;
     }
 
     pub fn reconcileRemoteTerminals(model: *Model) void {
@@ -524,15 +786,33 @@ pub const Model = struct {
     pub fn topologySnapshot(model: *const Model) !TopologySnapshot {
         var snapshot: TopologySnapshot = .{ .tab_placement = model.tab_placement };
         var written: u8 = 0;
-        var selected: ?u8 = null;
-        for (model.tabs[0..model.tab_count], 0..) |current, index| {
-            const encoded = encodeTab(current) orelse continue;
-            snapshot.tabs[written] = encoded;
-            if (!model.web_selected and index == model.selected_tab) selected = written;
-            written += 1;
+        var windows: u8 = 0;
+        // Windows are written in INDEX order and renumbered densely, because
+        // the slot a window happened to occupy is an allocation detail: a
+        // session whose second window was closed must not restore as a hole.
+        for (0..max_windows) |window_index| {
+            if (!model.windowOpen(window_index)) continue;
+            const workspace = model.wsAtConst(window_index) orelse continue;
+            var selected: ?u8 = null;
+            const first = written;
+            for (workspace.tabs[0..workspace.tab_count], 0..) |current, index| {
+                if (written >= topology.max_snapshot_tabs) break;
+                const encoded = encodeTab(current) orelse continue;
+                snapshot.tabs[written] = encoded;
+                if (!workspace.web_selected and index == workspace.selected_tab) selected = written - first;
+                written += 1;
+            }
+            // A window that contributed no persistable tab is still a window
+            // the user has open — except window 0, whose absence from the
+            // snapshot is what "there is nothing to restore" has always meant.
+            snapshot.windows[windows] = .{
+                .tab_count = written - first,
+                .selection = if (selected) |value| .{ .tab = value } else .web,
+            };
+            windows += 1;
         }
+        snapshot.window_count = windows;
         snapshot.tab_count = written;
-        snapshot.selection = if (selected) |value| .{ .tab = value } else .web;
 
         // Directories are read off the LIVE panes rather than carried in the
         // tree, because the tree does not know them: a cwd is whatever the
@@ -560,33 +840,43 @@ pub const Model = struct {
     /// write per debounce window for no layout reason. Directories are still
     /// captured accurately, because every save serializes the CURRENT panes
     /// and the shutdown flush always writes one.
+    /// Folds in EVERY window: a tab opened in the window behind the one in
+    /// front still changes what a restore should produce, so a hash that only
+    /// saw the active workspace would leave that change unwritten until
+    /// something else happened to move the shape.
     pub fn topologyFingerprint(model: *const Model) u64 {
         var hasher = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hasher, model.tab_count);
-        std.hash.autoHash(&hasher, model.selected_tab);
-        std.hash.autoHash(&hasher, model.web_selected);
         std.hash.autoHash(&hasher, model.tab_placement);
-        for (model.tabs[0..model.tab_count]) |tab| {
-            std.hash.autoHash(&hasher, tab.root);
-            std.hash.autoHash(&hasher, tab.focus);
-            for (tab.nodes) |node| {
-                std.hash.autoHash(&hasher, node.kind);
-                if (node.kind == .free) continue;
-                std.hash.autoHash(&hasher, node.parent);
-                std.hash.autoHash(&hasher, node.first);
-                std.hash.autoHash(&hasher, node.second);
-                std.hash.autoHash(&hasher, node.orientation);
-                // A fraction is a float, which `autoHash` refuses; its bits
-                // are the identity that matters for "did the divider move".
-                std.hash.autoHash(&hasher, @as(u32, @bitCast(node.fraction)));
-                // Only LOCAL identity is folded in. A tab holding a remote
-                // pane is not persistable at all (`encodeTab` drops it), so
-                // there is no saved state for one to invalidate — and hashing
-                // a `RemoteTerminalId`'s inline host storage would cost a
-                // quarter-kilobyte per node on every message.
-                if (node.terminal) |id| {
-                    const raw: u64 = if (provider_contract.localId(id)) |local_id| @intFromEnum(local_id) else 0;
-                    std.hash.autoHash(&hasher, raw);
+        for (0..max_windows) |window_index| {
+            const open = model.windowOpen(window_index);
+            std.hash.autoHash(&hasher, open);
+            if (!open) continue;
+            const workspace = model.wsAtConst(window_index) orelse continue;
+            std.hash.autoHash(&hasher, workspace.tab_count);
+            std.hash.autoHash(&hasher, workspace.selected_tab);
+            std.hash.autoHash(&hasher, workspace.web_selected);
+            for (workspace.tabs[0..workspace.tab_count]) |tab| {
+                std.hash.autoHash(&hasher, tab.root);
+                std.hash.autoHash(&hasher, tab.focus);
+                for (tab.nodes) |node| {
+                    std.hash.autoHash(&hasher, node.kind);
+                    if (node.kind == .free) continue;
+                    std.hash.autoHash(&hasher, node.parent);
+                    std.hash.autoHash(&hasher, node.first);
+                    std.hash.autoHash(&hasher, node.second);
+                    std.hash.autoHash(&hasher, node.orientation);
+                    // A fraction is a float, which `autoHash` refuses; its bits
+                    // are the identity that matters for "did the divider move".
+                    std.hash.autoHash(&hasher, @as(u32, @bitCast(node.fraction)));
+                    // Only LOCAL identity is folded in. A tab holding a remote
+                    // pane is not persistable at all (`encodeTab` drops it), so
+                    // there is no saved state for one to invalidate — and
+                    // hashing a `RemoteTerminalId`'s inline host storage would
+                    // cost a quarter-kilobyte per node on every message.
+                    if (node.terminal) |id| {
+                        const raw: u64 = if (provider_contract.localId(id)) |local_id| @intFromEnum(local_id) else 0;
+                        std.hash.autoHash(&hasher, raw);
+                    }
                 }
             }
         }
@@ -774,36 +1064,46 @@ pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopo
 
     var model: Model = .{
         .provider = provider,
-        .tab_count = snapshot.tab_count,
         .tab_placement = snapshot.tab_placement,
-        .web_selected = snapshot.selection == .web,
-        .selected_tab = switch (snapshot.selection) {
-            .tab => |index| index,
-            .web => 0,
-        },
     };
     errdefer provider.destroy();
+    errdefer for (model.secondary) |slot| if (slot) |workspace| std.heap.page_allocator.destroy(workspace);
 
     // Every persisted leaf gets a FRESH session: process state is explicitly
     // not restored (`process_restoration_supported`), only the shape.
-    for (snapshot.tabs[0..snapshot.tab_count], 0..) |tab, tab_index| {
-        model.tabs[tab_index] = decodeTab(tab);
-        for (tab.nodes) |node| {
-            if (node.kind != .leaf or !node.has_terminal) continue;
-            const session = try grid.Session.create(gpa, io, 80, 24);
-            errdefer session.destroy();
-            var index: usize = 0;
-            while (index < max_terminals and provider.states[index] != .vacant) : (index += 1) {}
-            if (index == max_terminals) return error.TerminalCapacityReached;
-            provider.slots[index] = .{
-                .id = local.localRef(node.terminal),
-                .session = session,
-                .pty_key = provider.next_pty_key,
-                .argv = local.paneArgv(0),
-            };
-            provider.states[index] = .active;
-            provider.next_pty_key += 1;
-            provider.next_terminal_raw = @max(provider.next_terminal_raw, @intFromEnum(node.terminal) + 1);
+    //
+    // Windows are restored in the order they were written, which is the order
+    // they were numbered: window 0 into the inline workspace, the rest into
+    // freshly minted secondary slots. A snapshot from before windows existed
+    // migrates to exactly one window, so it lands entirely in `primary`.
+    for (0..snapshot.window_count) |window_index| {
+        const workspace = model.openWindow(window_index) orelse return error.WindowCapacityReached;
+        const tabs = snapshot.windowTabs(window_index);
+        workspace.tab_count = tabs.len;
+        workspace.web_selected = snapshot.windows[window_index].selection == .web;
+        workspace.selected_tab = switch (snapshot.windows[window_index].selection) {
+            .tab => |index| index,
+            .web => 0,
+        };
+        for (tabs, 0..) |tab, tab_index| {
+            workspace.tabs[tab_index] = decodeTab(tab);
+            for (tab.nodes) |node| {
+                if (node.kind != .leaf or !node.has_terminal) continue;
+                const session = try grid.Session.create(gpa, io, 80, 24);
+                errdefer session.destroy();
+                var index: usize = 0;
+                while (index < max_terminals and provider.states[index] != .vacant) : (index += 1) {}
+                if (index == max_terminals) return error.TerminalCapacityReached;
+                provider.slots[index] = .{
+                    .id = local.localRef(node.terminal),
+                    .session = session,
+                    .pty_key = provider.next_pty_key,
+                    .argv = local.paneArgv(0),
+                };
+                provider.states[index] = .active;
+                provider.next_pty_key += 1;
+                provider.next_terminal_raw = @max(provider.next_terminal_raw, @intFromEnum(node.terminal) + 1);
+            }
         }
     }
     return model;
@@ -818,6 +1118,10 @@ pub fn deinitModel(model: *Model) void {
         }
         if (model.phux_provider) |remote| remote.destroy();
         model.phux_provider = null;
+    }
+    for (&model.secondary) |*slot| {
+        if (slot.*) |workspace| std.heap.page_allocator.destroy(workspace);
+        slot.* = null;
     }
     model.provider.destroy();
 }

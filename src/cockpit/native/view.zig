@@ -15,6 +15,7 @@ const scene_module = @import("scene.zig");
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 const Model = model_module.Model;
+const Workspace = model_module.Workspace;
 const Pane = local_terminal.Pane;
 const LocalTerminalId = support.LocalTerminalId;
 const Phase = support.Phase;
@@ -224,9 +225,9 @@ fn paneStatus(ui: *TerminalUi, model: *const Model, terminal_ref: TerminalRef) T
 /// The spoken description of one tab. Unchanged in content from the old
 /// strip: a screen reader still gets the whole diagnostic sentence the eye no
 /// longer sees.
-fn tabSemantics(ui: *TerminalUi, model: *const Model, tab_index: usize, id: TerminalRef, title: []const u8, selected: bool) []const u8 {
+fn tabSemantics(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_index: usize, id: TerminalRef, title: []const u8, selected: bool) []const u8 {
     const shortcut = ui.fmt("CMD+{d}", .{tab_index + 1});
-    const panes_in_tab = if (model.treeConst(tab_index)) |current| current.paneCount() else 1;
+    const panes_in_tab = if (ws.treeConst(tab_index)) |current| current.paneCount() else 1;
     const kind_label = if (provider_contract.isLocal(id)) "native terminal" else "phux terminal";
     return if (model.provider.terminalConst(id)) |terminal|
         ui.fmt("{s}, {s}, {d} pane(s); {s}; shortcut {s}{s}", .{
@@ -273,17 +274,17 @@ fn tabAttentionMarker(ui: *TerminalUi, model: *const Model, id: TerminalRef, tok
 /// nothing else, so it can never host a close affordance. This is the shape
 /// the toolkit's own code-editor example uses for exactly that reason — press
 /// target on the container, controls as real children inside it.
-fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, tab_index: usize, tokens: canvas.DesignTokens, extent: f32) TerminalUi.Node {
-    const id = model.tabTerminal(tab_index) orelse return ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
-    const selected = !model.web_selected and model.selected_tab == tab_index;
+fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_index: usize, tokens: canvas.DesignTokens, extent: f32) TerminalUi.Node {
+    const id = ws.tabTerminal(tab_index) orelse return ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
+    const selected = !ws.web_selected and ws.selected_tab == tab_index;
     const title = terminalTitle(ui, model, id);
-    const semantics = tabSemantics(ui, model, tab_index, id, title, selected);
+    const semantics = tabSemantics(ui, model, ws, tab_index, id, title, selected);
     const trigger_key: canvas.UiKey = .{ .index = terminalPaintIndex(model, id) };
 
     // The close `x` shows on the SELECTED tab and on whatever the pointer is
     // over. Showing it on every tab turns a strip of names into a strip of
     // buttons; showing it on none makes closing a mouse-only user's problem.
-    const show_close = selected or model.hovered_tab == tab_index;
+    const show_close = selected or ws.hovered_tab == tab_index;
     const close_node = if (show_close)
         ui.button(.{
             .width = tab_control_extent,
@@ -335,9 +336,9 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, tab_index: usize, to
 /// The side rail's row for one tab. The rail is a vertical list, so the
 /// register's own `list_item` still fits — it has a leading icon slot and a
 /// selected state, and the close affordance rides the row beside it.
-fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, tab_index: usize) TerminalUi.Node {
-    const id = model.tabTerminal(tab_index) orelse return ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
-    const selected = !model.web_selected and model.selected_tab == tab_index;
+fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_index: usize) TerminalUi.Node {
+    const id = ws.tabTerminal(tab_index) orelse return ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
+    const selected = !ws.web_selected and ws.selected_tab == tab_index;
     const title = terminalTitle(ui, model, id);
     const marker: []const u8 = if (terminalNeedsAttention(model, id)) attention_marker_icon else "";
     return ui.listItem(.{
@@ -348,7 +349,7 @@ fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, tab_index: usize) T
         .icon = marker,
         .selected = selected,
         .on_press = .{ .select_position = @intCast(tab_index) },
-        .semantics = .{ .role = .tab, .label = tabSemantics(ui, model, tab_index, id, title, selected) },
+        .semantics = .{ .role = .tab, .label = tabSemantics(ui, model, ws, tab_index, id, title, selected) },
     }, title);
 }
 
@@ -382,7 +383,7 @@ fn terminalSurfaceLabel(ui: *TerminalUi, model: *const Model, id: TerminalRef) [
 /// A single pane's interaction surface. No pane header: Ghostty has none,
 /// and the 24pt `TERMINAL 2 / PHUX / RUNNING` strip cost every split pane a
 /// row of grid for information the tab strip already carries.
-fn terminalSurface(ui: *TerminalUi, model: *const Model, node: layout.NodeId, terminal_ref: TerminalRef, rect: geometry.RectF) TerminalUi.Node {
+fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, node: layout.NodeId, terminal_ref: TerminalRef, rect: geometry.RectF) TerminalUi.Node {
     const pane = model.provider.terminalConst(terminal_ref);
     const screen = if (pane) |local|
         local.session.screenText()
@@ -437,7 +438,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, node: layout.NodeId, te
     // into it. The overlay is deliberately only for the UNFOCUSED case — the
     // focused pane already has the band, and two Restart buttons for one
     // terminal is worse than one in the wrong place.
-    const focused_node = if (model.selectedTreeConst()) |current| current.focus else layout.none;
+    const focused_node = if (ws.selectedTreeConst()) |current| current.focus else layout.none;
     if (node == focused_node or !paneLifecycleFailed(local_pane)) return surface;
     return ui.el(.stack, .{
         .grow = 1,
@@ -469,14 +470,14 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, node: layout.NodeId, te
 /// equal minimums), so it keeps a real draggable divider. A vertical branch
 /// becomes a column with explicit child heights, because the SDK's splitter
 /// is horizontal-only.
-fn paneSubtree(ui: *TerminalUi, model: *const Model, node: layout.NodeId, rect: geometry.RectF) TerminalUi.Node {
-    const current = model.selectedTreeConst() orelse return emptyStatusNode(ui);
+fn paneSubtree(ui: *TerminalUi, model: *const Model, ws: *const Workspace, node: layout.NodeId, rect: geometry.RectF) TerminalUi.Node {
+    const current = ws.selectedTreeConst() orelse return emptyStatusNode(ui);
     const entry = current.node(node);
     switch (entry.kind) {
         .free => return emptyStatusNode(ui),
         .leaf => {
             const terminal_ref = entry.terminal orelse return emptyStatusNode(ui);
-            return terminalSurface(ui, model, node, terminal_ref, rect);
+            return terminalSurface(ui, model, ws, node, terminal_ref, rect);
         },
         .branch => {
             const halves = layout.splitRect(
@@ -487,8 +488,8 @@ fn paneSubtree(ui: *TerminalUi, model: *const Model, node: layout.NodeId, rect: 
                 split_pane_min_width,
                 split_pane_min_height,
             );
-            const first = paneSubtree(ui, model, entry.first, halves[0]);
-            const second = paneSubtree(ui, model, entry.second, halves[1]);
+            const first = paneSubtree(ui, model, ws, entry.first, halves[0]);
+            const second = paneSubtree(ui, model, ws, entry.second, halves[1]);
             return switch (entry.orientation) {
                 .horizontal => ui.split(.{
                     .grow = 1,
@@ -522,8 +523,8 @@ const search_placeholder = "Search scrollback";
 /// never reach the child — which is a property of that routing, not of which
 /// widget happens to hold canvas focus. Drawing the field keeps the two in
 /// one place; the caret below is what tells the user the keyboard is here.
-fn searchBar(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignTokens) TerminalUi.Node {
-    const terminal_ref = model.selectedTerminalRef() orelse return emptyStatusNode(ui);
+fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens: canvas.DesignTokens) TerminalUi.Node {
+    const terminal_ref = projection.workspaceTerminalRef(model, ws) orelse return emptyStatusNode(ui);
     const pane = model.provider.terminalConst(terminal_ref) orelse return emptyStatusNode(ui);
     const session = pane.session;
     const needle = session.searchNeedle();
@@ -621,6 +622,25 @@ fn searchBar(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignTokens) 
     });
 }
 
+/// What a cmd+N at the window ceiling says.
+///
+/// It says something on purpose. The toolkit budgets four declared windows on
+/// top of the scene's own, so the fifth cmd+N has nowhere to go — and a chord
+/// that quietly does nothing reads as a chord that is not bound, which is the
+/// worse of the two failures. The band reveals itself to carry this (see
+/// `chromeRevealedIn`), so the message is visible even in the at-rest chrome
+/// the app normally hides.
+fn windowLimitNotice(ui: *TerminalUi) TerminalUi.Node {
+    return ui.el(.badge, .{
+        .variant = .destructive,
+        .text = ui.fmt("{d} WINDOW LIMIT", .{model_module.max_windows}),
+        .semantics = .{ .label = ui.fmt(
+            "Window limit reached: {d} windows is the maximum this app can open",
+            .{model_module.max_windows},
+        ) },
+    }, .{});
+}
+
 fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     return ui.panel(.{
         .width = webkit_parking_extent,
@@ -630,8 +650,28 @@ fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     }, .{});
 }
 
+/// The MAIN window's tree. Window 0 by construction: the scene declares
+/// exactly one canvas and the runtime builds it through `Options.view`.
 pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+    return viewWindow(ui, model, 0);
+}
+
+/// A DECLARED secondary window's tree, keyed by its window label.
+///
+/// An unknown label cannot happen (the runtime only builds windows the model
+/// declared) but falls back to window 0's tree rather than to an empty node:
+/// a window that renders nothing is indistinguishable from a broken one.
+pub fn windowView(ui: *TerminalUi, model: *const Model, window_label: []const u8) TerminalUi.Node {
+    return viewWindow(ui, model, scene_module.windowIndexForWindow(window_label) orelse 0);
+}
+
+/// ONE window's widget tree. Every function below it takes the workspace it is
+/// drawing rather than reading the active one, which is what makes two windows
+/// with different tabs, splits, and search state render side by side.
+pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) TerminalUi.Node {
     const tokens = cockpitTokens(model);
+    const ws = model.wsAtConst(window_index) orelse return ui.el(.stack, .{ .grow = 1 }, .{});
+    const is_main = window_index == 0;
     // A REAL slice, not a fixed tuple: tabs 9..16 used to exist in the model
     // and simply not be drawn, which is not a tab strip, it is a window into
     // one. `Ui.el` copies the slice into its own arena, so a stack array is
@@ -639,23 +679,25 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     //
     // The top strip draws a derived window that always contains the selected
     // tab; the side rail is a vertical list and draws every tab.
-    const window = visibleTabWindow(model, model.surface_size.width - windowPadding(model) * 2);
+    const window = projection.visibleTabWindowIn(ws, ws.surface_size.width - windowPadding(model) * 2);
     var strip_nodes: [max_tabs]TerminalUi.Node = undefined;
     var rail_nodes: [max_tabs]TerminalUi.Node = undefined;
     for (0..window.count) |offset| {
-        strip_nodes[offset] = terminalTabTrigger(ui, model, window.first + offset, tokens, window.extent);
+        strip_nodes[offset] = terminalTabTrigger(ui, model, ws, window.first + offset, tokens, window.extent);
     }
-    for (0..model.tab_count) |index| {
-        rail_nodes[index] = terminalRailTrigger(ui, model, index);
+    for (0..ws.tab_count) |index| {
+        rail_nodes[index] = terminalRailTrigger(ui, model, ws, index);
     }
     const strip_slice = strip_nodes[0..window.count];
-    const rail_slice = rail_nodes[0..model.tab_count];
+    const rail_slice = rail_nodes[0..ws.tab_count];
 
-    const chrome = workspaceChrome(model, model.surface_size);
-    const focused_ref = model.selectedTerminalRef();
-    const status = if (focused_ref) |id| paneStatus(ui, model, id) else emptyStatusNode(ui);
+    const chrome = projection.workspaceChromeIn(model, ws, ws.surface_size);
+    const focused_ref = projection.workspaceTerminalRef(model, ws);
+    const status = if (model.window_limit_refused)
+        windowLimitNotice(ui)
+    else if (focused_ref) |id| paneStatus(ui, model, id) else emptyStatusNode(ui);
 
-    const revealed = chromeRevealed(model);
+    const revealed = projection.chromeRevealedIn(model, ws);
     // The strip is TERMINALS ONLY. The web surface kept its pane, its scene
     // wiring and its reload token; what it lost is a permanent seat in a
     // terminal's tab bar, where it was pinned last regardless of how many
@@ -685,18 +727,25 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         // are cmd+1..cmd+N — the band is presentation, never the only path.
         else ui.el(.stack, .{ .height = 0, .semantics = .{ .hidden = true } }, .{});
 
-    const content = if (model.selectedTreeConst()) |current| blk: {
+    // The WebKit surface is a scene-declared view of the MAIN window, so only
+    // the main window's tree carries its anchor. A secondary window paints its
+    // panes and nothing else — the alternative, an anchor in every window,
+    // would have the last window rebuilt win the argument about where the one
+    // webview lives.
+    const content = if (ws.selectedTreeConst()) |current| blk: {
+        const panes = paneSubtree(ui, model, ws, current.root, chrome.content);
+        if (!is_main) break :blk panes;
         // Parking the webview at a one-point anchor preserves its native
         // page state without allowing it to cover or receive input over a
         // terminal tab.
         break :blk ui.el(.stack, .{ .grow = 1 }, .{
-            paneSubtree(ui, model, current.root, chrome.content),
+            panes,
             parkedWebKitAnchor(ui),
         });
-    } else ui.panel(.{
+    } else if (is_main) ui.panel(.{
         .grow = 1,
         .semantics = .{ .label = webview_anchor },
-    }, .{});
+    }, .{}) else ui.el(.stack, .{ .grow = 1 }, .{});
 
     const side_rail_content = ui.column(.{ .width = side_rail_width, .gap = 8 }, .{
         ui.list(.{ .width = side_rail_width, .gap = 3, .semantics = .{ .label = "Terminal tabs" } }, rail_slice),
@@ -716,8 +765,8 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     // The search band sits above the content in BOTH placements, and the
     // wrapper only exists while a search does: an unconditional column would
     // change the widget tree of every frame that has no search in it.
-    const body = if (projection.searchRevealed(model))
-        ui.column(.{ .grow = 1 }, .{ searchBar(ui, model, tokens), content })
+    const body = if (projection.searchRevealedIn(model, ws))
+        ui.column(.{ .grow = 1 }, .{ searchBar(ui, model, ws, tokens), content })
     else
         content;
 
@@ -742,10 +791,35 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     });
 }
 
-/// The grids, painted as a variable-length chrome prefix beneath the
-/// widget tree: real text through the canvas primitives, damage kept
-/// row-shaped by stable command ids, one id namespace per pane.
+/// THE per-window chrome builder, and the one this app registers.
+///
+/// `ChromeOptions.build` paints the main canvas only, because its signature
+/// cannot say which window it is drawing — and for an app whose terminals ARE
+/// chrome commands, that meant a second window rendered its tab strip, its
+/// dividers, and empty rectangles where the cells belonged (verified in the
+/// running app before `build_window` existed). The context names the canvas,
+/// which names the workspace, which is the whole difference.
+pub fn buildChromeWindow(model: *const Model, builder: *canvas.Builder, context: TerminalApp.ChromeContext) anyerror!void {
+    const window_index = scene_module.windowIndexForCanvas(context.canvas_label) orelse return;
+    return paintWindow(model, builder, window_index, context.size, context.tokens);
+}
+
+/// The main window's chrome through the legacy single-window seam. Kept so
+/// the tests that paint one window directly keep a stable entry point, and so
+/// an `Options.chrome.build` fallback still produces the right pixels.
 pub fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
+    return paintWindow(model, builder, 0, size, tokens);
+}
+
+/// The grids of ONE window, painted as a variable-length chrome prefix beneath
+/// that window's widget tree: real text through the canvas primitives, damage
+/// kept row-shaped by stable command ids, one id namespace per pane.
+///
+/// Pane id namespaces are the REGISTRY slot, which is global — so two windows
+/// showing different terminals never collide, and no window can ever show the
+/// same terminal as another (`Model.admitTab` refuses it).
+fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usize, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
+    const ws = model.wsAtConst(window_index) orelse return;
     // The grids paint with the TERMINAL tokens (the configured type size and
     // colors); everything else on this surface is chrome and keeps the app's
     // own register. See `projection.terminalTokens`.
@@ -762,7 +836,7 @@ pub fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry
         .fill = .{ .color = grid_tokens.colors.background },
     });
 
-    const chrome = workspaceChrome(model, size);
+    const chrome = projection.workspaceChromeIn(model, ws, size);
     if (chrome.header.height > 0) {
         // The band gets a real ground and a separator, so it reads as chrome
         // instead of as a floating strip over the terminal.
@@ -784,7 +858,7 @@ pub fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry
     const prologue = builder.len;
 
     var panes: [layout.max_panes]layout.Pane = undefined;
-    const count = resolvePanes(model, size, &panes);
+    const count = projection.resolvePanesIn(model, ws, size, &panes);
     if (count == 0) return;
 
     // The budgets are partitioned by kind, exactly as the two-pane painter
@@ -811,7 +885,7 @@ pub fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry
     // cells and a 320x96 grid needs 30720, so the single-pane case — the
     // common one — would start silently truncating again.
     const cell_share = canvas.max_display_list_cells / share_divisor;
-    const focus_node = if (model.selectedTreeConst()) |current| current.focus else layout.none;
+    const focus_node = if (ws.selectedTreeConst()) |current| current.focus else layout.none;
 
     for (panes[0..count], 0..) |pane, index| {
         if (pane.rect.width <= 0 or pane.rect.height <= 0) continue;
@@ -831,7 +905,11 @@ pub fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry
         const cell_reserve = cell_share * remaining;
         // Each pane owns its OWN background frame. Nothing paints outside
         // the pane it belongs to.
-        const options_focused = model.focused and pane.node == focus_node;
+        // A window that is not the one the user is in shows no focused pane:
+        // two windows both drawing a solid cursor would both claim the
+        // keyboard, and only one of them has it.
+        const window_active = model.focused and window_index == model.active_window;
+        const options_focused = window_active and pane.node == focus_node;
         if (model.provider.terminalConst(pane.terminal)) |terminal| {
             try grid.paint(terminal.session, builder, .{
                 .frame = pane.rect,
@@ -876,7 +954,7 @@ pub fn buildChrome(model: *const Model, builder: *canvas.Builder, size: geometry
         // is exactly what this app spent its last round removing. One pane
         // never dims — there is nothing to disambiguate — and neither does a
         // window that does not have key, where nothing is focused at all.
-        if (count > 1 and model.focused and pane.node != focus_node) {
+        if (count > 1 and window_active and pane.node != focus_node) {
             try builder.fillRect(.{
                 .id = pane_dim_command_id_base + index,
                 .rect = pane.rect,
@@ -896,9 +974,20 @@ fn dimScrim(tokens: canvas.DesignTokens) canvas.Color {
 /// Frame pump: resize each visible terminal against its actual pane. One
 /// resize message is emitted per frame; further changed panes follow on
 /// later frames without ever coupling a PTY's lifetime to layout.
+///
+/// Runs PER WINDOW — the runtime hands each slot's own `gpuSurfaceFrame` here
+/// — so the pump's whole job is to answer against the window the frame names
+/// rather than against whichever one is in front. A frame for a label this app
+/// does not own is ignored; a frame for a window that is not the active one
+/// still resizes ITS terminals, which is the difference between a background
+/// window's shells tracking their pane and keeping the grid they were born
+/// with.
 pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     if (frame.size.width <= 0 or frame.size.height <= 0) return null;
-    const frame_scale = if (validScale(frame.scale_factor)) frame.scale_factor else model.surface_scale_factor;
+    const window_index = scene_module.windowIndexForCanvas(frame.label) orelse return null;
+    const ws = model.wsAtConst(window_index) orelse return null;
+    const window: u8 = @intCast(window_index);
+    const frame_scale = if (validScale(frame.scale_factor)) frame.scale_factor else ws.surface_scale_factor;
     var pending = false;
     for (0..max_terminals) |index| {
         if (model.provider.states[index] != .active) continue;
@@ -908,7 +997,7 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
 
     // The SAME resolve the painter and the widget tree use.
     var panes: [layout.max_panes]layout.Pane = undefined;
-    const count = resolvePanes(model, frame.size, &panes);
+    const count = projection.resolvePanesIn(model, ws, frame.size, &panes);
     // Cell metrics for a LOCAL pane come from `session.cell_*`, which the
     // painter wrote from the live terminal tokens. Deriving them here instead
     // would be wrong, not merely redundant: only the painter's tokens carry
@@ -939,6 +1028,8 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
                         // whatever arrives, and the field's `= 1` default
                         // would silently reset a Retina surface to 1x.
                         .scale_factor = frame_scale,
+                        .window = window,
+                        .window_id = frame.window_id,
                     },
                 };
             }
@@ -958,13 +1049,20 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
                 .rows = proposed.y,
                 .size = frame.size,
                 .scale_factor = frame_scale,
+                .window = window,
+                .window_id = frame.window_id,
             } };
         }
     }
-    if (model.surface_size.width != frame.size.width or model.surface_size.height != frame.size.height or
-        model.surface_scale_factor != frame_scale)
+    if (ws.surface_size.width != frame.size.width or ws.surface_size.height != frame.size.height or
+        ws.surface_scale_factor != frame_scale or ws.window_id != frame.window_id)
     {
-        return .{ .surface_resized = .{ .size = frame.size, .scale_factor = frame_scale } };
+        return .{ .surface_resized = .{
+            .size = frame.size,
+            .scale_factor = frame_scale,
+            .window = window,
+            .window_id = frame.window_id,
+        } };
     }
     if (pending) return .flush_outbound;
     return null;
@@ -980,7 +1078,36 @@ pub fn webPanes(model: *const Model, out: []TerminalApp.WebViewPane) usize {
     return 1;
 }
 
+/// The secondary windows the model currently declares. Presence IS
+/// visibility: a slot the model stops naming is a window the runtime closes,
+/// so `Model.closeWindow` is the whole close path and there is no second flag
+/// saying whether a declared window is showing.
+pub fn windows(model: *const Model, scratch: *TerminalApp.WindowsScratch) []const TerminalApp.WindowDescriptor {
+    var count: usize = 0;
+    for (0..model_module.max_secondary_windows) |offset| {
+        const index = offset + 1;
+        if (!model.windowOpen(index)) continue;
+        scratch.windows[count] = .{
+            .label = scene_module.windowLabelFor(index),
+            .canvas_label = scene_module.canvasLabelFor(index),
+            .title = scene_module.app_name,
+            .width = scene_module.window_width,
+            .height = scene_module.window_height,
+            .min_width = scene_module.window_min_width,
+            .min_height = scene_module.window_min_height,
+            // The same hidden-inset band the scene's own window declares, so
+            // a second window is the same window, not a stock-chrome cousin.
+            .titlebar = .hidden_inset_tall,
+            .on_close = .{ .window_closed = @intCast(index) },
+        };
+        count += 1;
+    }
+    return scratch.windows[0..count];
+}
+
 pub fn onCommand(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, "window.new")) return .new_window;
+    if (std.mem.eql(u8, name, "window.fullscreen")) return .toggle_fullscreen;
     if (std.mem.eql(u8, name, "surface.1")) return .{ .select_position = 0 };
     if (std.mem.eql(u8, name, "surface.2")) return .{ .select_position = 1 };
     if (std.mem.eql(u8, name, "surface.3")) return .{ .select_position = 2 };

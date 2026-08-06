@@ -31,13 +31,29 @@ pub const SurfaceSelection = union(enum) {
     }
 };
 
-/// v3 is the tree schema PLUS per-terminal working directories. v2 was the
-/// same tree with no directories; v1 encoded a fixed two-pane workspace
-/// (`layout: {single,split}`, `attachments[2]`, one `split_fraction`,
-/// `focused_attachment`) and cannot express a tab that owns a nested tree,
-/// so it is MIGRATED, not read: every v1 terminal becomes its own tab, and a
-/// v1 split becomes a horizontal split inside the focused tab.
-pub const topology_snapshot_version: u16 = 3;
+/// v4 carries WINDOWS. v3 was one window's tree schema plus per-terminal
+/// working directories; v2 was the same tree with no directories; v1 encoded a
+/// fixed two-pane workspace (`layout: {single,split}`, `attachments[2]`, one
+/// `split_fraction`, `focused_attachment`) and cannot express a tab that owns a
+/// nested tree, so it is MIGRATED, not read: every v1 terminal becomes its own
+/// tab, and a v1 split becomes a horizontal split inside the focused tab.
+///
+/// v3 -> v4 is the same shape one level up: a pre-multi-window file describes
+/// exactly one window, so it migrates to a single `SnapshotWindow` owning
+/// every tab it carried.
+pub const topology_snapshot_version: u16 = 4;
+
+/// Windows one snapshot can carry — the model's own ceiling (the scene's
+/// window plus the toolkit's four declared ones).
+pub const max_snapshot_windows: usize = 5;
+
+/// Tabs one snapshot can carry ACROSS every window.
+///
+/// `max_tabs` is the per-window ceiling; this is the whole-session one, and it
+/// is `max_terminals` because a persistable tab holds at least one local
+/// terminal and the registry has that many slots. Five windows of sixteen tabs
+/// is not reachable — thirty-two terminals is.
+pub const max_snapshot_tabs: usize = max_terminals;
 
 /// Restoring recreates SHELLS in the saved shape. It does not, and cannot,
 /// reattach the processes that were running — the snapshot carries no pid and
@@ -114,6 +130,21 @@ pub const SnapshotTab = struct {
     focus: layout.NodeId = layout.none,
 };
 
+/// One serialized WINDOW: how many of the snapshot's tabs are its, and which
+/// of them it had selected.
+///
+/// Tabs are stored once, in one flat array, laid out in window order — so a
+/// window owns the CONTIGUOUS run starting after every earlier window's tabs.
+/// There is deliberately no per-tab window tag: a tag and a count are two
+/// encodings of one fact, and only one of them can be wrong.
+pub const SnapshotWindow = struct {
+    tab_count: u8 = 0,
+    /// The selected tab, numbered WITHIN this window's run. Window-relative so
+    /// a window's meaning does not depend on how many tabs the windows before
+    /// it happened to have.
+    selection: SnapshotSelection = .web,
+};
+
 /// The registry offset a terminal id occupies, or null when it is outside the
 /// registry entirely. The cwd side table is indexed by this, so it is the one
 /// place the id-to-slot arithmetic lives.
@@ -127,9 +158,14 @@ pub fn terminalOffset(id: LocalTerminalId) ?usize {
 
 pub const TopologySnapshot = struct {
     version: u16 = topology_snapshot_version,
+    /// Windows, densely numbered from zero. Window 0 is the main (scene)
+    /// window; a session that had only that one records `window_count == 1`,
+    /// and a session with nothing open at all records zero.
+    window_count: u8 = 0,
+    windows: [max_snapshot_windows]SnapshotWindow = [_]SnapshotWindow{.{}} ** max_snapshot_windows,
+    /// Every window's tabs, concatenated in window order.
     tab_count: u8 = 0,
-    tabs: [max_tabs]SnapshotTab = [_]SnapshotTab{.{}} ** max_tabs,
-    selection: SnapshotSelection = .web,
+    tabs: [max_snapshot_tabs]SnapshotTab = [_]SnapshotTab{.{}} ** max_snapshot_tabs,
     tab_placement: TabPlacement = .top,
     /// Working directories, indexed by REGISTRY OFFSET rather than by node.
     ///
@@ -150,10 +186,51 @@ pub const TopologySnapshot = struct {
         snapshot.cwds[offset].set(path);
     }
 
-    pub fn validate(snapshot: TopologySnapshot) !void {
+    /// The offset into `tabs` where window `index`'s run begins, or null when
+    /// there is no such window. Deliberately computed rather than stored: an
+    /// offset and a set of counts are two encodings of one fact.
+    pub fn windowTabOffset(snapshot: *const TopologySnapshot, index: usize) ?usize {
+        if (index >= snapshot.window_count) return null;
+        var offset: usize = 0;
+        for (snapshot.windows[0..index]) |window| offset += window.tab_count;
+        return offset;
+    }
+
+    /// Window `index`'s own tabs.
+    pub fn windowTabs(snapshot: *const TopologySnapshot, index: usize) []const SnapshotTab {
+        const offset = snapshot.windowTabOffset(index) orelse return &.{};
+        const count: usize = snapshot.windows[index].tab_count;
+        if (offset + count > snapshot.tab_count) return &.{};
+        return snapshot.tabs[offset..][0..count];
+    }
+
+    /// Taken BY POINTER, not by value: the snapshot carries thirty-two trees
+    /// and a directory table, and a by-value validator put tens of kilobytes
+    /// on the caller's frame at every save and every restore.
+    pub fn validate(snapshot: *const TopologySnapshot) !void {
         if (snapshot.version != topology_snapshot_version) return error.UnsupportedTopologyVersion;
-        if (snapshot.tab_count > max_tabs) return error.InvalidTopology;
+        if (snapshot.tab_count > max_snapshot_tabs) return error.InvalidTopology;
+        if (snapshot.window_count > max_snapshot_windows) return error.InvalidTopology;
         const count: usize = snapshot.tab_count;
+
+        // Every tab belongs to exactly one window, so the windows' counts must
+        // account for the tab array exactly — a short sum would leave orphan
+        // tabs no window restores, and a long one would read past the run.
+        var counted: usize = 0;
+        for (snapshot.windows[0..snapshot.window_count]) |window| {
+            if (window.tab_count > max_tabs) return error.InvalidTopology;
+            switch (window.selection) {
+                .tab => |index| if (index >= window.tab_count) return error.InvalidTopology,
+                .web => {},
+            }
+            counted += window.tab_count;
+        }
+        if (counted != count) return error.InvalidTopology;
+        // Windows past the count must be blank, so a truncated write cannot be
+        // read back as extra windows.
+        for (snapshot.windows[snapshot.window_count..]) |window| {
+            if (window.tab_count != 0 or window.selection != .web) return error.InvalidTopology;
+        }
 
         // Terminal identity is window-wide: the same terminal may never be a
         // leaf in two panes, in this tab or another, because two panes would
@@ -192,12 +269,6 @@ pub const TopologySnapshot = struct {
         for (snapshot.tabs[count..]) |tab| {
             if (tab.root != layout.none or tab.focus != layout.none) return error.InvalidTopology;
         }
-
-        switch (snapshot.selection) {
-            .tab => |index| if (index >= count) return error.InvalidTopology,
-            .web => {},
-        }
-        if (count == 0 and snapshot.selection != .web) return error.InvalidTopology;
 
         // A recorded directory has to be one a restored shell can actually be
         // put in, and one the line-oriented state file can round trip. An
@@ -265,11 +336,22 @@ pub const LegacyTopologySnapshotV2 = struct {
     tab_placement: TabPlacement = .top,
 };
 
+/// v3: one window's tree schema plus working directories, the schema before
+/// windows existed. Its whole content is window 0 of a v4 snapshot.
+pub const LegacyTopologySnapshotV3 = struct {
+    tab_count: u8 = 0,
+    tabs: [max_tabs]SnapshotTab = [_]SnapshotTab{.{}} ** max_tabs,
+    selection: SnapshotSelection = .web,
+    tab_placement: TabPlacement = .top,
+    cwds: [max_terminals]SnapshotCwd = [_]SnapshotCwd{.{}} ** max_terminals,
+};
+
 pub const PersistedTopologySnapshot = union(enum) {
     v0: LegacyTopologySnapshotV0,
     v1: LegacyTopologySnapshotV1,
     v2: LegacyTopologySnapshotV2,
-    v3: TopologySnapshot,
+    v3: LegacyTopologySnapshotV3,
+    v4: TopologySnapshot,
 };
 
 /// Build a one-leaf tab. Every migration path lands here: a legacy terminal
@@ -302,16 +384,33 @@ fn splitTab(first: LocalTerminalId, second: LocalTerminalId, fraction: f32, focu
 
 pub fn migrateTopologySnapshot(persisted: PersistedTopologySnapshot) !TopologySnapshot {
     const snapshot = switch (persisted) {
-        .v3 => |current| current,
+        .v4 => |current| current,
+        // v3 -> v4: a pre-multi-window file describes exactly ONE window, and
+        // restoring it as one window is the whole compatibility claim. A file
+        // with no tabs stays a zero-window snapshot, which is what "there is
+        // nothing to reopen" has always meant.
+        .v3 => |legacy| blk: {
+            var migrated: TopologySnapshot = .{
+                .tab_count = legacy.tab_count,
+                .tab_placement = legacy.tab_placement,
+                .cwds = legacy.cwds,
+            };
+            @memcpy(migrated.tabs[0..max_tabs], &legacy.tabs);
+            if (legacy.tab_count > 0 or legacy.selection != .web) {
+                migrated.window_count = 1;
+                migrated.windows[0] = .{ .tab_count = legacy.tab_count, .selection = legacy.selection };
+            }
+            break :blk migrated;
+        },
         // v2 -> v3 is purely additive: the tree arrives whole and NO working
         // directory was ever recorded, so every restored pane opens where a
         // pane whose shell never reported OSC 7 opens.
-        .v2 => |legacy| TopologySnapshot{
+        .v2 => |legacy| try migrateTopologySnapshot(.{ .v3 = .{
             .tab_count = legacy.tab_count,
             .tabs = legacy.tabs,
             .selection = legacy.selection,
             .tab_placement = legacy.tab_placement,
-        },
+        } }),
         .v1 => |legacy| try migrateV1(legacy),
         .v0 => |legacy| blk: {
             if (legacy.terminal_count > max_tabs or !std.math.isFinite(legacy.split_fraction)) return error.InvalidTopology;
@@ -335,6 +434,14 @@ pub fn migrateTopologySnapshot(persisted: PersistedTopologySnapshot) !TopologySn
     };
     try snapshot.validate();
     return snapshot;
+}
+
+/// The tab a migrated legacy snapshot had selected, in the ONE window it
+/// describes. A convenience for the migration tests and for anything that
+/// wants "the main window's selection" without spelling the indirection.
+pub fn primarySelection(snapshot: *const TopologySnapshot) SnapshotSelection {
+    if (snapshot.window_count == 0) return .web;
+    return snapshot.windows[0].selection;
 }
 
 /// v1 → v2: every terminal in the old tab order becomes its own tab. A v1
@@ -386,6 +493,11 @@ fn migrateV1(legacy: LegacyTopologySnapshotV1) !TopologySnapshot {
         tabs += 1;
     }
     migrated.tab_count = tabs;
-    migrated.selection = if (selected) |index| .{ .tab = index } else .web;
+    // Every pre-window schema describes exactly one window.
+    const selection: SnapshotSelection = if (selected) |index| .{ .tab = index } else .web;
+    if (tabs > 0 or selection != .web) {
+        migrated.window_count = 1;
+        migrated.windows[0] = .{ .tab_count = tabs, .selection = selection };
+    }
     return migrated;
 }

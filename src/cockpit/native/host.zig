@@ -87,9 +87,68 @@ pub const CockpitHost = struct {
         try self.inner_app.start(runtime);
     }
 
+    /// Point the model at the window an event came from, BEFORE that event is
+    /// handled.
+    ///
+    /// Every message that reshapes a workspace acts on `active_window`, so a
+    /// cmd+T typed in the second window has to find the second window already
+    /// selected. Canvas-carrying events name their window by LABEL; a shortcut
+    /// carries only a platform window id, which each workspace learns from its
+    /// own frame events (`Workspace.window_id`).
+    ///
+    /// Deliberately INPUT only, and deliberately the ROUTED half of it.
+    ///
+    /// A presented frame is not a focus signal — every open window presents
+    /// continuously, so adopting frames made the active window flap between
+    /// them dozens of times a second.
+    ///
+    /// A key arrives TWICE: once as `canvas_widget_keyboard` (routed, first,
+    /// and the delivery the model's `on_key` actually acts on) and once as the
+    /// raw `gpu_surface_input` echo. Adopting the echo as well undoes a focus
+    /// change the routed event's own message just made — cmd+N opens a window
+    /// and makes it active, and then the echo of that same keystroke, still
+    /// labelled with the window the chord was typed in, handed the next message
+    /// straight back to it. That was observed in the running app: a cmd+D
+    /// addressed to the second window's canvas split the FIRST window. So key
+    /// kinds are taken from the routed event only, and the raw channel is left
+    /// to the pointer kinds it is the sole carrier of.
+    fn adoptEventWindow(self: *CockpitHost, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) !void {
+        const index: ?usize = switch (event_value) {
+            .gpu_surface_input => |input| switch (input.kind) {
+                .key_down, .key_up, .text_input => null,
+                else => scene_module.windowIndexForCanvas(input.label),
+            },
+            .canvas_widget_keyboard => |routed| scene_module.windowIndexForCanvas(routed.view_label),
+            .canvas_widget_pointer => |routed| scene_module.windowIndexForCanvas(routed.view_label),
+            .shortcut => |shortcut| self.windowIndexForId(shortcut.window_id),
+            .command => |command| self.windowIndexForId(command.window_id),
+            else => null,
+        };
+        const resolved = index orelse return;
+        if (resolved == self.inner.model.active_window) return;
+        if (!self.inner.model.windowOpen(resolved)) return;
+        try self.inner.dispatch(runtime, self.windowIdFor(resolved), .{ .focus_window = @intCast(resolved) });
+    }
+
+    /// The window index behind a platform window id, or null when no
+    /// workspace has been rendered into it yet.
+    fn windowIndexForId(self: *const CockpitHost, window_id: native_sdk.platform.WindowId) ?usize {
+        for (0..model_module.max_windows) |index| {
+            const workspace = self.inner.model.wsAtConst(index) orelse continue;
+            if (workspace.window_id == window_id) return index;
+        }
+        return null;
+    }
+
+    fn windowIdFor(self: *const CockpitHost, index: usize) native_sdk.platform.WindowId {
+        const workspace = self.inner.model.wsAtConst(index) orelse return 1;
+        return if (workspace.window_id == 0) 1 else workspace.window_id;
+    }
+
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const self: *CockpitHost = @ptrCast(@alignCast(context));
         defer self.syncSelectionAutoscrollTimer(runtime) catch {};
+        try self.adoptEventWindow(runtime, event_value);
         switch (event_value) {
             .command => |command| {
                 if (command.source == .shortcut) {
@@ -167,8 +226,9 @@ pub const CockpitHost = struct {
                 }
             },
             .gpu_surface_input => |input| {
-                if (input.kind != .pointer_up or !std.mem.eql(u8, input.label, canvas_label)) return;
-                if (canvasActionControlFocused(runtime, input.window_id)) {
+                if (input.kind != .pointer_up) return;
+                if (scene_module.windowIndexForCanvas(input.label) == null) return;
+                if (canvasActionControlFocused(runtime, input.window_id, input.label)) {
                     try self.focusSelectedContent(runtime, input.window_id);
                 }
             },
@@ -176,15 +236,21 @@ pub const CockpitHost = struct {
         }
     }
 
+    /// Move the OS first responder onto whatever the window's workspace has
+    /// selected. Only the MAIN window hosts the webview, so a secondary
+    /// window's answer is always its own canvas.
     fn focusSelectedContent(self: *CockpitHost, runtime: *native_sdk.Runtime, window_id: native_sdk.platform.WindowId) !void {
-        const target = if (self.inner.model.selectedTerminalRef() == null) webview_label else canvas_label;
+        const index = self.windowIndexForId(window_id) orelse self.inner.model.active_window;
+        const surface = scene_module.canvasLabelFor(index);
+        const on_web = index == 0 and self.inner.model.selectedTerminalRef() == null;
+        const target = if (on_web) webview_label else surface;
         try runtime.focusView(window_id, target);
-        if (std.mem.eql(u8, target, canvas_label)) clearCanvasWidgetFocus(runtime, window_id);
+        if (!on_web) clearCanvasWidgetFocus(runtime, window_id, surface);
     }
 
-    fn canvasActionControlFocused(runtime: *native_sdk.Runtime, window_id: native_sdk.platform.WindowId) bool {
+    fn canvasActionControlFocused(runtime: *native_sdk.Runtime, window_id: native_sdk.platform.WindowId, surface: []const u8) bool {
         for (runtime.views[0..runtime.view_count]) |*runtime_view| {
-            if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
+            if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, surface)) continue;
             const focused = runtime_view.canvas_widget_focused_id;
             if (focused == 0) return false;
             const node = runtime_view.widgetLayoutTree().findById(focused) orelse return false;
@@ -200,9 +266,9 @@ pub const CockpitHost = struct {
         return false;
     }
 
-    fn clearCanvasWidgetFocus(runtime: *native_sdk.Runtime, window_id: native_sdk.platform.WindowId) void {
+    fn clearCanvasWidgetFocus(runtime: *native_sdk.Runtime, window_id: native_sdk.platform.WindowId, surface: []const u8) void {
         for (runtime.views[0..runtime.view_count]) |*runtime_view| {
-            if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
+            if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, surface)) continue;
             runtime_view.canvas_widget_focused_id = 0;
             runtime_view.canvas_widget_focus_visible_id = 0;
             runtime_view.canvas_widget_focus_visible_keyboard = false;
@@ -219,7 +285,7 @@ pub const CockpitHost = struct {
         runtime: *native_sdk.Runtime,
         routed: native_sdk.runtime.CanvasWidgetPointerEvent,
     ) !bool {
-        if (!std.mem.eql(u8, routed.view_label, canvas_label)) return false;
+        if (scene_module.windowIndexForCanvas(routed.view_label) == null) return false;
         const pointer = routed.pointer;
         // A new down supersedes only this physical pointer's old capture,
         // even when the new target is chrome rather than another terminal.
@@ -250,9 +316,9 @@ pub const CockpitHost = struct {
             terminal_id = owned.terminal_id;
             generation = owned.generation;
             frame = if (routed.target) |target|
-                if (target.id == terminalInteractionWidgetId(owned.terminal_id)) target.bounds else terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame
+                if (target.id == terminalInteractionWidgetId(owned.terminal_id)) target.bounds else terminalInteractionFrame(runtime, routed.window_id, routed.view_label, owned.terminal_id) orelse owned.frame
             else
-                terminalInteractionFrame(runtime, routed.window_id, owned.terminal_id) orelse owned.frame;
+                terminalInteractionFrame(runtime, routed.window_id, routed.view_label, owned.terminal_id) orelse owned.frame;
         } else {
             if (pointer.phase == .up or pointer.phase == .cancel or pointer.phase == .move) {
                 // A stale/unrelated terminal edge cannot borrow the SDK's
@@ -324,15 +390,19 @@ fn terminalInteractionWidgetId(id: LocalTerminalId) canvas.ObjectId {
 /// Routed widget pointer input reaches LOCAL terminals only: the remote path
 /// runs through the NSEvent monitor, which carries its own hit testing.
 fn terminalIdForInteractionWidget(model: *const Model, widget_id: canvas.ObjectId) ?LocalTerminalId {
-    // Every pane of every tab, not just one tab's: a widget id survives a tab
-    // switch, and routing must resolve it against the whole workspace.
-    for (0..model.tab_count) |tab_index| {
-        const tree = model.treeConst(tab_index) orelse continue;
-        var refs: [layout.max_panes]TerminalRef = undefined;
-        const count = tree.terminals(&refs);
-        for (refs[0..count]) |id| {
-            const local = provider_contract.localId(id) orelse continue;
-            if (terminalInteractionWidgetId(local) == widget_id) return local;
+    // Every pane of every tab of every WINDOW, not just one tab's: a widget id
+    // survives a tab switch and a window switch alike, and routing must
+    // resolve it against the whole session.
+    for (0..model_module.max_windows) |window_index| {
+        const workspace = model.wsAtConst(window_index) orelse continue;
+        for (0..workspace.tab_count) |tab_index| {
+            const tree = workspace.treeConst(tab_index) orelse continue;
+            var refs: [layout.max_panes]TerminalRef = undefined;
+            const count = tree.terminals(&refs);
+            for (refs[0..count]) |id| {
+                const local = provider_contract.localId(id) orelse continue;
+                if (terminalInteractionWidgetId(local) == widget_id) return local;
+            }
         }
     }
     return null;
@@ -341,11 +411,12 @@ fn terminalIdForInteractionWidget(model: *const Model, widget_id: canvas.ObjectI
 fn terminalInteractionFrame(
     runtime: *native_sdk.Runtime,
     window_id: native_sdk.platform.WindowId,
+    surface: []const u8,
     id: LocalTerminalId,
 ) ?geometry.RectF {
     const widget_id = terminalInteractionWidgetId(id);
     for (runtime.views[0..runtime.view_count]) |*runtime_view| {
-        if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, canvas_label)) continue;
+        if (runtime_view.window_id != window_id or !std.mem.eql(u8, runtime_view.label, surface)) continue;
         const node = runtime_view.widgetLayoutTree().findById(widget_id) orelse return null;
         if (node.widget.kind != .terminal) return null;
         return node.frame;

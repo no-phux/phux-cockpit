@@ -1,16 +1,34 @@
 # Topology Snapshots
 
 `Model.topologySnapshot()` is the durable boundary between terminal identity
-and a live local process. The current version is `3`, and
+and a live local process. The current version is `4`, and
 `process_restoration_supported` is explicitly `false`.
 
 ## Persisted State
 
-- The ordered tab list
+- The ordered **window** list, window 0 first (the scene's own window)
+- The ordered tab list, flat across every window: each window owns the
+  contiguous run of `tab_count` tabs that follows the windows before it
 - Each tab's **pane tree**: leaves naming stable local terminal IDs, branches
   carrying an orientation and a divider fraction
-- Selected tab, and each tree's focused leaf
+- Each window's selected tab — numbered **within that window's run** — and each
+  tree's focused leaf
 - Each terminal's working directory, when one was reported
+
+## Windows
+
+Tabs are stored once, in one flat array, in window order. A window records how
+many of them are its and which one it had selected; the offset into the array is
+derived (`TopologySnapshot.windowTabOffset`). There is deliberately no per-tab
+window tag: a tag and a count are two encodings of one fact, and only one of
+them can be wrong. `validate()` proves the windows' counts account for the tab
+array exactly, so a snapshot can neither strand a tab no window owns nor let a
+window read past its own run.
+
+The tab ceiling is per window (`max_tabs`, 16); the whole-session ceiling is
+`max_snapshot_tabs` (32, the registry size — a persistable tab holds at least
+one local terminal). Windows cap at `max_snapshot_windows` (5: the scene's
+window plus the four the toolkit budgets).
 
 ## Deliberately Ephemeral State
 
@@ -73,7 +91,10 @@ Validation therefore rejects non-canonical state:
   orphans, exactly one root
 - a branch names two distinct existing children; a leaf names a terminal
 - focus names a **leaf**, never a branch or a free slot
-- selection references a known tab
+- each window's selection references a tab that window owns
+- the windows' tab counts sum to exactly the tab list's length, so no tab is
+  orphaned and no window reads past its own run
+- windows past `window_count` are blank
 - divider fractions are finite and already within `0.05...0.95`
 - recorded working directories are absolute and free of NUL and newline
 - an empty registry has no tabs and selects nothing
@@ -98,6 +119,12 @@ union.
   is what that state always meant.
 - **Version 2** is byte-identical to version 3 except for working directories,
   so its migration is exactly "no directory was recorded".
+- **Version 3** is one window's worth of tabs plus a single file-level
+  selection — the schema from before windows existed. It migrates to a v4
+  snapshot with `window_count == 1` whose only window owns every tab it
+  carried, so **a pre-multi-window snapshot restores as exactly one window**.
+  A v3 file with no tabs stays a zero-window snapshot, which is what "there is
+  nothing to reopen" has always meant.
 
 Unknown versions are not guessed. Invalid counts, duplicate or exhausted IDs,
 dangling references, malformed trees, focus on a non-leaf, and out-of-range
@@ -110,17 +137,30 @@ directory — layout is state) as a flat, line-oriented text file terminated by 
 explicit `end`:
 
 ```
-phux-cockpit-state 3
+phux-cockpit-state 4
 placement top
-selection tab 1
+window tab 1
 tab 0 0
 node 0 leaf - 0
 tab 2 1
 node 0 leaf 2 1
 node 1 leaf 2 2
 node 2 branch - horizontal 0.5 0 1
+window web
+tab 0 0
+node 0 leaf - 3
 end
 ```
+
+A `window` line OPENS a window's run, and every `tab` line after it belongs to
+that window until the next `window` line — so a window's tab count is implied
+by the file's own structure rather than written down twice. The window's own
+`web`/`tab N` argument is its selection, numbered within its run. A `tab` line
+before any `window` line is a tab with no owner and rejects the file.
+
+Version 3 and earlier have no `window` line and carry one file-level
+`selection` line instead; a `selection` line in a v4 file is a parse failure,
+because it is a claim the schema stopped making.
 
 The format is deliberately non-nesting. This file is read at startup, from a
 user-editable path, and may have been half-written by a crash. A recursive

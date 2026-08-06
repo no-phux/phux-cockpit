@@ -21,8 +21,8 @@ test "versioned snapshot restores the tab trees into fresh sessions without proc
     // A real split inside the selected tab: the snapshot has to carry a
     // BRANCH, which the old two-pane schema could not express.
     app.update(&state.model, .split_down, &state.effects);
-    const branch = state.model.tabs[state.model.selected_tab].root;
-    state.model.tabs[state.model.selected_tab].setFraction(branch, 0.63);
+    const branch = state.model.ws().tabs[state.model.ws().selected_tab].root;
+    state.model.ws().tabs[state.model.ws().selected_tab].setFraction(branch, 0.63);
     state.model.tab_placement = .side;
     const live_id = state.model.selectedTerminalId().?;
     const live_session = state.model.provider.terminal(live_id).?.session;
@@ -30,30 +30,30 @@ test "versioned snapshot restores the tab trees into fresh sessions without proc
 
     const snapshot = try state.model.topologySnapshot();
     try snapshot.validate();
-    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v3 = snapshot });
+    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v4 = snapshot });
     defer app.deinitModel(&restored);
     try testing.expectEqual(snapshot.version, app.topology_snapshot_version);
-    try testing.expectEqual(state.model.tab_count, restored.tab_count);
-    try testing.expectEqual(state.model.selected_tab, restored.selected_tab);
+    try testing.expectEqual(state.model.ws().tab_count, restored.ws().tab_count);
+    try testing.expectEqual(state.model.ws().selected_tab, restored.ws().selected_tab);
     try testing.expectEqual(state.model.tab_placement, restored.tab_placement);
 
     // The tree shape survives, fraction and focus included.
-    for (0..state.model.tab_count) |index| {
+    for (0..state.model.ws().tab_count) |index| {
         const source = state.model.treeConst(index).?;
         const target = restored.treeConst(index).?;
         try testing.expectEqual(source.paneCount(), target.paneCount());
         try testing.expectEqual(source.focus, target.focus);
         try testing.expectEqual(source.isSplit(), target.isSplit());
     }
-    const restored_branch = restored.tabs[restored.selected_tab].root;
+    const restored_branch = restored.ws().tabs[restored.ws().selected_tab].root;
     try testing.expectApproxEqAbs(
         @as(f32, 0.63),
-        restored.tabs[restored.selected_tab].node(restored_branch).fraction,
+        restored.ws().tabs[restored.ws().selected_tab].node(restored_branch).fraction,
         0.0001,
     );
     try testing.expectEqual(
         app.Orientation.vertical,
-        restored.tabs[restored.selected_tab].node(restored_branch).orientation,
+        restored.ws().tabs[restored.ws().selected_tab].node(restored_branch).orientation,
     );
 
     const fresh = restored.provider.terminal(live_id) orelse return error.TestExpectedTerminal;
@@ -82,14 +82,14 @@ test "legacy migration turns each old terminal into a tab and an old split into 
     // The split's two terminals merge into ONE tab, placed where the FIRST
     // of them stood in the old tab order (terminal 4, the selected one), and
     // that tab inherits the selection.
-    try testing.expect(migrated.selection.eql(.{ .tab = 2 }));
+    try testing.expect(app.primarySnapshotSelection(&migrated).eql(.{ .tab = 2 }));
     const split_tab = migrated.tabs[2];
     try testing.expectEqual(app.Kind.branch, split_tab.nodes[split_tab.root].kind);
     try testing.expectApproxEqAbs(@as(f32, 0.7), split_tab.nodes[split_tab.root].fraction, 0.0001);
 
     var future = migrated;
     future.version = 99;
-    try testing.expectError(error.UnsupportedTopologyVersion, app.migrateTopologySnapshot(.{ .v3 = future }));
+    try testing.expectError(error.UnsupportedTopologyVersion, app.migrateTopologySnapshot(.{ .v4 = future }));
     try testing.expectError(error.InvalidTopology, app.migrateTopologySnapshot(.{ .v0 = .{ .terminal_count = 5 } }));
 
     // A v1 payload with one terminal per tab migrates one-for-one.
@@ -101,7 +101,7 @@ test "legacy migration turns each old terminal into a tab and an old split into 
         .tab_placement = .side,
     } });
     try testing.expectEqual(@as(u8, 2), from_v1.tab_count);
-    try testing.expect(from_v1.selection.eql(.{ .tab = 1 }));
+    try testing.expect(app.primarySnapshotSelection(&from_v1).eql(.{ .tab = 1 }));
     try testing.expectEqual(app.TabPlacement.side, from_v1.tab_placement);
     // A duplicate in the old tab order is not migratable topology.
     try testing.expectError(error.InvalidTopology, app.migrateTopologySnapshot(.{ .v1 = .{
@@ -117,16 +117,16 @@ test "canonical snapshots reject topology rewrites and round trip exactly" {
     defer stopCockpit(state);
     app.update(&state.model, .new_terminal, &state.effects);
     app.update(&state.model, .split_right, &state.effects);
-    const branch = state.model.tabs[state.model.selected_tab].root;
-    state.model.tabs[state.model.selected_tab].setFraction(branch, 0.63);
+    const branch = state.model.ws().tabs[state.model.ws().selected_tab].root;
+    state.model.ws().tabs[state.model.ws().selected_tab].setFraction(branch, 0.63);
 
     const snapshot = try state.model.topologySnapshot();
-    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v3 = snapshot });
+    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v4 = snapshot });
     defer app.deinitModel(&restored);
     try testing.expectEqualDeep(snapshot, try restored.topologySnapshot());
     try testing.expect(!app.process_restoration_supported);
 
-    const selected: usize = switch (snapshot.selection) {
+    const selected: usize = switch (app.primarySnapshotSelection(&snapshot)) {
         .tab => |index| index,
         .web => return error.TestExpectedTabSelection,
     };
@@ -149,7 +149,7 @@ test "canonical snapshots reject topology rewrites and round trip exactly" {
 
     // A selection naming a tab that is not there is refused.
     invalid = snapshot;
-    invalid.selection = .{ .tab = invalid.tab_count };
+    invalid.windows[0].selection = .{ .tab = invalid.tab_count };
     try testing.expectError(error.InvalidTopology, invalid.validate());
 
     // A terminal id past the registry ceiling is refused.
@@ -184,8 +184,8 @@ test "the state file round trips a split workspace, its divider, and its working
     defer stopCockpit(state);
     app.update(&state.model, .new_terminal, &state.effects);
     app.update(&state.model, .split_right, &state.effects);
-    const branch = state.model.tabs[state.model.selected_tab].root;
-    state.model.tabs[state.model.selected_tab].setFraction(branch, 0.63);
+    const branch = state.model.ws().tabs[state.model.ws().selected_tab].root;
+    state.model.ws().tabs[state.model.ws().selected_tab].setFraction(branch, 0.63);
     state.model.tab_placement = .side;
 
     // The directory is the shell's own OSC 7 report, which is the only place
@@ -206,7 +206,7 @@ test "the state file round trips a split workspace, its divider, and its working
     try testing.expectEqualDeep(snapshot, try app.migrateTopologySnapshot(parsed));
 
     // And the file is text a person can read, not an opaque blob.
-    try testing.expect(std.mem.startsWith(u8, encoded, "phux-cockpit-state 3\n"));
+    try testing.expect(std.mem.startsWith(u8, encoded, "phux-cockpit-state 4\n"));
     try testing.expect(std.mem.indexOf(u8, encoded, "placement side\n") != null);
     try testing.expect(std.mem.indexOf(u8, encoded, "\ncwd 2 /Users/phall/my dir\n") != null);
     try testing.expect(std.mem.endsWith(u8, encoded, "\nend\n"));
@@ -359,7 +359,7 @@ test "a topology change arms one debounced write and ordinary input arms none" {
 
     // A divider drag reshapes the tree on every frame; the debounce is what
     // keeps that from being a write per frame.
-    const branch = state.model.tabs[state.model.selected_tab].root;
+    const branch = state.model.ws().tabs[state.model.ws().selected_tab].root;
     var step: f32 = 0.30;
     while (step < 0.60) : (step += 0.01) {
         app.update(&state.model, .{ .split_resized = .{ .node = branch, .value = step } }, &state.effects);
@@ -468,7 +468,7 @@ test "restored panes reopen in their saved working directory" {
     state.model.provider.terminal(focused).?.session.feed("\x1b]7;file:///Users/phall/project\x1b\\");
 
     const snapshot = try state.model.topologySnapshot();
-    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v3 = snapshot });
+    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v4 = snapshot });
     defer app.deinitModel(&restored);
     app.applyRestoredWorkingDirectories(&restored, &snapshot);
 
@@ -479,7 +479,7 @@ test "restored panes reopen in their saved working directory" {
     try testing.expect(std.mem.indexOf(u8, with_cwd.argv[with_cwd.argv.len - 1], "/Users/phall/project") != null);
 
     var refs: [app.max_panes_per_tab]app.TerminalRef = undefined;
-    const count = restored.treeConst(restored.selected_tab).?.terminals(&refs);
+    const count = restored.treeConst(restored.ws().selected_tab).?.terminals(&refs);
     try testing.expectEqual(@as(usize, 2), count);
     for (refs[0..count]) |id| {
         if (id.eql(focused)) continue;
@@ -524,9 +524,9 @@ test "normalizing topology drops panes whose terminal is gone and collapses empt
 
     // A tab whose only pane names a terminal nobody has is not a tab.
     _ = model.admitTab(try remoteRef(72));
-    try testing.expectEqual(@as(usize, 2), model.tab_count);
+    try testing.expectEqual(@as(usize, 2), model.ws().tab_count);
     model.normalizeTopology();
-    try testing.expectEqual(@as(usize, 1), model.tab_count);
+    try testing.expectEqual(@as(usize, 1), model.ws().tab_count);
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
 
     // Web stays a CHOICE: normalization must not yank the operator back to

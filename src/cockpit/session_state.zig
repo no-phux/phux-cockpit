@@ -131,43 +131,56 @@ pub fn serialize(snapshot: *const TopologySnapshot, out: []u8) SerializeError![]
     var emitter: Emitter = .{ .out = out };
     try emitter.print("{s} {d}\n", .{ magic, snapshot.version });
     try emitter.print("placement {s}\n", .{@tagName(snapshot.tab_placement)});
-    switch (snapshot.selection) {
-        .web => try emitter.raw("selection web\n"),
-        .tab => |index| try emitter.print("selection tab {d}\n", .{index}),
-    }
 
-    for (snapshot.tabs[0..snapshot.tab_count]) |tab| {
-        try emitter.raw("tab ");
-        try emitNodeId(&emitter, tab.root);
-        try emitter.raw(" ");
-        try emitNodeId(&emitter, tab.focus);
-        try emitter.raw("\n");
-        for (tab.nodes, 0..) |node, index| {
-            switch (node.kind) {
-                .free => continue,
-                .leaf => {
-                    // A leaf that never got a terminal is not persistable
-                    // structure; `validate` refuses it on the way back in, so
-                    // refusing to write it keeps the file honest.
-                    const offset = topology.terminalOffset(node.terminal) orelse return error.UnpersistableTerminal;
-                    try emitter.print("node {d} leaf ", .{index});
-                    try emitNodeId(&emitter, node.parent);
-                    try emitter.print(" {d}\n", .{offset});
-                },
-                .branch => {
-                    try emitter.print("node {d} branch ", .{index});
-                    try emitNodeId(&emitter, node.parent);
-                    // `{d}` on a float is the shortest decimal that reads
-                    // back as the same f32, so a divider position survives a
-                    // save/load cycle bit for bit.
-                    try emitter.print(" {s} {d} ", .{ @tagName(node.orientation), node.fraction });
-                    try emitNodeId(&emitter, node.first);
-                    try emitter.raw(" ");
-                    try emitNodeId(&emitter, node.second);
-                    try emitter.raw("\n");
-                },
+    // WINDOWS own tabs now, so a `window` line OPENS each run and every `tab`
+    // line after it belongs to that window until the next `window` line. The
+    // tab count is therefore implied by the file's own structure rather than
+    // written down — a count and a run are two encodings of one fact, and a
+    // reader that trusted the count could disagree with the lines it read.
+    //
+    // `selection` moved inside the window for the same reason it is
+    // window-relative in the struct: which tab is current is a fact about one
+    // window, and a file-level one could only ever be about the first.
+    var written: usize = 0;
+    for (snapshot.windows[0..snapshot.window_count]) |window| {
+        switch (window.selection) {
+            .web => try emitter.raw("window web\n"),
+            .tab => |index| try emitter.print("window tab {d}\n", .{index}),
+        }
+        for (snapshot.tabs[written..][0..window.tab_count]) |tab| {
+            try emitter.raw("tab ");
+            try emitNodeId(&emitter, tab.root);
+            try emitter.raw(" ");
+            try emitNodeId(&emitter, tab.focus);
+            try emitter.raw("\n");
+            for (tab.nodes, 0..) |node, index| {
+                switch (node.kind) {
+                    .free => continue,
+                    .leaf => {
+                        // A leaf that never got a terminal is not persistable
+                        // structure; `validate` refuses it on the way back in,
+                        // so refusing to write it keeps the file honest.
+                        const offset = topology.terminalOffset(node.terminal) orelse return error.UnpersistableTerminal;
+                        try emitter.print("node {d} leaf ", .{index});
+                        try emitNodeId(&emitter, node.parent);
+                        try emitter.print(" {d}\n", .{offset});
+                    },
+                    .branch => {
+                        try emitter.print("node {d} branch ", .{index});
+                        try emitNodeId(&emitter, node.parent);
+                        // `{d}` on a float is the shortest decimal that reads
+                        // back as the same f32, so a divider position survives
+                        // a save/load cycle bit for bit.
+                        try emitter.print(" {s} {d} ", .{ @tagName(node.orientation), node.fraction });
+                        try emitNodeId(&emitter, node.first);
+                        try emitter.raw(" ");
+                        try emitNodeId(&emitter, node.second);
+                        try emitter.raw("\n");
+                    },
+                }
             }
         }
+        written += window.tab_count;
     }
 
     for (snapshot.cwds, 0..) |cwd, offset| {
@@ -187,9 +200,17 @@ pub fn serialize(snapshot: *const TopologySnapshot, out: []u8) SerializeError![]
 /// directories, which makes a `cwd` line in a v2 file a parse failure rather
 /// than a silently ignored line.
 const Sink = struct {
-    tabs: *[max_tabs]SnapshotTab,
+    tabs: []SnapshotTab,
     tab_count: *u8,
-    selection: *SnapshotSelection,
+    /// Where a pre-v4 file's single `selection` line lands. Null for v4,
+    /// whose selection rides its `window` lines instead — which makes a
+    /// `selection` line in a v4 file a parse failure rather than a silently
+    /// ignored one.
+    selection: ?*SnapshotSelection,
+    /// The v4 window table. Null for the older versions, which describe
+    /// exactly one window and say so by having no `window` line at all.
+    windows: ?*[topology.max_snapshot_windows]topology.SnapshotWindow = null,
+    window_count: ?*u8 = null,
     tab_placement: *TabPlacement,
     cwds: ?*[max_terminals]SnapshotCwd,
 };
@@ -223,7 +244,7 @@ pub fn parse(bytes: []const u8, out: *PersistedTopologySnapshot) bool {
                 .cwds = null,
             };
         },
-        else => blk: {
+        3 => blk: {
             out.* = .{ .v3 = .{} };
             break :blk .{
                 .tabs = &out.v3.tabs,
@@ -233,12 +254,25 @@ pub fn parse(bytes: []const u8, out: *PersistedTopologySnapshot) bool {
                 .cwds = &out.v3.cwds,
             };
         },
+        else => blk: {
+            out.* = .{ .v4 = .{} };
+            break :blk .{
+                .tabs = &out.v4.tabs,
+                .tab_count = &out.v4.tab_count,
+                .selection = null,
+                .windows = &out.v4.windows,
+                .window_count = &out.v4.window_count,
+                .tab_placement = &out.v4.tab_placement,
+                .cwds = &out.v4.cwds,
+            };
+        },
     };
 
     var placement_seen = false;
     var selection_seen = false;
     var terminated = false;
     var tabs: usize = 0;
+    var windows: usize = 0;
 
     while (lines.next()) |raw_line| {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
@@ -270,27 +304,56 @@ pub fn parse(bytes: []const u8, out: *PersistedTopologySnapshot) bool {
         }
 
         if (std.mem.eql(u8, keyword, "selection")) {
+            // A v4 file has no file-level selection: its windows carry their
+            // own. Reading one here would be reading a claim the schema
+            // stopped making.
+            const target = sink.selection orelse return false;
             if (selection_seen) return false;
             selection_seen = true;
             const value = fields.next() orelse return false;
             if (std.mem.eql(u8, value, "web")) {
                 if (fields.next() != null) return false;
-                sink.selection.* = .web;
+                target.* = .web;
             } else if (std.mem.eql(u8, value, "tab")) {
                 const index = std.fmt.parseInt(u8, fields.next() orelse return false, 10) catch return false;
                 if (fields.next() != null) return false;
-                sink.selection.* = .{ .tab = index };
+                target.* = .{ .tab = index };
             } else return false;
             continue;
         }
 
+        if (std.mem.eql(u8, keyword, "window")) {
+            const table = sink.windows orelse return false;
+            if (windows >= topology.max_snapshot_windows) return false;
+            const value = fields.next() orelse return false;
+            var selection: SnapshotSelection = .web;
+            if (std.mem.eql(u8, value, "web")) {
+                if (fields.next() != null) return false;
+            } else if (std.mem.eql(u8, value, "tab")) {
+                const index = std.fmt.parseInt(u8, fields.next() orelse return false, 10) catch return false;
+                if (fields.next() != null) return false;
+                selection = .{ .tab = index };
+            } else return false;
+            table[windows] = .{ .tab_count = 0, .selection = selection };
+            windows += 1;
+            continue;
+        }
+
         if (std.mem.eql(u8, keyword, "tab")) {
-            if (tabs >= max_tabs) return false;
+            if (tabs >= sink.tabs.len) return false;
+            // In v4 a tab has to belong to a window, and the window line that
+            // opens the run is what says which. A tab before any window line
+            // is a tab with no owner.
+            if (sink.windows != null and windows == 0) return false;
             const root = parseNodeId(fields.next() orelse return false) orelse return false;
             const focus = parseNodeId(fields.next() orelse return false) orelse return false;
             if (fields.next() != null) return false;
             sink.tabs[tabs] = .{ .root = root, .focus = focus };
             tabs += 1;
+            if (sink.windows) |table| {
+                if (table[windows - 1].tab_count == max_tabs) return false;
+                table[windows - 1].tab_count += 1;
+            }
             continue;
         }
 
@@ -365,5 +428,6 @@ pub fn parse(bytes: []const u8, out: *PersistedTopologySnapshot) bool {
 
     if (!terminated) return false;
     sink.tab_count.* = @intCast(tabs);
+    if (sink.window_count) |count| count.* = @intCast(windows);
     return true;
 }

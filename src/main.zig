@@ -79,6 +79,11 @@ pub const TopologySnapshot = topology.TopologySnapshot;
 pub const LegacyTopologySnapshotV0 = topology.LegacyTopologySnapshotV0;
 pub const LegacyTopologySnapshotV1 = topology.LegacyTopologySnapshotV1;
 pub const LegacyTopologySnapshotV2 = topology.LegacyTopologySnapshotV2;
+pub const LegacyTopologySnapshotV3 = topology.LegacyTopologySnapshotV3;
+pub const SnapshotWindow = topology.SnapshotWindow;
+pub const max_snapshot_windows = topology.max_snapshot_windows;
+pub const max_snapshot_tabs = topology.max_snapshot_tabs;
+pub const primarySnapshotSelection = topology.primarySelection;
 pub const PersistedTopologySnapshot = topology.PersistedTopologySnapshot;
 pub const SnapshotCwd = topology.SnapshotCwd;
 pub const max_snapshot_cwd_bytes = topology.max_snapshot_cwd_bytes;
@@ -101,6 +106,10 @@ pub const PointerDragMode = model_module.PointerDragMode;
 pub const PointerCapture = model_module.PointerCapture;
 pub const BrowserPage = model_module.BrowserPage;
 pub const Model = model_module.Model;
+pub const Workspace = model_module.Workspace;
+pub const TerminalLocation = model_module.TerminalLocation;
+pub const max_windows = model_module.max_windows;
+pub const max_secondary_windows = model_module.max_secondary_windows;
 pub const reconcileRemoteRefs = model_module.reconcileRemoteRefs;
 pub const initialModelWithPhux = model_module.initialModelWithPhux;
 pub const initialModel = model_module.initialModel;
@@ -150,7 +159,9 @@ pub const terminalTokensFrom = projection.terminalTokensFrom;
 pub const windowPadding = projection.windowPadding;
 pub const chromeRevealed = projection.chromeRevealed;
 pub const workspaceChrome = projection.workspaceChrome;
+pub const workspaceChromeIn = projection.workspaceChromeIn;
 pub const resolvePanes = projection.resolvePanes;
+pub const resolvePanesIn = projection.resolvePanesIn;
 pub const paneFrames = projection.paneFrames;
 pub const paneAtPoint = projection.paneAtPoint;
 pub const paneFrameFor = projection.paneFrameFor;
@@ -174,6 +185,12 @@ pub const web_origins = scene.web_origins;
 pub const cockpit_shortcuts = scene.cockpit_shortcuts;
 pub const cockpit_menus = scene.cockpit_menus;
 pub const shell_scene = scene.shell_scene;
+pub const secondary_window_labels = scene.secondary_window_labels;
+pub const secondary_canvas_labels = scene.secondary_canvas_labels;
+pub const windowLabelFor = scene.windowLabelFor;
+pub const canvasLabelFor = scene.canvasLabelFor;
+pub const windowIndexForCanvas = scene.windowIndexForCanvas;
+pub const windowIndexForWindow = scene.windowIndexForWindow;
 
 pub const Config = config_module.Config;
 pub const ConfigTabPlacement = config_module.TabPlacement;
@@ -184,8 +201,14 @@ pub const paneArgvIn = local.paneArgvIn;
 pub const CwdArgv = local.CwdArgv;
 
 pub const view = view_module.view;
+pub const viewWindow = view_module.viewWindow;
+pub const windowView = view_module.windowView;
+pub const declaredWindows = view_module.windows;
+pub const buildChrome = view_module.buildChrome;
+pub const buildChromeWindow = view_module.buildChromeWindow;
 pub const webPanes = view_module.webPanes;
 pub const onCommand = view_module.onCommand;
+pub const onFrame = view_module.onFrame;
 pub const tabPlacementFromText = view_module.tabPlacementFromText;
 pub const onTimer = view_module.onTimer;
 pub const CockpitHost = host.CockpitHost;
@@ -217,10 +240,22 @@ pub fn appOptions() TerminalApp.Options {
         .on_frame = view_module.onFrame,
         .web_panes = webPanes,
         .on_command = onCommand,
+        // The declared secondary windows, and their trees. Presence in
+        // `windows_fn`'s answer IS visibility, so `Model.closeWindow` closes
+        // a window by no longer naming it.
+        .windows_fn = view_module.windows,
+        .window_view = view_module.windowView,
         .chrome = .{
             .prefix_commands = chrome_command_envelope,
             .variable_prefix = true,
+            // `build` still has to be set (it is the non-optional field), but
+            // `build_window` is what actually runs: it is the only one that
+            // can say WHICH window it is painting, and for an app whose
+            // terminals are chrome commands the difference is a second window
+            // full of live cells versus a second window painting a tab strip
+            // over an empty canvas.
             .build = view_module.buildChrome,
+            .build_window = view_module.buildChromeWindow,
         },
     };
 }
@@ -395,11 +430,11 @@ fn restoreWorkspace(
     var persisted: PersistedTopologySnapshot = undefined;
     if (!readPersistedState(io, path, &persisted)) return null;
     const snapshot = migrateTopologySnapshot(persisted) catch return null;
-    // A snapshot with no tabs describes a window with nothing in it. That is
+    // A snapshot with no tabs describes a session with nothing in it. That is
     // valid state (the web surface was selected when the last tab closed) but
     // it is not a workspace to reopen, so it takes the fresh path.
     if (snapshot.tab_count == 0) return null;
-    const model = restoreModel(gpa, io, .{ .v3 = snapshot }) catch return null;
+    const model = restoreModel(gpa, io, .{ .v4 = snapshot }) catch return null;
     restored.* = snapshot;
     return model;
 }
@@ -569,4 +604,5 @@ test {
     _ = @import("tests/config_wiring_tests.zig");
     _ = @import("tests/tab_strip_tests.zig");
     _ = @import("tests/scrollback_search_tests.zig");
+    _ = @import("tests/multi_window_tests.zig");
 }
