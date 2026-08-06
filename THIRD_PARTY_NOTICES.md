@@ -51,10 +51,13 @@ Source: https://github.com/phall1/phux/tree/v0.12.0
 
 ## JetBrains Mono Nerd Font
 
-Phux Cockpit embeds `JetBrainsMonoNL Nerd Font Mono Regular` from Nerd Fonts
-v3.4.0. The patched font is licensed under the SIL Open Font License, Version
-1.1. The complete copyright notice and license are distributed beside this
-file as `JetBrainsMono-OFL.txt`.
+Phux Cockpit embeds `JetBrainsMonoNL Nerd Font Mono` from Nerd Fonts v3.4.0 in
+four weights — Regular, Bold, Italic, and BoldItalic — so that SGR bold and
+italic select a real face rather than a synthesized one, and so that a bold
+prompt keeps the same Nerd Font glyph coverage as a regular one. The patched
+font is licensed under the SIL Open Font License, Version 1.1. The complete
+copyright notice and license are distributed beside this file as
+`JetBrainsMono-OFL.txt`.
 
 JetBrains Mono copyright 2020 The JetBrains Mono Project Authors.
 Nerd Fonts font patches copyright 2014 Ryan L McIntyre.
