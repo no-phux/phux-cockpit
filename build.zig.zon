@@ -50,9 +50,23 @@
         // (faux bold double-strikes, faux italic shears about the baseline),
         // because a bold run that renders bold on the reference path and plain
         // on the host is worse than no bold at all.
+        // Secondary windows can finally paint. Every terminal cell comes from
+        // `chrome.build`, and the toolkit installed an app-owned chrome
+        // display list for the MAIN canvas only — a second window rendered its
+        // tab strip and divider with zero terminal cells. `build_window` takes
+        // a `ChromeContext` naming the window, `rebuildWindowSlot` installs
+        // through it, and `on_frame` now runs per slot so a secondary
+        // window's terminals are actually resized. Additive: an app that has
+        // not migrated is unchanged, because the branch is gated on
+        // `build_window` rather than on `chrome`.
+        //
+        // Also adds the fullscreen verb the platform layer never had. It
+        // REPORTED `WindowInfo.fullscreen` and had no way to enter or leave —
+        // and the field it reported was never filled by anything, so it was a
+        // constant false.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/e1f3921d5af5694cf899de0b618b9ca7860f00d6.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQhN44QFQMfH1uNbXuMMX0WZTaPXuTl1h2y77LiF7",
+            .url = "https://github.com/phall1/native/archive/e8bd84886db89ce2ada4a8c7b9fac0137096e3dc.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQuPh4QEi6A1KMfbWF0w10cns3S-erI_4RQEZ0HGK",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream
