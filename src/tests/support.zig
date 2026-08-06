@@ -124,6 +124,18 @@ pub const CellGridView = struct {
         return cell.bg;
     }
 
+    /// The cell's SGR 58 underline colour, or null when it named none
+    /// and the underline takes the cell foreground. `has_underline_color`
+    /// is what says the cell carried one at all, exactly as
+    /// `has_background` does for the background — the stored colour is
+    /// zeroed, not absent, so reading the field alone would report opaque
+    /// black for every cell that never set one.
+    pub fn underlineColor(self: CellGridView, x: usize, y: usize) ?canvas.CellColor {
+        const cell = self.grid.at(x, y) orelse return null;
+        if (!cell.style().has_underline_color) return null;
+        return cell.underline_color;
+    }
+
     /// Row `y` as a renderer would ink it: every cell's cluster bytes,
     /// left to right. Cells that ink nothing contribute nothing, so a
     /// row's trailing blanks never reach the string.

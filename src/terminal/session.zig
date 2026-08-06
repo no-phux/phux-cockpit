@@ -276,30 +276,74 @@ pub const Session = struct {
                     .codepoint, .codepoint_grapheme => cell.raw.content.codepoint.data,
                     else => 0,
                 };
-                var fg = palette.foreground;
-                var underline = false;
-                const bg = cellBackground(cell, &palette);
+                // The projected cell, assembled in place. Everything that
+                // does not depend on the code point is resolved up front;
+                // `cp` and `cluster` land at the bottom because the
+                // invisible flag can still zero the code point.
+                var projected: canvas.TerminalCell = .{
+                    .fg = palette.foreground,
+                    .bg = cellBackground(cell, &palette),
+                    .wide = switch (cell.raw.wide) {
+                        .wide => .wide,
+                        .spacer_tail, .spacer_head => .spacer,
+                        else => .narrow,
+                    },
+                };
                 if (cp != 0 and cell.raw.style_id != 0) {
                     const style = cell.style;
-                    // `resolveFg` folds every attribute the painter can
-                    // actually carry into the resolved color: inverse
-                    // (fg/bg swap), faint (blend toward the background),
-                    // and bold-as-bright over the ANSI-8 range.
+                    // Two kinds of attribute, and the split is the whole
+                    // shape of this block.
                     //
-                    // `canvas.TerminalCell` carries a code point, a
-                    // cluster, two colors, ONE boolean underline, and a
-                    // wide flag — so italic, strikethrough, overline, the
-                    // underline STYLE (double/curly/dotted/dashed), the
-                    // underline COLOR, and a real bold weight have nowhere
-                    // to go and are dropped here rather than faked. Every
-                    // underline style collapses to the single line the
-                    // painter draws, which is the honest degradation:
-                    // "underlined" survives, its flavor does not.
-                    fg = palette.resolveFg(style, bg);
-                    underline = style.flags.underline != .none;
+                    // COLOR decisions are folded into the resolved
+                    // foreground by `resolveFg`, because they have no
+                    // separate destination and never will: inverse (fg/bg
+                    // swap), faint (blend toward the background), and
+                    // bold-as-bright over the ANSI-8 range.
+                    //
+                    // Everything else is a real field on
+                    // `canvas.TerminalCell` and is PROJECTED, not dropped:
+                    // bold, italic, strikethrough, overline, the underline
+                    // STYLE (single/double/curly/dotted/dashed) and the
+                    // underline COLOR. What each one turns into on the
+                    // glass is the SDK renderer's call — the decorations
+                    // are drawn from `canvas.CellDecoration` geometry,
+                    // while bold and italic need registered companion
+                    // faces to change the GLYPH and the bundled face is a
+                    // single mono one. Carrying the flag is still right:
+                    // the cell state is the truth, and a renderer that
+                    // grows a weight axis reads it without this projection
+                    // changing.
+                    //
+                    // Cells with no code point are skipped for the same
+                    // reason their foreground is: an unwritten cell has no
+                    // style to speak of. A styled BLANK is a space
+                    // (`cp == 0x20`) in every stream that produces one, so
+                    // it lands here like any other character.
+                    projected.fg = palette.resolveFg(style, projected.bg);
+                    projected.bold = style.flags.bold;
+                    projected.italic = style.flags.italic;
+                    projected.strikethrough = style.flags.strikethrough;
+                    projected.overline = style.flags.overline;
+                    projected.underline = style.flags.underline != .none;
+                    // The SDK reads `underline_style` only when
+                    // `underline` is set, so libghostty's `.none` maps to
+                    // the SDK's own default rather than inventing a
+                    // "styled but not underlined" state the packed cell
+                    // deliberately cannot represent.
+                    projected.underline_style = switch (style.flags.underline) {
+                        .none, .single => .single,
+                        .double => .double,
+                        .curly => .curly,
+                        .dotted => .dotted,
+                        .dashed => .dashed,
+                    };
+                    projected.underline_color = palette.resolveUnderlineColor(style);
                     // An invisible cell resolves to "no ink" HERE so the
                     // painter's measure and paint cannot disagree — the
-                    // contract `TerminalCell.cp == 0` states.
+                    // contract `TerminalCell.cp == 0` states. The
+                    // decorations above survive it, which matches what the
+                    // SGR attribute means: the GLYPH is hidden, the line
+                    // through the cell is not.
                     if (style.flags.invisible) cp = 0;
                 }
 
@@ -344,18 +388,9 @@ pub const Session = struct {
                     }
                 }
 
-                out[x] = .{
-                    .cp = cp,
-                    .cluster = cluster,
-                    .fg = fg,
-                    .bg = bg,
-                    .underline = underline,
-                    .wide = switch (cell.raw.wide) {
-                        .wide => .wide,
-                        .spacer_tail, .spacer_head => .spacer,
-                        else => .narrow,
-                    },
-                };
+                projected.cp = cp;
+                projected.cluster = cluster;
+                out[x] = projected;
             }
 
             session.snap_rows[row_count] = .{
@@ -374,13 +409,6 @@ pub const Session = struct {
         // directly: `rs.cursor.viewport` is null when the cursor sits
         // outside the visible viewport (scrolled into history), which is
         // exactly the painter's "no cursor" case.
-        //
-        // Not projected, because `canvas.TerminalCursor` has nowhere to
-        // put them: the DECSCUSR blink bit (`rs.cursor.blinking`) and the
-        // two-column extent of a cursor sitting on a wide cell. Ghostty's
-        // custom hollow-block style collapses onto `.block` — the painter
-        // reserves hollow for the UNFOCUSED cue, which it drives itself
-        // from `TerminalPaintOptions.focused`.
         const cursor: ?canvas.TerminalCursor = blk: {
             if (!rs.cursor.visible) break :blk null;
             const vp = rs.cursor.viewport orelse break :blk null;
@@ -393,11 +421,34 @@ pub const Session = struct {
                 // stays unmarked.
                 .x = if (vp.wide_tail and x > 0) x - 1 else x,
                 .y = @intCast(vp.y),
+                // Ghostty's hollow block is a shape the EMULATOR asked
+                // for (it is not a DECSCUSR value; it arrives through the
+                // configured default style). It maps to the SDK's own
+                // `block_hollow` rather than collapsing onto `.block`,
+                // because the painter has two independent reasons to
+                // outline a cursor — this one, and the unfocused-window
+                // cue it drives itself from `TerminalPaintOptions.focused`
+                // — and they have to stay independent. Collapsing made a
+                // program's explicit hollow cursor paint solid whenever
+                // the window happened to be focused.
                 .shape = switch (rs.cursor.visual_style) {
                     .bar => .bar,
                     .underline => .underline,
-                    .block, .block_hollow => .block,
+                    .block => .block,
+                    .block_hollow => .block_hollow,
                 },
+                // DECSCUSR's blink bit, which libghostty resolves into
+                // mode 12 (`rs.cursor.blinking`). Carried as STATE: the
+                // painter draws the visible phase and the host owns
+                // arming an animation, so a producer that reports it and
+                // a renderer that ignores it still agree about the
+                // cursor.
+                .blinking = rs.cursor.blinking,
+                // A cursor on a double-width glyph covers BOTH of its
+                // columns — either because it sits on the wide cell
+                // itself, or because it sits on that cell's spacer tail
+                // and `.x` above already walked it back to the primary.
+                .wide = rs.cursor.cell.wide == .wide or vp.wide_tail,
             };
         };
 

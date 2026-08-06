@@ -76,15 +76,39 @@ pub const Palette = struct {
             .none => palette.foreground,
             // Bold-as-bright over the ANSI-8 range, the convention every
             // terminal ships and every prompt theme assumes: `\x1b[1;31m` is
-            // bright red. It is the ONLY channel bold has here — the painter
-            // draws one mono face and cannot carry a weight axis — so without
-            // it a bold-red prompt and a plain-red error render identically.
-            // Deliberately NOT applied to the bright range (8-15, already
-            // bright), the cube, or truecolor, where the application named an
-            // exact color.
+            // bright red. Deliberately NOT applied to the bright range (8-15,
+            // already bright), the cube, or truecolor, where the application
+            // named an exact color.
+            //
+            // This SURVIVES `TerminalCell.bold` becoming a real projected
+            // flag, and the two cannot double-apply because they act on
+            // different channels: bold-as-bright is a COLOR decision resolved
+            // here, `bold` is a WEIGHT request carried to the renderer. A
+            // bold ANSI-1 cell therefore gets BOTH — the bright palette entry
+            // and the flag. Dropping the brightening in favor of the flag
+            // would be a visible regression today: the SDK draws one mono
+            // face and synthesizes nothing, so `\x1b[1;31m` and `\x1b[31m`
+            // would become pixel-identical. If a companion bold face ever
+            // registers and the renderer starts embodying weight, the
+            // brightening is the half to reconsider — it lives here, in one
+            // switch arm, exactly so that stays a one-line decision.
             .palette => |index| palette.indexed(
                 if (style.flags.bold and index < 8) index + 8 else index,
             ),
+            .rgb => |rgb| canvas.Color.rgb8(rgb.r, rgb.g, rgb.b),
+        };
+    }
+
+    /// SGR 58's underline color, or null when the cell never named one —
+    /// which is the SDK's own default too (`TerminalCell.underline_color`
+    /// null takes the cell foreground, the SGR 59 behavior). Indexed
+    /// colors go through the same live 256-entry lookup as every other
+    /// palette read, so an OSC 4 override moves the underline with the
+    /// text it belongs to.
+    pub fn resolveUnderlineColor(palette: *const Palette, style: vt.Style) ?canvas.Color {
+        return switch (style.underline_color) {
+            .none => null,
+            .palette => |index| palette.indexed(index),
             .rgb => |rgb| canvas.Color.rgb8(rgb.r, rgb.g, rgb.b),
         };
     }
