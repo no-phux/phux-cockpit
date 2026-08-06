@@ -11,22 +11,38 @@ native control environment for large-scale directed machine work. See
 
 ## Spatial runtime
 
-- Cockpit launches with **one terminal** and one shell process. New creates
-  subsequent terminals, up to four. Each has a durable terminal ID and owns its
-  own PTY, emulator, scrollback, selection, input queue, and retained-rendering
-  namespace. Tab order and visible placement do not own execution.
-- **Split** projects at most two live terminal sessions simultaneously through
-  a real draggable and keyboard-operable divider. Splitting, focusing,
-  resizing, and collapsing never restart either process.
-- **Tabs** are native canvas controls with tab accessibility semantics. They
-  compact to `T1` through `T4` at full capacity; Web remains stable and pinned
-  last. Direct selection and next/previous shortcuts preserve hidden state.
-  Tabs can sit above the workspace or in a scroll-safe side rail without
-  changing terminal identity, focus, or process state.
+- Cockpit launches with **one terminal** and one shell process, up to 32. Each
+  has a durable terminal ID and owns its own PTY, emulator, scrollback,
+  selection, input queue, and retained-rendering namespace. Tab order and
+  visible placement do not own execution.
+- **A tab owns a pane tree**, not a terminal. A leaf is a terminal; a branch
+  divides its rect between two children along an orientation at a fraction.
+  `cmd+D` splits right and `cmd+shift+D` splits down, each creating a NEW
+  shell beside the focused pane, nested arbitrarily up to 16 panes per tab.
+  Closing a pane promotes its sibling into the parent's rect, so a split never
+  collapses into a hole and never pulls in an unrelated tab. Splitting,
+  focusing, resizing, and collapsing never restart a process.
+- **One geometry.** `resolve()` over that tree is the single source of truth
+  for pane rects: the painter, the hit-test widget tree, and the PTY sizing
+  pump all consume the same call. They used to be three independent
+  derivations, and they had already drifted.
+- **Tabs** are native canvas controls with tab accessibility semantics,
+  rendered from a real slice with a close affordance and a `+`. A tab is
+  titled by its focused pane's shell title (OSC 0/2), then the last component
+  of its working directory (OSC 7), then its mint number. Tabs can sit above
+  the workspace or in a side rail without changing terminal identity, focus,
+  or process state.
 - **Web** is a native WebKit surface for the explicitly allowed GitHub,
-  Superlogical, and Mitchell Hashimoto top-level origins. It keeps its page
-  process alive while another tab is selected. Native bridge commands are
-  disabled; WebKit subframes and page resources remain ordinary web content.
+  Superlogical, and Mitchell Hashimoto top-level origins, reachable by
+  `cmd+shift+B` and the View menu. It is deliberately NOT a tab in the
+  terminal strip: the strip shows terminals. It keeps its page process alive
+  while a terminal is selected. Native bridge commands are disabled; WebKit
+  subframes and page resources remain ordinary web content.
+- **The workspace persists.** Tab list, pane trees, divider fractions,
+  selection, focus, and each terminal's working directory are written to the
+  platform state directory on a debounce and restored before the first
+  terminal is created. Restoring recreates shells in the saved shape;
+  `process_restoration_supported` is `false` and nothing pretends otherwise.
 - **Phux terminals** published by a coordinator enter the same bounded tab
   topology as local ones. One that appears becomes a tab; it takes a visible
   pane when you select it, never by displacing a live local terminal. `cmd+W`
@@ -40,39 +56,84 @@ healthy terminal gets the whole content area: no tab strip, no toolbar, no
 status banner.
 
 The band appears when the workspace actually has structure to show — a second
-terminal, a split, the Web surface, or a terminal that needs attention — and
-retracts when that structure goes away. Reveal is driven only by discrete state
-you caused; nothing incidental moves it, because every change to the band
+tab, the Web surface, or a terminal that needs attention — and retracts when
+that structure goes away. A split alone does not raise it: two panes in one tab
+are still one tab, and the divider says so. Reveal is driven only by discrete
+state you caused; nothing incidental moves it, because every change to the band
 reflows the content area and resizes a live PTY.
 
-The band is presentation, never the only path: `cmd+T`, `cmd+W`, `cmd+D`, and
-`cmd+1`..`cmd+5` reach the model whether or not it is showing. The window stays
-draggable by its titlebar inset in every state.
+The band is presentation, never the only path: every shortcut in the table below
+reaches the model whether or not it is showing, and the menu bar carries the
+same commands. The window stays draggable by its titlebar inset in every state.
 
 All terminal executions stay live while hidden or reordered. libghostty-vt owns
-terminal state and native-sdk paints the visible attachments into one Metal
-surface under strict combined command, text, glyph, and path budgets.
+terminal state, and native-sdk paints each visible pane as one packed
+`cell_grid` command per row — a lattice of 20-byte cells the renderer expands,
+rather than per-run rectangles and text. That is what lets a dense screen paint
+in full: a distinct foreground and background on every cell merges nothing, and
+the old per-run emission wanted roughly 24,000 commands for a 200x60 screen
+against a 2,048 ceiling, truncating from the bottom without saying so. Where a
+budget does genuinely bind, the painter reports the loss instead of quietly
+dropping rows.
 
-Terminal tabs show an attention marker when a hidden process exits or develops
-an operational issue, and an exception is itself enough to bring the band back
-when a lone terminal is in trouble. Healthy single-terminal mode has no
-permanent RUNNING banner. Split mode identifies each pane quietly; lifecycle
-text appears only for transitions and exceptions. Full lifecycle and I/O detail remains accessible.
-Recovered stalls disappear. Finished terminals expose a placement-specific
-**Restart** control for clean and abnormal exits.
+Terminal tabs show an attention dot when a hidden process rings the bell, exits,
+or develops an operational issue, and an exception is itself enough to bring the
+band back when a lone terminal is in trouble. Splits carry no pane header at
+all: the focused pane is the bright one, the others are dimmed by a scrim, and
+that is the whole indication. Byte counts, I/O-loss badges and lifecycle strings
+are not product chrome — they live in each surface's accessibility label, so a
+screen reader keeps every detail the eye is spared. A pane whose process died
+says so where it died, with its **Restart**.
 
-The local provider is a bounded dynamic registry independent from layout. New
-and Close are native actions; close tombstones one PTY until its exact exit is
-delivered, discards post-close output and generated terminal replies, and never
-reuses PTY keys in-process. This prevents stale traffic from crossing into a
-replacement terminal.
+The local provider is a bounded dynamic registry independent from layout. Close
+frees the emulator immediately rather than holding a registry slot against a pty
+exit that may never arrive, discards post-close output and generated terminal
+replies, and never reuses PTY keys in-process, so stale traffic cannot cross
+into a replacement terminal. Closing the last pane closes its tab, and closing
+the last tab closes the window *and quits* — AppKit keeps a process alive after
+its last window unless asked not to, and a running cockpit with no window is not
+a closed one.
 
-`Model.topologySnapshot()` exposes the versioned persistence boundary for
-terminal count, tab order, selection, split attachments, focus, and divider
-position. `restoreModel()` validates or migrates that snapshot and creates new
-emulator sessions and shell processes. The snapshot intentionally contains no
-PID, PTY key, screen memory, or process-survival claim. See
+`Model.topologySnapshot()` exposes the versioned persistence boundary for the
+tab list, each tab's pane tree, selection, focus, divider fractions, and
+per-terminal working directories. `restoreModel()` validates or migrates that
+snapshot and creates new emulator sessions and shell processes. The snapshot
+intentionally contains no PID, PTY key, screen memory, or process-survival
+claim. It is stored as a flat line-oriented file with an explicit terminator,
+chosen over a nested format because it is read at startup from a user-editable
+path a crash may have half-written, and a grammar with no nesting cannot
+overflow a stack however the bytes fall. See
 [Topology Snapshots](docs/TOPOLOGY_SNAPSHOTS.md).
+
+## Configuration
+
+Cockpit reads `~/.config/phux-cockpit/config` (or `$XDG_CONFIG_HOME/…`), falling
+back to the macOS platform config directory. The dotfile path is searched first
+on purpose: the people most likely to write one are arriving from Ghostty and
+will not go looking in `~/Library/Preferences`. `PHUX_COCKPIT_CONFIG` overrides
+both.
+
+The syntax is Ghostty's — one `key = value` per line, `#` starts a whole-line
+comment, and there are deliberately no trailing comments because `#` is also how
+every colour begins. An unknown key or a malformed value is a diagnostic, not a
+failure: one bad line costs that line, never the rest of the file.
+
+```
+font-size = 14
+cursor-style = bar
+cursor-style-blink = false
+background = #090b0f
+foreground = #f4f7fb
+palette = 1 = #f38ba8
+scrollback-limit = 50000000
+inherit-working-directory = true
+tab-placement = top
+```
+
+`font-family` and `selection-foreground` are parsed but not yet applied: the SDK
+selects faces from a fixed registered set rather than by family name, and a
+terminal grid carries one selection colour rather than a foreground override.
+They are refused honestly rather than silently ignored.
 
 ## Install
 
@@ -90,13 +151,19 @@ attribute and reports that fact in its caveat.
 
 | Key | Action |
 |---|---|
-| `cmd+1` ... `cmd+5` | Select the surface at that current position; Web is always last |
-| `cmd+T` | Create and select a terminal, up to four |
-| `cmd+W` | Close the selected terminal; Web is never closed |
-| `cmd+shift+left` / `cmd+shift+right` | Move the selected terminal tab |
+| `cmd+1` ... `cmd+5` | Select the tab at that position |
+| `cmd+T` | Create and select a tab, up to 32 terminals |
+| `cmd+W` | Close the focused pane, then its tab, then the window |
+| `cmd+shift+left` / `cmd+shift+right` | Move the selected tab |
 | `cmd+shift+[` / `cmd+shift+]` | Select previous or next tab |
-| `cmd+D` | Split terminals or collapse to the active terminal; unclaimed until two terminals exist |
-| `cmd+option+left` / `cmd+option+right` | Move keyboard focus across split panes |
+| `cmd+D` | Split right, creating a new shell beside the focused pane |
+| `cmd+shift+D` | Split down, creating a new shell below the focused pane |
+| `cmd+[` / `cmd+]` | Focus previous or next pane |
+| `cmd+option+arrows` | Move keyboard focus to the pane in that direction |
+| `cmd+=` / `cmd+-` / `cmd+0` | Increase, decrease, or reset the terminal font size |
+| `cmd+A` | Select the visible screen |
+| `cmd+K` | Clear the screen and scrollback |
+| `cmd+shift+B` | Show the Web surface |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |
 | `shift` + arrow keys | Extend the selection |
@@ -128,9 +195,10 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Internet access on the first source build to fetch pinned dependencies
 
 native-sdk is pinned to the v0.8.1-based merge
-[`phall1/native@bfb8a4f`](https://github.com/phall1/native/commit/bfb8a4f0a5aa208e4b87b8bbcbd50600416db563),
-which includes Cockpit's terminal interaction, viewport, paint-budget, and font
-seams. libghostty-vt is pinned
+[`phall1/native@f7347de`](https://github.com/phall1/native/commit/f7347de1c607dcbe4e4f06dddd172fcf3f9d0507),
+which includes Cockpit's terminal interaction, viewport, and font seams plus the
+packed `cell_grid` canvas command, its AppKit decoder, and wire format v6.
+libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
 Zig 0.16-compatible checkpoint.
 
@@ -209,10 +277,23 @@ workflow against the existing draft tag.
 
 - Native Phux terminal identity and lifetime remain coordinator-owned; Cockpit
   projects published terminals but does not fake remote close or restoration.
-- Terminal topology has a versioned snapshot/restore API. The executable does
-  not yet choose a filesystem persistence policy; restoring always starts fresh
-  processes. `process_restoration_supported` is explicitly `false`; filesystem
-  persistence remains outside this slice.
+- Layout persistence restores the SHAPE of a workspace, never its processes.
+  Tabs, pane trees, divider fractions, selection, focus, and working
+  directories come back; scrollback and running programs do not.
+  `process_restoration_supported` is explicitly `false` and the snapshot
+  carries no PID.
+- Working-directory inheritance and shell-titled tabs depend on the shell
+  emitting OSC 7 and OSC 0/2. A shell without integration falls back to `$HOME`
+  and to numbered tabs — correct, but less useful, and not something Cockpit
+  can fix from its side.
+- Scrollback search matches case-insensitively for local terminals, because the
+  pinned engine's search API exposes no case option. The remote phux provider
+  takes a case-sensitivity flag, so the two do not agree.
+- `bold` and `italic` are carried into every cell and every renderer but cannot
+  change a glyph until companion mono faces are registered; the bundled face is
+  the explicit no-ligature JetBrains Mono NL, so ligatures are structurally
+  unavailable regardless of renderer support.
+- Single window. There is no new-window, fullscreen, or multi-window restore.
 - Detachable terminal windows are intentionally not faked. Cockpit does not yet
   project a stable terminal identity into native-sdk's model-declared secondary
   window trees with the same chrome and lifecycle guarantees as the main window.
