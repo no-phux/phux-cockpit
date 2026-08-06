@@ -128,6 +128,7 @@ pub const Fx = app_types.Fx;
 
 pub const moveResponsesToOutbound = runtime.moveResponsesToOutbound;
 pub const update = update_module.update;
+pub const appShortcutKeyMask = update_module.appShortcutKeyMask;
 pub const remoteFocusTarget = update_module.remoteFocusTarget;
 
 pub const header_height = projection.header_height;
@@ -138,6 +139,8 @@ pub const split_divider_width = projection.split_divider_width;
 pub const split_pane_min_width = projection.split_pane_min_width;
 pub const split_pane_min_height = projection.split_pane_min_height;
 pub const webkit_parking_extent = projection.webkit_parking_extent;
+pub const search_bar_height = projection.search_bar_height;
+pub const searchRevealed = projection.searchRevealed;
 pub const chrome_command_envelope = projection.chrome_command_envelope;
 pub const cockpitTokens = projection.cockpitTokens;
 pub const terminalTokens = projection.terminalTokens;
@@ -187,6 +190,9 @@ pub const CockpitHost = host.CockpitHost;
 
 pub const selection_autoscroll_timer_id = app_types.selection_autoscroll_timer_id;
 const terminal_font_id = scene.terminal_font_id;
+const terminal_bold_font_id = scene.terminal_bold_font_id;
+const terminal_italic_font_id = scene.terminal_italic_font_id;
+const terminal_bold_italic_font_id = scene.terminal_bold_italic_font_id;
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view };
 
 pub fn appOptions() TerminalApp.Options {
@@ -489,15 +495,42 @@ test "tab placement configuration accepts only documented values" {
     try std.testing.expectEqual(@as(?TabPlacement, null), tabPlacementFromText("left"));
 }
 
-test "the terminal face is bundled and selected by the design tokens" {
+test "the terminal family is bundled whole and selected by the design tokens" {
     const options = appOptions();
-    try std.testing.expectEqual(@as(usize, 1), options.fonts.len);
-    try std.testing.expectEqual(terminal_font_id, options.fonts[0].id);
-    try std.testing.expectEqualStrings("JetBrainsMonoNL Nerd Font Mono Regular", options.fonts[0].name);
-    try std.testing.expect(options.fonts[0].ttf.len > 4);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, options.fonts[0].ttf[0..4]);
+    // Four faces, not one: SGR bold and italic select a real face now, and a
+    // missing companion silently downgrades to synthesis rather than failing,
+    // so the count is worth asserting.
+    try std.testing.expectEqual(@as(usize, 4), options.fonts.len);
+    const expected = [_]struct { id: @TypeOf(terminal_font_id), name: []const u8 }{
+        .{ .id = terminal_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Regular" },
+        .{ .id = terminal_bold_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Bold" },
+        .{ .id = terminal_italic_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Italic" },
+        .{ .id = terminal_bold_italic_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Bold Italic" },
+    };
+    for (expected, 0..) |want, index| {
+        try std.testing.expectEqual(want.id, options.fonts[index].id);
+        try std.testing.expectEqualStrings(want.name, options.fonts[index].name);
+        // Every one is a real TrueType file, not an empty embed that would
+        // register and then render nothing.
+        try std.testing.expect(options.fonts[index].ttf.len > 4);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, options.fonts[index].ttf[0..4]);
+    }
+    // Ids must be distinct, or a later registration overwrites an earlier one
+    // and a whole weight vanishes.
+    for (expected, 0..) |a, i| {
+        for (expected, 0..) |b, j| {
+            if (i != j) try std.testing.expect(a.id != b.id);
+        }
+    }
+
     var unused_model: Model = undefined;
-    try std.testing.expectEqual(terminal_font_id, cockpitTokens(&unused_model).typography.mono_font_id);
+    const chrome = cockpitTokens(&unused_model);
+    try std.testing.expectEqual(terminal_font_id, chrome.typography.mono_font_id);
+    // The grid's tokens are what name the companions; a carried bold flag
+    // paints as bold only because these are set.
+    try std.testing.expectEqual(terminal_bold_font_id, chrome.typography.mono_bold_font_id);
+    try std.testing.expectEqual(terminal_italic_font_id, chrome.typography.mono_italic_font_id);
+    try std.testing.expectEqual(terminal_bold_italic_font_id, chrome.typography.mono_bold_italic_font_id);
 }
 
 test "AppKit pointer buttons map to provider mouse buttons" {
@@ -533,4 +566,5 @@ test {
     _ = @import("tests/shell_identity_tests.zig");
     _ = @import("tests/config_wiring_tests.zig");
     _ = @import("tests/tab_strip_tests.zig");
+    _ = @import("tests/scrollback_search_tests.zig");
 }

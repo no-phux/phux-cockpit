@@ -57,6 +57,52 @@ const snapshot_text_overflow_cluster = " " ** (canvas.max_display_list_text_byte
 /// than failing and leaving the pane titleless.
 pub const max_title_bytes: usize = 256;
 
+/// Scrollback-search needle ceiling. A needle is a phrase, not a document:
+/// 128 bytes holds any real one and keeps the whole search state inline on
+/// the session rather than adding another heap allocation per terminal.
+pub const max_search_needle_bytes: usize = 128;
+
+/// The tags handed to `RenderState.updateHighlightsFlattened`. Their VALUES
+/// are opaque to the emulator — these two are this projection's own
+/// vocabulary — but the ORDER they are applied in is load-bearing: the cell
+/// loop takes the FIRST range covering a cell, so the current match must be
+/// pushed before the full match list or a cell that is both would paint as
+/// merely a match. See `applySearchHighlights`.
+pub const search_current_tag: u8 = 1;
+pub const search_match_tag: u8 = 2;
+
+/// One terminal's scrollback search.
+///
+/// It lives on the SESSION, not on the model, for two reasons. The engine
+/// holds pins and page pointers into THIS emulator's `PageList`, so a search
+/// that outlived its screen would be reading freed pages; and per-session
+/// storage is what makes search state terminal-local BY CONSTRUCTION rather
+/// than by a lookup a new tab or pane could get wrong.
+pub const Search = struct {
+    /// The field is showing. Independent of whether anything is typed —
+    /// cmd+F opens it empty, and an empty field is not a failed search.
+    open: bool = false,
+    needle_buf: [max_search_needle_bytes]u8 = undefined,
+    needle_len: usize = 0,
+    /// The live engine, rebuilt whenever the needle changes. Null while the
+    /// needle is empty: libghostty's own sliding window treats an empty
+    /// needle as an inactive search, and "no search" must not read as "no
+    /// matches".
+    engine: ?vt.search.Screen = null,
+    /// Which SCREEN the engine pinned into. An application entering or
+    /// leaving the alternate screen swaps `screens.active` and can DESTROY
+    /// the screen it left, taking that screen's pin pool with it — so the
+    /// engine has to be rebuilt, and torn down through the teardown the
+    /// screen's state actually allows (see `discardSearchEngine`).
+    screen_key: vt.ScreenSet.Key = .primary,
+    screen_generation: usize = 0,
+    /// Where the viewport was when the field opened. Escape puts it back.
+    restore_row: usize = 0,
+    /// ...and whether that was the LIVE bottom, which is not the same
+    /// absolute row once output has arrived underneath the search.
+    restore_bottom: bool = true,
+};
+
 /// One live emulator session. Heap-owned by the app (the model holds a
 /// pointer): the emulator allocates internally and its state is derived
 /// entirely from journaled inputs — fed pty bytes, resizes, and
@@ -139,6 +185,8 @@ pub const Session = struct {
     /// session makes no noise and has no timer — the app reads it to mark a
     /// tab as wanting attention and clears it when the user looks.
     bell_rung: bool = false,
+    /// This terminal's scrollback search. See `Search`.
+    search: Search = .{},
 
     pub const CellPos = struct { x: u16 = 0, y: u16 = 0 };
 
@@ -256,6 +304,9 @@ pub const Session = struct {
         session.term.colors.cursor.default = themeRgb(tokens.colors.accent);
 
         try session.render.update(session.gpa, &session.term);
+        // AFTER the render update (which rebuilds — and so clears — the rows
+        // it touched) and BEFORE the cell loop reads them.
+        session.applySearchHighlights();
         const rs = &session.render;
         const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
 
@@ -345,6 +396,25 @@ pub const Session = struct {
                     // SGR attribute means: the GLYPH is hidden, the line
                     // through the cell is not.
                     if (style.flags.invisible) cp = 0;
+                }
+
+                // A search wash overrides the cell's own colors. It lands
+                // HERE, on `TerminalCell.bg`, rather than on
+                // `TerminalRow.selection`, because that field carries ONE
+                // range per row: a row routinely holds several matches, and
+                // may also be selected, and one range cannot say both.
+                //
+                // The ranges libghostty flattens are INCLUSIVE at both ends,
+                // and the FIRST entry covering a cell wins — the current
+                // match was pushed first (see `applySearchHighlights`), so a
+                // cell that is both "a match" and "the match" paints as the
+                // latter.
+                for (row.highlights.items) |hl| {
+                    if (x < hl.range[0] or x > hl.range[1]) continue;
+                    const current = hl.tag == search_current_tag;
+                    projected.bg = if (current) palette.search_current else palette.search_match;
+                    projected.fg = if (current) palette.search_current_text else palette.search_match_text;
+                    break;
                 }
 
                 // A box-drawing cell carries no cluster: the painter
@@ -503,6 +573,11 @@ pub const Session = struct {
 
     pub fn destroy(session: *Session) void {
         const gpa = session.gpa;
+        // BEFORE the terminal: the engine untracks pins in the screen's own
+        // pool, which `term.deinit` is about to free. This is also what makes
+        // closing a terminal (or a whole tab) with its search field open
+        // leave nothing behind — there is no separate teardown to forget.
+        session.discardSearchEngine();
         session.pointer_selection.deinit(&session.term);
         session.render.deinit(gpa);
         session.stream.deinit();
@@ -534,6 +609,11 @@ pub const Session = struct {
     /// mode would misencode the new shell's keys or misparse its first
     /// output as a continuation of the old stream.
     pub fn reset(session: *Session) void {
+        // The engine pins into pages `fullReset` is about to free, and a
+        // restarted shell inherits none of the previous one's scrollback —
+        // so there is nothing for a surviving search to be a search OF.
+        session.discardSearchEngine();
+        session.search = .{};
         session.pointer_selection.reset(&session.term);
         session.term.fullReset();
         // `fullReset` (a RIS) leaves the OSC color state alone, so clear
@@ -781,6 +861,12 @@ pub const Session = struct {
             session.select_anchor = session.select_head;
             session.applySelection();
         }
+        // Reflow can replace every page node the search flattened its results
+        // over. `ScreenSearch` re-inits itself on `select`/`feed`, but the
+        // PROJECTION reads those results every frame and nothing calls either
+        // between a resize and the next paint — so the search is rebuilt here,
+        // against the screen that now exists.
+        if (session.search.open) session.searchRefresh();
         return true;
     }
 
@@ -808,6 +894,21 @@ pub const Session = struct {
         session.scrollTracked(.{ .top = {} });
     }
 
+    /// Put `pin`'s row at the top of the viewport. The other wrappers only
+    /// expose `.active`/`.top`/`.delta_row`, and scroll-into-view needs an
+    /// ABSOLUTE destination that survives the viewport moving under it.
+    /// Routed through `scrollTracked` like every other scroll so the cached
+    /// screen text is invalidated with the move.
+    pub fn scrollToPin(session: *Session, pin: vt.Pin) void {
+        session.scrollTracked(.{ .pin = pin });
+    }
+
+    /// Put the viewport back on the absolute row `offset` — the coordinate
+    /// `scrollbar().offset` reports, so a saved offset restores exactly.
+    pub fn scrollToRow(session: *Session, offset: usize) void {
+        session.scrollTracked(.{ .row = offset });
+    }
+
     /// Every scroll goes through here: a scroll that actually MOVED the
     /// viewport changes what the screen shows, so the cached semantic
     /// text is invalidated with it — scrollback browsing must read (to
@@ -825,6 +926,198 @@ pub const Session = struct {
     /// screen) plus the total row count, for the scroll indicator.
     pub fn scrollbar(session: *Session) vt.PageList.Scrollbar {
         return session.term.screens.active.pages.scrollbar();
+    }
+
+    // ---------------------------------------------- scrollback search
+
+    /// Open the search field. Remembers where the viewport was so Escape can
+    /// put it back.
+    pub fn searchOpen(session: *Session) void {
+        if (session.search.open) return;
+        const bar = session.scrollbar();
+        // The ROW alone is not enough: a viewport pinned to the live bottom
+        // sits at a row that OUTPUT moves, so "put it back" means "back to
+        // the bottom" there and "back to that row" everywhere else.
+        session.search.restore_bottom = bar.offset + bar.len >= bar.total;
+        session.search.restore_row = bar.offset;
+        session.search.open = true;
+    }
+
+    /// Dismiss the field, drop the engine, and restore the pre-search
+    /// viewport. The washes go with it: `applySearchHighlights` clears every
+    /// row before it decides whether to apply anything.
+    pub fn searchClose(session: *Session) void {
+        if (!session.search.open) return;
+        session.search.open = false;
+        session.search.needle_len = 0;
+        session.discardSearchEngine();
+        if (session.search.restore_bottom) {
+            session.scrollToBottom();
+        } else {
+            session.scrollToRow(session.search.restore_row);
+        }
+    }
+
+    pub fn searchNeedle(session: *const Session) []const u8 {
+        return session.search.needle_buf[0..session.search.needle_len];
+    }
+
+    /// Append committed text to the needle and re-run the search. False means
+    /// the needle did not change — a press at the ceiling is a no-op, never a
+    /// silent truncation that would search for a different phrase than the
+    /// one on screen.
+    pub fn searchInput(session: *Session, text: []const u8) bool {
+        if (!session.search.open or text.len == 0) return false;
+        // Control bytes are not part of a phrase, and one that landed in the
+        // needle would search for something the user cannot see they typed.
+        for (text) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+        if (session.search.needle_len + text.len > session.search.needle_buf.len) return false;
+        @memcpy(session.search.needle_buf[session.search.needle_len..][0..text.len], text);
+        session.search.needle_len += text.len;
+        session.searchRefresh();
+        return true;
+    }
+
+    /// Delete the last SCALAR of the needle. Cutting a single byte off a
+    /// multi-byte character leaves an invalid needle that matches nothing and
+    /// paints as replacement junk.
+    pub fn searchBackspace(session: *Session) bool {
+        if (!session.search.open or session.search.needle_len == 0) return false;
+        var end = session.search.needle_len - 1;
+        while (end > 0 and session.search.needle_buf[end] & 0xC0 == 0x80) end -= 1;
+        session.search.needle_len = end;
+        session.searchRefresh();
+        return true;
+    }
+
+    /// Step to the next (`forward`) or previous match and bring it on screen.
+    /// False means there was nothing to step to — which the chrome says out
+    /// loud rather than swallowing.
+    pub fn searchStep(session: *Session, forward: bool) bool {
+        if (!session.search.open) return false;
+        if (session.searchScreenStale()) session.searchRefresh();
+        const engine = if (session.search.engine) |*value| value else return false;
+        const moved = engine.select(if (forward) .next else .prev) catch return false;
+        if (!moved) return false;
+        session.revealCurrentMatch();
+        return true;
+    }
+
+    /// Matches found for the current needle. Zero with a NON-EMPTY needle is
+    /// the honest "nothing here"; zero with an empty one only means nothing
+    /// has been asked yet.
+    pub fn searchMatchCount(session: *const Session) usize {
+        const engine = if (session.search.engine) |*value| value else return 0;
+        return engine.matchesLen();
+    }
+
+    /// The current match's position in READING order (1 = the oldest match
+    /// found), or 0 when none is selected. The engine indexes from the
+    /// NEWEST match, which is the right order to step in and the wrong one to
+    /// show a person.
+    pub fn searchMatchOrdinal(session: *const Session) usize {
+        const engine = if (session.search.engine) |*value| value else return 0;
+        const selected = engine.selected orelse return 0;
+        const total = engine.matchesLen();
+        if (selected.idx >= total) return 0;
+        return total - selected.idx;
+    }
+
+    /// Rebuild the engine for the current needle and land on a match.
+    fn searchRefresh(session: *Session) void {
+        session.discardSearchEngine();
+        const needle = session.searchNeedle();
+        if (needle.len == 0) return;
+        const screens = &session.term.screens;
+        session.search.engine = vt.search.Screen.init(session.gpa, screens.active, needle) catch return;
+        // Recorded BEFORE the search runs, so a teardown on the failure path
+        // below already knows which screen the pins belong to.
+        session.search.screen_key = screens.active_key;
+        session.search.screen_generation = screens.generation(screens.active_key);
+        // `vt.search.Thread` is `void` in a libghostty-vt built as a LIBRARY
+        // (`GhosttyZig.zig` pins `artifact = .lib`), so there is no background
+        // searcher to hand this to: the whole scrollback is walked here, on
+        // the dispatch thread, in exactly the tick/feed loop `searchAll` runs.
+        // See the handoff note about a deep scrollback.
+        session.search.engine.?.searchAll() catch {
+            session.discardSearchEngine();
+            return;
+        };
+        // Land on a match immediately. A needle that has already typed itself
+        // into a hit should show that hit, not wait for a separate Enter.
+        _ = session.search.engine.?.select(.next) catch {};
+        session.revealCurrentMatch();
+    }
+
+    /// Push the live matches into the render state's per-row highlight lists.
+    ///
+    /// Clear-then-apply, in ghostty's own order (`renderer/generic.zig`
+    /// ~1306): `updateHighlightsFlattened` APPENDS and never clears, and the
+    /// current match goes in FIRST because the cell loop takes the first
+    /// range covering a cell.
+    fn applySearchHighlights(session: *Session) void {
+        const row_data = session.render.row_data.slice();
+        for (row_data.items(.highlights), row_data.items(.dirty)) |*hls, *dirty| {
+            if (hls.items.len == 0) continue;
+            hls.clearRetainingCapacity();
+            // The renderer's own "this row changed" flag. Nothing on this
+            // path reads it (the projection is rebuilt whole every frame),
+            // but leaving a row whose washes just vanished marked CLEAN would
+            // be a lie to any consumer that does.
+            dirty.* = true;
+        }
+        if (!session.search.open or session.searchScreenStale()) return;
+        const engine = if (session.search.engine) |*value| value else return;
+        if (engine.selectedMatch()) |current| {
+            session.render.updateHighlightsFlattened(
+                session.gpa,
+                search_current_tag,
+                &.{current},
+            ) catch {};
+        }
+        // The SLICE is caller-owned; the highlights inside it stay owned by
+        // the search, so only the slice is freed here.
+        const all = engine.matches(session.gpa) catch return;
+        defer session.gpa.free(all);
+        session.render.updateHighlightsFlattened(session.gpa, search_match_tag, all) catch {};
+    }
+
+    /// Bring the current match on screen, and ONLY when it is not already
+    /// there: stepping between two matches inside one viewport must not jump
+    /// the text out from under the reader.
+    fn revealCurrentMatch(session: *Session) void {
+        const engine = if (session.search.engine) |*value| value else return;
+        const match = engine.selectedMatch() orelse return;
+        const screen = session.term.screens.active;
+        const start = match.startPin();
+        if (screen.pages.pointFromPin(.viewport, start) != null) return;
+        session.scrollToPin(start);
+    }
+
+    /// Tear the engine down with the teardown the SCREEN's state allows.
+    /// `deinit` untracks pins in that screen's PageList pool; once the screen
+    /// itself is gone — an application leaving the alternate screen frees it
+    /// — the pool went with it and only `deinitScreenInvalid` is safe.
+    fn discardSearchEngine(session: *Session) void {
+        const engine = if (session.search.engine) |*value| value else return;
+        if (session.searchScreenAlive()) engine.deinit() else engine.deinitScreenInvalid();
+        session.search.engine = null;
+    }
+
+    /// Whether the screen the engine pinned into still exists, unreplaced.
+    fn searchScreenAlive(session: *const Session) bool {
+        const screens = &session.term.screens;
+        if (screens.get(session.search.screen_key) == null) return false;
+        return screens.generation(session.search.screen_key) == session.search.screen_generation;
+    }
+
+    /// Whether the engine no longer describes the screen being PAINTED —
+    /// an application swapped to (or back from) the alternate screen under it.
+    fn searchScreenStale(session: *const Session) bool {
+        if (session.search.engine == null) return true;
+        const screens = &session.term.screens;
+        return screens.active_key != session.search.screen_key or
+            screens.generation(screens.active_key) != session.search.screen_generation;
     }
 
     // ---------------------------------------------------- selection

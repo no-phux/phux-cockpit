@@ -43,9 +43,16 @@
         //
         // The per-view command ceiling also went back 4096 -> 2048: terminals
         // were the only reason it was raised, and one now costs ~100 commands.
+        // A cell grid also carries a font FAMILY — regular plus bold, italic,
+        // and bold-italic ids — and both renderers select per cell off the
+        // style flags, so one row mixes weights. Where a companion face is not
+        // registered the renderers synthesize identically from one shared rule
+        // (faux bold double-strikes, faux italic shears about the baseline),
+        // because a bold run that renders bold on the reference path and plain
+        // on the host is worse than no bold at all.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/f7347de1c607dcbe4e4f06dddd172fcf3f9d0507.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQtoO4QE1WNhiIIVID3lmSyf_UzEs5QAt_cH1PjXR",
+            .url = "https://github.com/phall1/native/archive/e1f3921d5af5694cf899de0b618b9ca7860f00d6.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQhN44QFQMfH1uNbXuMMX0WZTaPXuTl1h2y77LiF7",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

@@ -350,6 +350,14 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             if (!model.focused or model.selectedTerminalRef() == null or event.text.len == 0) return;
             const terminal_ref = model.focusedTerminalRef() orelse return;
             if (model.provider.terminal(terminal_ref)) |pane| {
+                // An open search field is where committed text GOES. This is
+                // the other half of the modal gate in `handleKey`: printable
+                // presses never reach that function, so the field would be
+                // untypeable and the shell would receive the needle instead.
+                if (pane.session.search.open) {
+                    _ = pane.session.searchInput(event.text);
+                    return;
+                }
                 if (pane.selecting or !pane.acceptsInput()) return;
                 if (pane.session.selectionActive()) pane.session.clearSelection();
                 pane.session.scrollToBottom();
@@ -610,6 +618,25 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .font_size_reset => _ = model.resetFontSize(),
         .select_all => selectAllVisible(model),
         .clear_terminal => clearFocusedTerminal(model, fx),
+        .search_open => {
+            const pane = focusedLocalPane(model) orelse return;
+            // Keyboard selection and the search field both want Escape and
+            // both want the keyboard. Only one of them can have either, and
+            // the one the user just asked for wins.
+            if (pane.selecting) {
+                pane.selecting = false;
+                pane.session.clearSelection();
+            }
+            pane.session.searchOpen();
+        },
+        .search_close => {
+            const pane = focusedLocalPane(model) orelse return;
+            pane.session.searchClose();
+        },
+        .search_step => |delta| {
+            const pane = focusedLocalPane(model) orelse return;
+            _ = pane.session.searchStep(delta >= 0);
+        },
         .close_tab => |index| closeTab(model, fx, index),
         .hover_tab => |index| model.hovered_tab = index,
         .unhover_tab => model.hovered_tab = model_module.no_hovered_tab,
@@ -704,6 +731,19 @@ fn closeTab(model: *Model, fx: *Fx, index: u8) void {
         if (providerKind(id) != .local) continue;
         closePaneForTerminal(model, fx, id, true);
     }
+}
+
+/// The focused terminal's LOCAL pane, or null when focus is on the web
+/// surface, on a remote terminal, or on nothing.
+///
+/// Scrollback search is local-only: `vt.search.Screen` matches
+/// case-INSENSITIVELY with no option to change it, while the phux provider's
+/// own `search` takes a `case_sensitive` flag — so one chord driving both
+/// would mean one visible control with two different matching rules. See the
+/// handoff note.
+fn focusedLocalPane(model: *Model) ?*Pane {
+    const terminal_ref = model.selectedTerminalRef() orelse return null;
+    return model.provider.terminal(terminal_ref);
 }
 
 /// cmd+A: cover the visible screen with a selection the next cmd+C can copy.
@@ -1049,6 +1089,21 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         updateModel(model, .new_terminal, fx);
         return;
     }
+    // cmd+F opens scrollback search over the focused terminal; cmd+G and
+    // cmd+shift+G step it. Both live with the GLOBAL chords rather than down
+    // in the terminal block, because the shortcut latch keys on the physical
+    // key regardless of which channel delivered the press — and because the
+    // arms themselves already no-op when there is no local terminal focused.
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "f")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .search_open, fx);
+        return;
+    }
+    if (primary and !mods.alt and !mods.control and keyIs(event.key, "g")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .{ .search_step = if (mods.shift) -1 else 1 }, fx);
+        return;
+    }
     if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "w")) {
         if (!selectedTerminalCanClose(model)) return;
         latchAppShortcut(model, event.key);
@@ -1098,6 +1153,18 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // Keyboard input belongs to the active terminal tab.
     const pane = model.provider.terminal(terminal_ref) orelse return;
     const session = pane.session;
+    // The search field is MODAL over the terminal. While it is open every
+    // key from here down belongs to it — including the ones that would
+    // otherwise scroll, select, copy, or reach the child. This is the whole
+    // "typing into the field must not reach the shell" contract, stated once
+    // as a single early return rather than as a condition repeated on the
+    // dozen chords below (which is exactly how that bug gets reintroduced).
+    // Everything ABOVE this line is window chrome — tabs, splits, font size,
+    // the web surface — and stays live, the way a real search bar does.
+    if (session.search.open) {
+        handleSearchKey(model, fx, pane, event);
+        return;
+    }
     // scrollback, restart.
     //
     if (primary and mods.shift and keyIs(event.key, "space")) {
@@ -1217,6 +1284,32 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     encodeKeyEvent(pane, fx, event, .press);
 }
 
+/// Every key press that reaches an OPEN search field.
+///
+/// Three of them do something and the rest are SWALLOWED, which is the point:
+/// a key with no meaning here is not a key that should fall through to the
+/// child. Printable presses do not arrive here at all — they come through the
+/// text channel (see the `.text` arm) and are appended to the needle there.
+fn handleSearchKey(model: *Model, fx: *Fx, pane: *Pane, event: canvas.WidgetKeyboardEvent) void {
+    if (keyIs(event.key, "escape")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .search_close, fx);
+        return;
+    }
+    if (keyIs(event.key, "enter")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .{ .search_step = if (event.modifiers.shift) -1 else 1 }, fx);
+        return;
+    }
+    if (keyIs(event.key, "backspace")) {
+        // No latch: backspace has no shortcut mask (the u32 latch is full).
+        // Its RELEASE is stopped by the search gate in `dispatchKeyEvent`,
+        // which is the single funnel every release goes through anyway.
+        _ = pane.session.searchBackspace();
+        return;
+    }
+}
+
 fn providerModifiers(event: canvas.WidgetKeyboardEvent) ModifierMask {
     return .{
         .shift = event.modifiers.shift,
@@ -1266,7 +1359,10 @@ fn dispatchKeyEvent(
 ) void {
     if (!model.ownerIsCurrent(owner)) return;
     if (model.provider.terminal(owner.terminal_ref)) |pane| {
-        if (pane.selecting or !pane.acceptsInput()) return;
+        // The search field owns the keyboard, RELEASES included: a child
+        // running the kitty protocol would otherwise hear the release of
+        // every key typed into the field.
+        if (pane.selecting or pane.session.search.open or !pane.acceptsInput()) return;
         encodeKeyEvent(pane, fx, event, action);
         return;
     }
@@ -1511,7 +1607,18 @@ pub fn appShortcutKeyMask(key: []const u8) u32 {
     if (keyIs(key, "b")) return 1 << 27;
     if (keyIs(key, "pageup")) return 1 << 28;
     if (keyIs(key, "pagedown")) return 1 << 29;
+    if (keyIs(key, "f")) return 1 << 30;
+    if (keyIs(key, "g")) return 1 << 31;
     return 0;
+}
+
+comptime {
+    // The latch is a u32 and every bit is now spoken for. The next chord that
+    // needs one has to widen `consumed_shortcut_keys_held`,
+    // `global_shortcut_keys_held`, and `suppressed_canvas_shortcuts` together
+    // — they are three views of the same mask, and widening one alone would
+    // silently drop the top bits of the other two.
+    std.debug.assert(@bitSizeOf(@TypeOf(appShortcutKeyMask("f"))) == 32);
 }
 
 pub fn commandShortcutKeyMask(name: []const u8) u32 {

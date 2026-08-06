@@ -47,6 +47,12 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "terminal.copy", .key = "c", .modifiers = .{ .primary = true } },
     .{ .id = "terminal.paste", .key = "v", .modifiers = .{ .primary = true } },
     .{ .id = "terminal.clear", .key = "k", .modifiers = .{ .primary = true } },
+    // Scrollback search: the cmd+F / cmd+G / cmd+shift+G trio every macOS
+    // app shares. Registered globally so the platform does not beep at a
+    // chord the app answers, and so the menu items below have equivalents.
+    .{ .id = "terminal.find", .key = "f", .modifiers = .{ .primary = true } },
+    .{ .id = "terminal.find-next", .key = "g", .modifiers = .{ .primary = true } },
+    .{ .id = "terminal.find-previous", .key = "g", .modifiers = .{ .primary = true, .shift = true } },
     // `=` is the physical key; the platform reports the chord as cmd+`=`
     // whether or not shift is down, so ONE registration covers cmd+= and
     // cmd++.
@@ -87,6 +93,10 @@ const edit_menu_items = [_]native_sdk.MenuItem{
     .{ .separator = true },
     .{ .label = "Select All", .command = "terminal.select-all", .key = "a", .modifiers = .{ .primary = true } },
     .{ .label = "Clear", .command = "terminal.clear", .key = "k", .modifiers = .{ .primary = true } },
+    .{ .separator = true },
+    .{ .label = "Find", .command = "terminal.find", .key = "f", .modifiers = .{ .primary = true } },
+    .{ .label = "Find Next", .command = "terminal.find-next", .key = "g", .modifiers = .{ .primary = true } },
+    .{ .label = "Find Previous", .command = "terminal.find-previous", .key = "g", .modifiers = .{ .primary = true, .shift = true } },
 };
 
 const view_menu_items = [_]native_sdk.MenuItem{
@@ -144,8 +154,39 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
 pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
 pub const terminal_font_id: canvas.FontId = canvas.min_registered_font_id;
-pub const cockpit_fonts = [_]TerminalApp.FontRegistration{.{
-    .id = terminal_font_id,
-    .name = "JetBrainsMonoNL Nerd Font Mono Regular",
-    .ttf = @embedFile("../../fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf"),
-}};
+/// The weighted companions. SGR bold and italic reach every cell and every
+/// renderer, but a glyph cannot change weight without a face to change to —
+/// without these the SDK falls back to synthesis (double-strike and shear),
+/// which is a fallback, not a typeface.
+///
+/// Deliberately the Nerd Font Mono variants matching the regular above, and
+/// not the plain `JetBrainsMonoNL-*` weights that ship inside the SDK's own
+/// font package. Those carry no patched glyphs, so a bold prompt would lose
+/// its powerline separators and devicons while a regular one kept them — a
+/// difference that shows up only in somebody's actual shell.
+pub const terminal_bold_font_id: canvas.FontId = terminal_font_id + 1;
+pub const terminal_italic_font_id: canvas.FontId = terminal_font_id + 2;
+pub const terminal_bold_italic_font_id: canvas.FontId = terminal_font_id + 3;
+
+pub const cockpit_fonts = [_]TerminalApp.FontRegistration{
+    .{
+        .id = terminal_font_id,
+        .name = "JetBrainsMonoNL Nerd Font Mono Regular",
+        .ttf = @embedFile("../../fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf"),
+    },
+    .{
+        .id = terminal_bold_font_id,
+        .name = "JetBrainsMonoNL Nerd Font Mono Bold",
+        .ttf = @embedFile("../../fonts/JetBrainsMonoNLNerdFontMono-Bold.ttf"),
+    },
+    .{
+        .id = terminal_italic_font_id,
+        .name = "JetBrainsMonoNL Nerd Font Mono Italic",
+        .ttf = @embedFile("../../fonts/JetBrainsMonoNLNerdFontMono-Italic.ttf"),
+    },
+    .{
+        .id = terminal_bold_italic_font_id,
+        .name = "JetBrainsMonoNL Nerd Font Mono Bold Italic",
+        .ttf = @embedFile("../../fonts/JetBrainsMonoNLNerdFontMono-BoldItalic.ttf"),
+    },
+};

@@ -170,6 +170,35 @@ test "ADVERSARIAL: scrollback search and selection remain terminal-local" {
     model.provider.slots[0].session.clearSelection();
     try testing.expect(!model.provider.slots[0].session.selectionActive());
     try testing.expect(!model.provider.slots[1].session.selectionActive());
+
+    // The probes above drive `vt.search.Active` by hand against each
+    // emulator, which proves the SCREENS are separate but says nothing about
+    // the product feature. Now that cmd+F exists, the same claim has to hold
+    // for the search STATE a terminal carries: an open field, its needle, its
+    // match set, and its current match are per terminal, and none of them
+    // follow focus to the neighbour.
+    const alpha_session = model.provider.slots[0].session;
+    const bravo_session = model.provider.slots[1].session;
+    alpha_session.searchOpen();
+    try testing.expect(alpha_session.searchInput("ONLY_ALPHA_NEEDLE"));
+    try testing.expect(alpha_session.searchMatchCount() > 0);
+    try testing.expect(alpha_session.searchMatchOrdinal() > 0);
+    try testing.expect(!bravo_session.search.open);
+    try testing.expectEqualStrings("", bravo_session.searchNeedle());
+    try testing.expectEqual(@as(usize, 0), bravo_session.searchMatchCount());
+
+    // The neighbour searching for the SAME needle finds nothing, and finding
+    // nothing does not disturb the terminal that did find something.
+    bravo_session.searchOpen();
+    try testing.expect(bravo_session.searchInput("ONLY_ALPHA_NEEDLE"));
+    try testing.expectEqual(@as(usize, 0), bravo_session.searchMatchCount());
+    try testing.expect(alpha_session.searchMatchCount() > 0);
+
+    // Closing one field closes exactly one.
+    bravo_session.searchClose();
+    try testing.expect(!bravo_session.search.open);
+    try testing.expect(alpha_session.search.open);
+    try testing.expectEqualStrings("ONLY_ALPHA_NEEDLE", alpha_session.searchNeedle());
 }
 
 test "ADVERSARIAL: a hard reset of pane 0 does not reset pane 1" {

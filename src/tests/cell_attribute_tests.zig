@@ -62,6 +62,59 @@ test "bold reaches the cell as a flag" {
     try testing.expect(!(try flagsAt(view, "tail")).bold);
 }
 
+test "a weighted row occupies exactly the same cells as a plain one" {
+    // The grid is a LATTICE: every column is one cell wide and every row
+    // one cell tall, whatever ink lands in them. That has to survive the
+    // renderer growing a weight axis — a bold face has different advances
+    // than the regular one, and a projection or a painter that let the
+    // face influence the cell box would shear a bold prompt out of
+    // alignment with the output under it, move every mouse report, and
+    // desynchronize the PTY column count from what is on the glass.
+    //
+    // Written against the CURRENT renderer, which synthesizes weight
+    // rather than selecting a face, precisely so it is already standing
+    // when real bold/italic faces are registered. See the handoff note.
+    const session = try createSession(30, 4);
+    defer session.destroy();
+    session.feed("REG abcdefgh\r\n");
+    session.feed("\x1b[1mBLD\x1b[22m \x1b[3mabcdefgh\x1b[23m\r\n");
+
+    var commands: [512]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    const view = try paintGrid(session, &builder);
+
+    // Same columns: the two rows carry the same text after a prefix of the
+    // same LENGTH, so a face-dependent advance shows up as a different
+    // column.
+    const plain_x = view.findInRow(0, "abcdefgh") orelse return error.TestExpectedCell;
+    const weighted_x = view.findInRow(1, "abcdefgh") orelse return error.TestExpectedCell;
+    try testing.expectEqual(plain_x, weighted_x);
+    const bold_x = view.findInRow(1, "BLD") orelse return error.TestExpectedCell;
+    try testing.expect(view.style(bold_x, 1).?.bold);
+    try testing.expect(view.style(weighted_x, 1).?.italic);
+
+    // Same cell BOX, column by column, across the whole run.
+    var column: usize = 0;
+    while (column < "abcdefgh".len) : (column += 1) {
+        const plain_rect = view.cellRect(plain_x + column, 0);
+        const weighted_rect = view.cellRect(weighted_x + column, 1);
+        try testing.expectEqual(plain_rect.x, weighted_rect.x);
+        try testing.expectEqual(plain_rect.width, weighted_rect.width);
+        try testing.expectEqual(plain_rect.height, weighted_rect.height);
+    }
+
+    // Same BASELINE spacing: row 1 sits exactly one cell height below row
+    // 0, so a taller face cannot push the rows apart.
+    const first = view.cellRect(plain_x, 0);
+    const second = view.cellRect(weighted_x, 1);
+    try testing.expectEqual(first.height, second.y - first.y);
+
+    // ...and the session's own metrics, which the PTY sizing pump and the
+    // pointer hit test both derive from, are one number for the pane.
+    try testing.expectEqual(session.cell_width, first.width);
+    try testing.expectEqual(session.cell_height, first.height);
+}
+
 test "italic reaches the cell as a flag" {
     const session = try createSession(30, 4);
     defer session.destroy();

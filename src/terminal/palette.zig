@@ -39,6 +39,13 @@ pub const Palette = struct {
     foreground: canvas.Color,
     cursor: canvas.Color,
     selection: canvas.Color,
+    /// The wash under EVERY scrollback-search match, and the text color that
+    /// reads on it.
+    search_match: canvas.Color,
+    search_match_text: canvas.Color,
+    /// The wash under the ONE match the user is standing on.
+    search_current: canvas.Color,
+    search_current_text: canvas.Color,
     terminal: *const vt.RenderState.Colors,
     /// The emulator's live 256-color palette, overrides applied. Read directly
     /// (rather than mirrored into a local array) so OSC 4 lands the same frame.
@@ -48,11 +55,27 @@ pub const Palette = struct {
         const colors = tokens.colors;
         // Resolved render colors already include theme defaults, OSC overrides,
         // and DECSCNM reverse swap.
+        const background = rgbToColor(terminal_colors.background);
+        const foreground = rgbToColor(terminal_colors.foreground);
+        // Two search washes, and they are two different HUES rather than two
+        // intensities of one. A screen can hold dozens of matches, and the
+        // question the eye is actually asking is "where am I" — a brightness
+        // step alone does not answer that across a dense screen, while amber
+        // (the match convention every editor and browser shares) against the
+        // UI accent does. The match wash is pulled partway toward the
+        // terminal's own background so ordinary matches stay readable text
+        // rather than becoming a row of blocks.
+        const match = blend(colors.warning, background, 0.45);
+        const current = colors.accent;
         return .{
-            .background = rgbToColor(terminal_colors.background),
-            .foreground = rgbToColor(terminal_colors.foreground),
+            .background = background,
+            .foreground = foreground,
             .cursor = if (terminal_colors.cursor) |cur| rgbToColor(cur) else colors.accent,
             .selection = colors.accent,
+            .search_match = match,
+            .search_match_text = readableOver(match, foreground, background),
+            .search_current = current,
+            .search_current_text = readableOver(current, foreground, background),
             .terminal = terminal_colors,
             .dynamic = dynamic,
         };
@@ -139,6 +162,21 @@ pub fn cellBackground(cell: anytype, palette: *const Palette) ?canvas.Color {
         .palette => |index| palette.indexed(index),
         .rgb => |rgb| canvas.Color.rgb8(rgb.r, rgb.g, rgb.b),
     };
+}
+
+/// Rec. 601 perceived luminance. The cheap standard weighting, and enough
+/// for the one question asked of it below.
+fn luminance(color: canvas.Color) f32 {
+    return 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
+}
+
+/// Whichever of `a` or `b` reads on `wash`. The candidates are the
+/// TERMINAL's own foreground and background rather than black and white, so
+/// a configured light theme keeps its palette instead of having a hardcoded
+/// pair forced onto its search results.
+fn readableOver(wash: canvas.Color, a: canvas.Color, b: canvas.Color) canvas.Color {
+    const target = luminance(wash);
+    return if (@abs(luminance(a) - target) >= @abs(luminance(b) - target)) a else b;
 }
 
 fn blend(a: canvas.Color, b: canvas.Color, t: f32) canvas.Color {

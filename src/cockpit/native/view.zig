@@ -508,6 +508,119 @@ fn paneSubtree(ui: *TerminalUi, model: *const Model, node: layout.NodeId, rect: 
     }
 }
 
+/// What the field shows before anything is typed. Deliberately not "No
+/// matches": a field with nothing in it has not searched for anything yet,
+/// and reporting a failure the user did not cause is worse than saying
+/// nothing.
+const search_placeholder = "Search scrollback";
+
+/// The scrollback-search band for the focused terminal.
+///
+/// The needle is drawn rather than hosted in a text-entry widget on purpose.
+/// The app routes every canvas key itself (`update.handleKey`), and the one
+/// requirement that matters here is that a keystroke aimed at the field can
+/// never reach the child — which is a property of that routing, not of which
+/// widget happens to hold canvas focus. Drawing the field keeps the two in
+/// one place; the caret below is what tells the user the keyboard is here.
+fn searchBar(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignTokens) TerminalUi.Node {
+    const terminal_ref = model.selectedTerminalRef() orelse return emptyStatusNode(ui);
+    const pane = model.provider.terminalConst(terminal_ref) orelse return emptyStatusNode(ui);
+    const session = pane.session;
+    const needle = session.searchNeedle();
+    const total = session.searchMatchCount();
+    const empty = needle.len == 0;
+    const missing = !empty and total == 0;
+    const status = if (empty)
+        ""
+    else if (missing)
+        "No matches"
+    else
+        ui.fmt("{d} of {d}", .{ session.searchMatchOrdinal(), total });
+
+    const control_extent = projection.search_bar_height - 12;
+    return ui.row(.{
+        .height = projection.search_bar_height,
+        .gap = 8,
+        .cross = .center,
+        .padding = 6,
+        .style = .{ .background = tokens.colors.surface_subtle },
+        .semantics = .{
+            .label = ui.fmt("Scrollback search, {s}, {s}", .{
+                if (empty) "empty" else needle,
+                if (empty) "type to search" else status,
+            }),
+        },
+    }, .{
+        // Decorative, and deliberately NOT `semantics.hidden`: that flag
+        // suppresses RENDERING as well as the accessibility node
+        // (`widget_render.zig` returns early on it), so a "hidden from
+        // assistive tech" icon is simply an icon that never paints. It stays
+        // unnamed instead — the band's own label above already says
+        // everything a reader needs.
+        ui.icon(.{
+            .width = 14,
+            .height = 14,
+            .style = .{ .foreground = tokens.colors.text_muted },
+        }, "search"),
+        ui.row(.{ .grow = 1, .gap = 1, .cross = .center }, .{
+            ui.text(.{
+                .wrap = false,
+                .overflow = .ellipsis,
+                .style = .{ .foreground = if (empty) tokens.colors.text_muted else tokens.colors.text },
+            }, if (empty) search_placeholder else needle),
+            // The caret. The field has no widget focus to show, so this is
+            // the only thing on screen that says the keyboard is pointed at
+            // the search and not at the shell — which makes it worth more
+            // than a hairline. It is a BLOCK, matching the terminal's own
+            // cursor two rows below: a 2pt bar was invisible against the
+            // band at 1x, and an invisible focus cue is not one.
+            ui.el(.stack, .{
+                .width = 7,
+                .height = 16,
+                .style = .{ .background = tokens.colors.accent },
+            }, .{}),
+            ui.spacer(1),
+        }),
+        ui.text(.{
+            .wrap = false,
+            .style = .{ .foreground = if (missing) tokens.colors.warning else tokens.colors.text_muted },
+        }, status),
+        // Labelled by DIRECTION, not by "next"/"previous". The search lands
+        // on the newest match (that is where the user already is), so the
+        // useful step is backwards through the log — and a button that says
+        // "next" while the screen moves UP is a button that has to be
+        // learned. The menu keeps the platform's Find Next/Find Previous
+        // vocabulary over the same two messages.
+        ui.button(.{
+            .width = control_extent,
+            .height = control_extent,
+            .size = .icon,
+            .variant = .ghost,
+            .icon = "chevron-up",
+            .on_press = .{ .search_step = 1 },
+            .semantics = .{ .label = "Older match" },
+        }, ""),
+        ui.button(.{
+            .width = control_extent,
+            .height = control_extent,
+            .size = .icon,
+            .variant = .ghost,
+            .icon = "chevron-down",
+            .on_press = .{ .search_step = -1 },
+            .semantics = .{ .label = "Newer match" },
+        }, ""),
+        ui.button(.{
+            .width = control_extent,
+            .height = control_extent,
+            .size = .icon,
+            .variant = .ghost,
+            .icon = "x",
+            .on_press = .search_close,
+            .semantics = .{ .label = "Close search" },
+        }, ""),
+    });
+}
+
 fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     return ui.panel(.{
         .width = webkit_parking_extent,
@@ -600,10 +713,18 @@ pub fn view(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     else
         ui.el(.stack, .{ .width = 0, .semantics = .{ .hidden = true } }, .{});
 
-    const workspace = if (revealed and model.tab_placement == .side)
-        ui.row(.{ .grow = 1, .gap = side_rail_gap }, .{ side_rail, content })
+    // The search band sits above the content in BOTH placements, and the
+    // wrapper only exists while a search does: an unconditional column would
+    // change the widget tree of every frame that has no search in it.
+    const body = if (projection.searchRevealed(model))
+        ui.column(.{ .grow = 1 }, .{ searchBar(ui, model, tokens), content })
     else
-        ui.column(.{ .grow = 1 }, .{ top_header, content });
+        content;
+
+    const workspace = if (revealed and model.tab_placement == .side)
+        ui.row(.{ .grow = 1, .gap = side_rail_gap }, .{ side_rail, body })
+    else
+        ui.column(.{ .grow = 1 }, .{ top_header, body });
 
     // The hidden-inset titlebar band. It carries `window_drag` UNCONDITIONALLY,
     // because it is the only element that can: the SDK has no
@@ -881,6 +1002,9 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "terminal.paste")) return .paste_focused;
     if (std.mem.eql(u8, name, "terminal.select-all")) return .select_all;
     if (std.mem.eql(u8, name, "terminal.clear")) return .clear_terminal;
+    if (std.mem.eql(u8, name, "terminal.find")) return .search_open;
+    if (std.mem.eql(u8, name, "terminal.find-next")) return .{ .search_step = 1 };
+    if (std.mem.eql(u8, name, "terminal.find-previous")) return .{ .search_step = -1 };
     if (std.mem.eql(u8, name, "view.font-larger")) return .{ .font_size_step = 1 };
     if (std.mem.eql(u8, name, "view.font-smaller")) return .{ .font_size_step = -1 };
     if (std.mem.eql(u8, name, "view.font-reset")) return .font_size_reset;

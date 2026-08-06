@@ -60,6 +60,21 @@ pub const Msg = union(enum) {
     select_all,
     /// cmd+K: clear the screen AND the scrollback, the way `clear` does.
     clear_terminal,
+    /// cmd+F: open the scrollback search field over the focused terminal.
+    /// Idempotent — a second cmd+F on an open field changes nothing, and in
+    /// particular must not re-record the restore position.
+    search_open,
+    /// Escape, or the field's own close control: dismiss the field and put
+    /// the viewport back where the search found it.
+    search_close,
+    /// cmd+G / cmd+shift+G, and Enter / shift+Enter while the field is open.
+    ///
+    /// POSITIVE steps toward OLDER output (up the screen), negative toward
+    /// newer. That is the direction libghostty calls `.next`, and it is the
+    /// useful one here: a fresh search lands on the newest match because that
+    /// is where the user already is, so stepping means walking back through
+    /// the log.
+    search_step: i8,
     /// Close a tab by index — what the strip's own `x` presses.
     close_tab: u8,
     /// Pointer entered/left a tab. Only the close affordance reads it.

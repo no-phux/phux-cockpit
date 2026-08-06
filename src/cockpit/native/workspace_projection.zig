@@ -112,6 +112,12 @@ pub fn cockpitTokens(_: *const Model) canvas.DesignTokens {
     tokens.colors.warning = canvas.Color.rgb8(253, 224, 71);
     tokens.colors.destructive = canvas.Color.rgb8(248, 113, 113);
     tokens.typography.mono_font_id = scene.terminal_font_id;
+    // Naming the companions is what turns a carried `bold`/`italic` flag into
+    // a different glyph. Left unset, the renderers synthesize instead — which
+    // they do consistently, but a double-struck regular is not a bold face.
+    tokens.typography.mono_bold_font_id = scene.terminal_bold_font_id;
+    tokens.typography.mono_italic_font_id = scene.terminal_italic_font_id;
+    tokens.typography.mono_bold_italic_font_id = scene.terminal_bold_italic_font_id;
     return tokens;
 }
 
@@ -208,11 +214,31 @@ pub fn chromeRevealed(model: *const Model) bool {
     return false;
 }
 
+/// The scrollback-search band's height.
+///
+/// The band takes its room from the CONTENT rect rather than floating over
+/// the grid. Painter, widget tree, and PTY sizing pump all derive from
+/// `workspaceChrome`, so an overlay would leave the three disagreeing about
+/// how tall the terminal is — which is the same class of bug that once left a
+/// zone of painted text with no hit target behind it.
+pub const search_bar_height: f32 = 34;
+
+/// Whether the focused terminal has its search field open. Derived, with no
+/// stored copy to drift: search state lives on the session, so a tab switch
+/// changes this answer without anything having to remember to update it.
+pub fn searchRevealed(model: *const Model) bool {
+    const terminal_ref = model.selectedTerminalRef() orelse return false;
+    const pane = model.provider.terminalConst(terminal_ref) orelse return false;
+    return pane.session.search.open;
+}
+
 pub const WorkspaceChrome = struct {
     titlebar_height: f32,
     /// The band's own rect, so the header ground and its separator paint
     /// exactly where the strip is laid out. Zero-height when at rest.
     header: geometry.RectF,
+    /// The scrollback-search band. Zero-height when no search is open.
+    search: geometry.RectF,
     content: geometry.RectF,
 };
 
@@ -222,6 +248,8 @@ pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrom
     const revealed = chromeRevealed(model);
     const side_extent = if (revealed and model.tab_placement == .side) side_rail_width + side_rail_gap else 0;
     const top_extent = if (revealed and model.tab_placement == .top) header_height else 0;
+    const search_extent = if (searchRevealed(model)) search_bar_height else 0;
+    const body_width = @max(0, size.width - inset * 2 - side_extent);
     return .{
         .titlebar_height = titlebar,
         .header = geometry.RectF.init(
@@ -230,11 +258,17 @@ pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrom
             @max(0, size.width - inset * 2),
             top_extent,
         ),
-        .content = geometry.RectF.init(
+        .search = geometry.RectF.init(
             inset + side_extent,
             titlebar + top_extent,
-            @max(0, size.width - inset * 2 - side_extent),
-            @max(0, size.height - titlebar - top_extent - inset),
+            body_width,
+            search_extent,
+        ),
+        .content = geometry.RectF.init(
+            inset + side_extent,
+            titlebar + top_extent + search_extent,
+            body_width,
+            @max(0, size.height - titlebar - top_extent - search_extent - inset),
         ),
     };
 }
