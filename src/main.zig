@@ -129,6 +129,8 @@ pub const Fx = app_types.Fx;
 pub const moveResponsesToOutbound = runtime.moveResponsesToOutbound;
 pub const update = update_module.update;
 pub const appShortcutKeyMask = update_module.appShortcutKeyMask;
+pub const RemoteUiState = model_module.RemoteUiState;
+pub const retainSelectionAfterCopy = update_module.retainSelectionAfterCopy;
 pub const remoteFocusTarget = update_module.remoteFocusTarget;
 
 pub const header_height = projection.header_height;

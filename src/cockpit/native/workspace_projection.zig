@@ -242,6 +242,30 @@ pub const WorkspaceChrome = struct {
     content: geometry.RectF,
 };
 
+/// The band's reveal is a STEP, deliberately, and it must stay one.
+///
+/// It reads as an abrupt layout flip and the SDK does have a layout-tween
+/// primitive (`Runtime.startCanvasWidgetLayoutTween`, driven from
+/// `UiApp.scheduleLayoutTweens`) that nothing here uses. Easing this extent
+/// with it is still the wrong move, for two independent reasons:
+///
+///   1. The tween animates the WIDGET layout tree only. The painter
+///      (`view.buildChrome`), the hit targets, and the PTY sizing pump all
+///      derive their rects from THIS function instead — see `resolvePanes` —
+///      so an eased widget tree over a stepped `content` would leave the
+///      three disagreeing for the length of the animation. That is the exact
+///      failure the comment on `resolvePanes` records, replayed once per tab
+///      open and close.
+///   2. Easing the extent HERE instead, so all three stay in lockstep, moves
+///      `content.height` every frame. `view.onFrame` emits a `.viewport` the
+///      moment the proposed row count changes, and that arm calls
+///      `fx.ptyResize` — a SIGWINCH. `header_height` is 50pt over a ~17.5pt
+///      cell, so a single reveal would cost three resizes per pane instead of
+///      one: three full redraws of whatever TUI is running, per tab.
+///
+/// The band's CONTENTS may be animated freely — opacity, a slide inside the
+/// band's own rect — because none of that moves `content`. Only the extent is
+/// load-bearing, and only the extent is forbidden to move gradually.
 pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrome {
     const inset = windowPadding(model);
     const titlebar = @max(inset, model.chrome_top + 4);

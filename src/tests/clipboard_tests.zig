@@ -390,6 +390,39 @@ test "a copied selection persists while failure remains retryable" {
     try testing.expect(app_state.model.provider.slots[0].session.selectionActive());
 }
 
+// phux-cockpit-zly. A successful copy used to mean two different things
+// depending on which provider owned the pane: the local arm left the range
+// highlighted, the remote arm told the coordinator to drop it and released
+// both anchors. They agree now, on the LOCAL behaviour — the convention every
+// Mac terminal this app's users arrive from already follows, and the only
+// confirmation that the copy took the range they meant.
+//
+// The remote CLIPBOARD arm needs a live coordinator (`-Dphux-enabled=true`),
+// so what is reachable from a default build is the rule itself. The local half
+// of the same rule is pinned end-to-end by "a copied selection persists while
+// failure remains retryable" above.
+test "a successful copy ends selection mode on a remote pane and keeps its range" {
+    var state: app.RemoteUiState = .{
+        .selecting = true,
+        .start_anchor = 0x51,
+        .end_anchor = 0x52,
+        .copied_bytes = 7,
+    };
+    app.retainSelectionAfterCopy(&state);
+    // Keyboard-selection mode ends, exactly as `pane.selecting = false` ends
+    // it locally: a further arrow key moves the cursor rather than extending a
+    // range the user has finished with.
+    try testing.expect(!state.selecting);
+    // The anchors — and so the coordinator's own range, and so the wash on
+    // screen — are untouched. This is what used to be thrown away.
+    try testing.expectEqual(@as(u64, 0x51), state.start_anchor);
+    try testing.expectEqual(@as(u64, 0x52), state.end_anchor);
+    // A success is not a failure, and the byte count stays as the copy's own
+    // report of what it took.
+    try testing.expect(!state.copy_failed);
+    try testing.expectEqual(@as(u64, 7), state.copied_bytes);
+}
+
 test "a copy over a vanished emulator range reports failure, never a quiet no-op" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });

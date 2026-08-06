@@ -99,6 +99,25 @@ const edit_menu_items = [_]native_sdk.MenuItem{
     .{ .label = "Find Previous", .command = "terminal.find-previous", .key = "g", .modifiers = .{ .primary = true, .shift = true } },
 };
 
+/// There is no "Enter Full Screen" item here, and it is not an oversight.
+///
+/// The toolkit's stock View menu carries one (`appkit_host.m`, ctrl+cmd+F on
+/// `toggleFullScreen:`), but supplying ANY custom menu replaces the whole bar
+/// and every item in a custom menu is built by `commandMenuItem:` — an
+/// `NSMenuItem` whose action is always `menuCommandItemClicked:`, routed back
+/// through `on_command`. So an item can be DECLARED and its chord registered,
+/// and then the app has nothing to perform with: `PlatformServices` exposes
+/// `focus`/`close`/`minimize`/`show` window verbs and reports
+/// `WindowInfo.fullscreen`, but has no verb that ENTERS or leaves it, and
+/// `Effects` mirrors exactly that set. A menu item wired to a command the app
+/// cannot answer is worse than no item.
+///
+/// The window itself is titled and resizable, so AppKit's green button still
+/// enters fullscreen, and the reflow that follows is sound — a fullscreen
+/// transition is a surface resize plus a chrome re-query, and the grid, the
+/// hit targets, and the pty all follow it (verified by driving a resize
+/// against the running app). Only the trigger is missing. See the handoff
+/// note for the SDK verb this needs.
 const view_menu_items = [_]native_sdk.MenuItem{
     .{ .label = "Increase Font Size", .command = "view.font-larger", .key = "=", .modifiers = .{ .primary = true } },
     .{ .label = "Decrease Font Size", .command = "view.font-smaller", .key = "-", .modifiers = .{ .primary = true } },
@@ -139,6 +158,25 @@ const shell_views = [_]native_sdk.ShellView{
 /// so the window tears down normally and the shutdown lifecycle that flushes
 /// the workspace layout still runs.
 pub const main_window_label = "main";
+
+/// The whole window ceiling this toolkit affords, and why there is no
+/// `cmd+N` yet.
+///
+/// A second window can only be a MODEL-DECLARED one (`UiApp.Options.
+/// windows_fn` + `window_view`); the SDK budgets four of those on top of the
+/// scene's own, so five is the ceiling and it is the toolkit's, not this
+/// app's. That part works — five windows really do open. What does NOT work
+/// is painting a terminal in any of them: every cell this app draws comes out
+/// of `UiApp.Options.chrome.build` (`view.buildChrome`), and the runtime
+/// installs an app-owned chrome display list for the MAIN canvas only
+/// (`ui_app.zig` `rebuild` calls `installChromeDisplayList`;
+/// `rebuildWindowSlot` publishes the widget layout and emits a widget-only
+/// list). A declared second window therefore renders the tab strip, the split
+/// divider, and empty terminal rectangles — verified in the running app.
+///
+/// So the constant is documented rather than used: shipping the chord would
+/// ship a blank terminal. See the handoff note for the SDK change this needs.
+pub const max_windows: usize = 5;
 
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = main_window_label,

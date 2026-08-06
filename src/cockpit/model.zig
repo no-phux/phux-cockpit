@@ -215,7 +215,7 @@ pub const Model = struct {
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
     focused: bool = true,
-    consumed_shortcut_keys_held: u32 = 0,
+    consumed_shortcut_keys_held: u64 = 0,
     held_terminal_keys: [max_held_terminal_keys]HeldTerminalKey = [_]HeldTerminalKey{.{}} ** max_held_terminal_keys,
     pointer_captures: [max_pointer_captures]PointerCapture = [_]PointerCapture{.{ .terminal_id = .terminal_1 }} ** max_pointer_captures,
     copy_inflight: bool = false,

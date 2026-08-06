@@ -492,7 +492,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             }
             const state = model.remoteUi(model.copy_owner.terminal_ref) orelse return;
             if (result.outcome == .ok) {
-                clearRemoteSelection(model, state);
+                retainSelectionAfterCopy(state);
             } else {
                 state.copied_bytes = 0;
                 state.copy_failed = true;
@@ -1446,6 +1446,32 @@ fn moveRemoteSelection(model: *Model, terminal_ref: TerminalRef, state: *RemoteU
     applyRemoteSelection(model, state);
 }
 
+/// What a SUCCESSFUL copy does to the range it copied — and the reason this is
+/// one named rule rather than two lines in two arms.
+///
+/// The local arm has always left the highlight standing (`pane.selecting =
+/// false` ends keyboard-selection MODE; the emulator's range, and therefore
+/// the wash on screen, survives). The remote arm called `clearRemoteSelection`,
+/// which tells the coordinator to drop the range and releases both anchors —
+/// so the same cmd+C left a Phux pane bare and a native pane highlighted.
+///
+/// The behaviour kept is the LOCAL one: the highlight stays. Every Mac
+/// terminal a user of this app arrives from (Terminal.app, iTerm2, Ghostty)
+/// keeps it, and it is the only confirmation that the copy took the range the
+/// user meant — clearing it deletes the evidence at the exact moment the user
+/// wants to check it, and makes a re-copy cost a fresh selection. Typing, a new
+/// selection, and a restart all still clear it, on both sides.
+///
+/// Split out as a function over the state alone because the remote clipboard
+/// arm is only reachable in a `-Dphux-enabled=true` build: the rule is pinned
+/// here, where a default build's tests can reach it.
+pub fn retainSelectionAfterCopy(state: *RemoteUiState) void {
+    // Keyboard-selection MODE ends — a further arrow key must move the cursor,
+    // not extend a range the user has finished with — while the anchors and
+    // the coordinator's own range stay exactly where the copy found them.
+    state.selecting = false;
+}
+
 fn clearRemoteSelection(model: *Model, state: *RemoteUiState) void {
     const remote = model.phux() orelse return;
     remote.clearSelection(state.owner) catch return;
@@ -1573,7 +1599,7 @@ fn latchAppShortcut(model: *Model, key: []const u8) void {
     model.consumed_shortcut_keys_held |= appShortcutKeyMask(key);
 }
 
-pub fn appShortcutKeyMask(key: []const u8) u32 {
+pub fn appShortcutKeyMask(key: []const u8) u64 {
     if (keyIs(key, "1")) return 1 << 0;
     if (keyIs(key, "2")) return 1 << 1;
     if (keyIs(key, "3")) return 1 << 12;
@@ -1613,15 +1639,15 @@ pub fn appShortcutKeyMask(key: []const u8) u32 {
 }
 
 comptime {
-    // The latch is a u32 and every bit is now spoken for. The next chord that
-    // needs one has to widen `consumed_shortcut_keys_held`,
-    // `global_shortcut_keys_held`, and `suppressed_canvas_shortcuts` together
-    // — they are three views of the same mask, and widening one alone would
-    // silently drop the top bits of the other two.
-    std.debug.assert(@bitSizeOf(@TypeOf(appShortcutKeyMask("f"))) == 32);
+    // The latch was a u32 with every bit spoken for; it is a u64 now, and the
+    // three views of the same mask — `consumed_shortcut_keys_held`,
+    // `global_shortcut_keys_held`, and `suppressed_canvas_shortcuts` — must
+    // be widened TOGETHER, because widening one alone silently drops the top
+    // bits of the other two.
+    std.debug.assert(@bitSizeOf(@TypeOf(appShortcutKeyMask("f"))) == 64);
 }
 
-pub fn commandShortcutKeyMask(name: []const u8) u32 {
+pub fn commandShortcutKeyMask(name: []const u8) u64 {
     for (cockpit_shortcuts) |shortcut| {
         if (std.mem.eql(u8, name, shortcut.id)) return appShortcutKeyMask(shortcut.key);
     }

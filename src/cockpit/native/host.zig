@@ -35,11 +35,11 @@ pub const CockpitHost = struct {
     /// Global AppKit shortcuts and canvas key delivery can describe the same
     /// physical edge. Suppress only the duplicate canvas edge; the model's
     /// latch remains reserved for shortcuts originating on the canvas itself.
-    suppressed_canvas_shortcuts: u32 = 0,
+    suppressed_canvas_shortcuts: u64 = 0,
     /// Platform shortcut callbacks have no key phase. Hold the physical key
     /// until a canvas release or a different shortcut edge so repeated
     /// callbacks for one edge execute the command exactly once.
-    global_shortcut_keys_held: u32 = 0,
+    global_shortcut_keys_held: u64 = 0,
     selection_autoscroll_timer_active: bool = false,
 
     pub fn init(self: *CockpitHost, allocator: std.mem.Allocator, model: Model, options: TerminalApp.Options) void {
