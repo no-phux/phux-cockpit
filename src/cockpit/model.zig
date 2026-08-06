@@ -7,6 +7,7 @@ const local = @import("../providers/local/provider.zig");
 const topology = @import("topology.zig");
 const layout = @import("layout.zig");
 const config_module = @import("../config/config.zig");
+const session_state = @import("session_state.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -30,6 +31,54 @@ pub const max_tabs = topology.max_tabs;
 pub const max_remote_terminals = support.max_remote_terminals;
 
 pub const max_held_terminal_keys: usize = 16;
+
+/// Path ceiling for the layout state file, matching the SDK's own
+/// `max_effect_file_path_bytes` — a path the write effect would refuse is a
+/// path there is no point storing.
+pub const max_state_path_bytes: usize = 1024;
+
+/// Layout-persistence bookkeeping.
+///
+/// The path is resolved ONCE at startup and copied here, because `update` has
+/// no environment and no `Io`: by the time a topology change wants writing,
+/// the only thing that can still answer "where" is the model.
+///
+/// `fingerprint` is the topology hash as of the end of the previous `update`.
+/// Comparing against it is what makes a save EDGE-triggered — a keystroke
+/// leaves it unchanged and arms nothing, while a divider drag changes it every
+/// frame and re-arms the same one-shot timer, which is the debounce.
+pub const StatePersistence = struct {
+    path_storage: [max_state_path_bytes]u8 = undefined,
+    path_len: usize = 0,
+    fingerprint: u64 = 0,
+    /// A write effect is outstanding on the state-file key. A second write on
+    /// a live key is rejected by the SDK, so one waits rather than racing.
+    inflight: bool = false,
+    /// The topology moved while that write was in flight, so another is owed
+    /// the moment it lands.
+    pending: bool = false,
+
+    pub fn path(state: *const StatePersistence) []const u8 {
+        return state.path_storage[0..state.path_len];
+    }
+
+    pub fn enabled(state: *const StatePersistence) bool {
+        return state.path_len != 0;
+    }
+
+    /// Adopt a resolved path, or disable persistence when there is none to
+    /// adopt. A window that cannot find a state directory still runs.
+    pub fn setPath(state: *StatePersistence, value: ?[]const u8) void {
+        const resolved = value orelse "";
+        if (resolved.len == 0 or resolved.len > max_state_path_bytes) {
+            state.path_len = 0;
+            return;
+        }
+        @memcpy(state.path_storage[0..resolved.len], resolved);
+        state.path_len = resolved.len;
+    }
+};
+
 /// Sentinel for "the pointer is over no tab". `max_tabs` is a valid index in
 /// no tab list, so it can never collide with a real hover.
 pub const no_hovered_tab: usize = std.math.maxInt(usize);
@@ -183,6 +232,10 @@ pub const Model = struct {
     chrome_top: f32 = 0,
     surface_size: geometry.SizeF = geometry.SizeF.init(1100, 640),
     surface_scale_factor: f32 = 1,
+    /// Where the layout snapshot goes and what is owed to it. Disabled by
+    /// default so every test and every fixture stays free of disk traffic
+    /// until a composition root hands it a real path.
+    state: StatePersistence = .{},
 
     pub fn phux(model: *Model) ?*PhuxProvider {
         if (comptime !support.phux_enabled) return null;
@@ -480,10 +533,107 @@ pub const Model = struct {
         }
         snapshot.tab_count = written;
         snapshot.selection = if (selected) |value| .{ .tab = value } else .web;
+
+        // Directories are read off the LIVE panes rather than carried in the
+        // tree, because the tree does not know them: a cwd is whatever the
+        // shell last reported through OSC 7, and a pane that never reported
+        // one records nothing (which restores as "$HOME", the first
+        // terminal's behaviour, not as "/").
+        for (snapshot.tabs[0..written]) |tab| {
+            for (tab.nodes) |node| {
+                if (node.kind != .leaf or !node.has_terminal) continue;
+                const pane = model.provider.terminalConst(local.localRef(node.terminal)) orelse continue;
+                snapshot.setCwd(node.terminal, pane.pwd());
+            }
+        }
+
         try snapshot.validate();
         return snapshot;
     }
+
+    /// A cheap hash of everything the SNAPSHOT would carry about shape:
+    /// the tab list, each tab's tree, which tab is selected, and where the
+    /// strip sits.
+    ///
+    /// Deliberately excludes working directories. A cwd changes on every `cd`,
+    /// and folding it in here would turn ordinary shell navigation into a disk
+    /// write per debounce window for no layout reason. Directories are still
+    /// captured accurately, because every save serializes the CURRENT panes
+    /// and the shutdown flush always writes one.
+    pub fn topologyFingerprint(model: *const Model) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hasher, model.tab_count);
+        std.hash.autoHash(&hasher, model.selected_tab);
+        std.hash.autoHash(&hasher, model.web_selected);
+        std.hash.autoHash(&hasher, model.tab_placement);
+        for (model.tabs[0..model.tab_count]) |tab| {
+            std.hash.autoHash(&hasher, tab.root);
+            std.hash.autoHash(&hasher, tab.focus);
+            for (tab.nodes) |node| {
+                std.hash.autoHash(&hasher, node.kind);
+                if (node.kind == .free) continue;
+                std.hash.autoHash(&hasher, node.parent);
+                std.hash.autoHash(&hasher, node.first);
+                std.hash.autoHash(&hasher, node.second);
+                std.hash.autoHash(&hasher, node.orientation);
+                // A fraction is a float, which `autoHash` refuses; its bits
+                // are the identity that matters for "did the divider move".
+                std.hash.autoHash(&hasher, @as(u32, @bitCast(node.fraction)));
+                // Only LOCAL identity is folded in. A tab holding a remote
+                // pane is not persistable at all (`encodeTab` drops it), so
+                // there is no saved state for one to invalidate — and hashing
+                // a `RemoteTerminalId`'s inline host storage would cost a
+                // quarter-kilobyte per node on every message.
+                if (node.terminal) |id| {
+                    const raw: u64 = if (provider_contract.localId(id)) |local_id| @intFromEnum(local_id) else 0;
+                    std.hash.autoHash(&hasher, raw);
+                }
+            }
+        }
+        return hasher.final();
+    }
+
+    /// Write the layout SYNCHRONOUSLY, right now, on the calling thread.
+    ///
+    /// The debounced effect covers everything that happens while the app runs;
+    /// this covers the interval between the last change and the debounce expiring
+    /// — which is exactly "open a tab, then quit". It cannot be an effect: by the
+    /// time shutdown is known, nothing will drain another effect queue, and a
+    /// write posted to a worker thread would race the process out the door.
+    ///
+    /// Failure is silent by design, at every step. An app that refuses to exit
+    /// because it could not write a layout file is worse than one that opens with
+    /// the previous layout.
+    pub fn writeWorkspaceState(model: *const Model, io: std.Io) void {
+        if (!model.state.enabled()) return;
+        var bytes: [session_state.max_state_bytes]u8 = undefined;
+        const snapshot = model.topologySnapshot() catch return;
+        const encoded = session_state.serialize(&snapshot, &bytes) catch return;
+        const cwd = std.Io.Dir.cwd();
+        const path = model.state.path();
+        if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(io, parent) catch return;
+        cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return;
+    }
 };
+
+/// Put every restored pane's shell in the directory the snapshot recorded.
+///
+/// Split out of `restoreModel` rather than done inside it because `Pane.argv`
+/// is a SLICE into `Model.cwd_argv`, and `restoreModel` returns its model BY
+/// VALUE — an argv written there would point into a model that is about to be
+/// copied into its real home and then go out of scope. This runs against the
+/// model in its final storage, which is the only place the slice is allowed to
+/// point.
+pub fn applyRestoredWorkingDirectories(model: *Model, snapshot: *const TopologySnapshot) void {
+    for (0..max_terminals) |index| {
+        if (model.provider.states[index] != .active) continue;
+        const pane = model.provider.slot(index);
+        const id = provider_contract.localId(pane.id) orelse continue;
+        const cwd = snapshot.cwdFor(id);
+        if (cwd.len == 0) continue;
+        pane.argv = local.paneArgvIn(cwd, &model.cwd_argv[index]);
+    }
+}
 
 /// Serialize one tree. A tab holding a REMOTE terminal is not persistable —
 /// a phux terminal exists because its coordinator says so, and restoring it

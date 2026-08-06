@@ -31,13 +31,52 @@ pub const SurfaceSelection = union(enum) {
     }
 };
 
-/// v2 is the tree schema. v1 encoded a fixed two-pane workspace
+/// v3 is the tree schema PLUS per-terminal working directories. v2 was the
+/// same tree with no directories; v1 encoded a fixed two-pane workspace
 /// (`layout: {single,split}`, `attachments[2]`, one `split_fraction`,
 /// `focused_attachment`) and cannot express a tab that owns a nested tree,
 /// so it is MIGRATED, not read: every v1 terminal becomes its own tab, and a
 /// v1 split becomes a horizontal split inside the focused tab.
-pub const topology_snapshot_version: u16 = 2;
+pub const topology_snapshot_version: u16 = 3;
+
+/// Restoring recreates SHELLS in the saved shape. It does not, and cannot,
+/// reattach the processes that were running — the snapshot carries no pid and
+/// makes no survival claim, and every restored leaf gets a fresh emulator.
 pub const process_restoration_supported = false;
+
+/// Byte ceiling for one persisted working directory.
+///
+/// Deliberately far below `std.fs.max_path_bytes` (1024): the snapshot is
+/// passed BY VALUE through migration and validation, and a full-length path
+/// per registry slot would put half a megabyte on the stack for a field whose
+/// realistic occupancy is a few dozen bytes. A path past the ceiling is simply
+/// not recorded, which degrades to "this pane opens in $HOME" — the behaviour
+/// of a pane whose shell never reported OSC 7.
+pub const max_snapshot_cwd_bytes: usize = 256;
+
+/// One terminal's persisted working directory. Empty means UNKNOWN — the
+/// shell never reported one, or it was past the ceiling — never "/".
+pub const SnapshotCwd = struct {
+    bytes: [max_snapshot_cwd_bytes]u8 = @splat(0),
+    len: u16 = 0,
+
+    pub fn slice(cwd: *const SnapshotCwd) []const u8 {
+        if (cwd.len > max_snapshot_cwd_bytes) return "";
+        return cwd.bytes[0..cwd.len];
+    }
+
+    /// Record `path`, or record nothing when it cannot be honoured on the way
+    /// back in. Rejects what `paneArgvIn` would reject anyway (relative paths)
+    /// plus the two bytes the on-disk line format cannot round trip.
+    pub fn set(cwd: *SnapshotCwd, path: []const u8) void {
+        cwd.* = .{};
+        if (path.len == 0 or path.len > max_snapshot_cwd_bytes) return;
+        if (path[0] != '/') return;
+        for (path) |byte| if (byte == 0 or byte == '\n') return;
+        @memcpy(cwd.bytes[0..path.len], path);
+        cwd.len = @intCast(path.len);
+    }
+};
 
 pub const SnapshotSelection = union(enum) {
     tab: u8,
@@ -75,12 +114,41 @@ pub const SnapshotTab = struct {
     focus: layout.NodeId = layout.none,
 };
 
+/// The registry offset a terminal id occupies, or null when it is outside the
+/// registry entirely. The cwd side table is indexed by this, so it is the one
+/// place the id-to-slot arithmetic lives.
+pub fn terminalOffset(id: LocalTerminalId) ?usize {
+    const raw = @intFromEnum(id);
+    if (raw < local.first_terminal_raw) return null;
+    const offset = raw - local.first_terminal_raw;
+    if (offset >= max_terminals) return null;
+    return @intCast(offset);
+}
+
 pub const TopologySnapshot = struct {
     version: u16 = topology_snapshot_version,
     tab_count: u8 = 0,
     tabs: [max_tabs]SnapshotTab = [_]SnapshotTab{.{}} ** max_tabs,
     selection: SnapshotSelection = .web,
     tab_placement: TabPlacement = .top,
+    /// Working directories, indexed by REGISTRY OFFSET rather than by node.
+    ///
+    /// A cwd belongs to a terminal, not to the pane that happens to hold it,
+    /// and `validate` already proves every leaf's terminal is a distinct
+    /// registry offset — so a flat 32-entry table is both the honest shape and
+    /// an order of magnitude smaller than one path per tree node (31 nodes x
+    /// 16 tabs) would be.
+    cwds: [max_terminals]SnapshotCwd = [_]SnapshotCwd{.{}} ** max_terminals,
+
+    pub fn cwdFor(snapshot: *const TopologySnapshot, id: LocalTerminalId) []const u8 {
+        const offset = terminalOffset(id) orelse return "";
+        return snapshot.cwds[offset].slice();
+    }
+
+    pub fn setCwd(snapshot: *TopologySnapshot, id: LocalTerminalId, path: []const u8) void {
+        const offset = terminalOffset(id) orelse return;
+        snapshot.cwds[offset].set(path);
+    }
 
     pub fn validate(snapshot: TopologySnapshot) !void {
         if (snapshot.version != topology_snapshot_version) return error.UnsupportedTopologyVersion;
@@ -130,6 +198,18 @@ pub const TopologySnapshot = struct {
             .web => {},
         }
         if (count == 0 and snapshot.selection != .web) return error.InvalidTopology;
+
+        // A recorded directory has to be one a restored shell can actually be
+        // put in, and one the line-oriented state file can round trip. An
+        // entry for a terminal no pane holds is left alone: it is dead weight,
+        // not a lie about the topology.
+        for (snapshot.cwds) |cwd| {
+            if (cwd.len > max_snapshot_cwd_bytes) return error.InvalidTopology;
+            if (cwd.len == 0) continue;
+            const path = cwd.bytes[0..cwd.len];
+            if (path[0] != '/') return error.InvalidTopology;
+            for (path) |byte| if (byte == 0 or byte == '\n') return error.InvalidTopology;
+        }
     }
 };
 
@@ -175,10 +255,21 @@ pub const LegacyTopologySnapshotV1 = struct {
     tab_placement: TabPlacement = .top,
 };
 
+/// v2: the tree schema before working directories. The TREE part is
+/// byte-identical to v3 — `SnapshotTab` and `SnapshotNode` did not change —
+/// so this carries the same tabs and differs only in having no cwd table.
+pub const LegacyTopologySnapshotV2 = struct {
+    tab_count: u8 = 0,
+    tabs: [max_tabs]SnapshotTab = [_]SnapshotTab{.{}} ** max_tabs,
+    selection: SnapshotSelection = .web,
+    tab_placement: TabPlacement = .top,
+};
+
 pub const PersistedTopologySnapshot = union(enum) {
     v0: LegacyTopologySnapshotV0,
     v1: LegacyTopologySnapshotV1,
-    v2: TopologySnapshot,
+    v2: LegacyTopologySnapshotV2,
+    v3: TopologySnapshot,
 };
 
 /// Build a one-leaf tab. Every migration path lands here: a legacy terminal
@@ -211,7 +302,16 @@ fn splitTab(first: LocalTerminalId, second: LocalTerminalId, fraction: f32, focu
 
 pub fn migrateTopologySnapshot(persisted: PersistedTopologySnapshot) !TopologySnapshot {
     const snapshot = switch (persisted) {
-        .v2 => |current| current,
+        .v3 => |current| current,
+        // v2 -> v3 is purely additive: the tree arrives whole and NO working
+        // directory was ever recorded, so every restored pane opens where a
+        // pane whose shell never reported OSC 7 opens.
+        .v2 => |legacy| TopologySnapshot{
+            .tab_count = legacy.tab_count,
+            .tabs = legacy.tabs,
+            .selection = legacy.selection,
+            .tab_placement = legacy.tab_placement,
+        },
         .v1 => |legacy| try migrateV1(legacy),
         .v0 => |legacy| blk: {
             if (legacy.terminal_count > max_tabs or !std.math.isFinite(legacy.split_fraction)) return error.InvalidTopology;

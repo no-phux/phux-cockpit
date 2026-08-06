@@ -7,6 +7,7 @@ const local = @import("../providers/local/provider.zig");
 const topology = @import("topology.zig");
 const layout = @import("layout.zig");
 const model_module = @import("model.zig");
+const session_state = @import("session_state.zig");
 const app_types = @import("app_types.zig");
 const runtime = @import("terminal_runtime.zig");
 const pointer_input = @import("pointer_input.zig");
@@ -179,11 +180,72 @@ fn acknowledgeVisibleBells(model: *Model) void {
     }
 }
 
+/// Effect key for the layout snapshot write. Shares the key space with pty
+/// spawns (1..) and the clipboard pair (100, 101), so it sits well clear of
+/// both; the SDK checks file keys against live spawns and fetches.
+pub const topology_state_file_key: u64 = 200;
+
+/// Timer key for the save debounce. Timer keys are their own namespace, so
+/// this cannot collide with the file key above or the selection autoscroll
+/// timer (which is a RUNTIME timer, not an fx one).
+pub const topology_persist_timer_key: u64 = 200;
+
+/// How long the layout has to hold still before it is written.
+///
+/// Long enough that a divider drag — which changes the tree on every frame —
+/// costs exactly one write when the mouse comes to rest, and that opening
+/// three tabs in a burst costs one write rather than three. Short enough that
+/// a change is on disk long before anything a user would call "later". The
+/// shutdown flush covers the window between the last change and this expiry.
+pub const topology_persist_debounce_ms: u64 = 750;
+
+/// Take a snapshot and hand it to the SDK's file writer.
+///
+/// A LEAF function on purpose: the serialized buffer is `max_state_bytes` of
+/// stack, and the SDK copies it at the call, so it must exist here and nowhere
+/// up the already-deep dispatch frame.
+fn writeTopologySnapshot(model: *Model, fx: *Fx) void {
+    var bytes: [session_state.max_state_bytes]u8 = undefined;
+    const snapshot = model.topologySnapshot() catch return;
+    const encoded = session_state.serialize(&snapshot, &bytes) catch return;
+    model.state.inflight = true;
+    model.state.pending = false;
+    fx.writeFile(.{
+        .key = topology_state_file_key,
+        .path = model.state.path(),
+        .bytes = encoded,
+        .on_result = Fx.fileMsg(.topology_persisted),
+    });
+}
+
+/// Re-arm the debounce. Starting a timer key that is already active REPLACES
+/// it in place, so a burst of changes leaves exactly one pending expiry.
+fn armTopologyPersist(model: *Model, fx: *Fx) void {
+    if (!model.state.enabled()) return;
+    fx.startTimer(.{
+        .key = topology_persist_timer_key,
+        .interval_ms = topology_persist_debounce_ms,
+        .mode = .one_shot,
+        .on_fire = Fx.timerMsg(.persist_topology),
+    });
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const focus_before = remoteFocusTarget(model);
     const owner_before = remoteFocusOwner(model);
     updateModel(model, msg, fx);
     acknowledgeVisibleBells(model);
+    // Persistence is EDGE triggered off the shape hash, not wired into the
+    // dozen arms that can reshape a workspace (new tab, close, reorder,
+    // select, split, divider drag, pane focus, placement toggle, a shell
+    // exiting on its own, a remote reconciliation). Every one of those arms
+    // is an arm that could forget; a hash cannot.
+    const fingerprint = model.topologyFingerprint();
+    if (fingerprint != model.state.fingerprint) {
+        model.state.fingerprint = fingerprint;
+        model.state.pending = true;
+        armTopologyPersist(model, fx);
+    }
     const focus_after = remoteFocusTarget(model);
     const owner_after = remoteFocusOwner(model);
     if (!optRefEql(focus_before, focus_after)) {
@@ -574,6 +636,29 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             ) orelse return;
             updateModel(model, .{ .focus_pane = next }, fx);
         },
+        // The timer's `outcome` is deliberately not consulted. A rejection
+        // (full timer table, no platform timer service) still arrives here
+        // exactly once, and the right answer to "the debounce could not be
+        // armed" is to save NOW rather than to drop the save.
+        .persist_topology => {
+            if (!model.state.enabled() or !model.state.pending) return;
+            // A write is already on this key; the SDK would reject a second.
+            // The result arm restarts the debounce, so nothing is dropped.
+            if (model.state.inflight) return;
+            writeTopologySnapshot(model, fx);
+        },
+        .shutdown => {
+            // Synchronous, on this thread, through the provider's own `Io`:
+            // the effect queue will not be drained again, so a `writeFile`
+            // here would be posted to a worker and lost to the exit.
+            model.writeWorkspaceState(model.provider.io);
+        },
+        .topology_persisted => {
+            model.state.inflight = false;
+            // The shape moved while the write was out. Re-arm rather than
+            // writing immediately: whatever moved it may still be moving.
+            if (model.state.pending) armTopologyPersist(model, fx);
+        },
         .browser_page => |page| {
             model.browser_page = page;
             model.browser_navigation_token +%= 1;
@@ -689,10 +774,21 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
     endHiddenCaptures(model, fx);
 
     if (model.tab_count == 0) {
-        // The last tab was the window's whole reason to exist. This is the
-        // real OS close, with the platform's own last-window semantics.
+        // The last tab was the window's whole reason to exist.
+        //
+        // `closeWindow` alone is NOT enough, and the comment that used to sit
+        // here claiming it was "the real OS close with the platform's own
+        // last-window semantics" was wrong: AppKit does not terminate an app
+        // when its last window closes unless the delegate opts in, so this
+        // left a running process with no window and no way back to it. The
+        // user's word for that was that closing "doesn't actually close".
+        //
+        // Close the window AND quit. Both, in that order, so the window tears
+        // down through the normal path and the shutdown lifecycle — which is
+        // what flushes the workspace layout to disk — still runs.
         model.web_selected = true;
         fx.closeWindow(scene.main_window_label);
+        fx.quitApp();
     }
 }
 /// ONE copy in flight: the clipboard write reuses a fixed key, so a second
@@ -846,6 +942,9 @@ pub fn onLifecycle(event: native_sdk.LifecycleEvent) ?Msg {
     return switch (event) {
         .activate => .{ .focus_changed = true },
         .deactivate => .{ .focus_changed = false },
+        // `.stop` is dispatched from the runtime's own shutdown path, BEFORE
+        // the app's stop hook, so the model is still whole when it arrives.
+        .stop => .shutdown,
         else => null,
     };
 }

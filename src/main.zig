@@ -10,6 +10,7 @@ const local = @import("providers/local/provider.zig");
 const topology = @import("cockpit/topology.zig");
 const layout = @import("cockpit/layout.zig");
 const model_module = @import("cockpit/model.zig");
+const session_state = @import("cockpit/session_state.zig");
 const app_types = @import("cockpit/app_types.zig");
 const runtime = @import("cockpit/terminal_runtime.zig");
 const projection = @import("cockpit/native/workspace_projection.zig");
@@ -77,7 +78,11 @@ pub const SnapshotNode = topology.SnapshotNode;
 pub const TopologySnapshot = topology.TopologySnapshot;
 pub const LegacyTopologySnapshotV0 = topology.LegacyTopologySnapshotV0;
 pub const LegacyTopologySnapshotV1 = topology.LegacyTopologySnapshotV1;
+pub const LegacyTopologySnapshotV2 = topology.LegacyTopologySnapshotV2;
 pub const PersistedTopologySnapshot = topology.PersistedTopologySnapshot;
+pub const SnapshotCwd = topology.SnapshotCwd;
+pub const max_snapshot_cwd_bytes = topology.max_snapshot_cwd_bytes;
+pub const terminalOffset = topology.terminalOffset;
 pub const singleLeafTab = topology.singleLeafTab;
 pub const Tree = layout.Tree;
 pub const Kind = layout.Kind;
@@ -103,7 +108,19 @@ pub const attachPhuxProvider = model_module.attachPhuxProvider;
 pub const initialModelWithIo = model_module.initialModelWithIo;
 pub const initialProductionModelWithIo = model_module.initialProductionModelWithIo;
 pub const restoreModel = model_module.restoreModel;
+pub const applyRestoredWorkingDirectories = model_module.applyRestoredWorkingDirectories;
+pub const writeWorkspaceState = model_module.writeWorkspaceState;
 pub const deinitModel = model_module.deinitModel;
+pub const StatePersistence = model_module.StatePersistence;
+
+pub const state_file_name = session_state.file_name;
+pub const max_state_bytes = session_state.max_state_bytes;
+pub const serializeWorkspaceState = session_state.serialize;
+pub const parseWorkspaceState = session_state.parse;
+pub const workspaceStatePath = session_state.joinPath;
+pub const topology_state_file_key = update_module.topology_state_file_key;
+pub const topology_persist_timer_key = update_module.topology_persist_timer_key;
+pub const topology_persist_debounce_ms = update_module.topology_persist_debounce_ms;
 
 pub const Msg = app_types.Msg;
 pub const TerminalApp = app_types.TerminalApp;
@@ -309,22 +326,123 @@ fn readConfig(io: std.Io, path: []const u8) ?Config {
     return config_module.loadOrDefault(bytes[0..read]);
 }
 
+/// Where the workspace LAYOUT is written: the platform STATE directory
+/// (macOS: `~/Library/Application Support/Phux Cockpit/State`), never the
+/// config file. Layout is state — nobody hand-writes it, and it changes every
+/// time a tab opens — so mixing it into the file a user edits would mean
+/// rewriting their settings on every split.
+///
+/// `PHUX_COCKPIT_STATE` names a file directly and wins, the same seam
+/// `PHUX_COCKPIT_CONFIG` gives the config: a second profile, a test, or a
+/// wrapper that wants a throwaway workspace. Null means no state directory
+/// could be resolved, which silently disables persistence rather than
+/// refusing to start.
+pub fn resolveStatePath(
+    env: native_sdk.app_dirs.Env,
+    override_path: ?[]const u8,
+    dir_storage: []u8,
+    path_storage: []u8,
+) ?[]const u8 {
+    if (override_path) |explicit| {
+        if (explicit.len == 0 or explicit.len > path_storage.len) return null;
+        @memcpy(path_storage[0..explicit.len], explicit);
+        return path_storage[0..explicit.len];
+    }
+    const dir = native_sdk.app_dirs.resolveOne(
+        .{ .name = app_name },
+        native_sdk.app_dirs.currentPlatform(),
+        env,
+        .state,
+        dir_storage,
+    ) catch return null;
+    return session_state.joinPath(dir, path_storage) catch null;
+}
+
+/// Read and parse the state file. False means "there is no usable workspace
+/// here" — no file, an unreadable one, an empty one, a truncated one, one from
+/// a future version, or one byte of noise — and it is never an error, because
+/// every one of those cases has exactly one correct behaviour: open a fresh
+/// window.
+fn readPersistedState(io: std.Io, path: []const u8, out: *PersistedTopologySnapshot) bool {
+    var bytes: [session_state.max_state_bytes]u8 = undefined;
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+    // A file past the ceiling fills the buffer and loses its terminator, so
+    // it fails the parse rather than reading back as a shorter workspace.
+    const read = file.readPositionalAll(io, &bytes, 0) catch return false;
+    return session_state.parse(bytes[0..read], out);
+}
+
+/// Rebuild the saved workspace before anything else exists, so the window
+/// opens INTO the restored layout instead of being seen to assemble it.
+/// `restored` receives the migrated snapshot, which still holds the working
+/// directories the panes have to be put in once the model reaches its final
+/// storage.
+fn restoreWorkspace(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    restored: *TopologySnapshot,
+) ?Model {
+    var persisted: PersistedTopologySnapshot = undefined;
+    if (!readPersistedState(io, path, &persisted)) return null;
+    const snapshot = migrateTopologySnapshot(persisted) catch return null;
+    // A snapshot with no tabs describes a window with nothing in it. That is
+    // valid state (the web surface was selected when the last tab closed) but
+    // it is not a workspace to reopen, so it takes the fresh path.
+    if (snapshot.tab_count == 0) return null;
+    const model = restoreModel(gpa, io, .{ .v3 = snapshot }) catch return null;
+    restored.* = snapshot;
+    return model;
+}
+
 pub fn main(init: std.process.Init) !void {
-    const session = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
+    const env = native_sdk.debug.envFromMap(init.environ_map);
+    var state_dir_storage: [std.fs.max_path_bytes]u8 = undefined;
+    var state_path_storage: [std.fs.max_path_bytes]u8 = undefined;
+    const state_path = resolveStatePath(
+        env,
+        init.environ_map.get("PHUX_COCKPIT_STATE"),
+        &state_dir_storage,
+        &state_path_storage,
+    );
+
+    // The restore runs BEFORE the default terminal is created, not after: a
+    // model that boots with one shell and is then reshaped would show the
+    // fresh window for a frame and rebuild itself in front of the user.
+    var restored_snapshot: TopologySnapshot = .{};
+    var restored = false;
+    var model = restore: {
+        if (state_path) |path| {
+            if (restoreWorkspace(std.heap.page_allocator, init.io, path, &restored_snapshot)) |saved| {
+                restored = true;
+                break :restore saved;
+            }
+        }
+        const session = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
+        break :restore initialProductionModelWithIo(std.heap.page_allocator, init.io, session) catch |err| {
+            session.destroy();
+            return err;
+        };
+    };
     const remote_provider = createConfiguredPhuxProvider(init) catch |err| {
-        session.destroy();
+        deinitModel(&model);
         return err;
     };
-    var model = initialProductionModelWithIo(std.heap.page_allocator, init.io, session) catch |err| {
-        session.destroy();
-        if (remote_provider) |remote| remote.destroy();
-        return err;
-    };
+    model.state.setPath(state_path);
+    // Seed the shape hash with what is already on disk, so a launch that
+    // changes nothing writes nothing.
+    model.state.fingerprint = model.topologyFingerprint();
     model.config = loadUserConfig(init.io, init);
     model.tab_placement = switch (model.config.tab_placement) {
         .top => .top,
         .side => .side,
     };
+    // A restored placement outranks the config's, because it is the same
+    // setting one act later: the config value was already in effect when the
+    // user toggled the strip, so replaying the config would undo them on every
+    // launch. It does not outrank the env knob below.
+    if (restored) model.tab_placement = restored_snapshot.tab_placement;
     // The env override stays and stays LAST: it is the debugging knob, and a
     // knob that a config file could silently disable would not be one.
     if (init.environ_map.get("PHUX_COCKPIT_TABS")) |value| {
@@ -336,6 +454,15 @@ pub fn main(init: std.process.Init) !void {
     defer std.heap.page_allocator.destroy(app_state);
     app_state.init(std.heap.page_allocator, model, appOptions());
     defer app_state.deinit();
+    // The argv can only be written once the model is in the storage it will
+    // live in: it holds SLICES into that model's own `cwd_argv`.
+    if (restored) applyRestoredWorkingDirectories(&app_state.inner.model, &restored_snapshot);
+    // The runtime's own `.stop` lifecycle already flushes the layout, which is
+    // the path that actually fires on a macOS quit. This is the belt to that
+    // pair of braces, for a host whose run loop returns without a shutdown
+    // event; it runs before `app_state.deinit`, and writing the same bytes
+    // twice costs one file write on exit.
+    defer app_state.inner.model.writeWorkspaceState(init.io);
     try runner.runWithOptions(app_state.app(), .{
         .app_name = app_name,
         .window_title = app_name,

@@ -19,13 +19,32 @@ pub fn cursorCommandId(id_base: u64) u64 {
     return canvas.terminal_grid.paintIdBase(id_base) +% 0x61_0002;
 }
 
-/// The packed `cell_grid` command a pane's screen paints as. A terminal
-/// screen is ONE command now, so this is how a caller (and every test)
-/// picks the grid belonging to a specific pane out of a frame that holds
-/// several — the same seam `cursorCommandId` already provides for the
-/// cursor, at the offset the SDK painter emits its lattice on.
-pub fn cellGridCommandId(id_base: u64) u64 {
-    return canvas.terminal_grid.paintIdBase(id_base) +% 0x62_0000;
+/// The command-id NAMESPACE a pane's paint occupies.
+///
+/// The SDK painter derives every id it emits from `paintIdBase(id_base)`
+/// — a wrapping multiply by 2^24 — and keeps every offset under that
+/// stride, so a pane's commands are exactly the ids in
+/// `[idNamespace(id_base), + id_namespace_stride)` and two panes with
+/// different bases can never overlap.
+///
+/// This is the seam for picking ONE pane's commands out of a frame that
+/// holds several. It replaced a single `cellGridCommandId`: a terminal
+/// screen used to be one `cell_grid` command at one fixed offset, and is
+/// now one command PER ROW (the retained diff's unit of change is a
+/// command, so a screen-wide lattice re-encoded every cell on every
+/// keystroke). There is no single id to ask for any more — there is a
+/// namespace, and the rows are whichever grids fall inside it.
+pub fn idNamespace(id_base: u64) u64 {
+    return canvas.terminal_grid.paintIdBase(id_base);
+}
+
+/// The stride between namespaces: the painter's own 24-bit slot space.
+pub const id_namespace_stride: u64 = 1 << 24;
+
+/// The namespace an emitted command id belongs to — the inverse of
+/// `idNamespace`, for a reader holding an id rather than a pane index.
+pub fn idNamespaceOf(id: u64) u64 {
+    return id & ~(id_namespace_stride - 1);
 }
 
 pub const cursor_command_id: u64 = cursorCommandId(grid_id_base);

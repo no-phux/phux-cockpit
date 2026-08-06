@@ -253,6 +253,11 @@ test "Cmd+W closes the focused pane, then the tab, then the window" {
     try testing.expectEqual(@as(usize, 0), app_state.model.provider.activeCount());
     try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().close_count);
     try testing.expectEqualStrings(app.main_window_label, app_state.effects.windowActionState().lastLabel());
+    // Closing the window is not enough to END the app: AppKit keeps a process
+    // alive after its last window unless the delegate opts in, so closing the
+    // final tab used to leave a running cockpit with no window and no way back
+    // to it. Quit has to be asked for explicitly.
+    try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().quit_count);
 }
 
 test "a clean shell exit closes its pane; an abnormal one keeps it for Restart" {
@@ -303,6 +308,10 @@ test "the last clean exit in the last tab closes the window" {
     try testing.expectEqual(@as(usize, 0), app_state.model.tab_count);
     try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().close_count);
     try testing.expectEqualStrings(app.main_window_label, app_state.effects.windowActionState().lastLabel());
+    // A shell that ends on its own has to end the app the same way cmd+W
+    // does — otherwise typing `exit` in the last terminal leaves a headless
+    // process behind.
+    try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().quit_count);
 }
 
 test "split divider drag and keyboard resize stay in lockstep with the painted rects" {

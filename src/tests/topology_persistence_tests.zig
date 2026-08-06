@@ -30,7 +30,7 @@ test "versioned snapshot restores the tab trees into fresh sessions without proc
 
     const snapshot = try state.model.topologySnapshot();
     try snapshot.validate();
-    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v2 = snapshot });
+    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v3 = snapshot });
     defer app.deinitModel(&restored);
     try testing.expectEqual(snapshot.version, app.topology_snapshot_version);
     try testing.expectEqual(state.model.tab_count, restored.tab_count);
@@ -89,7 +89,7 @@ test "legacy migration turns each old terminal into a tab and an old split into 
 
     var future = migrated;
     future.version = 99;
-    try testing.expectError(error.UnsupportedTopologyVersion, app.migrateTopologySnapshot(.{ .v2 = future }));
+    try testing.expectError(error.UnsupportedTopologyVersion, app.migrateTopologySnapshot(.{ .v3 = future }));
     try testing.expectError(error.InvalidTopology, app.migrateTopologySnapshot(.{ .v0 = .{ .terminal_count = 5 } }));
 
     // A v1 payload with one terminal per tab migrates one-for-one.
@@ -121,7 +121,7 @@ test "canonical snapshots reject topology rewrites and round trip exactly" {
     state.model.tabs[state.model.selected_tab].setFraction(branch, 0.63);
 
     const snapshot = try state.model.topologySnapshot();
-    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v2 = snapshot });
+    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v3 = snapshot });
     defer app.deinitModel(&restored);
     try testing.expectEqualDeep(snapshot, try restored.topologySnapshot());
     try testing.expect(!app.process_restoration_supported);
@@ -156,6 +156,365 @@ test "canonical snapshots reject topology rewrites and round trip exactly" {
     invalid = snapshot;
     invalid.tabs[0].nodes[invalid.tabs[0].focus].terminal = @enumFromInt(std.math.maxInt(u64) - 1);
     try testing.expectError(error.InvalidTopology, invalid.validate());
+}
+
+/// A fired one-shot debounce, as the fx timer would deliver it.
+fn debounceFired() app.Msg {
+    return .{ .persist_topology = .{
+        .key = app.topology_persist_timer_key,
+        .timestamp_ns = 0,
+        .outcome = .fired,
+    } };
+}
+
+fn writeCompleted(outcome: native_sdk.EffectFileOutcome) app.Msg {
+    return .{ .topology_persisted = .{
+        .key = app.topology_state_file_key,
+        .op = .write,
+        .outcome = outcome,
+    } };
+}
+
+const state_path = "/tmp/phux-cockpit-tests/workspace.state";
+
+test "the state file round trips a split workspace, its divider, and its working directories" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .split_right, &state.effects);
+    const branch = state.model.tabs[state.model.selected_tab].root;
+    state.model.tabs[state.model.selected_tab].setFraction(branch, 0.63);
+    state.model.tab_placement = .side;
+
+    // The directory is the shell's own OSC 7 report, which is the only place
+    // a cwd ever comes from.
+    const focused = state.model.selectedTerminalId().?;
+    state.model.provider.terminal(focused).?.session.feed("\x1b]7;file://host/Users/phall/my%20dir\x1b\\");
+
+    const snapshot = try state.model.topologySnapshot();
+    try testing.expectEqualStrings("/Users/phall/my dir", snapshot.cwdFor(app.localId(focused).?));
+
+    var bytes: [app.max_state_bytes]u8 = undefined;
+    const encoded = try app.serializeWorkspaceState(&snapshot, &bytes);
+    var parsed: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(encoded, &parsed));
+    // Byte-for-byte: the fraction survives because `{d}` prints the shortest
+    // decimal that reads back as the same f32, so a divider does not creep by
+    // a ulp per launch.
+    try testing.expectEqualDeep(snapshot, try app.migrateTopologySnapshot(parsed));
+
+    // And the file is text a person can read, not an opaque blob.
+    try testing.expect(std.mem.startsWith(u8, encoded, "phux-cockpit-state 3\n"));
+    try testing.expect(std.mem.indexOf(u8, encoded, "placement side\n") != null);
+    try testing.expect(std.mem.indexOf(u8, encoded, "\ncwd 2 /Users/phall/my dir\n") != null);
+    try testing.expect(std.mem.endsWith(u8, encoded, "\nend\n"));
+}
+
+test "a corrupt, truncated, empty, or future state file falls back to a fresh launch" {
+    var parsed: app.PersistedTopologySnapshot = undefined;
+
+    // Nothing at all.
+    try testing.expect(!app.parseWorkspaceState("", &parsed));
+    try testing.expect(!app.parseWorkspaceState("\n\n\n", &parsed));
+
+    // Somebody else's file.
+    try testing.expect(!app.parseWorkspaceState("# phux cockpit config\nfont-size = 13\n", &parsed));
+
+    // A version from the future is refused rather than read optimistically:
+    // a newer build may mean something different by the same keywords.
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 99\nplacement top\nselection web\nend\n",
+        &parsed,
+    ));
+    // ...and one from before the oldest readable schema.
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 1\nplacement top\nselection web\nend\n",
+        &parsed,
+    ));
+    try testing.expect(!app.parseWorkspaceState("phux-cockpit-state\n", &parsed));
+    try testing.expect(!app.parseWorkspaceState("phux-cockpit-state x\nend\n", &parsed));
+
+    const whole =
+        "phux-cockpit-state 3\n" ++
+        "placement top\n" ++
+        "selection tab 0\n" ++
+        "tab 2 1\n" ++
+        "node 0 leaf 2 0\n" ++
+        "node 1 leaf 2 1\n" ++
+        "node 2 branch - horizontal 0.5 0 1\n" ++
+        "end\n";
+    try testing.expect(app.parseWorkspaceState(whole, &parsed));
+
+    // TRUNCATION at every line boundary. Each prefix is a syntactically
+    // perfect file describing a SMALLER workspace, which is exactly why the
+    // terminator exists: without it, a half-written save would silently
+    // restore half a window.
+    var cut: usize = 0;
+    while (cut < whole.len) : (cut += 1) {
+        if (whole[cut] != '\n') continue;
+        if (cut + 1 == whole.len) continue;
+        try testing.expect(!app.parseWorkspaceState(whole[0 .. cut + 1], &parsed));
+    }
+
+    // Structural corruption inside an otherwise well-formed file.
+    try testing.expect(!app.parseWorkspaceState(whole ++ "tab 0 0\n", &parsed));
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 3\nnode 0 leaf - 0\nend\n",
+        &parsed,
+    ));
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 3\ntab 0 0\nnode 0 leaf - 0\nnode 0 leaf - 1\nend\n",
+        &parsed,
+    ));
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 3\ntab 0 0\nnode 0 leaf - 999\nend\n",
+        &parsed,
+    ));
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 3\ntab 0 0\nnode 0 branch - sideways 0.5 0 1\nend\n",
+        &parsed,
+    ));
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 3\ntab 0 0\nnode 0 branch - horizontal nan 0 1\nend\n",
+        &parsed,
+    ));
+    try testing.expect(!app.parseWorkspaceState("phux-cockpit-state 3\nteleport 4\nend\n", &parsed));
+
+    // RANDOM BYTES. Two hundred files of noise, plus noise carrying the magic
+    // so the scan actually reaches the line loop. None may crash, hang, or
+    // parse: the grammar has no nesting, so the work is one linear pass
+    // whatever the bytes say.
+    var prng = std.Random.DefaultPrng.init(0x5eed_c0de);
+    const random = prng.random();
+    var noise: [1024]u8 = undefined;
+    for (0..200) |_| {
+        const len = random.uintLessThan(usize, noise.len);
+        random.bytes(noise[0..len]);
+        _ = app.parseWorkspaceState(noise[0..len], &parsed);
+
+        var seeded: [1024 + 32]u8 = undefined;
+        const header = "phux-cockpit-state 3\n";
+        @memcpy(seeded[0..header.len], header);
+        @memcpy(seeded[header.len..][0..len], noise[0..len]);
+        _ = app.parseWorkspaceState(seeded[0 .. header.len + len], &parsed);
+    }
+}
+
+test "a version 2 state file migrates into the current schema with no working directories" {
+    // v2 is the tree schema before directories. The tree arrives whole; every
+    // pane opens where a pane whose shell never reported OSC 7 opens.
+    var parsed: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(
+        "phux-cockpit-state 2\n" ++
+            "placement side\n" ++
+            "selection tab 0\n" ++
+            "tab 2 1\n" ++
+            "node 0 leaf 2 0\n" ++
+            "node 1 leaf 2 1\n" ++
+            "node 2 branch - vertical 0.25 0 1\n" ++
+            "end\n",
+        &parsed,
+    ));
+    try testing.expect(parsed == .v2);
+
+    const migrated = try app.migrateTopologySnapshot(parsed);
+    try testing.expectEqual(app.topology_snapshot_version, migrated.version);
+    try testing.expectEqual(@as(u8, 1), migrated.tab_count);
+    try testing.expectEqual(app.TabPlacement.side, migrated.tab_placement);
+    try testing.expectEqual(app.Orientation.vertical, migrated.tabs[0].nodes[2].orientation);
+    for (migrated.cwds) |cwd| try testing.expectEqual(@as(u16, 0), cwd.len);
+
+    // A v2 file may not carry one: the keyword did not exist in that schema,
+    // and quietly accepting it would make the version number a lie.
+    try testing.expect(!app.parseWorkspaceState(
+        "phux-cockpit-state 2\ntab 0 0\nnode 0 leaf - 0\ncwd 0 /tmp\nend\n",
+        &parsed,
+    ));
+}
+
+test "a topology change arms one debounced write and ordinary input arms none" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    state.model.state.setPath(state_path);
+    try testing.expect(state.model.state.enabled());
+
+    // Input that reshapes nothing writes nothing. This is the whole reason
+    // the trigger is a shape hash and not a call in each arm: a terminal
+    // takes thousands of these a minute.
+    app.update(&state.model, .unhover_tab, &state.effects);
+    app.update(&state.model, .{ .hover_tab = 0 }, &state.effects);
+    try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+
+    // Every shape-changing act arms exactly one pending expiry, and a BURST
+    // of them still arms one: re-arming an active timer key replaces it.
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .split_right, &state.effects);
+    app.update(&state.model, .{ .move_terminal = -1 }, &state.effects);
+    try state.effects.fireTimer(app.topology_persist_timer_key);
+    try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+
+    // A divider drag reshapes the tree on every frame; the debounce is what
+    // keeps that from being a write per frame.
+    const branch = state.model.tabs[state.model.selected_tab].root;
+    var step: f32 = 0.30;
+    while (step < 0.60) : (step += 0.01) {
+        app.update(&state.model, .{ .split_resized = .{ .node = branch, .value = step } }, &state.effects);
+    }
+    try state.effects.fireTimer(app.topology_persist_timer_key);
+    try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+}
+
+test "the debounced write carries the live layout and a second one waits for it" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    state.model.state.setPath(state_path);
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .split_down, &state.effects);
+
+    app.update(&state.model, debounceFired(), &state.effects);
+    try testing.expectEqual(@as(usize, 1), state.effects.pendingFileCount());
+    const request = state.effects.pendingFileAt(0) orelse return error.TestExpectedFileRequest;
+    try testing.expectEqual(app.topology_state_file_key, request.key);
+    try testing.expectEqual(native_sdk.EffectFileOp.write, request.op);
+    try testing.expectEqualStrings(state_path, request.path);
+
+    var parsed: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(request.bytes, &parsed));
+    const written = try app.migrateTopologySnapshot(parsed);
+    try testing.expectEqualDeep(try state.model.topologySnapshot(), written);
+
+    // The SDK rejects a second write on a live key, and a rejection would
+    // report a failure for a save that never started. So a change made while
+    // a write is out waits for it instead of racing it.
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, debounceFired(), &state.effects);
+    try testing.expectEqual(@as(usize, 1), state.effects.pendingFileCount());
+
+    // The terminal result is the only thing that releases the key — and it
+    // re-arms, because the shape moved while the write was out.
+    app.update(&state.model, writeCompleted(.ok), &state.effects);
+    try testing.expect(!state.model.state.inflight);
+    try state.effects.fireTimer(app.topology_persist_timer_key);
+
+    // With nothing owed, an expiry writes nothing at all.
+    state.model.state.pending = false;
+    try state.effects.feedFileResult(app.topology_state_file_key, .ok, "");
+    app.update(&state.model, debounceFired(), &state.effects);
+    try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
+}
+
+test "the shutdown message puts the layout on disk without waiting for the debounce" {
+    // The one claim that cannot be made without real IO: quitting inside the
+    // debounce window still saves. Nothing else drains an effect queue after
+    // shutdown, so the write has to be synchronous, and "synchronous" is only
+    // provable against a file.
+    const root = ".zig-cache/phux-cockpit-state-tests";
+    const path = root ++ "/shutdown.state";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing.io, root) catch {};
+    defer cwd.deleteTree(testing.io, root) catch {};
+
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    state.model.state.setPath(path);
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .split_right, &state.effects);
+    // The debounce has not expired, so no effect has written anything.
+    try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
+
+    app.update(&state.model, .shutdown, &state.effects);
+
+    var bytes: [app.max_state_bytes]u8 = undefined;
+    var file = try cwd.openFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    const read = try file.readPositionalAll(testing.io, &bytes, 0);
+    var parsed: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(bytes[0..read], &parsed));
+    try testing.expectEqualDeep(try state.model.topologySnapshot(), try app.migrateTopologySnapshot(parsed));
+}
+
+test "a model with no state path never touches the disk" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    // No composition root handed this model a path — every fixture and every
+    // test is in this state, and none of them may write files.
+    try testing.expect(!state.model.state.enabled());
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .split_right, &state.effects);
+    try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+    app.update(&state.model, debounceFired(), &state.effects);
+    try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
+    // Nor does shutdown: there is nowhere to write.
+    app.update(&state.model, .shutdown, &state.effects);
+}
+
+test "restored panes reopen in their saved working directory" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    app.update(&state.model, .split_right, &state.effects);
+    const focused = state.model.selectedTerminalId().?;
+    state.model.provider.terminal(focused).?.session.feed("\x1b]7;file:///Users/phall/project\x1b\\");
+
+    const snapshot = try state.model.topologySnapshot();
+    var restored = try app.restoreModel(testing.allocator, testing.io, .{ .v3 = snapshot });
+    defer app.deinitModel(&restored);
+    app.applyRestoredWorkingDirectories(&restored, &snapshot);
+
+    // The pane that reported a directory carries the generated `cd` argv; the
+    // one that never did keeps the plain login shell, exactly as a first
+    // terminal does.
+    const with_cwd = restored.provider.terminal(focused) orelse return error.TestExpectedTerminal;
+    try testing.expect(std.mem.indexOf(u8, with_cwd.argv[with_cwd.argv.len - 1], "/Users/phall/project") != null);
+
+    var refs: [app.max_panes_per_tab]app.TerminalRef = undefined;
+    const count = restored.treeConst(restored.selected_tab).?.terminals(&refs);
+    try testing.expectEqual(@as(usize, 2), count);
+    for (refs[0..count]) |id| {
+        if (id.eql(focused)) continue;
+        const bare = restored.provider.terminal(id).?;
+        try testing.expectEqualSlices(u8, app.paneArgv(0)[0], bare.argv[0]);
+        try testing.expect(std.mem.indexOf(u8, bare.argv[bare.argv.len - 1], "/Users/phall/project") == null);
+    }
+
+    // Restoring recreates SHELLS, never processes: the snapshot carries no
+    // pid and claims none.
+    try testing.expect(!app.process_restoration_supported);
+}
+
+test "a working directory that cannot be honoured is not recorded" {
+    var cwd: app.SnapshotCwd = .{};
+    cwd.set("/Users/phall/work");
+    try testing.expectEqualStrings("/Users/phall/work", cwd.slice());
+
+    // Relative paths cannot be restored into (`paneArgvIn` refuses them), a
+    // newline would break the line format, and a NUL would be truncated at the
+    // C boundary. Each records NOTHING, which restores as "$HOME".
+    cwd.set("relative/path");
+    try testing.expectEqual(@as(u16, 0), cwd.len);
+    cwd.set("/has\nnewline");
+    try testing.expectEqual(@as(u16, 0), cwd.len);
+    cwd.set("/has\x00nul");
+    try testing.expectEqual(@as(u16, 0), cwd.len);
+    cwd.set("/" ++ "x" ** app.max_snapshot_cwd_bytes);
+    try testing.expectEqual(@as(u16, 0), cwd.len);
+
+    // And a snapshot cannot be made to carry one behind `set`'s back.
+    var snapshot: app.TopologySnapshot = .{ .tab_count = 0 };
+    snapshot.cwds[0].bytes[0] = 'x';
+    snapshot.cwds[0].len = 1;
+    try testing.expectError(error.InvalidTopology, snapshot.validate());
 }
 
 test "normalizing topology drops panes whose terminal is gone and collapses empty tabs" {

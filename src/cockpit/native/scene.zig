@@ -121,7 +121,13 @@ const shell_views = [_]native_sdk.ShellView{
     .{ .label = webview_label, .kind = .webview, .parent = canvas_label, .url = model_module.BrowserPage.github.url(), .x = 0, .y = 0, .width = webkit_parking_extent, .height = webkit_parking_extent, .layer = 20 },
 };
 /// The window's declared label. `fx.closeWindow` addresses a window by this
-/// name, and closing the last tab is how the app exits.
+/// name.
+///
+/// Closing the last tab closes this window AND quits: `closeWindow` on its
+/// own leaves a live process, because AppKit only terminates after the last
+/// window when the delegate asks it to. Both effects are sent, in that order,
+/// so the window tears down normally and the shutdown lifecycle that flushes
+/// the workspace layout still runs.
 pub const main_window_label = "main";
 
 const shell_windows = [_]native_sdk.ShellWindow{.{

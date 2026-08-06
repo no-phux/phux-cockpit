@@ -81,6 +81,18 @@ pub const Msg = union(enum) {
     wheel_fallback: struct { x: f32, y: f32, delta: f32 },
     chrome_changed: native_sdk.platform.WindowChrome,
     focus_changed: bool,
+    /// The layout-snapshot debounce expired: write the workspace shape now.
+    /// Arriving as a Msg rather than as a direct write inside every topology
+    /// arm is the whole debounce — the timer is re-armed on each change and
+    /// only its final expiry reaches here.
+    persist_topology: native_sdk.EffectTimer,
+    /// The snapshot write finished. Terminal for its key, so it is also the
+    /// only place a queued follow-up write may start.
+    topology_persisted: native_sdk.EffectFileResult,
+    /// The runtime is shutting down. The LAST message this model will ever
+    /// see, and the only chance to put a change made inside the debounce
+    /// window on disk — nothing will drain another effect queue after it.
+    shutdown,
 };
 
 pub const TerminalApp = native_sdk.UiApp(Model, Msg);

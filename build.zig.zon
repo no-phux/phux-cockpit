@@ -23,13 +23,29 @@
         // IS the index, so a fallback glyph cannot shift its row off the grid.
         // Every SGR attribute finally has somewhere to live.
         //
-        // Caveat: `cell_grid` has no GPU encoder yet, so terminal frames route
-        // to the CPU reference path on macOS and Windows. Correct everywhere,
-        // but the frame cost against the old CoreGraphics packet path is
-        // unmeasured. See phux-cockpit-ffh.
+        // The grid is emitted one command PER ROW, not one per screen. A
+        // retained command is the unit of change, so a screen-wide grid would
+        // have made every keystroke re-encode every cell — moving the
+        // full-surface cost from the rasterizer to the wire rather than
+        // removing it. Cluster interning is per-row for the same reason:
+        // per-screen interning put every row's fingerprint on every other
+        // row's characters, and one new letter re-encoded the screen (measured
+        // at 31 upserts / 8449 bytes a frame before the fix, 1 upsert and
+        // ~400-800 bytes after).
+        //
+        // With the AppKit decoder and wire v6, terminal frames are back on the
+        // GPU packet path with incremental patching, which the CPU fallback
+        // had disabled entirely:
+        //   gpu_present_path    pixels -> packet
+        //   present_mode        none   -> patch
+        //   present_patch_bytes 0      -> 789 (one upsert on a prompt)
+        //   input latency       19.4ms -> 5.36ms, against a 16.67ms budget
+        //
+        // The per-view command ceiling also went back 4096 -> 2048: terminals
+        // were the only reason it was raised, and one now costs ~100 commands.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/7a14a5dc5512e33b55a71aec6342d2a24c736214.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQuVY4QHlvlZvO25uuDknQG03TBBqTfdVskQdkPg9",
+            .url = "https://github.com/phall1/native/archive/f7347de1c607dcbe4e4f06dddd172fcf3f9d0507.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQtoO4QE1WNhiIIVID3lmSyf_UzEs5QAt_cH1PjXR",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream
