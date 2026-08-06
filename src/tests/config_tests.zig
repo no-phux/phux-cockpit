@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const config = @import("../config/config.zig");
+const app = @import("../main.zig");
 
 test "an empty or absent config yields usable defaults" {
     const absent = config.loadOrDefault(null);
@@ -202,4 +203,62 @@ test "carriage returns from a CRLF file do not corrupt values" {
     try std.testing.expectApproxEqAbs(@as(f32, 16), parsed.font_size, 0.001);
     try std.testing.expectEqual(config.CursorStyle.bar, parsed.cursor_style);
     try std.testing.expectEqual(@as(usize, 0), parsed.diagnostic_count);
+}
+
+test "path joining normalizes a trailing slash instead of doubling it" {
+    var out: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("/a/b", try config.joinDir("/a", "b", &out));
+    try std.testing.expectEqualStrings("/a/b", try config.joinDir("/a/", "b", &out));
+    try std.testing.expectEqualStrings("/a/config", try config.joinPath("/a", &out));
+    try std.testing.expectEqualStrings("/a/config", try config.joinPath("/a/", &out));
+
+    // A destination that cannot hold the result is refused, not truncated — a
+    // truncated path is a DIFFERENT path, and silently reading the wrong file
+    // is worse than reading none.
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, config.joinDir("/aaa", "bbb", &tiny));
+    try std.testing.expectError(error.NoSpaceLeft, config.joinPath("/aaa", &tiny));
+}
+
+test "the dotfile config location is where someone coming from Ghostty would put it" {
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+
+    // Without XDG set this is ~/.config/phux-cockpit/config, NOT the macOS
+    // platform directory app_dirs would choose. Both are searched; this one is
+    // searched first, because it is the one people actually write to.
+    try std.testing.expectEqualStrings(
+        "/Users/someone/.config/phux-cockpit/config",
+        app.resolveDotfileConfigPath(.{ .home = "/Users/someone" }, &out).?,
+    );
+
+    // XDG_CONFIG_HOME wins when set, which is the entire point of it.
+    try std.testing.expectEqualStrings(
+        "/elsewhere/phux-cockpit/config",
+        app.resolveDotfileConfigPath(
+            .{ .home = "/Users/someone", .xdg_config_home = "/elsewhere" },
+            &out,
+        ).?,
+    );
+
+    // An empty XDG value is treated as unset rather than as the filesystem
+    // root, so a stray `export XDG_CONFIG_HOME=` cannot aim the config at
+    // /phux-cockpit/config.
+    try std.testing.expectEqualStrings(
+        "/Users/someone/.config/phux-cockpit/config",
+        app.resolveDotfileConfigPath(
+            .{ .home = "/Users/someone", .xdg_config_home = "" },
+            &out,
+        ).?,
+    );
+
+    // With nothing to anchor on there is no dotfile candidate at all and the
+    // caller falls through to the platform location rather than guessing.
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        app.resolveDotfileConfigPath(.{}, &out),
+    );
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        app.resolveDotfileConfigPath(.{ .home = "" }, &out),
+    );
 }

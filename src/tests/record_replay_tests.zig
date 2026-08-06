@@ -33,6 +33,24 @@ const JournalBuffer = struct {
     }
 };
 
+/// Build a `SessionRecorder` DIRECTLY into caller-owned storage.
+///
+/// `SessionRecorder` is ~3 MB by value and `TerminalApp` ~4.5 MB, and a
+/// debug build materialises a returned aggregate as a temporary in the
+/// CALLER's frame that then lives for the rest of the function. Built
+/// inline, this file's recorder fixture carried ~7.9 MB of dead stack
+/// through its whole body — on top of the ~4.8 MB the test frame around
+/// it carried for the same reason. That was survivable until the packed
+/// cell grid landed: `canvas.Builder` now embeds a 32k-cell store, and
+/// the SDK's chrome installer holds two builders plus two per-view
+/// command arrays on ONE frame (~4.1 MB, up ~1.3 MB), which put this
+/// path over the 16 MB main-thread stack and crashed it with SIGSEGV
+/// inside the SDK's frame rebuild. Constructing in a LEAF helper keeps
+/// the temporary in a frame that pops immediately.
+fn initSessionRecorder(slot: *native_sdk.runtime.SessionRecorder, sink: native_sdk.runtime.SessionRecorderSink) void {
+    slot.* = native_sdk.runtime.SessionRecorder.init(sink);
+}
+
 /// Drive one recorded terminal session against the scriptable fake pty:
 /// spawn (init_fx), a prompt, typed input (echoed by the script), and
 /// the exit. Returns the recorded model and the state fingerprint.
@@ -49,7 +67,7 @@ fn recordTerminalSession(
 ) !RecordedTerminalSession {
     const recorder = try std.heap.page_allocator.create(native_sdk.runtime.SessionRecorder);
     defer std.heap.page_allocator.destroy(recorder);
-    recorder.* = native_sdk.runtime.SessionRecorder.init(buffer.sink());
+    initSessionRecorder(recorder, buffer.sink());
     recorder.blob_sink = store.sink();
     recorder.begin(.{ .platform_name = "test", .app_name = app.app_name, .window_width = 980, .window_height = 640 });
 
@@ -62,7 +80,7 @@ fn recordTerminalSession(
     const session = try createSession(80, 24);
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
+    support.initTerminalApp(app_state, session);
     defer app.deinitModel(&app_state.model);
     defer app_state.deinit();
     app_state.effects.executor = .fake;
@@ -173,7 +191,7 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     const session = try createSession(80, 24);
     const app_state = try gpa.create(TerminalApp);
     defer gpa.destroy(app_state);
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
+    support.initTerminalApp(app_state, session);
     defer app.deinitModel(&app_state.model);
     defer app_state.deinit();
 

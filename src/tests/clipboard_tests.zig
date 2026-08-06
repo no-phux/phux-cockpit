@@ -96,8 +96,8 @@ test "clipboard paste stays with its requesting terminal while Web is selected" 
     const app_iface = app_state.app();
 
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
-    // One tab, so the Web surface sits at cmd+2.
-    try pressCanvasKey(harness, app_iface, "2", .{ .primary = true, .command = true });
+    // The Web surface left the tab strip; cmd+shift+B is its own chord.
+    try pressCanvasKey(harness, app_iface, "b", .{ .primary = true, .command = true, .shift = true });
     try testing.expect(app_state.model.selectedSurface().eql(.web));
     try testing.expectEqual(@as(?app.TerminalRef, null), app_state.model.selectedTerminalRef());
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "original owner");

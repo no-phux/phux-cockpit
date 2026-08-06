@@ -13,13 +13,78 @@ const Model = model_module.Model;
 const Pane = local.Pane;
 const TerminalRef = support.TerminalRef;
 
+/// The default gutter between the window edge and the terminal. `window-padding`
+/// overrides it; `windowPadding` is the accessor everything geometric uses so
+/// the painter, the widget tree, and the PTY pump cannot disagree.
 pub const grid_inset: f32 = 8;
+
+/// The configured gutter, clamped to what the config parser already accepts
+/// (0..64). Kept as a function rather than a field read so a future
+/// per-window padding has one seam to change.
+pub fn windowPadding(model: *const Model) f32 {
+    return @max(0, model.config.window_padding);
+}
 /// The tab band's height. It must be at least the register's own trigger
 /// height, or the strip overflows the band and paints its hairline and
 /// underline indicator down into the terminal's first row. The Geist pack
 /// computes 50 at the default control size (`metrics.tabs_trigger_height`),
 /// and `headerHeightCoversTriggers` pins the two together.
 pub const header_height: f32 = 50;
+/// Tab geometry. Lives here rather than in the view because the visible-window
+/// derivation below is the thing tests pin, and it needs the same numbers the
+/// strip lays out with.
+pub const tab_extent: f32 = 168;
+/// Tabs SHRINK before the strip windows, the way every real tab bar does. 92pt
+/// still holds a readable ~10-character title plus the marker and the close
+/// affordance; below that a tab is a swatch, not a label.
+pub const tab_min_extent: f32 = 92;
+pub const tab_height: f32 = 34;
+pub const tab_control_extent: f32 = 18;
+pub const tab_marker_extent: f32 = 8;
+pub const tab_indicator_thickness: f32 = 2;
+/// Room held back at the right of the band for the `+` button and the focused
+/// pane's status, so a full strip never pushes either off the edge.
+pub const tab_strip_trailing_reserve: f32 = 220;
+
+pub const TabWindow = struct {
+    first: usize = 0,
+    count: usize = 0,
+    /// The width each visible tab lays out at, between `tab_min_extent` and
+    /// `tab_extent`.
+    extent: f32 = tab_extent,
+
+    pub fn contains(window: TabWindow, index: usize) bool {
+        return index >= window.first and index < window.first + window.count;
+    }
+};
+
+/// The contiguous run of tabs the strip shows, ALWAYS containing the selected
+/// one.
+///
+/// This replaces the old fixed 8-slot tuple, which simply did not draw tabs
+/// 9..16 at all. It is deliberately a derivation rather than a scroll widget:
+/// the toolkit's `scroll_view` is keyboard-focusable and consumes arrow keys,
+/// so a scroller in the tab band means a shell's Tab key can move focus onto
+/// the strip and the NEXT arrow key scrolls tabs instead of walking history.
+/// A window that follows selection gives scroll-into-view without putting a
+/// keyboard trap above the terminal.
+pub fn visibleTabWindow(model: *const Model, band_width: f32) TabWindow {
+    if (model.tab_count == 0) return .{};
+    const usable = @max(tab_min_extent, band_width - tab_strip_trailing_reserve);
+    // Shrink first, window second. A strip that windowed at full tab width
+    // would hide tab 4 in a 900pt window while leaving 200pt of gutter.
+    const capacity: usize = @max(1, @as(usize, @intFromFloat(@floor(usable / tab_min_extent))));
+    const shown = @min(capacity, model.tab_count);
+    const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(shown)));
+    if (shown == model.tab_count) return .{ .first = 0, .count = shown, .extent = extent };
+    const selected = @min(model.selected_tab, model.tab_count - 1);
+    // Anchor at the left until the selection walks past the right edge, then
+    // keep the selection as the LAST visible tab. Recentering on every step
+    // would make neighbouring tabs jump under the pointer.
+    const first = if (selected < shown) 0 else selected - shown + 1;
+    return .{ .first = first, .count = shown, .extent = extent };
+}
+
 pub const side_rail_width: f32 = 184;
 pub const side_rail_gap: f32 = 8;
 pub const side_tab_height: f32 = 34;
@@ -50,6 +115,43 @@ pub fn cockpitTokens(_: *const Model) canvas.DesignTokens {
     return tokens;
 }
 
+/// The tokens the TERMINAL GRIDS paint with — deliberately not the chrome's.
+///
+/// `canvas.terminalCellMetrics` derives the cell box from
+/// `typography.label_size`, and that same token sizes every widget label in
+/// the app. Driving one token from the `font-size` knob would grow the tab
+/// strip along with the terminal, which no Mac terminal does. Splitting the
+/// two here costs one extra token value per frame and keeps the chrome fixed
+/// while cmd+= walks the grid.
+pub fn terminalTokens(model: *const Model) canvas.DesignTokens {
+    return terminalTokensFrom(cockpitTokens(model), model);
+}
+
+/// The same derivation over an ALREADY-RESOLVED token set.
+///
+/// Taking a base rather than rebuilding one is load-bearing. The runtime
+/// stamps its text-measure provider onto the tokens it hands the chrome
+/// builder, and `canvas.terminalCellMetrics` measures the mono face's real
+/// advance through that provider. Rebuilding from `cockpitTokens` inside the
+/// painter would silently drop it and fall back to the `label_size * 0.6`
+/// estimate — a cell width nothing else in the app agrees with, which is
+/// exactly how a default-config launch would start reporting mouse positions
+/// against a grid it is not painting.
+pub fn terminalTokensFrom(base: canvas.DesignTokens, model: *const Model) canvas.DesignTokens {
+    var tokens = base;
+    const cfg = &model.config;
+    tokens.typography.label_size = model.fontSize();
+    // Background/foreground land in the emulator's own DEFAULTS through
+    // `Session.snapshot`, so an application's OSC 10/11 still wins over them.
+    if (cfg.background) |color| tokens.colors.background = canvas.Color.rgb8(color.r, color.g, color.b);
+    if (cfg.foreground) |color| tokens.colors.text = canvas.Color.rgb8(color.r, color.g, color.b);
+    // The selection wash reads `colors.accent` (see `palette.Palette.init`).
+    // The cursor does NOT come through here — `applySessionConfig` gives it
+    // the emulator's override channel so the two knobs stay independent.
+    if (cfg.selection_background) |color| tokens.colors.accent = canvas.Color.rgb8(color.r, color.g, color.b);
+    return tokens;
+}
+
 /// The band must be able to contain the tab triggers it hosts. The register
 /// sizes an underline trigger from `metrics.tabs_trigger_height`, scaled by
 /// density and the widget's size rung; the strip declares no size rung, so
@@ -68,7 +170,13 @@ pub fn paneHasConfirmedLoss(pane: *const Pane) bool {
 
 fn paneNeedsAttention(model: *const Model, pane: *const Pane) bool {
     const paste_failed = model.paste_owner.terminal_ref.eql(pane.id) and model.paste_failed;
-    return pane.phase == .ended or pane.phase == .failed or paneHasConfirmedLoss(pane) or
+    // The BELL is the signal a shell actually sends on purpose — a finished
+    // build, a prompt waiting on input — and it was being dropped on the
+    // floor. It latches until the tab is looked at (`acknowledgeVisibleBells`),
+    // so it survives arriving while the tab is hidden, which is the only time
+    // it matters.
+    return pane.bellRung() or
+        pane.phase == .ended or pane.phase == .failed or paneHasConfirmedLoss(pane) or
         pane.write_refusals > 0 or pane.native_delivery_failures > 0 or pane.copy_failed or paste_failed;
 }
 
@@ -84,6 +192,9 @@ pub fn selectedTerminalCanClose(model: *const Model) bool {
 }
 
 pub fn chromeRevealed(model: *const Model) bool {
+    // `hide-chrome-when-single = false` means "I want my tab strip", full
+    // stop — the at-rest hide is a default, not a law.
+    if (!model.config.hide_chrome_when_single) return true;
     if (model.tab_count > 1) return true;
     if (model.selectedTerminalRef() == null) return true;
     for (model.tabs[0..model.tab_count], 0..) |_, index| {
@@ -106,23 +217,24 @@ pub const WorkspaceChrome = struct {
 };
 
 pub fn workspaceChrome(model: *const Model, size: geometry.SizeF) WorkspaceChrome {
-    const titlebar = @max(grid_inset, model.chrome_top + 4);
+    const inset = windowPadding(model);
+    const titlebar = @max(inset, model.chrome_top + 4);
     const revealed = chromeRevealed(model);
     const side_extent = if (revealed and model.tab_placement == .side) side_rail_width + side_rail_gap else 0;
     const top_extent = if (revealed and model.tab_placement == .top) header_height else 0;
     return .{
         .titlebar_height = titlebar,
         .header = geometry.RectF.init(
-            grid_inset,
+            inset,
             titlebar,
-            @max(0, size.width - grid_inset * 2),
+            @max(0, size.width - inset * 2),
             top_extent,
         ),
         .content = geometry.RectF.init(
-            grid_inset + side_extent,
+            inset + side_extent,
             titlebar + top_extent,
-            @max(0, size.width - grid_inset * 2 - side_extent),
-            @max(0, size.height - titlebar - top_extent - grid_inset),
+            @max(0, size.width - inset * 2 - side_extent),
+            @max(0, size.height - titlebar - top_extent - inset),
         ),
     };
 }

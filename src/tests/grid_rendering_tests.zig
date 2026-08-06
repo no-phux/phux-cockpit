@@ -19,27 +19,18 @@ const startFocusedTerminal = support.startFocusedTerminal;
 const startTwoPaneCockpit = support.startTwoPaneCockpit;
 const pressCanvasKey = support.pressCanvasKey;
 
-/// Distinct baseline rows among a display-list slice's text commands —
-/// how many grid rows a paint actually put on screen.
-fn distinctTextRows(commands: []const canvas.CanvasCommand) usize {
-    var rows: [128]f32 = undefined;
-    var count: usize = 0;
-    outer: for (commands) |command| {
-        switch (command) {
-            .draw_text => |text| {
-                for (rows[0..count]) |seen| {
-                    if (seen == text.origin.y) continue :outer;
-                }
-                if (count < rows.len) {
-                    rows[count] = text.origin.y;
-                    count += 1;
-                }
-            },
-            else => {},
-        }
-    }
-    return count;
-}
+// A terminal screen is ONE packed `cell_grid` command now (see
+// support.zig), so the assertions below read CELLS: per-run `fill_rect`
+// and `draw_text` commands no longer exist for terminal content. What
+// each test pins is unchanged; only the surface it reads moved. Two
+// consequences run through the whole file:
+//   - Colours are 8-bit per channel, the terminal's own precision, so
+//     they compare EXACTLY where float run colours needed a tolerance.
+//   - A screen's COMMAND count is a constant (surface, clip, grid,
+//     cursor, clip pop) whatever it contains, so "how much painted" is
+//     measured in the grid's painted ROWS and inked CELLS.
+
+const expectCellGrid = support.expectCellGrid;
 
 /// A pane's worst case for run merging: every cell its own style, so no
 /// two adjacent cells share a run.
@@ -70,59 +61,42 @@ test "the grid paints real text runs with the engine's ANSI palette and exact tr
         .running = true,
         .selecting = false,
     });
-    const list = builder.displayList();
+    // Colour is a property of a CELL now, not of a merged run, so the
+    // three words are located by the columns they occupy and each
+    // word's first cell is read directly. Nothing merges and nothing
+    // can silently re-colour a neighbour.
+    const view = try expectCellGrid(builder.displayList());
+    const plain_x = view.findInRow(0, "plain") orelse return error.TestExpectedCell;
+    const red_x = view.findInRow(0, "red") orelse return error.TestExpectedCell;
+    const exact_x = view.findInRow(0, "exact") orelse return error.TestExpectedCell;
+    try testing.expectEqualStrings("p", view.cluster(plain_x, 0));
+    try testing.expectEqualStrings("r", view.cluster(red_x, 0));
+    try testing.expectEqualStrings("e", view.cluster(exact_x, 0));
 
-    var saw_plain = false;
-    var saw_red = false;
-    var saw_exact = false;
-    for (list.commands) |command| {
-        switch (command) {
-            .draw_text => |text| {
-                if (std.mem.indexOf(u8, text.text, "plain") != null) {
-                    saw_plain = true;
-                    // Default fg is the theme text token.
-                    try testing.expectEqual(tokens.colors.text.r, text.color.r);
-                }
-                if (std.mem.eql(u8, text.text, "red")) {
-                    saw_red = true;
-                    // ANSI 1 is the TERMINAL's red, not the UI's error color.
-                    // This used to resolve through `tokens.colors.destructive`,
-                    // which meant `\x1b[31m` painted whatever hue the design
-                    // system happened to use for destructive buttons — a
-                    // number with no relationship to what every other terminal
-                    // shows. It now comes from the emulator's own palette.
-                    const expected = vt.color.default[1];
-                    try testing.expectApproxEqAbs(
-                        @as(f32, @floatFromInt(expected.r)) / 255.0,
-                        text.color.r,
-                        0.01,
-                    );
-                    try testing.expectApproxEqAbs(
-                        @as(f32, @floatFromInt(expected.g)) / 255.0,
-                        text.color.g,
-                        0.01,
-                    );
-                    try testing.expectApproxEqAbs(
-                        @as(f32, @floatFromInt(expected.b)) / 255.0,
-                        text.color.b,
-                        0.01,
-                    );
-                    // And it is specifically NOT the design token any more.
-                    try testing.expect(@abs(tokens.colors.destructive.r - text.color.r) > 0.01);
-                }
-                if (std.mem.eql(u8, text.text, "exact")) {
-                    saw_exact = true;
-                    // Truecolor passes through exactly.
-                    try testing.expectApproxEqAbs(@as(f32, 10.0 / 255.0), text.color.r, 0.002);
-                    try testing.expectApproxEqAbs(@as(f32, 200.0 / 255.0), text.color.g, 0.002);
-                }
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_plain);
-    try testing.expect(saw_red);
-    try testing.expect(saw_exact);
+    // Default fg is the theme text token.
+    const plain_fg = view.foreground(plain_x, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(canvas.CellColor.fromColor(tokens.colors.text), plain_fg);
+
+    // ANSI 1 is the TERMINAL's red, not the UI's error color. This used
+    // to resolve through `tokens.colors.destructive`, which meant
+    // `\x1b[31m` painted whatever hue the design system happened to use
+    // for destructive buttons — a number with no relationship to what
+    // every other terminal shows. It now comes from the emulator's own
+    // palette, and the packed cell carries it at the emulator's own
+    // 8-bit precision, so this is an EXACT comparison.
+    const expected = vt.color.default[1];
+    const red_fg = view.foreground(red_x, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(expected.r, red_fg.r);
+    try testing.expectEqual(expected.g, red_fg.g);
+    try testing.expectEqual(expected.b, red_fg.b);
+    // And it is specifically NOT the design token any more.
+    try testing.expect(!canvas.CellColor.fromColor(tokens.colors.destructive).eql(red_fg));
+
+    // Truecolor passes through exactly.
+    const exact_fg = view.foreground(exact_x, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(@as(u8, 10), exact_fg.r);
+    try testing.expectEqual(@as(u8, 200), exact_fg.g);
+    try testing.expectEqual(@as(u8, 30), exact_fg.b);
 }
 
 test "the custom cursor fills only while focused and live" {
@@ -182,25 +156,39 @@ test "a styled wide character's background covers both of its cells" {
     });
     const cell_w = session.cell_width;
     // ANSI 41 is the engine's own red now, not the destructive design token,
-    // so the run is identified by the palette entry the emulator actually
-    // resolves. What is under test here is the GEOMETRY — that the spacer
-    // tail extends the run — not which red it is.
+    // so the background is identified by the palette entry the emulator
+    // actually resolves. What is under test here is the GEOMETRY — that the
+    // spacer tail extends the fill — not which red it is.
+    //
+    // The old shape of that claim was "one background RECT wider than 1.5
+    // cells". A packed lattice has no runs to widen: the same claim is now
+    // that the spacer column carries the primary's background of its own,
+    // and the two columns are adjacent, so the red covers two cell widths
+    // of glass with no gap.
     const ansi_red = vt.color.default[1];
-    const expected_r = @as(f32, @floatFromInt(ansi_red.r)) / 255.0;
-    var saw_two_cell_bg = false;
-    for (builder.displayList().commands) |command| {
-        switch (command) {
-            .fill_rect => |fill| {
-                if (std.math.approxEqAbs(f32, fill.fill.color.r, expected_r, 0.01) and
-                    fill.rect.x == 0 and fill.rect.width > cell_w * 1.5)
-                {
-                    saw_two_cell_bg = true;
-                }
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_two_cell_bg);
+    const view = try expectCellGrid(builder.displayList());
+    const primary = view.style(0, 0) orelse return error.TestExpectedCell;
+    const tail = view.style(1, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(canvas.CellWidth.wide, primary.width);
+    try testing.expectEqual(canvas.CellWidth.spacer, tail.width);
+
+    const left = view.background(0, 0) orelse return error.TestExpectedCell;
+    const right = view.background(1, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(ansi_red.r, left.r);
+    try testing.expectEqual(ansi_red.g, left.g);
+    try testing.expectEqual(ansi_red.b, left.b);
+    try testing.expect(left.eql(right));
+
+    // Adjacent columns, so the fill is continuous across both halves.
+    try testing.expectApproxEqAbs(@as(f32, 0), view.cellRect(0, 0).x, 0.001);
+    try testing.expectApproxEqAbs(cell_w, view.cellRect(1, 0).x, 0.01);
+    const tail_rect = view.cellRect(1, 0);
+    try testing.expectApproxEqAbs(cell_w * 2, tail_rect.x + tail_rect.width, 0.01);
+
+    // The wide cluster inks once, from the primary; the spacer paints no
+    // ink of its own, which is what keeps the glyph from doubling.
+    try testing.expectEqualStrings("\xe7\x95\x8c", view.cluster(0, 0));
+    try testing.expectEqual(@as(usize, 0), view.cluster(1, 0).len);
 }
 
 test "the glyph budget degrades row-wise before the atlas can overflow" {
@@ -225,32 +213,34 @@ test "the glyph budget degrades row-wise before the atlas can overflow" {
         .selecting = false,
         .glyph_budget = 40,
     });
-    var saw_first = false;
-    var saw_second = false;
-    for (builder.displayList().commands) |command| {
-        switch (command) {
-            .draw_text => |text| {
-                if (std.mem.indexOf(u8, text.text, "\xe4\xb8\x80") != null) saw_first = true;
-                if (std.mem.indexOf(u8, text.text, "\xe4\xb9\x9d") != null) saw_second = true;
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_first);
-    try testing.expect(!saw_second);
+    // The lattice is emitted at its PAINTED height, so "the second row
+    // never reached the glass" is now "the grid has exactly one row" —
+    // a stronger statement than the old "no text command carried its
+    // first scalar", because it also rules out a partially filled row.
+    const view = try expectCellGrid(builder.displayList());
+    try testing.expectEqual(@as(usize, 1), view.rows());
+    try testing.expectEqualStrings("\xe4\xb8\x80", view.cluster(0, 0));
+    try testing.expect(view.find("\xe4\xb9\x9d") == null);
+    try testing.expect(view.at(0, 1) == null);
+
+    // Degrading is never silent: the stop is recorded on the frame, by
+    // the store that caused it and with the rows it cost.
+    const loss = builder.degradation orelse return error.TestExpectedDegradation;
+    try testing.expectEqual(canvas.DisplayListStore.glyphs, loss.store);
+    try testing.expectEqual(@as(usize, 1), loss.produced);
+    try testing.expectEqual(@as(usize, 4), loss.requested);
 }
 
 test "a grapheme cluster the emulator holds paints whole - down to the last mark" {
+    // One cell: base + 100 combining acutes + a final enclosing mark,
+    // 204 bytes. Inside the packed cell's reach the original contract is
+    // unchanged and is what this pins: the cluster arrives WHOLE, every
+    // mark present, never truncated to fit a paint-tier buffer.
+    const cluster = "a" ++ ("\u{0301}" ** 100) ++ "\u{20DD}";
+    try testing.expectEqual(@as(usize, 204), cluster.len);
+
     const session = try createSession(30, 4);
     defer session.destroy();
-    // One cell: base + 200 combining acutes + a final enclosing mark.
-    // The paint scratch is sized to the WHOLE display-list text store,
-    // so any cluster the emulator can hold emits complete — the paint
-    // tier is never the binding constraint. (The pinned emulator's own
-    // grapheme storage bounds a cluster at roughly 256 scalars; the
-    // scratch stays store-sized so larger clusters keep painting whole
-    // as that bound moves.)
-    const cluster = "a" ++ ("\u{0301}" ** 200) ++ "\u{20DD}";
     session.feed(cluster);
 
     var commands: [512]canvas.CanvasCommand = undefined;
@@ -261,18 +251,46 @@ test "a grapheme cluster the emulator holds paints whole - down to the last mark
         .running = true,
         .selecting = false,
     });
-    var saw_full_cluster = false;
-    for (builder.displayList().commands) |command| {
-        switch (command) {
-            .draw_text => |text| {
-                if (text.text.len >= cluster.len and std.mem.indexOf(u8, text.text, cluster) != null) {
-                    saw_full_cluster = true;
-                }
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_full_cluster);
+    const view = try expectCellGrid(builder.displayList());
+    try testing.expectEqualStrings(cluster, view.cluster(0, 0));
+}
+
+test "a grapheme past the packed cell's reach is dropped whole, never torn" {
+    // The companion to the test above, and a REGRESSION the packed
+    // representation introduced deliberately: a cell addresses its
+    // cluster with a u8 length, so 255 bytes is the whole reach. The old
+    // text-run path painted any cluster the emulator could hold; a
+    // 404-byte grapheme (base + 200 acutes + an enclosing mark) now
+    // paints NO ink at all.
+    //
+    // What is pinned here is the part that must never move: the painter
+    // drops such a cluster WHOLE rather than emitting a prefix of it. A
+    // torn grapheme is a different character, not a smaller one, so a
+    // truncating painter would put a wrong glyph on the glass — strictly
+    // worse than an empty cell. The cell keeps its background either
+    // way, so the cliff is a missing glyph and not a hole in the screen.
+    const cluster = "a" ++ ("\u{0301}" ** 200) ++ "\u{20DD}";
+    try testing.expect(cluster.len > 255);
+
+    const session = try createSession(30, 4);
+    defer session.destroy();
+    session.feed(cluster);
+
+    var commands: [512]canvas.CanvasCommand = undefined;
+    var builder = canvas.Builder.init(&commands);
+    try grid.paint(session, &builder, .{
+        .frame = geometry.RectF.init(0, 0, 400, 200),
+        .tokens = .{},
+        .running = true,
+        .selecting = false,
+    });
+    const view = try expectCellGrid(builder.displayList());
+    // Whole, not torn: nothing, rather than a prefix that would render
+    // as "a" wearing the wrong marks.
+    try testing.expectEqual(@as(usize, 0), view.cluster(0, 0).len);
+    // The row still painted — one unrepresentable cluster does not cost
+    // the screen its row.
+    try testing.expect(view.rows() >= 1);
 }
 
 test "a concealed row never blanks the rows painted after it" {
@@ -296,19 +314,19 @@ test "a concealed row never blanks the rows painted after it" {
         .selecting = false,
         .text_reserve = canvas.max_display_list_text_bytes - 32,
     });
-    var saw_visible = false;
-    var saw_concealed = false;
-    for (builder.displayList().commands) |command| {
-        switch (command) {
-            .draw_text => |text| {
-                if (std.mem.indexOf(u8, text.text, "visible") != null) saw_visible = true;
-                if (std.mem.indexOf(u8, text.text, "x") != null) saw_concealed = true;
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_visible);
-    try testing.expect(!saw_concealed);
+    const view = try expectCellGrid(builder.displayList());
+    var row: [512]u8 = undefined;
+    // Every row still reached the glass — the concealed row cost nothing.
+    try testing.expectEqual(@as(usize, 6), view.rows());
+    // The concealed row inks nothing anywhere in the lattice (SGR 8
+    // resolves to a cell with no cluster, so `x` is not in the grid's
+    // interned text either)...
+    try testing.expectEqual(@as(usize, 0), view.rowText(0, &row).len);
+    try testing.expect(view.find("x") == null);
+    // ...and the row after it paints in full.
+    try testing.expectEqualStrings("visible", view.rowText(1, &row));
+    // Nothing was lost to a budget: a suppressed row is not a spent one.
+    try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), builder.degradation);
 }
 
 test "inverse video paints text in the background color, not on itself" {
@@ -328,19 +346,20 @@ test "inverse video paints text in the background color, not on itself" {
         .running = true,
         .selecting = false,
     });
-    var saw_rev = false;
-    for (builder.displayList().commands) |command| {
-        switch (command) {
-            .draw_text => |text| if (std.mem.eql(u8, text.text, "REV")) {
-                saw_rev = true;
-                // Text is the background token; distinctly not the fg.
-                try testing.expectApproxEqAbs(tokens.colors.background.r, text.color.r, 0.01);
-                try testing.expect(text.color.r != tokens.colors.text.r);
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw_rev);
+    const view = try expectCellGrid(builder.displayList());
+    var row: [64]u8 = undefined;
+    try testing.expectEqualStrings("REV", view.rowText(0, &row));
+    // Ink is the background token; distinctly not the fg.
+    const ink = view.foreground(0, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(canvas.CellColor.fromColor(tokens.colors.background), ink);
+    try testing.expect(!canvas.CellColor.fromColor(tokens.colors.text).eql(ink));
+    // The cell's own background is the swapped-in foreground. A packed
+    // cell carries both halves of the swap, so the pair can be checked
+    // together — the old per-run assertion could only see the ink and
+    // had to trust that a separate background rect matched it.
+    const wash = view.background(0, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(canvas.CellColor.fromColor(tokens.colors.text), wash);
+    try testing.expect(!wash.eql(ink));
 }
 
 test "the grid never emits past its command budget" {
@@ -392,19 +411,17 @@ test "an OSC 4 palette override is honored even when it equals the default RGB" 
         .running = true,
         .selecting = false,
     });
-    var saw = false;
-    for (builder.displayList().commands) |command| {
-        switch (command) {
-            .draw_text => |text| if (std.mem.eql(u8, text.text, "R")) {
-                saw = true;
-                // The live (overridden) RGB, not the theme destructive.
-                try testing.expectApproxEqAbs(@as(f32, @floatFromInt(default_red.r)) / 255.0, text.color.r, 0.004);
-                try testing.expect(text.color.r != tokens.colors.destructive.r);
-            },
-            else => {},
-        }
-    }
-    try testing.expect(saw);
+    const view = try expectCellGrid(builder.displayList());
+    try testing.expectEqualStrings("R", view.cluster(0, 0));
+    // The live (overridden) RGB, not the theme destructive. The packed
+    // cell holds the terminal's own 8-bit channels, so what used to need
+    // a 0.004 tolerance is now an exact byte-for-byte match against the
+    // RGB the program set.
+    const ink = view.foreground(0, 0) orelse return error.TestExpectedCell;
+    try testing.expectEqual(default_red.r, ink.r);
+    try testing.expectEqual(default_red.g, ink.g);
+    try testing.expectEqual(default_red.b, ink.b);
+    try testing.expect(!canvas.CellColor.fromColor(tokens.colors.destructive).eql(ink));
 }
 
 test "a tall sparse terminal paints its bottom row" {
@@ -425,14 +442,16 @@ test "a tall sparse terminal paints its bottom row" {
         .selecting = false,
         .command_budget = 1792,
     });
-    var saw_bottom = false;
-    for (builder.displayList().commands) |command| switch (command) {
-        .draw_text => |text| if (std.mem.indexOf(u8, text.text, "BOTTOM") != null) {
-            saw_bottom = true;
-        },
-        else => {},
-    };
-    try testing.expect(saw_bottom);
+    // "The bottom row reached the surface" is now exactly checkable: a
+    // cell's position IS its index, so the marker has to be found on the
+    // last row of a lattice that is the full viewport tall — not merely
+    // somewhere in a text run whose baseline happened to be low.
+    const view = try expectCellGrid(builder.displayList());
+    try testing.expectEqual(@as(usize, grid.max_rows), view.rows());
+    const at = view.find("BOTTOM") orelse return error.TestExpectedMarker;
+    try testing.expectEqual(@as(usize, grid.max_rows - 1), at.y);
+    try testing.expectEqual(@as(usize, 0), at.x);
+    try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), builder.degradation);
 }
 
 test "box-drawing cells render as edge-to-edge geometry, never glyphs" {
@@ -527,14 +546,15 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
             try band_colors.put(value, {});
         }
     }
-    var retained_prompt = false;
-    for (harness.runtime.views[0].canvasDisplayList().commands) |command| switch (command) {
-        .draw_text => |text| if (std.mem.indexOf(u8, text.text, "demo$") != null) {
-            retained_prompt = true;
-        },
-        else => {},
-    };
-    try testing.expect(retained_prompt);
+    // The retained half of the oracle: the prompt is in the scene as
+    // CELLS, on the grid's first row at its first column. The old scan
+    // could only say "some text command somewhere contained demo$"; the
+    // lattice pins the exact cell, which is the cell the pixel band
+    // below samples.
+    const retained = try expectCellGrid(harness.runtime.views[0].canvasDisplayList());
+    const prompt = retained.find("demo$") orelse return error.TestExpectedMarker;
+    try testing.expectEqual(@as(usize, 0), prompt.y);
+    try testing.expectEqual(@as(usize, 0), prompt.x);
     // Background alone is one color; ink adds more (glyph coverage is
     // antialiased, so ink contributes MANY distinct values — demand a
     // handful so a single stray pixel cannot pass).
@@ -586,13 +606,25 @@ test "switching terminal Works retains distinct id namespaces the diff accepts" 
 }
 
 test "each selected terminal receives the full chrome command envelope" {
+    // The point of this test has always been that content cannot
+    // SILENTLY VANISH: whichever terminal is selected gets the same
+    // budget and paints the same amount of screen.
+    //
+    // The mechanism moved. A screen is one packed `cell_grid` command,
+    // so a terminal's command count is a constant (four here) whatever
+    // it contains and no longer measures anything. What a dense screen
+    // now spends is CELLS, and what it puts on the glass is painted
+    // ROWS — so the envelope claim is re-pinned on those, plus the
+    // painter's own truncation report, which is the signal that says
+    // "you are not seeing all of it".
     const sessions = try createSessions(40, 40);
     defer for (sessions) |each| each.destroy();
     for (sessions) |session| feedAdversarialRows(session, 40, 40);
 
     var painted: [2]usize = @splat(0);
+    var cells: [2]usize = @splat(0);
     for (sessions, 0..) |session, index| {
-        var commands: [2048]canvas.CanvasCommand = undefined;
+        var commands: [4096]canvas.CanvasCommand = undefined;
         var builder = canvas.Builder.init(&commands);
         try grid.paint(session, &builder, .{
             .frame = geometry.RectF.init(0, 0, 746, 580),
@@ -602,13 +634,26 @@ test "each selected terminal receives the full chrome command envelope" {
             .command_budget = app.chrome_command_envelope,
             .text_reserve = canvas.terminal_grid.widget_text_reserve,
             .glyph_budget = canvas.terminal_grid.widget_glyph_budget,
+            .cell_reserve = canvas.terminal_grid.widget_cell_reserve,
             .id_base = grid.paneIdBase(index),
         });
-        painted[index] = distinctTextRows(builder.displayList().commands);
+        const view = try expectCellGrid(builder.displayList());
+        painted[index] = view.rows();
+        cells[index] = view.cellCount();
         try testing.expect(builder.displayList().commands.len <= app.chrome_command_envelope);
+        // Every row that fit the frame was painted whole: the frame is
+        // 580pt of 18pt rows, so the screen ends at the viewport, not at
+        // a budget. Nothing was dropped, and the painter says so.
+        try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), builder.degradation);
+        // The screen fits a PANE's share of the frame's cell store —
+        // the budget that actually binds a terminal now, and the one a
+        // split has to leave half of for the other pane.
+        try testing.expect(cells[index] <= canvas.terminal_grid.widget_cell_reserve);
+        try testing.expectEqual(view.rows() * view.cols(), cells[index]);
     }
     try testing.expect(painted[0] >= 5);
     try testing.expectEqual(painted[0], painted[1]);
+    try testing.expectEqual(cells[0], cells[1]);
 }
 
 test "a screen of double box drawing stays inside the selected terminal budget" {
@@ -623,7 +668,19 @@ test "a screen of double box drawing stays inside the selected terminal budget" 
         session.feed("\r\n");
     }
 
-    var commands: [2048]canvas.CanvasCommand = undefined;
+    // Box drawing is the one thing the packed lattice deliberately does
+    // NOT carry — it renders as exact geometry at cell bounds, because
+    // glyphs fill the em box rather than the padded cell and borders
+    // built from them show seams. So this screen is still priced in
+    // COMMANDS, and the envelope still binds it: this test kept its
+    // original assertion unchanged.
+    //
+    // The storage grew from 2048 to the envelope itself. Backgrounds and
+    // text no longer cost commands, so more box rows now fit under the
+    // same 3840-command ceiling — enough that the old 2048-slot array
+    // overflowed before the budget did, failing the paint with
+    // DisplayListFull instead of exercising the budget.
+    var commands: [app.chrome_command_envelope]canvas.CanvasCommand = undefined;
     var builder = canvas.Builder.init(&commands);
     try grid.paint(session, &builder, .{
         .frame = geometry.RectF.init(0, 0, 600, 600),
@@ -634,6 +691,16 @@ test "a screen of double box drawing stays inside the selected terminal budget" 
         .id_base = grid.paneIdBase(0),
     });
     try testing.expect(builder.displayList().commands.len <= app.chrome_command_envelope);
+    // The budget genuinely BIT — this screen is denser than the envelope
+    // — and it degraded row-atomically and said so, rather than
+    // overshooting and failing the whole frame.
+    const view = try expectCellGrid(builder.displayList());
+    const loss = builder.degradation orelse return error.TestExpectedDegradation;
+    try testing.expectEqual(canvas.DisplayListStore.commands, loss.store);
+    try testing.expectEqual(view.rows(), loss.produced);
+    try testing.expect(loss.produced > 0);
+    try testing.expect(loss.produced < loss.requested);
+    try testing.expectEqual(@as(usize, 24), loss.requested);
 }
 
 test "only the selected terminal has a cursor command and deactivation hollows it" {

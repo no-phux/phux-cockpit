@@ -188,6 +188,11 @@ pub const CockpitHost = struct {
             const focused = runtime_view.canvas_widget_focused_id;
             if (focused == 0) return false;
             const node = runtime_view.widgetLayoutTree().findById(focused) orelse return false;
+            // Role, not just kind: a tab trigger is a plain container now
+            // (a segmented control cannot host a close affordance), and a
+            // click that leaves canvas widget focus parked on it is a click
+            // after which the keyboard no longer reaches the terminal.
+            if (node.widget.semantics.role == .tab) return true;
             return node.widget.kind == .segmented_control or
                 node.widget.kind == .toggle_button or
                 node.widget.kind == .button;

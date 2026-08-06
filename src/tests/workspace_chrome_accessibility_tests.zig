@@ -74,10 +74,15 @@ test "native tabs and only the selected terminal surface reach accessibility" {
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("cockpit"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Surfaces") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal tabs") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal 1, native terminal, RUNNING") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal 2, native terminal, RUNNING") != null);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, system WebKit, shortcut") != null);
+    // The web surface no longer occupies a seat in a TERMINAL tab strip. It
+    // is still reachable — the chord and the View menu both name it — but the
+    // strip speaks terminals only.
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, system WebKit") == null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Terminal tabs") != null);
+    try testing.expect(app.onCommand("surface.web") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "TERMINAL 1 / RUNNING") == null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "outbound loss 7 bytes; reply loss 2 bytes") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), "copy failed") != null);
@@ -283,10 +288,10 @@ test "one-terminal production accessibility is the terminal alone, and the band 
     try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
     var revealed_tabs: usize = 0;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (node.widget.kind == .segmented_control) revealed_tabs += 1;
+        if (node.widget.semantics.role == .tab) revealed_tabs += 1;
     }
-    // Two terminals plus Web.
-    try testing.expectEqual(@as(usize, 3), revealed_tabs);
+    // Two terminals. Nothing else: the strip is terminals only now.
+    try testing.expectEqual(@as(usize, 2), revealed_tabs);
 }
 
 test "a terminal that needs attention pulls the band back even when it is alone" {
@@ -385,7 +390,7 @@ test "four-terminal accessibility is compact ordered and keyboard-complete" {
         const label = try std.fmt.bufPrint(&expected, "Terminal {d}, native terminal", .{number});
         try testing.expect(std.mem.indexOf(u8, a11y, label) != null);
     }
-    try testing.expect(std.mem.indexOf(u8, a11y, "Web, system WebKit, shortcut CMD+5") != null);
+    try testing.expect(std.mem.indexOf(u8, a11y, "Web, system WebKit") == null);
     // The band carries the tab strip and nothing else: New/Close/Split and
     // the bookmark buttons are gone, and each remains reachable by chord.
     try testing.expect(std.mem.indexOf(u8, a11y, "New Terminal, Command T") == null);
@@ -400,7 +405,10 @@ test "four-terminal accessibility is compact ordered and keyboard-complete" {
         .key = "5",
         .modifiers = .{ .primary = true },
     } });
-    try testing.expect(state.model.selectedSurface().eql(.web));
+    // Four tabs, so cmd+5 addresses nothing. It used to fall through to the
+    // Web surface, which meant the chord for a given terminal shifted every
+    // time a tab opened; the selection is simply unchanged now.
+    try testing.expect(!state.model.web_selected);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .gpu_surface_input = .{
         .window_id = 1,
         .label = app.canvas_label,
@@ -416,9 +424,17 @@ test "four-terminal accessibility is compact ordered and keyboard-complete" {
     } });
     try testing.expectEqual(state.model.tabTerminal(3).?, state.model.selectedTerminalId().?);
     try testing.expect(app.onCommand("surface.5") != null);
+    // Every menu command the bar declares has to resolve to a message, or the
+    // item is a dead entry in a real macOS menu.
+    for (app.cockpit_menus) |menu| {
+        for (menu.items) |item| {
+            if (item.separator) continue;
+            try testing.expect(app.onCommand(item.command) != null);
+        }
+    }
 }
 
-test "four-terminal tab layout stays inside the minimum window with Web last" {
+test "four-terminal tab layout stays inside the minimum window and shows terminals only" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
@@ -430,12 +446,13 @@ test "four-terminal tab layout stays inside the minimum window with Web last" {
     var tab_labels: [app.max_tabs + 1][]const u8 = undefined;
     var tab_count: usize = 0;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (node.widget.kind != .segmented_control) continue;
+        if (node.widget.semantics.role != .tab) continue;
         tab_frames[tab_count] = node.frame;
-        tab_labels[tab_count] = node.widget.text;
+        tab_labels[tab_count] = node.widget.semantics.label;
         tab_count += 1;
     }
-    try testing.expectEqual(@as(usize, 5), tab_count);
+    // Four terminals, four tabs. The Web surface is not one of them.
+    try testing.expectEqual(@as(usize, 4), tab_count);
     for (tab_frames[0..tab_count], 0..) |frame, index| {
         try testing.expect(frame.width > 0 and frame.height > 0);
         try testing.expect(frame.x >= 0 and frame.x + frame.width <= app.window_min_width);
@@ -443,9 +460,22 @@ test "four-terminal tab layout stays inside the minimum window with Web last" {
     }
     // Labels stay WHOLE. The old compaction turned every tab into `T1`/`PHX`
     // as soon as a fourth surface existed, which is not a tab strip.
-    try testing.expectEqualStrings("Terminal 1", tab_labels[0]);
-    try testing.expectEqualStrings("Terminal 4", tab_labels[3]);
-    try testing.expectEqualStrings("Web", tab_labels[4]);
+    try testing.expect(std.mem.startsWith(u8, tab_labels[0], "Terminal 1,"));
+    try testing.expect(std.mem.startsWith(u8, tab_labels[3], "Terminal 4,"));
+    for (tab_labels[0..tab_count]) |label| {
+        try testing.expect(std.mem.indexOf(u8, label, "Web") == null);
+    }
+
+    // Every tab carries a close affordance reachable without the keyboard,
+    // and the strip ends in a New Terminal button.
+    var saw_close = false;
+    var saw_new = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.startsWith(u8, node.widget.semantics.label, "Close Terminal")) saw_close = true;
+        if (std.mem.startsWith(u8, node.widget.semantics.label, "New terminal")) saw_new = true;
+    }
+    try testing.expect(saw_close);
+    try testing.expect(saw_new);
 }
 
 test "side tabs remain accessible and bounded at the minimum window" {
@@ -481,7 +511,7 @@ test "side tabs remain accessible and bounded at the minimum window" {
         tab_count += 1;
     }
     try testing.expect(saw_scroll_region);
-    try testing.expectEqual(@as(usize, 5), tab_count);
+    try testing.expectEqual(@as(usize, 4), tab_count);
 }
 
 test "four-terminal compact chrome screenshot (env-gated)" {

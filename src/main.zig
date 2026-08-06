@@ -18,6 +18,7 @@ const update_module = @import("cockpit/update.zig");
 const scene = @import("cockpit/native/scene.zig");
 const view_module = @import("cockpit/native/view.zig");
 const host = @import("cockpit/native/host.zig");
+const config_module = @import("config/config.zig");
 
 const geometry = native_sdk.geometry;
 
@@ -122,6 +123,9 @@ pub const split_pane_min_height = projection.split_pane_min_height;
 pub const webkit_parking_extent = projection.webkit_parking_extent;
 pub const chrome_command_envelope = projection.chrome_command_envelope;
 pub const cockpitTokens = projection.cockpitTokens;
+pub const terminalTokens = projection.terminalTokens;
+pub const terminalTokensFrom = projection.terminalTokensFrom;
+pub const windowPadding = projection.windowPadding;
 pub const chromeRevealed = projection.chromeRevealed;
 pub const workspaceChrome = projection.workspaceChrome;
 pub const resolvePanes = projection.resolvePanes;
@@ -129,6 +133,12 @@ pub const paneFrames = projection.paneFrames;
 pub const paneAtPoint = projection.paneAtPoint;
 pub const paneFrameFor = projection.paneFrameFor;
 pub const tabTriggerHeight = projection.tabTriggerHeight;
+pub const TabWindow = projection.TabWindow;
+pub const visibleTabWindow = projection.visibleTabWindow;
+pub const tab_extent = projection.tab_extent;
+pub const tab_min_extent = projection.tab_min_extent;
+pub const pane_dim_command_id_base = view_module.pane_dim_command_id_base;
+pub const terminalNeedsAttention = projection.terminalNeedsAttention;
 
 pub const canvas_label = scene.canvas_label;
 pub const webview_label = scene.webview_label;
@@ -140,7 +150,16 @@ pub const window_min_width = scene.window_min_width;
 pub const window_min_height = scene.window_min_height;
 pub const web_origins = scene.web_origins;
 pub const cockpit_shortcuts = scene.cockpit_shortcuts;
+pub const cockpit_menus = scene.cockpit_menus;
 pub const shell_scene = scene.shell_scene;
+
+pub const Config = config_module.Config;
+pub const ConfigTabPlacement = config_module.TabPlacement;
+pub const configPath = config_module.joinPath;
+pub const parseConfig = config_module.parse;
+pub const loadConfigOrDefault = config_module.loadOrDefault;
+pub const paneArgvIn = local.paneArgvIn;
+pub const CwdArgv = local.CwdArgv;
 
 pub const view = view_module.view;
 pub const webPanes = view_module.webPanes;
@@ -195,6 +214,101 @@ fn createConfiguredPhuxProvider(init: std.process.Init) !?*PhuxProvider {
     return try PhuxProvider.create(std.heap.page_allocator, init.io, .{ .unix = socket_path }, session, "phux-cockpit");
 }
 
+/// Where the config file lives, resolved through the SDK's `app_dirs`
+/// primitive so the platform owns the rule (macOS:
+/// `~/Library/Preferences/Phux Cockpit/config`). `PHUX_COCKPIT_CONFIG` names
+/// a file directly and wins — that is the seam a test, a second profile, or a
+/// `--config` wrapper uses, and it costs one env read.
+///
+/// Returns null when the platform has no home to resolve against, which is a
+/// silent fall back to defaults, never an error: a terminal that refuses to
+/// start because it could not find a file the user never wrote is broken.
+pub fn resolveConfigPath(env: native_sdk.app_dirs.Env, override_path: ?[]const u8, dir_storage: []u8, path_storage: []u8) ?[]const u8 {
+    if (override_path) |explicit| {
+        if (explicit.len == 0 or explicit.len > path_storage.len) return null;
+        @memcpy(path_storage[0..explicit.len], explicit);
+        return path_storage[0..explicit.len];
+    }
+    const dir = native_sdk.app_dirs.resolveOne(
+        .{ .name = app_name },
+        native_sdk.app_dirs.currentPlatform(),
+        env,
+        .config,
+        dir_storage,
+    ) catch return null;
+    return config_module.joinPath(dir, path_storage) catch null;
+}
+
+/// The dotfile location: `$XDG_CONFIG_HOME/phux-cockpit/config`, else
+/// `~/.config/phux-cockpit/config`.
+///
+/// `app_dirs` follows each platform's own convention, which on macOS means
+/// `~/Library/Preferences/Phux Cockpit/`. That is correct for a Mac app and
+/// wrong for this audience: the people most likely to write a config here are
+/// arriving from Ghostty, and they will put the file in `~/.config` without
+/// looking it up. Checking here FIRST costs one stat and removes an entire
+/// class of "my config does nothing" confusion. The platform path still works,
+/// so nothing is taken away.
+pub fn resolveDotfileConfigPath(env: native_sdk.app_dirs.Env, path_storage: []u8) ?[]const u8 {
+    var joined: [std.fs.max_path_bytes]u8 = undefined;
+    const base = if (env.xdg_config_home) |xdg| blk: {
+        if (xdg.len == 0) break :blk null;
+        break :blk xdg;
+    } else null;
+    const dir = if (base) |explicit|
+        config_module.joinDir(explicit, "phux-cockpit", &joined) catch return null
+    else dir: {
+        const home = env.home orelse return null;
+        if (home.len == 0) return null;
+        var home_config: [std.fs.max_path_bytes]u8 = undefined;
+        const dotconfig = config_module.joinDir(home, ".config", &home_config) catch return null;
+        break :dir config_module.joinDir(dotconfig, "phux-cockpit", &joined) catch return null;
+    };
+    return config_module.joinPath(dir, path_storage) catch null;
+}
+
+/// Read and parse the user's config. Every failure — no home, no file, an
+/// unreadable file, a file larger than the ceiling — lands on defaults, and a
+/// malformed LINE is already a diagnostic rather than a failure inside the
+/// parser. There is exactly one way this function does not produce a usable
+/// Config, and that is never.
+fn loadUserConfig(io: std.Io, init: std.process.Init) Config {
+    var dir_storage: [std.fs.max_path_bytes]u8 = undefined;
+    var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+    var dotfile_storage: [std.fs.max_path_bytes]u8 = undefined;
+    const env = native_sdk.debug.envFromMap(init.environ_map);
+    const override = init.environ_map.get("PHUX_COCKPIT_CONFIG");
+
+    // An explicit override answers on its own. Otherwise the dotfile location
+    // is tried first and the platform location second — first file that opens
+    // wins, so someone who has never heard of `~/Library/Preferences` and
+    // someone who expects a Mac app to live there are both right.
+    if (override) |explicit| {
+        if (readConfig(io, explicit)) |parsed| return parsed;
+        return .{};
+    }
+    if (resolveDotfileConfigPath(env, &dotfile_storage)) |dotfile| {
+        if (readConfig(io, dotfile)) |parsed| return parsed;
+    }
+    const path = resolveConfigPath(env, null, &dir_storage, &path_storage) orelse return .{};
+    return readConfig(io, path) orelse .{};
+}
+
+/// Read and parse one candidate. Null means "there was no usable file here",
+/// which is the normal case for every location but one and must never be an
+/// error.
+fn readConfig(io: std.Io, path: []const u8) ?Config {
+    var bytes: [config_module.max_config_bytes]u8 = undefined;
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer file.close(io);
+    // A config longer than the ceiling is TRUNCATED, not refused: the bytes
+    // that fit are a prefix of whole lines plus at most one partial one, and a
+    // partial line is a diagnostic. Refusing the whole file would drop every
+    // valid setting above it.
+    const read = file.readPositionalAll(io, &bytes, 0) catch return null;
+    return config_module.loadOrDefault(bytes[0..read]);
+}
+
 pub fn main(init: std.process.Init) !void {
     const session = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
     const remote_provider = createConfiguredPhuxProvider(init) catch |err| {
@@ -206,6 +320,13 @@ pub fn main(init: std.process.Init) !void {
         if (remote_provider) |remote| remote.destroy();
         return err;
     };
+    model.config = loadUserConfig(init.io, init);
+    model.tab_placement = switch (model.config.tab_placement) {
+        .top => .top,
+        .side => .side,
+    };
+    // The env override stays and stays LAST: it is the debugging knob, and a
+    // knob that a config file could silently disable would not be one.
     if (init.environ_map.get("PHUX_COCKPIT_TABS")) |value| {
         if (tabPlacementFromText(value)) |placement| model.tab_placement = placement;
     }
@@ -223,6 +344,7 @@ pub fn main(init: std.process.Init) !void {
         .restore_state = false,
         .js_window_api = false,
         .shortcuts = &cockpit_shortcuts,
+        .menus = &cockpit_menus,
         .security = .{
             .permissions = &app_permissions,
             .navigation = .{
@@ -280,4 +402,7 @@ test {
     _ = @import("tests/adversarial_isolation_tests.zig");
     _ = @import("tests/layout_tree_tests.zig");
     _ = @import("tests/config_tests.zig");
+    _ = @import("tests/shell_identity_tests.zig");
+    _ = @import("tests/config_wiring_tests.zig");
+    _ = @import("tests/tab_strip_tests.zig");
 }

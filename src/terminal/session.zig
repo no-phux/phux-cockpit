@@ -50,6 +50,13 @@ pub const max_cells: usize = max_cols * max_rows;
 pub const snapshot_text_capacity: usize = max_cells * 4;
 const snapshot_text_overflow_cluster = " " ** (canvas.max_display_list_text_bytes + 1);
 
+/// OSC 0/2 title ceiling. libghostty-vt already clamps a title at 1024 bytes
+/// (`stream_terminal.zig` `windowTitle`) purely as a DoS bound; this is the
+/// display bound. Nothing renders a 256-byte tab label, and a title is a
+/// hint, not a document — so the copy truncates (at a scalar boundary) rather
+/// than failing and leaving the pane titleless.
+pub const max_title_bytes: usize = 256;
+
 /// One live emulator session. Heap-owned by the app (the model holds a
 /// pointer): the emulator allocates internally and its state is derived
 /// entirely from journaled inputs — fed pty bytes, resizes, and
@@ -111,6 +118,27 @@ pub const Session = struct {
     snap_cells: []canvas.TerminalCell = &.{},
     snap_text: []u8 = &.{},
     snap_text_len: usize = 0,
+    /// The child's last OSC 0/2 title, COPIED out of the emulator at the
+    /// moment it changed. The emulator's own storage is only valid until the
+    /// next `setTitle` or reset, and a tab label is read on every paint —
+    /// long after the feed that set it — so the session owns a snapshot
+    /// instead of holding a borrowed slice. Fixed-size and truncating: see
+    /// `max_title_bytes`. Zero length means "never reported", never "empty
+    /// title" — the two are indistinguishable to a caller choosing a
+    /// fallback, and the fallback is right for both.
+    title_buf: [max_title_bytes]u8 = undefined,
+    title_len: usize = 0,
+    /// The child's last OSC 7 directory, DECODED to a plain filesystem path
+    /// (see `decodePwdUrl`). Sized to the platform path ceiling because that
+    /// is exactly what it holds: a path a spawn can `cd` into. Zero length
+    /// means "unknown" — never reported, or reported in a form this decoder
+    /// refused.
+    pwd_buf: [std.fs.max_path_bytes]u8 = undefined,
+    pwd_len: usize = 0,
+    /// BEL arrived since the app last cleared it. A latch, not a sound: the
+    /// session makes no noise and has no timer — the app reads it to mark a
+    /// tab as wanting attention and clears it when the user looks.
+    bell_rung: bool = false,
 
     pub const CellPos = struct { x: u16 = 0, y: u16 = 0 };
 
@@ -394,20 +422,29 @@ pub const Session = struct {
         };
     }
 
-    /// Wire the stream handler's effect callbacks — only `write_pty`
-    /// (query answers routed back to the pty); everything else stays
-    /// null (the emulator's read-only defaults). Called at create and
+    /// Wire the stream handler's effect callbacks. Called at create and
     /// after `reset` rebuilds the stream.
+    ///
+    /// Four are live: `write_pty` (query answers routed back to the pty),
+    /// `title_changed` and `pwd_changed` (the child naming itself and its
+    /// directory), and `bell`. All four only ever COPY into session-owned
+    /// storage — the callbacks run inside the parser, so none of them may
+    /// allocate, block, or reach back into the app.
+    ///
+    /// The rest stay null (the emulator's read-only defaults). Notably
+    /// `clipboard_write`: OSC 52 lets any program running in the terminal
+    /// write the user's clipboard, and routing that needs a consent story
+    /// the session does not have.
     fn installStreamEffects(session: *Session) void {
         session.stream.handler.effects = .{
-            .bell = null,
+            .bell = bellRang,
             .clipboard_write = null,
             .color_scheme = null,
             .device_attributes = null,
             .enquiry = null,
             .size = null,
-            .title_changed = null,
-            .pwd_changed = null,
+            .title_changed = titleChanged,
+            .pwd_changed = pwdChanged,
             .write_pty = writePtyResponse,
             .xtversion = null,
         };
@@ -466,6 +503,14 @@ pub const Session = struct {
         session.select_head = .{};
         session.select_block = false;
         session.screen_text_dirty = true;
+        // `fullReset` clears the emulator's own title and pwd, so the cached
+        // copies must go with them: a restarted shell must not inherit the
+        // dead one's tab label or hand a new pane the directory the previous
+        // process was in. The bell latch drops for the same reason — an
+        // attention cue for a session that no longer exists.
+        session.title_len = 0;
+        session.pwd_len = 0;
+        session.bell_rung = false;
     }
 
     /// Terminal query answers accumulated by the last feeds; the caller
@@ -503,6 +548,150 @@ pub const Session = struct {
         }
         @memcpy(session.response_buffer[session.response_len..needed], bytes);
         session.response_len += bytes.len;
+    }
+
+    // ------------------------------------------- child-reported identity
+
+    /// OSC 0/2 landed. libghostty-vt has already stored the title on the
+    /// terminal and hands us nothing but the notification, so the value
+    /// comes back through `getTitle` (the contract stated on
+    /// `Effects.title_changed`).
+    fn titleChanged(handler: *vt.TerminalStream.Handler) void {
+        const session: *Session = @alignCast(@fieldParentPtr("term", handler.terminal));
+        const reported = handler.terminal.getTitle() orelse "";
+        const kept = truncateUtf8(reported, session.title_buf.len);
+        @memcpy(session.title_buf[0..kept.len], kept);
+        session.title_len = kept.len;
+    }
+
+    /// OSC 7 landed. What `getPwd` returns is the payload VERBATIM —
+    /// libghostty-vt's `reportPwd` states it stores the raw payload unparsed
+    /// and that "embedders read it via getPwd() and are responsible for
+    /// decoding any URI scheme". In practice every shell integration emits a
+    /// `file://<host>/<percent-encoded path>` URL, which is useless to a
+    /// spawn until it is decoded, so the decode happens HERE, once per
+    /// report, rather than at each of the readers.
+    fn pwdChanged(handler: *vt.TerminalStream.Handler) void {
+        const session: *Session = @alignCast(@fieldParentPtr("term", handler.terminal));
+        const reported = handler.terminal.getPwd() orelse "";
+        session.pwd_len = decodePwdUrl(reported, &session.pwd_buf);
+    }
+
+    /// BEL. Latch it and return: a callback running inside the parser is the
+    /// wrong place to make noise, and the app owns whether an attention cue
+    /// is even wanted for this pane.
+    fn bellRang(handler: *vt.TerminalStream.Handler) void {
+        const session: *Session = @alignCast(@fieldParentPtr("term", handler.terminal));
+        session.bell_rung = true;
+    }
+
+    /// The child's OSC 0/2 title, or "" when it never set one. The slice
+    /// points into the session and stays valid until the next title report.
+    pub fn title(session: *const Session) []const u8 {
+        return session.title_buf[0..session.title_len];
+    }
+
+    /// The child's OSC 7 directory as a plain absolute path, or "" when it is
+    /// unknown. The slice points into the session and stays valid until the
+    /// next pwd report.
+    pub fn pwd(session: *const Session) []const u8 {
+        return session.pwd_buf[0..session.pwd_len];
+    }
+
+    /// Read AND clear the bell latch — the app's cue is edge-triggered, and a
+    /// reader that had to remember to clear separately would eventually
+    /// leave a tab marked forever.
+    pub fn takeBell(session: *Session) bool {
+        const rung = session.bell_rung;
+        session.bell_rung = false;
+        return rung;
+    }
+
+    /// Whether the cursor sits at a shell prompt rather than in command
+    /// output. This is the emulator's own OSC 133 answer (`cursorIsAtPrompt`)
+    /// — a couple of field reads off the active cursor, no walk — and it is
+    /// false for every shell without prompt-mark integration, which is the
+    /// honest "unknown" for a cue that must never guess.
+    pub fn atPrompt(session: *Session) bool {
+        return session.term.cursorIsAtPrompt();
+    }
+
+    /// Clamp `bytes` to `limit` WITHOUT cutting a UTF-8 scalar in half. A cut
+    /// sequence is not a shorter title, it is an invalid one — it paints as
+    /// replacement junk and reads as junk to assistive tech.
+    fn truncateUtf8(bytes: []const u8, limit: usize) []const u8 {
+        if (bytes.len <= limit) return bytes;
+        // `bytes[end]` is the first DROPPED byte. While it is a continuation
+        // byte (0b10xxxxxx) the cut lands inside a sequence, so walk back to
+        // that sequence's lead byte and drop it whole.
+        var end = limit;
+        while (end > 0 and bytes[end] & 0xC0 == 0x80) end -= 1;
+        return bytes[0..end];
+    }
+
+    /// Decode an OSC 7 payload into a plain filesystem path, returning the
+    /// number of bytes written to `out` (0 = unusable, which the readers
+    /// surface as "unknown").
+    ///
+    /// The shape is `file://<host>/<percent-encoded path>`; `kitty-shell-cwd`
+    /// is the other scheme in the wild and carries the same authority/path
+    /// split. A payload with no scheme but a leading `/` is taken verbatim
+    /// (some integrations emit a bare path).
+    ///
+    /// The HOST is deliberately ignored rather than validated as local: this
+    /// module has no hostname API (ghostty's own `isLocal` check lives in its
+    /// app layer, not in libghostty-vt), and the consequence of an ssh
+    /// session's remote path is bounded — the spawn's `cd` simply fails and
+    /// falls back (see `paneArgvIn`), never runs anything.
+    fn decodePwdUrl(raw: []const u8, out: []u8) usize {
+        var path = raw;
+        if (std.mem.indexOf(u8, raw, "://")) |scheme_end| {
+            const scheme = raw[0..scheme_end];
+            if (!std.ascii.eqlIgnoreCase(scheme, "file") and
+                !std.ascii.eqlIgnoreCase(scheme, "kitty-shell-cwd"))
+            {
+                return 0;
+            }
+            const authority = raw[scheme_end + 3 ..];
+            // The authority ends at the first '/', which is also the path's
+            // own first byte. No slash means no path at all.
+            const path_start = std.mem.indexOfScalar(u8, authority, '/') orelse return 0;
+            path = authority[path_start..];
+        }
+        // Anything not absolute names nothing a spawn could cd into: a
+        // relative path is relative to a directory we do not know.
+        if (path.len == 0 or path[0] != '/') return 0;
+        return percentDecode(path, out);
+    }
+
+    /// Percent-decode in place into `out`. Returns 0 — the whole value, never
+    /// a prefix — on a malformed escape, an embedded NUL, or an overrun: a
+    /// half-decoded path is a DIFFERENT directory, and handing one to a
+    /// spawn is worse than admitting the pwd is unknown.
+    fn percentDecode(raw: []const u8, out: []u8) usize {
+        var written: usize = 0;
+        var index: usize = 0;
+        while (index < raw.len) {
+            if (written == out.len) return 0;
+            const byte = raw[index];
+            if (byte == '%') {
+                if (index + 2 >= raw.len) return 0;
+                const hi = std.fmt.charToDigit(raw[index + 1], 16) catch return 0;
+                const lo = std.fmt.charToDigit(raw[index + 2], 16) catch return 0;
+                const decoded = hi * 16 + lo;
+                // A decoded NUL would cut the path at the C boundary, so the
+                // child would receive a path shorter than the one checked.
+                if (decoded == 0) return 0;
+                out[written] = decoded;
+                index += 3;
+            } else {
+                if (byte == 0) return 0;
+                out[written] = byte;
+                index += 1;
+            }
+            written += 1;
+        }
+        return written;
     }
 
     pub fn cols(session: *const Session) u16 {

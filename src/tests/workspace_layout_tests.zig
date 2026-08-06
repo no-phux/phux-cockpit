@@ -416,7 +416,7 @@ test "sub-cell frame changes still update surface geometry" {
     try testing.expectEqual(rows, app_state.model.provider.slots[0].rows);
 }
 
-test "tab cycling crosses tabs and the Web surface without sending terminal bytes" {
+test "tab cycling walks terminal tabs only and sends no terminal bytes" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
     defer harness.destroy(gpa);
@@ -426,13 +426,23 @@ test "tab cycling crosses tabs and the Web surface without sending terminal byte
     defer app_state.deinit();
     const app_iface = app_state.app();
 
+    // Cycling walks the TERMINAL tabs and wraps within them. The web surface
+    // is no longer a station on that ring — it has its own chord — so two
+    // forward steps over two tabs land back where they started.
     try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true });
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try releaseCanvasKey(harness, app_iface, "]", .{});
     try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true });
-    try testing.expect(app_state.model.selectedSurface().eql(.web));
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
     try releaseCanvasKey(harness, app_iface, "]", .{});
     try pressCanvasKey(harness, app_iface, "[", .{ .primary = true, .shift = true });
+    try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
+
+    // Cycling OUT of the web surface re-enters the tab list where it was,
+    // rather than stranding the user on a surface the strip does not show.
+    try releaseCanvasKey(harness, app_iface, "[", .{});
+    app_state.model.selectWeb();
+    try pressCanvasKey(harness, app_iface, "]", .{ .primary = true, .shift = true });
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(0)));
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));

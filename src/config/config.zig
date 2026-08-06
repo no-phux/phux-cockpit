@@ -385,6 +385,19 @@ fn trim(text: []const u8) []const u8 {
 /// this module keeps no ambient dependency and stays unit-testable.
 pub const file_name = "config";
 
+/// Join a directory with a child component, normalizing a trailing slash.
+/// Path building lives here rather than at the call site so the config file's
+/// several candidate locations are assembled one way.
+pub fn joinDir(base: []const u8, child: []const u8, output: []u8) error{NoSpaceLeft}![]const u8 {
+    const separator: []const u8 = if (base.len > 0 and base[base.len - 1] == '/') "" else "/";
+    const total = base.len + separator.len + child.len;
+    if (total > output.len) return error.NoSpaceLeft;
+    @memcpy(output[0..base.len], base);
+    @memcpy(output[base.len..][0..separator.len], separator);
+    @memcpy(output[base.len + separator.len ..][0..child.len], child);
+    return output[0..total];
+}
+
 /// Join a resolved config directory with the config file name.
 pub fn joinPath(config_dir: []const u8, output: []u8) error{NoSpaceLeft}![]const u8 {
     const separator: []const u8 = if (config_dir.len > 0 and config_dir[config_dir.len - 1] == '/') "" else "/";

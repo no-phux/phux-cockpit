@@ -364,29 +364,51 @@ test "ADVERSARIAL: split paints both hostile terminals inside one collision-free
             if (id >= base and id < base + stride) count.* += 1;
         }
     }
-    try testing.expect(per_pane[0] > 20);
-    try testing.expect(per_pane[1] > 20);
+    // Both panes own commands in their OWN namespace: that half of the
+    // claim is unchanged. What is no longer a content measure is HOW
+    // MANY — a whole screen is one packed `cell_grid` command now, so a
+    // dense pane and an empty one both emit a handful.
+    try testing.expect(per_pane[0] > 0);
+    try testing.expect(per_pane[1] > 0);
+
+    // "Both terminals genuinely painted a lot" is therefore re-pinned on
+    // what still scales with content, which is now split by KIND: a
+    // glyph screen's ink is inked CELLS in that pane's own lattice, and
+    // a box-drawing screen's ink is geometry COMMANDS in that pane's own
+    // namespace (box cells deliberately carry no cluster — their ink is
+    // exact rects at cell bounds). Pane 0 here is the hostile ANSI
+    // screen and pane 1 the dense box screen, so the two halves of the
+    // envelope are measured by the channel each one actually uses. A
+    // pane that painted nothing, or that painted into its neighbour's
+    // namespace, fails here exactly as it used to fail on the raw
+    // command count.
+    for (0..2) |index| {
+        const slot = app_state.model.provider.slotIndex(resolved[index].terminal) orelse
+            return error.TestExpectedTerminal;
+        const view = try support.expectPaneCellGrid(list, slot);
+        try testing.expect(view.rows() > 0);
+        try testing.expect(view.inkedCells() + per_pane[index] > 20);
+    }
 }
 
 // --------------------------------------------------- A3/A4: budget reality
 
 /// Rows the pane actually put on screen this paint.
-fn paintedRows(commands: []const canvas.CanvasCommand) usize {
-    var rows: [256]f32 = undefined;
-    var count: usize = 0;
-    outer: for (commands) |command| {
-        switch (command) {
-            .draw_text => |text| {
-                for (rows[0..count]) |seen| if (seen == text.origin.y) continue :outer;
-                if (count < rows.len) {
-                    rows[count] = text.origin.y;
-                    count += 1;
-                }
-            },
-            else => {},
-        }
+///
+/// A screen is ONE packed `cell_grid` command, emitted at its PAINTED
+/// height, so the painted-row count is now read straight off the
+/// lattice instead of inferred from distinct text-run baselines. Same
+/// number, exact instead of derived.
+fn paintedRows(display_list: canvas.DisplayList) usize {
+    const view = support.findCellGrid(display_list) orelse return 0;
+    return view.rows();
+}
+
+fn feedBoxRows(session: *grid.Session, cols: usize, rows: usize) void {
+    for (0..rows) |_| {
+        for (0..cols) |_| session.feed("\u{256C}");
+        session.feed("\r\n");
     }
-    return count;
 }
 
 fn feedHostileRows(session: *grid.Session, cols: usize, rows: usize) void {
@@ -436,29 +458,41 @@ test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
     // that only asserts `len <= budget` on a quiet screen. This compares
     // the SAME hostile screen painted bounded vs unbounded: if the bound
     // did nothing, the two lists would be the same length.
+    //
+    // The SCREEN had to change, following this file's own stated rule
+    // that density has to outrun the ceiling for the assertion to keep
+    // meaning what it says. A truecolor screen no longer costs commands
+    // at all — every cell of it is one packed `cell_grid` command — so
+    // painting it bounded and unbounded now yields four commands either
+    // way, and the comparison would be a tautology. Box drawing is what
+    // still prices in COMMANDS (it renders as exact geometry at cell
+    // bounds, never glyphs), so that is the screen the command envelope
+    // is measured against. The cell budget, which is what the truecolor
+    // screen actually spends, is pinned by its own test below.
     const gpa = testing.allocator;
     const session = try grid.Session.create(std.heap.page_allocator, testing.io, 60, 40);
     defer session.destroy();
-    feedTruecolorRows(session, 60, 40);
+    feedBoxRows(session, 60, 40);
 
     const big = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
     defer gpa.free(big);
 
     var unbounded = canvas.Builder.init(big);
     try grid.paint(session, &unbounded, .{
-        .frame = geometry.RectF.init(0, 0, 480, 600),
+        .frame = geometry.RectF.init(0, 0, 480, 800),
         .tokens = .{},
         .running = true,
         .selecting = false,
         .id_base = grid.paneIdBase(0),
     });
     const unbounded_len = unbounded.displayList().commands.len;
+    const unbounded_rows = paintedRows(unbounded.displayList());
 
     const small = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
     defer gpa.free(small);
     var bounded = canvas.Builder.init(small);
     try grid.paint(session, &bounded, .{
-        .frame = geometry.RectF.init(0, 0, 480, 600),
+        .frame = geometry.RectF.init(0, 0, 480, 800),
         .tokens = .{},
         .running = true,
         .selecting = false,
@@ -468,15 +502,19 @@ test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
         .id_base = grid.paneIdBase(0),
     });
     const bounded_len = bounded.displayList().commands.len;
+    const bounded_rows = paintedRows(bounded.displayList());
 
     std.debug.print(
-        "\nMEASURED budget bind: unbounded={d} bounded={d} budget={d}\n",
-        .{ unbounded_len, bounded_len, app.chrome_command_envelope },
+        "\nMEASURED budget bind: unbounded={d}/{d} rows bounded={d}/{d} rows budget={d}\n",
+        .{ unbounded_len, unbounded_rows, bounded_len, bounded_rows, app.chrome_command_envelope },
     );
     try testing.expect(app.chrome_command_envelope > 0);
     try testing.expect(unbounded_len > app.chrome_command_envelope); // the screen CAN overflow
     try testing.expect(bounded_len < unbounded_len); // the bound truncated it
     try testing.expect(bounded_len <= app.chrome_command_envelope);
+    // ...and it cost real SCREEN, not just commands: fewer rows reached
+    // the glass under the bound than without it.
+    try testing.expect(bounded_rows < unbounded_rows);
 
     // Truncation must be LOUD. Rows dropped off the bottom of the glass used
     // to be indistinguishable from a short screen: the frame presented
@@ -485,10 +523,67 @@ test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
     // tell "the shell printed 40 rows and you are seeing all of them" from
     // "you are seeing the first 30".
     const loss = bounded.degradation orelse return error.TruncationWentUnreported;
+    try testing.expectEqual(canvas.DisplayListStore.commands, loss.store);
+    try testing.expectEqual(bounded_rows, loss.produced);
     try testing.expect(loss.produced < loss.requested);
 
     // ...and the unbounded paint of the same screen reports nothing, so the
     // signal tracks real loss rather than firing on every dense frame.
+    try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), unbounded.degradation);
+}
+
+test "ADVERSARIAL: the packed cell budget genuinely binds a dense screen" {
+    // The other half of the split above, and the budget that actually
+    // bounds a terminal now: a screen costs CELLS, 20 bytes each, and
+    // the frame's cell store is what a split has to divide between
+    // panes. The same anti-tautology discipline applies — the truecolor
+    // screen is painted with the whole store and again with all but 600
+    // cells of it reserved, and the bound has to be visible in the
+    // painted rows, not merely satisfied.
+    const gpa = testing.allocator;
+    const session = try grid.Session.create(std.heap.page_allocator, testing.io, 60, 40);
+    defer session.destroy();
+    feedTruecolorRows(session, 60, 40);
+
+    const big = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
+    defer gpa.free(big);
+    var unbounded = canvas.Builder.init(big);
+    try grid.paint(session, &unbounded, .{
+        .frame = geometry.RectF.init(0, 0, 480, 600),
+        .tokens = .{},
+        .running = true,
+        .selecting = false,
+        .id_base = grid.paneIdBase(0),
+    });
+    const unbounded_rows = paintedRows(unbounded.displayList());
+
+    const small = try gpa.alloc(canvas.CanvasCommand, 32 * 1024);
+    defer gpa.free(small);
+    var bounded = canvas.Builder.init(small);
+    try grid.paint(session, &bounded, .{
+        .frame = geometry.RectF.init(0, 0, 480, 600),
+        .tokens = .{},
+        .running = true,
+        .selecting = false,
+        // Ten 60-column rows' worth of store left for this pane.
+        .cell_reserve = canvas.max_display_list_cells - 600,
+        .id_base = grid.paneIdBase(0),
+    });
+    const bounded_rows = paintedRows(bounded.displayList());
+
+    std.debug.print(
+        "\nMEASURED cell bind: unbounded={d} rows bounded={d} rows store={d} cells\n",
+        .{ unbounded_rows, bounded_rows, canvas.max_display_list_cells },
+    );
+    try testing.expect(unbounded_rows > 10); // the screen CAN outgrow the reserve
+    try testing.expect(bounded_rows < unbounded_rows); // the bound truncated it
+    try testing.expectEqual(@as(usize, 10), bounded_rows);
+
+    // Loud, by the store that caused it.
+    const loss = bounded.degradation orelse return error.TruncationWentUnreported;
+    try testing.expectEqual(canvas.DisplayListStore.cells, loss.store);
+    try testing.expectEqual(bounded_rows, loss.produced);
+    try testing.expect(loss.produced < loss.requested);
     try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), unbounded.degradation);
 }
 
@@ -531,8 +626,13 @@ test "ADVERSARIAL: either selected tab gets the same full hostile-content budget
             .id_base = grid.paneIdBase(index),
         });
         used[index] = builder.displayList().commands.len;
-        painted[index] = paintedRows(builder.displayList().commands);
+        painted[index] = paintedRows(builder.displayList());
         try testing.expect(used[index] <= app.chrome_command_envelope);
+        // Whichever tab is selected, nothing of its screen was lost to a
+        // budget — the symmetry claim now covers the truncation report
+        // too, so "both tabs painted the same amount" cannot be
+        // satisfied by both of them losing the same rows.
+        try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), builder.degradation);
     }
     std.debug.print(
         "\nMEASURED selected symmetry: rows={{ {d}, {d} }} commands={{ {d}, {d} }} envelope={d}\n",

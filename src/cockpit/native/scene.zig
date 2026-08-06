@@ -30,6 +30,7 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "surface.3", .key = "3", .modifiers = .{ .primary = true } },
     .{ .id = "surface.4", .key = "4", .modifiers = .{ .primary = true } },
     .{ .id = "surface.5", .key = "5", .modifiers = .{ .primary = true } },
+    .{ .id = "surface.web", .key = "b", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
@@ -42,6 +43,77 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "pane.next", .key = "]", .modifiers = .{ .primary = true } },
     .{ .id = "tab.move-left", .key = "arrowleft", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.move-right", .key = "arrowright", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .id = "terminal.select-all", .key = "a", .modifiers = .{ .primary = true } },
+    .{ .id = "terminal.copy", .key = "c", .modifiers = .{ .primary = true } },
+    .{ .id = "terminal.paste", .key = "v", .modifiers = .{ .primary = true } },
+    .{ .id = "terminal.clear", .key = "k", .modifiers = .{ .primary = true } },
+    // `=` is the physical key; the platform reports the chord as cmd+`=`
+    // whether or not shift is down, so ONE registration covers cmd+= and
+    // cmd++.
+    .{ .id = "view.font-larger", .key = "=", .modifiers = .{ .primary = true } },
+    .{ .id = "view.font-smaller", .key = "-", .modifiers = .{ .primary = true } },
+    .{ .id = "view.font-reset", .key = "0", .modifiers = .{ .primary = true } },
+    .{ .id = "pane.focus-left", .key = "arrowleft", .modifiers = .{ .primary = true, .option = true } },
+    .{ .id = "pane.focus-right", .key = "arrowright", .modifiers = .{ .primary = true, .option = true } },
+    .{ .id = "pane.focus-up", .key = "arrowup", .modifiers = .{ .primary = true, .option = true } },
+    .{ .id = "pane.focus-down", .key = "arrowdown", .modifiers = .{ .primary = true, .option = true } },
+};
+
+/// The application menu bar.
+///
+/// Supplying ANY menu replaces the toolkit's stock File/Edit/View/Window bar
+/// wholesale (`appkit_host.m` rebuilds `mainMenu` as the app menu plus these),
+/// so everything a terminal user reaches for has to be re-stated here — the
+/// stock Edit menu's Copy/Paste went through the AppKit responder chain and
+/// never reached a terminal pane anyway, which is exactly why three
+/// `onCommand` entries had no way to fire.
+///
+/// Every item's `command` is a name `view.onCommand` already answers, so the
+/// menu adds a surface, never a second code path. The key equivalents mirror
+/// the registered shortcuts on purpose: the model's shortcut latch keys on the
+/// physical key, so one edge executes once regardless of which channel
+/// delivered it.
+const shell_menu_items = [_]native_sdk.MenuItem{
+    .{ .label = "New Tab", .command = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
+    .{ .label = "Split Right", .command = "pane.split-right", .key = "d", .modifiers = .{ .primary = true } },
+    .{ .label = "Split Down", .command = "pane.split-down", .key = "d", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .separator = true },
+    .{ .label = "Close", .command = "terminal.close", .key = "w", .modifiers = .{ .primary = true } },
+};
+
+const edit_menu_items = [_]native_sdk.MenuItem{
+    .{ .label = "Copy", .command = "terminal.copy", .key = "c", .modifiers = .{ .primary = true } },
+    .{ .label = "Paste", .command = "terminal.paste", .key = "v", .modifiers = .{ .primary = true } },
+    .{ .separator = true },
+    .{ .label = "Select All", .command = "terminal.select-all", .key = "a", .modifiers = .{ .primary = true } },
+    .{ .label = "Clear", .command = "terminal.clear", .key = "k", .modifiers = .{ .primary = true } },
+};
+
+const view_menu_items = [_]native_sdk.MenuItem{
+    .{ .label = "Increase Font Size", .command = "view.font-larger", .key = "=", .modifiers = .{ .primary = true } },
+    .{ .label = "Decrease Font Size", .command = "view.font-smaller", .key = "-", .modifiers = .{ .primary = true } },
+    .{ .label = "Reset Font Size", .command = "view.font-reset", .key = "0", .modifiers = .{ .primary = true } },
+    .{ .separator = true },
+    .{ .label = "Toggle Tab Placement", .command = "tabs.toggle-placement" },
+    .{ .label = "Web Surface", .command = "surface.web", .key = "b", .modifiers = .{ .primary = true, .shift = true } },
+};
+
+const window_menu_items = [_]native_sdk.MenuItem{
+    .{ .label = "Previous Tab", .command = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .label = "Next Tab", .command = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .separator = true },
+    .{ .label = "Move Tab Left", .command = "tab.move-left", .key = "arrowleft", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .label = "Move Tab Right", .command = "tab.move-right", .key = "arrowright", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .separator = true },
+    .{ .label = "Previous Pane", .command = "pane.previous", .key = "[", .modifiers = .{ .primary = true } },
+    .{ .label = "Next Pane", .command = "pane.next", .key = "]", .modifiers = .{ .primary = true } },
+};
+
+pub const cockpit_menus = [_]native_sdk.Menu{
+    .{ .title = "Shell", .items = &shell_menu_items },
+    .{ .title = "Edit", .items = &edit_menu_items },
+    .{ .title = "View", .items = &view_menu_items },
+    .{ .title = "Window", .items = &window_menu_items },
 };
 
 const shell_views = [_]native_sdk.ShellView{

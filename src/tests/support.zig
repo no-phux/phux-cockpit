@@ -49,6 +49,194 @@ pub fn remoteTerminalRef(id: u32) !app.TerminalRef {
     };
 }
 
+// --------------------------------------------------------- cell grids
+//
+// A terminal screen is now ONE display-list command: `cell_grid`, a
+// packed cols x rows lattice of 20-byte cells, each carrying its own
+// background, cluster (an offset into the grid's interned byte pool),
+// foreground, underline colour, and style bits. Every renderer expands
+// the lattice itself.
+//
+// What that means for a TEST: there are no per-run `fill_rect` /
+// `draw_text` commands for terminal CONTENT any more, so a test that
+// wants to know what reached the glass reads CELLS. It also means a
+// screen costs a CONSTANT number of commands (surface fill, clip push,
+// the grid, the cursor, clip pop) whatever it contains — command counts
+// no longer measure content, and cells and painted rows do.
+//
+// Everything below is that one seam. No test decodes a cell by hand.
+
+/// One `cell_grid` command, with lookup by (col, row).
+pub const CellGridView = struct {
+    grid: canvas.CellGrid,
+
+    pub fn cols(self: CellGridView) usize {
+        return self.grid.cols;
+    }
+
+    /// Rows the painter actually PUT on the glass. The painter emits the
+    /// lattice at its painted height, so this is the migrated form of
+    /// "how many distinct text baselines did the paint produce".
+    pub fn rows(self: CellGridView) usize {
+        return self.grid.rows;
+    }
+
+    pub fn cellCount(self: CellGridView) usize {
+        return self.grid.cellCount();
+    }
+
+    pub fn at(self: CellGridView, x: usize, y: usize) ?canvas.Cell {
+        return self.grid.at(x, y);
+    }
+
+    /// The rect cell (x, y) covers — geometry is implied by the INDEX
+    /// now, so a cell's position can no longer drift with its face.
+    pub fn cellRect(self: CellGridView, x: usize, y: usize) geometry.RectF {
+        return self.grid.cellRect(x, y);
+    }
+
+    /// The cell's grapheme cluster bytes; empty for a cell that inks
+    /// nothing (a blank, a wide cell's spacer, a box-drawing cell whose
+    /// ink is geometry).
+    pub fn cluster(self: CellGridView, x: usize, y: usize) []const u8 {
+        const cell = self.grid.at(x, y) orelse return "";
+        return cell.cluster(self.grid.text);
+    }
+
+    pub fn style(self: CellGridView, x: usize, y: usize) ?canvas.CellFlags {
+        const cell = self.grid.at(x, y) orelse return null;
+        return cell.style();
+    }
+
+    /// The cell's resolved foreground, at the terminal's own 8-bit
+    /// precision.
+    pub fn foreground(self: CellGridView, x: usize, y: usize) ?canvas.CellColor {
+        const cell = self.grid.at(x, y) orelse return null;
+        return cell.fg;
+    }
+
+    /// The cell's own background, or null when it paints none and the
+    /// grid's surface shows through. The distinction is load-bearing:
+    /// `has_background` is what says a cell painted a background at all.
+    pub fn background(self: CellGridView, x: usize, y: usize) ?canvas.CellColor {
+        const cell = self.grid.at(x, y) orelse return null;
+        if (!cell.style().has_background) return null;
+        return cell.bg;
+    }
+
+    /// Row `y` as a renderer would ink it: every cell's cluster bytes,
+    /// left to right. Cells that ink nothing contribute nothing, so a
+    /// row's trailing blanks never reach the string.
+    pub fn rowText(self: CellGridView, y: usize, out: []u8) []const u8 {
+        var len: usize = 0;
+        var x: usize = 0;
+        while (x < self.grid.cols) : (x += 1) {
+            const bytes = self.cluster(x, y);
+            if (len + bytes.len > out.len) break;
+            @memcpy(out[len..][0..bytes.len], bytes);
+            len += bytes.len;
+        }
+        return out[0..len];
+    }
+
+    /// Where `needle` starts in the grid, scanning rows top to bottom —
+    /// the column of the first CELL whose cluster begins the match.
+    /// Null when no row carries it.
+    pub fn find(self: CellGridView, needle: []const u8) ?CellPos {
+        var y: usize = 0;
+        while (y < self.grid.rows) : (y += 1) {
+            if (self.findInRow(y, needle)) |x| return .{ .x = x, .y = y };
+        }
+        return null;
+    }
+
+    /// Where `needle` starts in row `y`, as a COLUMN. Built by walking
+    /// the row's clusters and remembering which column each byte came
+    /// from, so a multi-byte or multi-cell match still reports the cell
+    /// it began in.
+    pub fn findInRow(self: CellGridView, y: usize, needle: []const u8) ?usize {
+        if (needle.len == 0) return null;
+        var text: [row_text_capacity]u8 = undefined;
+        var columns: [row_text_capacity]u16 = undefined;
+        var len: usize = 0;
+        var x: usize = 0;
+        while (x < self.grid.cols) : (x += 1) {
+            const bytes = self.cluster(x, y);
+            if (len + bytes.len > text.len) break;
+            for (bytes, 0..) |byte, offset| {
+                text[len + offset] = byte;
+                columns[len + offset] = @intCast(x);
+            }
+            len += bytes.len;
+        }
+        const hit = std.mem.indexOf(u8, text[0..len], needle) orelse return null;
+        return columns[hit];
+    }
+
+    /// Cells that put ink on the glass — a cluster, an underline, a
+    /// strikethrough, or an overline. The migrated measure of "this
+    /// terminal genuinely painted content", now that a screen's command
+    /// count is a constant.
+    pub fn inkedCells(self: CellGridView) usize {
+        var total: usize = 0;
+        var y: usize = 0;
+        while (y < self.grid.rows) : (y += 1) {
+            var x: usize = 0;
+            while (x < self.grid.cols) : (x += 1) {
+                const cell = self.grid.at(x, y) orelse continue;
+                if (cell.hasInk()) total += 1;
+            }
+        }
+        return total;
+    }
+};
+
+pub const CellPos = struct { x: usize, y: usize };
+
+/// A row's cluster bytes can exceed one byte per column (combining
+/// marks, wide clusters); sized well past `terminal_grid.max_cols` so a
+/// dense row still resolves whole.
+const row_text_capacity = 8192;
+
+/// The first `cell_grid` command in a display list — the shape a
+/// single-terminal paint produces.
+pub fn findCellGrid(display_list: anytype) ?CellGridView {
+    for (display_list.commands) |command| {
+        if (command == .cell_grid) return .{ .grid = command.cell_grid };
+    }
+    return null;
+}
+
+pub fn expectCellGrid(display_list: anytype) !CellGridView {
+    return findCellGrid(display_list) orelse error.TestExpectedCellGrid;
+}
+
+/// The grid belonging to pane `index`, by the painter's own command id.
+/// A split emits one grid per pane, so tests that care WHICH terminal
+/// they are reading go through here rather than taking the first.
+pub fn findPaneCellGrid(display_list: anytype, index: usize) ?CellGridView {
+    const id = grid.cellGridCommandId(grid.paneIdBase(index));
+    const command = display_list.findCommandById(id) orelse return null;
+    if (command.command != .cell_grid) return null;
+    return .{ .grid = command.command.cell_grid };
+}
+
+pub fn expectPaneCellGrid(display_list: anytype, index: usize) !CellGridView {
+    return findPaneCellGrid(display_list, index) orelse error.TestExpectedCellGrid;
+}
+
+/// Every `cell_grid` in the list, in emission order.
+pub fn collectCellGrids(display_list: anytype, out: []CellGridView) []CellGridView {
+    var count: usize = 0;
+    for (display_list.commands) |command| {
+        if (command != .cell_grid) continue;
+        if (count == out.len) break;
+        out[count] = .{ .grid = command.cell_grid };
+        count += 1;
+    }
+    return out[0..count];
+}
+
 pub const CursorPaintKind = enum { filled, hollow };
 
 pub fn expectCursorPaintKind(display_list: anytype, expected: CursorPaintKind) !void {
@@ -65,6 +253,26 @@ pub fn expectPaneCursorPaintKind(display_list: anytype, index: usize, expected: 
     }
 }
 
+/// Build a `TerminalApp` DIRECTLY into caller-owned storage.
+///
+/// `TerminalApp` is ~4.5 MB by value, and a debug build materialises a
+/// returned aggregate as a temporary in the CALLER's frame that then
+/// lives for the rest of that function — so every fixture that wrote
+/// `app_state.* = TerminalApp.init(...)` inline was carrying 4.5 MB of
+/// dead stack through its whole body, and a fixture that also built one
+/// other multi-megabyte value carried both at once.
+///
+/// That never mattered until the packed cell grid landed: `canvas.Builder`
+/// now embeds a 32k-cell store (640 KB), and the SDK's chrome installer
+/// holds TWO builders plus two per-view command arrays on one frame,
+/// ~4.1 MB. Deep fixtures plus that frame overran the 16 MB main-thread
+/// stack. Constructing in a LEAF helper keeps the temporary in a frame
+/// that pops immediately, which is the difference between ~9 MB of live
+/// stack at the deepest point and ~17 MB.
+pub fn initTerminalApp(slot: *TerminalApp, session: *grid.Session) void {
+    slot.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
+}
+
 pub fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*TerminalApp {
     harness.null_platform.gpu_surfaces = true;
     harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
@@ -74,7 +282,7 @@ pub fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*Terminal
         session.destroy();
         return err;
     };
-    app_state.* = TerminalApp.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
+    initTerminalApp(app_state, session);
     errdefer {
         app_state.deinit();
         app.deinitModel(&app_state.model);
@@ -285,25 +493,34 @@ pub fn rectCenter(rect: geometry.RectF) geometry.PointF {
     return geometry.PointF.init(rect.x + rect.width / 2, rect.y + rect.height / 2);
 }
 
+/// A terminal's text reached the glass INSIDE `frame`.
+///
+/// Same two claims as before the cell grid landed — the marker is on
+/// screen, and it is horizontally inside the pane that owns it — read
+/// off cells instead of `draw_text` runs. The x check is now exact
+/// rather than approximate: a cell's rect comes from its INDEX, so this
+/// pins the column the marker actually occupies, not where a text run
+/// happened to start.
 pub fn expectDisplayListMarker(display_list: anytype, marker: []const u8, frame: geometry.RectF) !void {
-    for (display_list.commands) |command| {
-        switch (command) {
-            .draw_text => |text| if (std.mem.indexOf(u8, text.text, marker) != null) {
-                try testing.expect(text.origin.x >= frame.x);
-                try testing.expect(text.origin.x < frame.x + frame.width);
-                return;
-            },
-            else => {},
-        }
+    var grids: [max_cell_grids]CellGridView = undefined;
+    for (collectCellGrids(display_list, &grids)) |view| {
+        const at = view.find(marker) orelse continue;
+        const rect = view.cellRect(at.x, at.y);
+        try testing.expect(rect.x >= frame.x);
+        try testing.expect(rect.x < frame.x + frame.width);
+        try testing.expect(rect.x + rect.width <= frame.x + frame.width + 0.5);
+        return;
     }
     return error.TestExpectedMarker;
 }
 
+/// No terminal on this frame carries `marker` — the hidden-pane claim.
 pub fn expectDisplayListMissingMarker(display_list: anytype, marker: []const u8) !void {
-    for (display_list.commands) |command| {
-        switch (command) {
-            .draw_text => |text| try testing.expect(std.mem.indexOf(u8, text.text, marker) == null),
-            else => {},
-        }
+    var grids: [max_cell_grids]CellGridView = undefined;
+    for (collectCellGrids(display_list, &grids)) |view| {
+        try testing.expect(view.find(marker) == null);
     }
 }
+
+/// Grids one frame can hold: one per pane, with slack.
+const max_cell_grids = 16;

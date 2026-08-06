@@ -62,6 +62,85 @@ pub fn paneArgv(_: usize) []const []const u8 {
     return shell_argv;
 }
 
+/// Byte ceiling for the generated `cd ... ; exec ...` command word.
+///
+/// The SDK caps a spawn's argv at `max_effect_argv_bytes` (2048) across ALL
+/// arguments and refuses the whole spawn past it, so the command must stay
+/// well inside that with the shell path and flags accounted for. 1024 leaves
+/// better than 2x headroom and still holds any real path: single-quoting only
+/// grows a path when it contains quotes, which directories essentially never
+/// do at length.
+pub const max_cwd_command_bytes: usize = 1024;
+
+/// Storage for one generated cwd-carrying argv. The caller owns it and must
+/// keep it alive as long as the argv is: `Pane.argv` is a slice, and the SDK
+/// copies argv at `ptySpawn`, so this only has to outlive the spawn call —
+/// but a `Pane` that holds the argv holds the storage with it.
+pub const CwdArgv = struct {
+    command: [max_cwd_command_bytes]u8 = undefined,
+    slots: [4][]const u8 = undefined,
+};
+
+/// The argv for a shell that STARTS in `cwd` — the working-directory
+/// inheritance a new terminal or split wants from the pane it was opened
+/// from.
+///
+/// This has to ride argv because there is nowhere else to put it: the SDK's
+/// `PtySpawnOptions` carries key/argv/cols/rows/term/on_event and nothing
+/// else, and its child environment is the bound host environ verbatim
+/// (`flattenPtyEnviron`) — no cwd field, no env field, no hook.
+///
+/// The path is SINGLE-quoted with embedded quotes escaped as `'\''`, which is
+/// the only POSIX quoting with no escape sequences of its own: `$`, backtick,
+/// `"`, `\`, spaces, newlines, and `;` are all literal inside it, so a
+/// hostile directory name cannot break out of the word and become a command.
+///
+/// Failure to `cd` falls back to `$HOME` rather than aborting: `&&` would
+/// leave the shell exiting immediately (no exec, no shell, a pane that dies
+/// on open) whenever the directory moved, was unmounted, or came from a
+/// remote OSC 7. A terminal in the wrong directory beats no terminal.
+///
+/// Returns the plain no-cwd argv when `cwd` is empty, not absolute, contains
+/// a NUL (which the SDK rejects and the C boundary would truncate), or does
+/// not fit — the degradation is exactly "the first terminal's behavior".
+pub fn paneArgvIn(cwd: []const u8, out: *CwdArgv) []const []const u8 {
+    if (builtin.os.tag == .windows) return shell_argv;
+    if (cwd.len == 0 or cwd[0] != '/') return shell_argv;
+    if (std.mem.indexOfScalar(u8, cwd, 0) != null) return shell_argv;
+
+    const prefix = "cd '";
+    const suffix = "' 2>/dev/null || cd \"$HOME\"; exec " ++ default_shell ++ " -i";
+    var written: usize = prefix.len;
+    @memcpy(out.command[0..prefix.len], prefix);
+    for (cwd) |byte| {
+        // A single quote is the ONE byte that ends the quoted word, so it
+        // closes the word (`'`), passes an escaped literal quote (`\'`), and
+        // reopens (`'`) — four bytes for one.
+        const piece: []const u8 = if (byte == '\'') "'\\''" else (&byte)[0..1];
+        if (written + piece.len + suffix.len > out.command.len) return shell_argv;
+        @memcpy(out.command[written..][0..piece.len], piece);
+        written += piece.len;
+    }
+    if (written + suffix.len > out.command.len) return shell_argv;
+    @memcpy(out.command[written..][0..suffix.len], suffix);
+    written += suffix.len;
+
+    // `-l` only where the plain argv already asks for a login shell (macOS,
+    // where the user's PATH comes from the login environment). Elsewhere the
+    // default argv is a bare interactive `/bin/sh`, and `sh -l` is not
+    // portable enough to introduce here.
+    out.slots[0] = default_shell;
+    if (builtin.os.tag == .macos) {
+        out.slots[1] = "-l";
+        out.slots[2] = "-c";
+        out.slots[3] = out.command[0..written];
+        return out.slots[0..4];
+    }
+    out.slots[1] = "-c";
+    out.slots[2] = out.command[0..written];
+    return out.slots[0..3];
+}
+
 pub const Pane = struct {
     id: TerminalRef,
     session: *grid.Session,
@@ -96,6 +175,44 @@ pub const Pane = struct {
 
     pub fn acceptsInput(pane: *const Pane) bool {
         return pane.phase == .starting or pane.phase == .live;
+    }
+
+    /// The child's OSC 0/2 title, or "" when it never reported one. The slice
+    /// belongs to the pane's session and stays valid until the next title
+    /// report. EMPTY IS NOT A TITLE — it means "not reported", and the caller
+    /// owns the fallback (a slot label, the pwd's basename, whatever the
+    /// chrome wants), because only the caller knows what it is rendering.
+    pub fn title(pane: *const Pane) []const u8 {
+        return pane.session.title();
+    }
+
+    /// The child's OSC 7 working directory as a plain absolute path (URL
+    /// scheme and percent-encoding already decoded), or "" when unknown. Same
+    /// lifetime and same empty-means-unreported rule as `title`.
+    pub fn pwd(pane: *const Pane) []const u8 {
+        return pane.session.pwd();
+    }
+
+    /// A BEL arrived and nobody has acknowledged it. Read-only: a hidden tab
+    /// paints its attention marker from this, every frame, without consuming
+    /// it. `clearBell` is the acknowledgement.
+    pub fn bellRung(pane: *const Pane) bool {
+        return pane.session.bell_rung;
+    }
+
+    /// Acknowledge the bell. Takes a `*const Pane` because the latch lives on
+    /// the heap-owned session, not in the pane's own bytes — the pane is a
+    /// handle here, and the view holding a const one is still allowed to say
+    /// "the user has seen it".
+    pub fn clearBell(pane: *const Pane) void {
+        pane.session.bell_rung = false;
+    }
+
+    /// Whether the cursor sits at a shell prompt rather than mid-output.
+    /// False for every shell without OSC 133 integration — the honest
+    /// unknown, not a guess.
+    pub fn atPrompt(pane: *const Pane) bool {
+        return pane.session.atPrompt();
     }
 };
 

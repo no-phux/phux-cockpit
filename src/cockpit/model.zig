@@ -6,6 +6,7 @@ const support = @import("phux_support.zig");
 const local = @import("../providers/local/provider.zig");
 const topology = @import("topology.zig");
 const layout = @import("layout.zig");
+const config_module = @import("../config/config.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -18,6 +19,7 @@ pub const Presentation = support.Presentation;
 pub const MouseButton = support.MouseButton;
 pub const Pane = local.Pane;
 pub const LocalProvider = local.LocalProvider;
+pub const Config = config_module.Config;
 pub const TabPlacement = topology.TabPlacement;
 pub const SurfaceSelection = topology.SurfaceSelection;
 pub const TopologySnapshot = topology.TopologySnapshot;
@@ -28,6 +30,9 @@ pub const max_tabs = topology.max_tabs;
 pub const max_remote_terminals = support.max_remote_terminals;
 
 pub const max_held_terminal_keys: usize = 16;
+/// Sentinel for "the pointer is over no tab". `max_tabs` is a valid index in
+/// no tab list, so it can never collide with a real hover.
+pub const no_hovered_tab: usize = std.math.maxInt(usize);
 pub const max_pointer_captures: usize = 8;
 
 pub const HeldTerminalKey = struct {
@@ -127,6 +132,23 @@ pub const BrowserPage = enum {
 /// content area without belonging to a tab.
 pub const Model = struct {
     provider: *LocalProvider,
+    /// The user's config, loaded once at startup and then MODEL STATE: the
+    /// font-size chords mutate it, so everything downstream (design tokens,
+    /// cell metrics, the PTY sizing pump) reads it from here rather than
+    /// from the file it came from.
+    config: Config = .{},
+    /// Live cmd+= / cmd+- delta over `config.font_size`, in points.
+    font_size_offset: f32 = 0,
+    /// Backing storage for the cwd-carrying argv of each registry slot.
+    ///
+    /// `Pane.argv` is a SLICE, and `spawnPane` re-reads it on every Restart,
+    /// so the bytes have to outlive the spawn that first used them — stack
+    /// storage at the spawn site would dangle the instant it returned. The
+    /// storage lives HERE rather than on `Pane` because the pane's layout is
+    /// owned by the provider, and because the model outlives every pane in
+    /// it: a slot reused by a new terminal is rewritten before that
+    /// terminal's first spawn, so no live argv ever aliases a dead one.
+    cwd_argv: [max_terminals]local.CwdArgv = [_]local.CwdArgv{.{}} ** max_terminals,
     phux_provider: ?*PhuxProvider = null,
     remote_ui: [max_remote_terminals]RemoteUiState = [_]RemoteUiState{.{}} ** max_remote_terminals,
     pointer_state: ?*PointerState = null,
@@ -137,6 +159,10 @@ pub const Model = struct {
     /// so returning from Web restores the tab that was there.
     web_selected: bool = false,
     tab_placement: TabPlacement = .top,
+    /// The tab the pointer is over, or `no_hovered_tab`. Purely presentational
+    /// — it decides whether that tab shows its close `x` — but it lives on the
+    /// model because the view is a pure function of it.
+    hovered_tab: usize = no_hovered_tab,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
     focused: bool = true,
@@ -405,6 +431,41 @@ pub const Model = struct {
         for (refs[0..count]) |terminal_ref| _ = model.remoteUi(terminal_ref);
     }
 
+    /// The LIVE terminal type size. `font_size_offset` is the live delta the
+    /// cmd+= / cmd+- chords own; the config's own size is the origin cmd+0
+    /// returns to, which is why the two are separate — resetting to a
+    /// hardcoded 13 would throw away the `font-size` the user wrote down.
+    pub fn fontSize(model: *const Model) f32 {
+        return std.math.clamp(
+            model.config.fontSize() + model.font_size_offset,
+            config_module.min_font_size,
+            config_module.max_font_size,
+        );
+    }
+
+    /// Step the terminal type size by whole points and say whether it moved.
+    /// A step at the clamp is a no-op rather than a silently growing number
+    /// that reflows nothing.
+    pub fn stepFontSize(model: *Model, delta: f32) bool {
+        const before = model.fontSize();
+        model.font_size_offset += delta;
+        const after = model.fontSize();
+        if (after == before) {
+            // Undo the step that fell off the end, so the offset cannot
+            // accumulate an arbitrarily long way past the clamp and make
+            // the first step back a dead key.
+            model.font_size_offset -= delta;
+            return false;
+        }
+        return true;
+    }
+
+    pub fn resetFontSize(model: *Model) bool {
+        if (model.font_size_offset == 0) return false;
+        model.font_size_offset = 0;
+        return true;
+    }
+
     // ------------------------------------------------------ persistence
 
     pub fn topologySnapshot(model: *const Model) !TopologySnapshot {
@@ -477,6 +538,41 @@ fn decodeTab(tab: topology.SnapshotTab) layout.Tree {
         };
     }
     return current;
+}
+
+/// Push the settings only an EMULATOR can hold into one session.
+///
+/// The split is deliberate. Background, foreground, and the selection wash
+/// reach the painter through the design tokens (`terminalTokens`), because
+/// those are the ones the emulator composes from its own defaults and an
+/// application's OSC 10/11 must still be able to win. These three cannot go
+/// that way:
+///
+///   palette      the ANSI-16 slots are the EMULATOR's (`vt.color.default`),
+///                read back verbatim by the projection, so an override has
+///                to land in the emulator's dynamic palette;
+///   cursor color a user's `cursor-color` is an explicit choice, not a theme
+///                default — it is exactly OSC 12's override channel, and
+///                using `.default` would have the token accent overwrite it
+///                on the next snapshot;
+///   cursor style DECSCUSR state, which only the emulator carries.
+///
+/// Called AFTER `spawnPane`, which hard-resets the emulator: applying before
+/// the reset would drop every one of these on the floor.
+pub fn applySessionConfig(cfg: *const Config, session: *grid.Session) void {
+    for (cfg.palette, 0..) |maybe_color, index| {
+        const color = maybe_color orelse continue;
+        session.term.colors.palette.set(@intCast(index), .{ .r = color.r, .g = color.g, .b = color.b });
+    }
+    if (cfg.cursor_color) |color| {
+        session.term.colors.cursor.set(.{ .r = color.r, .g = color.g, .b = color.b });
+    }
+    session.term.setDefaultCursorStyle(switch (cfg.cursor_style) {
+        .block => .block,
+        .bar => .bar,
+        .underline => .underline,
+    });
+    session.term.setDefaultCursorBlink(cfg.cursor_style_blink);
 }
 
 pub fn initialModelWithPhux(session: *grid.Session, phux_provider: ?*PhuxProvider) Model {

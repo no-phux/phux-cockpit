@@ -34,6 +34,9 @@ pub const Msg = union(enum) {
     copy_selection,
     copy_terminal: TerminalRef,
     paste_terminal: TerminalRef,
+    /// Paste into whatever is focused. `paste_terminal` needs a ref the caller
+    /// already has; a menu item does not have one.
+    paste_focused,
     /// Restart names the terminal, not a pane slot: a pane's identity is its
     /// terminal, and the tree it sits in can reshape between press and
     /// dispatch.
@@ -47,6 +50,21 @@ pub const Msg = union(enum) {
     close_terminal,
     move_terminal: i8,
     toggle_tab_placement,
+    /// cmd+= / cmd+- step the terminal type size by whole points; cmd+0
+    /// returns to the size the config file names. The grid reflow rides the
+    /// existing onFrame viewport pump — nothing here touches a PTY directly.
+    font_size_step: i8,
+    font_size_reset,
+    /// cmd+A over the focused terminal: arm a selection covering the whole
+    /// visible screen, so the very next cmd+C copies it.
+    select_all,
+    /// cmd+K: clear the screen AND the scrollback, the way `clear` does.
+    clear_terminal,
+    /// Close a tab by index — what the strip's own `x` presses.
+    close_tab: u8,
+    /// Pointer entered/left a tab. Only the close affordance reads it.
+    hover_tab: u8,
+    unhover_tab,
     /// A real split: mint a new terminal and divide the focused pane.
     split_right,
     split_down,

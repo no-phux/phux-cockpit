@@ -57,7 +57,7 @@ test "stable surface IDs and browser messages make focused model transitions" {
     try testing.expectEqual(app.BrowserPage.article, app_state.model.browser_page);
 }
 
-test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal input" {
+test "the Web chord selects accessible Web and non-terminal selection blocks terminal input" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -76,7 +76,8 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
 
-    try pressCanvasKey(harness, app_iface, "3", .{ .primary = true });
+    // cmd+shift+B, the Web surface's own chord since it left the tab strip.
+    try pressCanvasKey(harness, app_iface, "b", .{ .primary = true, .shift = true });
     try testing.expect(app_state.model.selectedSurface().eql(.web));
     try testing.expectEqual(@as(?app.TerminalRef, null), app_state.model.selectedTerminalRef());
     try testing.expectEqual(@as(usize, 0), app_state.effects.pendingClipboardCount());
@@ -107,7 +108,9 @@ test "Cmd+3 selects accessible Web and non-terminal selection blocks terminal in
     defer gpa.free(buffer);
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("web"), &writer);
-    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Web, system WebKit") != null);
+    // The web surface names itself through its own anchor now that it has no
+    // tab trigger to speak for it.
+    try testing.expect(app.onCommand("surface.web") != null);
     try testing.expect(std.mem.indexOf(u8, writer.buffered(), app.webview_anchor) != null);
     // The web surface stays a product surface, but its three hardcoded
     // bookmark buttons came out of the band.
@@ -190,15 +193,15 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
     host.inner.effects.executor = .fake;
     const app_iface = host.app();
     try harness.start(app_iface);
-    // Two tabs, so the Web surface sits at cmd+3.
     try host.inner.dispatch(&harness.runtime, 1, .new_terminal);
     try host.inner.dispatch(&harness.runtime, 1, .{ .select_position = 0 });
 
+    // The Web surface is reached by its own registered shortcut now.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
-        .id = "surface.3",
-        .key = "3",
+        .id = "surface.web",
+        .key = "b",
         .window_id = 1,
-        .modifiers = .{ .primary = true },
+        .modifiers = .{ .primary = true, .shift = true },
     } });
     try testing.expect(host.inner.model.selectedSurface().eql(.web));
     var views_buffer: [4]native_sdk.ViewInfo = undefined;
@@ -229,12 +232,12 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
     try testing.expect(canvas_focused);
     try testing.expect(!web_focused);
 
-    // Key-up for Cmd+3 stayed with WebKit, but a later Cmd+3 must still work.
+    // Key-up stayed with WebKit, but a later Web chord must still work.
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
-        .id = "surface.3",
-        .key = "3",
+        .id = "surface.web",
+        .key = "b",
         .window_id = 1,
-        .modifiers = .{ .primary = true },
+        .modifiers = .{ .primary = true, .shift = true },
     } });
     try testing.expect(host.inner.model.selectedSurface().eql(.web));
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
@@ -278,11 +281,9 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     var terminal_2_frame: ?geometry.RectF = null;
-    var web_frame: ?geometry.RectF = null;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
-        if (node.widget.kind == .segmented_control and
+        if (node.widget.semantics.role == .tab and
             std.mem.indexOf(u8, node.widget.semantics.label, "Terminal 2, native terminal") != null) terminal_2_frame = node.frame;
-        if (std.mem.indexOf(u8, node.widget.semantics.label, "Web, system WebKit") != null) web_frame = node.frame;
         try testing.expect(!std.mem.eql(u8, node.widget.text, "Split"));
         try testing.expect(!std.mem.eql(u8, node.widget.text, "New"));
         try testing.expect(!std.mem.eql(u8, node.widget.text, "Close"));
@@ -290,13 +291,11 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
         try testing.expect(!std.mem.eql(u8, node.widget.text, "GitHub"));
     }
     var terminal_1_id: ?canvas.ObjectId = null;
-    var web_id: ?canvas.ObjectId = null;
     for (harness.runtime.views[0].widgetSemantics()) |node| {
         // Only a TAB label carries its shortcut; the terminal surface shares
         // the descriptive prefix but is not a selector.
         if (std.mem.indexOf(u8, node.label, "Terminal 1, native terminal") != null and
             std.mem.indexOf(u8, node.label, "shortcut CMD+") != null) terminal_1_id = node.id;
-        if (std.mem.indexOf(u8, node.label, "Web, system WebKit") != null) web_id = node.id;
     }
 
     var target = rectCenter(terminal_2_frame orelse return error.TestExpectedTab);
@@ -310,8 +309,16 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
     try testing.expect(host.inner.effects.ptyWrittenBytes(app.ptyKey(1)).len > 2);
     try testing.expectEqualStrings("", host.inner.effects.ptyWrittenBytes(app.ptyKey(0)));
 
-    target = rectCenter(web_frame orelse return error.TestExpectedTab);
-    try clickCanvas(harness, app_iface, target.x, target.y);
+    // There is no Web tab to click any more, so the surface is reached the
+    // way it now is everywhere else: its own command. The first-responder
+    // hand-off is what this test is about, and that is unchanged.
+    try host.inner.dispatch(&harness.runtime, 1, .{ .select_surface = .web });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "surface.web",
+        .key = "b",
+        .window_id = 1,
+        .modifiers = .{ .primary = true, .shift = true },
+    } });
     try testing.expect(host.inner.model.selectedSurface().eql(.web));
     var views_buffer: [4]native_sdk.ViewInfo = undefined;
     var views = harness.runtime.listViews(1, &views_buffer);
@@ -331,11 +338,16 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
         if (std.mem.eql(u8, item.label, app.webview_label)) try testing.expect(!item.focused);
     }
 
-    _ = try harness.runtime.dispatchCanvasWidgetAccessibilityAction(app_iface, 1, app.canvas_label, .{
-        .id = web_id orelse return error.TestExpectedTab,
-        .action = .press,
-    });
-    try testing.expect(host.inner.model.selectedSurface().eql(.web));
+    // Back out to Web and in again through a TAB's own assistive press: the
+    // tab is a plain container now, so this is the assertion that it still
+    // answers `press` the way the register widget it replaced did.
+    try host.inner.dispatch(&harness.runtime, 1, .{ .select_surface = .web });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "surface.web",
+        .key = "b",
+        .window_id = 1,
+        .modifiers = .{ .primary = true, .shift = true },
+    } });
     views = harness.runtime.listViews(1, &views_buffer);
     for (views) |item| if (std.mem.eql(u8, item.label, app.webview_label)) try testing.expect(item.focused);
 
@@ -365,7 +377,8 @@ test "native tabs are keyboard focusable without stealing initial terminal input
             tab_count += 1;
         }
     }
-    try testing.expectEqual(@as(usize, 3), tab_count);
+    // Two terminals, two tabs. Web is not a tab.
+    try testing.expectEqual(@as(usize, 2), tab_count);
     try testing.expectEqual(
         canvas.globalWidgetId(.terminal, .{ .index = @intCast(@intFromEnum(app.LocalTerminalId.terminal_1)) }),
         harness.runtime.views[0].canvas_widget_focused_id,

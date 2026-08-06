@@ -61,11 +61,40 @@ const paneFrameForTerminal = pointer_input.paneFrameForTerminal;
 const validScale = pointer_input.validScale;
 const syncMouseProtocol = pointer_input.syncMouseProtocol;
 const cockpit_shortcuts = scene.cockpit_shortcuts;
-const cockpitTokens = projection.cockpitTokens;
+const terminalTokens = projection.terminalTokens;
 const selectedTerminalCanClose = projection.selectedTerminalCanClose;
+
+/// Spawn a pane and then hand its fresh emulator the user's terminal-level
+/// settings. `spawnPane` hard-resets the emulator, so this ORDER is the whole
+/// point: every path that starts a shell (boot, New, split, Restart) goes
+/// through here so no terminal can end up with the default palette because
+/// its entry point forgot.
+fn spawnConfiguredPane(model: *Model, pane: *Pane, fx: *Fx) void {
+    spawnPane(pane, fx);
+    model_module.applySessionConfig(&model.config, pane.session);
+}
+
+/// A new terminal or split starts in the focused pane's directory, the way
+/// Ghostty does — `inherit-working-directory` turns it off.
+///
+/// Set BEFORE the spawn, because the argv is what the spawn carries. The
+/// generated argv is quoted against hostile paths by `paneArgvIn` and falls
+/// back to `$HOME` (never to no shell at all) when the directory has moved.
+/// A pane whose shell never reported OSC 7 has no cwd to inherit, so the
+/// plain argv stands.
+fn adoptWorkingDirectory(model: *Model, origin: ?TerminalRef, pane: *Pane) void {
+    if (!model.config.inherit_working_directory) return;
+    const source_ref = origin orelse return;
+    const source = model.provider.terminalConst(source_ref) orelse return;
+    const cwd = source.pwd();
+    if (cwd.len == 0) return;
+    const slot = model.provider.slotIndex(pane.id) orelse return;
+    pane.argv = local.paneArgvIn(cwd, &model.cwd_argv[slot]);
+}
+
 pub fn initFx(model: *Model, fx: *Fx) void {
     for (0..max_terminals) |index| {
-        if (model.provider.states[index] == .active) spawnPane(model.provider.slot(index), fx);
+        if (model.provider.states[index] == .active) spawnConfiguredPane(model, model.provider.slot(index), fx);
     }
     openPhuxChannel(model, fx, false);
     openPointerMonitor(model, fx);
@@ -133,10 +162,28 @@ fn remoteFocusOwner(model: *const Model) ?ReplicaOwner {
     return model.terminalOwner(terminal_ref);
 }
 
+/// A bell on a terminal you are LOOKING at is not news.
+///
+/// Acknowledged for every pane of the selected tab — not just the focused one
+/// — because every pane of the selected tab is on screen. Skipped entirely
+/// when the window does not have key: a bell that rings while the app is in
+/// the background is exactly the one worth keeping.
+fn acknowledgeVisibleBells(model: *Model) void {
+    if (!model.focused) return;
+    const current = model.selectedTreeConst() orelse return;
+    var refs: [layout.max_panes]TerminalRef = undefined;
+    const count = current.terminals(&refs);
+    for (refs[0..count]) |id| {
+        const pane = model.provider.terminalConst(id) orelse continue;
+        pane.clearBell();
+    }
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const focus_before = remoteFocusTarget(model);
     const owner_before = remoteFocusOwner(model);
     updateModel(model, msg, fx);
+    acknowledgeVisibleBells(model);
     const focus_after = remoteFocusTarget(model);
     const owner_after = remoteFocusOwner(model);
     if (!optRefEql(focus_before, focus_after)) {
@@ -335,7 +382,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // own viewport.
             const state = model.remoteUi(terminal_ref) orelse return;
             if (state.selecting) return;
-            const cell_h = @max(1, canvas.terminalCellMetrics(cockpitTokens(model)).height);
+            const cell_h = @max(1, canvas.terminalCellMetrics(terminalTokens(model)).height);
             state.wheel_accum += wheel.delta;
             const rows = @trunc(state.wheel_accum / cell_h);
             if (rows != 0) {
@@ -353,6 +400,10 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .copy_terminal => |id| copySelection(model, fx, id),
         .paste_terminal => |id| requestPaste(model, fx, id),
+        .paste_focused => {
+            const id = model.selectedTerminalId() orelse return;
+            requestPaste(model, fx, id);
+        },
         .clipboard => |result| {
             if (!model.copy_inflight) return;
             model.copy_inflight = false;
@@ -420,7 +471,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 if (model.paste_inflight) fx.cancel(paste_clipboard_key);
             }
             endCapturesForTerminal(model, fx, pane.id);
-            spawnPane(pane, fx);
+            spawnConfiguredPane(model, pane, fx);
         },
         .focus_pane => |node| {
             const current = model.selectedTree() orelse return;
@@ -439,36 +490,40 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             }
             endHiddenCaptures(model, fx);
         },
+        // cmd+N and tab cycling address TERMINAL TABS only. Web used to be
+        // addressable as "one past the last tab", which meant the chord for a
+        // given terminal moved every time a tab opened or closed; it has its
+        // own chord (cmd+shift+B) and its own menu item now.
         .select_position => |position| {
-            if (position < model.tab_count) {
-                _ = model.selectTab(position);
-            } else if (position == model.tab_count) {
-                model.selectWeb();
-            }
+            if (position >= model.tab_count) return;
+            _ = model.selectTab(position);
             endHiddenCaptures(model, fx);
         },
         .cycle_tab => |delta| {
-            const count: i8 = @intCast(model.tab_count + 1);
-            const current: i8 = if (model.web_selected)
-                @intCast(model.tab_count)
-            else
-                @intCast(model.selected_tab);
-            const next: usize = @intCast(@mod(current + delta, count));
-            if (next == model.tab_count) model.selectWeb() else _ = model.selectTab(next);
+            if (model.tab_count == 0) return;
+            const count: i8 = @intCast(model.tab_count);
+            // Cycling from the web surface re-enters the tab list at the tab
+            // that was there, rather than stranding the user on a surface the
+            // strip no longer shows.
+            const current: i8 = @intCast(model.selected_tab);
+            const next: usize = @intCast(@mod(current + if (model.web_selected) 0 else delta, count));
+            _ = model.selectTab(next);
             endHiddenCaptures(model, fx);
         },
         .new_terminal => {
             // A new terminal is a new TAB. Capacity is bounded on both ends:
             // tab slots and registry slots.
             if (model.tab_count >= max_tabs) return;
+            const origin = model.selectedTerminalRef();
             const pane = model.provider.createTerminal() catch return;
+            adoptWorkingDirectory(model, origin, pane);
             if (!model.admitTab(pane.id)) {
                 _ = model.provider.destroyTerminal(pane.id);
                 return;
             }
             _ = model.selectTerminal(pane.id);
             endHiddenCaptures(model, fx);
-            spawnPane(pane, fx);
+            spawnConfiguredPane(model, pane, fx);
         },
         .close_terminal => {
             const id = model.selectedTerminalRef() orelse return;
@@ -485,6 +540,17 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             model.tab_placement = if (model.tab_placement == .top) .side else .top;
             endHiddenCaptures(model, fx);
         },
+        // Font sizing needs NO effect of its own: the design tokens derive the
+        // cell box from the live size, and the onFrame pump already emits one
+        // `.viewport` per changed pane, which is what resizes the emulator and
+        // the pty. Every pane in every tab follows on its next frame.
+        .font_size_step => |delta| _ = model.stepFontSize(@floatFromInt(delta)),
+        .font_size_reset => _ = model.resetFontSize(),
+        .select_all => selectAllVisible(model),
+        .clear_terminal => clearFocusedTerminal(model, fx),
+        .close_tab => |index| closeTab(model, fx, index),
+        .hover_tab => |index| model.hovered_tab = index,
+        .unhover_tab => model.hovered_tab = model_module.no_hovered_tab,
         .split_right => splitFocusedPane(model, fx, .horizontal),
         .split_down => splitFocusedPane(model, fx, .vertical),
         .split_resized => |resize| {
@@ -525,7 +591,9 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
     const current = model.selectedTree() orelse return;
     const target = current.focus;
     if (target == layout.none or current.node(target).kind != .leaf) return;
+    const origin = current.focusedTerminal();
     const pane = model.provider.createTerminal() catch return;
+    adoptWorkingDirectory(model, origin, pane);
     _ = current.split(target, orientation, pane.id) catch {
         // The tree refused (at its pane ceiling): the terminal minted for it
         // has no home, so it goes back rather than leaking a live shell.
@@ -533,7 +601,61 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
         return;
     };
     endHiddenCaptures(model, fx);
-    spawnPane(pane, fx);
+    spawnConfiguredPane(model, pane, fx);
+}
+
+/// Close a WHOLE tab — every pane in it — which is what the strip's `x`
+/// means. Panes are closed one at a time through the ordinary path so each
+/// one's pty kill, capture teardown, and clipboard cancellation happen
+/// exactly as cmd+W would do them; the tab drops with its last pane.
+///
+/// A Phux pane cannot be closed locally (its coordinator owns it), so a tab
+/// holding one keeps that pane and survives — the same rule cmd+W follows.
+fn closeTab(model: *Model, fx: *Fx, index: u8) void {
+    const current = model.treeConst(index) orelse return;
+    var refs: [layout.max_panes]TerminalRef = undefined;
+    const count = current.terminals(&refs);
+    for (refs[0..count]) |id| {
+        if (providerKind(id) != .local) continue;
+        closePaneForTerminal(model, fx, id, true);
+    }
+}
+
+/// cmd+A: cover the visible screen with a selection the next cmd+C can copy.
+///
+/// Composed from the existing keyboard-selection primitives rather than a new
+/// emulator call: `beginSelection` anchors at the cursor, one clamped
+/// non-extending move drags the anchor to the top-left, and one clamped
+/// extending move drags the head to the bottom-right. It is therefore
+/// VIEWPORT-wide, not scrollback-wide — see the handoff note.
+fn selectAllVisible(model: *Model) void {
+    const terminal_ref = model.selectedTerminalRef() orelse return;
+    const pane = model.provider.terminal(terminal_ref) orelse return;
+    const session = pane.session;
+    const span_x: i32 = @intCast(session.cols());
+    const span_y: i32 = @intCast(session.rows());
+    session.beginSelection(false);
+    session.moveSelection(-span_x, -span_y, false);
+    session.moveSelection(span_x, span_y, true);
+    pane.selecting = true;
+}
+
+/// cmd+K: clear the screen and the scrollback.
+///
+/// Written as terminal OUTPUT rather than as a new emulator entry point,
+/// because that is exactly what it is: `CSI H` homes the cursor, `CSI 2 J`
+/// erases the display, `CSI 3 J` erases the saved lines. It is byte-for-byte
+/// what `clear` sends, so the emulator ends in a state it already knows how
+/// to be in.
+fn clearFocusedTerminal(model: *Model, fx: *Fx) void {
+    const terminal_ref = model.selectedTerminalRef() orelse return;
+    const pane = model.provider.terminal(terminal_ref) orelse return;
+    pane.selecting = false;
+    pane.session.clearSelection();
+    feedOutput(pane, fx, "\x1b[H\x1b[2J\x1b[3J");
+    pane.session.scrollToBottom();
+    pane.session.refreshScreenText();
+    moveResponsesToOutbound(pane, fx);
 }
 
 /// Close the pane holding `terminal_ref`, then cascade: the tab goes when it
@@ -805,6 +927,24 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         updateModel(model, .{ .cycle_pane = 1 }, fx);
         return;
     }
+    // Font sizing: cmd+= / cmd+- / cmd+0, the chords every Mac terminal
+    // ships. Shift is tolerated on `=` because that key IS `+` with shift and
+    // people press cmd+shift+= without thinking.
+    if (primary and !mods.alt and !mods.control and (keyIs(event.key, "=") or keyIs(event.key, "+"))) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .{ .font_size_step = 1 }, fx);
+        return;
+    }
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "-")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .{ .font_size_step = -1 }, fx);
+        return;
+    }
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "0")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .font_size_reset, fx);
+        return;
+    }
     if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "t")) {
         latchAppShortcut(model, event.key);
         updateModel(model, .new_terminal, fx);
@@ -814,6 +954,14 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         if (!selectedTerminalCanClose(model)) return;
         latchAppShortcut(model, event.key);
         updateModel(model, .close_terminal, fx);
+        return;
+    }
+    // cmd+shift+B reaches the Web surface. It left the tab strip (a terminal
+    // tab strip shows terminals), so it needs a chord of its own or it would
+    // only be reachable from the menu.
+    if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "b")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .{ .select_surface = .web }, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "arrowleft")) {
@@ -874,6 +1022,19 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         requestPaste(model, fx, pane.id);
         return;
     }
+    // cmd+A and cmd+K, the two chords every Mac terminal has and this one did
+    // not. They sit here rather than with the tab chords because both act on
+    // the FOCUSED terminal and mean nothing over the web surface.
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "a")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .select_all, fx);
+        return;
+    }
+    if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "k")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .clear_terminal, fx);
+        return;
+    }
     if (primary and keyIs(event.key, "r") and (pane.phase == .ended or pane.phase == .failed)) {
         latchAppShortcut(model, event.key);
         update(model, .{ .restart = pane.id }, fx);
@@ -886,6 +1047,20 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // text than a copy returns. (The chords fall through to the
     // selection block below, where primary+arrows are simply inert.)
     if (!pane.selecting) {
+        // shift+PageUp / shift+PageDown page the scrollback. This is the
+        // chord terminals have shared for thirty years — xterm, Terminal.app,
+        // and Ghostty (`shift+page_up=scroll_page_up`) all ship it — and it
+        // was the one genuinely MISSING scrollback binding here.
+        if (mods.shift and !primary and !mods.alt and !mods.control and keyIs(event.key, "pageup")) {
+            latchAppShortcut(model, event.key);
+            session.scrollLines(-@as(isize, pane.rows));
+            return;
+        }
+        if (mods.shift and !primary and !mods.alt and !mods.control and keyIs(event.key, "pagedown")) {
+            latchAppShortcut(model, event.key);
+            session.scrollLines(@as(isize, pane.rows));
+            return;
+        }
         if (primary and keyIs(event.key, "arrowup")) {
             latchAppShortcut(model, event.key);
             session.scrollLines(-if (mods.shift) @as(isize, pane.rows) else 1);
@@ -1226,6 +1401,17 @@ pub fn appShortcutKeyMask(key: []const u8) u32 {
     if (keyIs(key, "arrowright")) return 1 << 17;
     if (keyIs(key, "t")) return 1 << 18;
     if (keyIs(key, "w")) return 1 << 19;
+    // `=` and `+` are ONE physical key: a press reported as `+` and a release
+    // reported as `=` (or the reverse, depending on the shift edge) must
+    // clear the same latch or the key wedges held forever.
+    if (keyIs(key, "=") or keyIs(key, "+")) return 1 << 22;
+    if (keyIs(key, "-")) return 1 << 23;
+    if (keyIs(key, "0")) return 1 << 24;
+    if (keyIs(key, "a")) return 1 << 25;
+    if (keyIs(key, "k")) return 1 << 26;
+    if (keyIs(key, "b")) return 1 << 27;
+    if (keyIs(key, "pageup")) return 1 << 28;
+    if (keyIs(key, "pagedown")) return 1 << 29;
     return 0;
 }
 
