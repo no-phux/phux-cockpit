@@ -19,8 +19,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Bug Fixes
 
-* repair the production phux build, which CI caught and I had not run ([3544f4c](https://github.com/phall1/phux-cockpit/commit/3544f4c192f417e82c8ae64f8c009fc046ff9c06))
-* retain the copied selection on remote panes, and record two SDK walls ([2fb8927](https://github.com/phall1/phux-cockpit/commit/2fb8927eea3385018002d1f7cdf6458d8953da0d))
+* repair the production phux provider build ([3544f4c](https://github.com/phall1/phux-cockpit/commit/3544f4c192f417e82c8ae64f8c009fc046ff9c06))
+* retain the copied selection on remote panes ([2fb8927](https://github.com/phall1/phux-cockpit/commit/2fb8927eea3385018002d1f7cdf6458d8953da0d))
 
 
 ### Documentation
