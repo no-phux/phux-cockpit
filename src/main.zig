@@ -123,6 +123,7 @@ pub const deinitModel = model_module.deinitModel;
 pub const StatePersistence = model_module.StatePersistence;
 
 pub const state_file_name = session_state.file_name;
+pub const release_state_file_name = session_state.release_file_name;
 pub const max_state_bytes = session_state.max_state_bytes;
 pub const serializeWorkspaceState = session_state.serialize;
 pub const parseWorkspaceState = session_state.parse;

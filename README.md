@@ -217,6 +217,37 @@ workspace without restarting or resizing through intermediate states.
 The application is macOS-only. The null platform is used only for deterministic
 tests; it does not exercise Metal presentation.
 
+### Running a local build beside the installed app
+
+Both can coexist: Homebrew installs an `.app` bundle, `zig build` produces a
+bare binary in `zig-out/bin`. They are different files in different places, so
+nothing needs uninstalling to test a change.
+
+What they *would* have shared is your saved layout. A debug build writes
+`workspace-dev.state` and a packaged build writes `workspace.state`, keyed off
+the optimize mode so it is right without anyone remembering — plain `zig build`
+is Debug, and `scripts/package-macos.sh` is ReleaseSafe. Without that split, a
+dev build running a newer schema would replace the layout the installed app was
+about to restore; the version guard means the loser opens a fresh window rather
+than crashing, but a window arrangement lost to a test build still reads as the
+app having forgotten it.
+
+Config is deliberately NOT split: font size and colors are yours, and you want
+them in both.
+
+To separate two builds of the same optimize mode, or to keep a scratch layout
+entirely apart, override the paths:
+
+```sh
+PHUX_COCKPIT_STATE=/tmp/cockpit-scratch.state \
+PHUX_COCKPIT_CONFIG=~/.config/phux-cockpit/scratch \
+  ./zig-out/bin/phux-cockpit
+```
+
+Add `-Dautomation=true` to drive the running app: commands are written as
+`command-<n>.txt` files into `.zig-cache/native-sdk-automation/`, and
+screenshots and a full widget snapshot appear beside them.
+
 ## Package
 
 Create an arm64 app, ZIP, DMG, and `SHA256SUMS` under `zig-out/release`:

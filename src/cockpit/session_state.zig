@@ -54,7 +54,29 @@ pub const terminator = "end";
 /// The state file's name inside the platform STATE directory. Layout is
 /// STATE, not configuration: nobody hand-writes it and losing it costs a
 /// session shape, not a setting.
-pub const file_name = "workspace.state";
+/// A DEBUG build writes its layout somewhere else.
+///
+/// The installed app and a binary run straight out of `zig-out/bin` belong to
+/// the same user, so they resolved the same state file — and a dev build is
+/// exactly the thing most likely to be running a NEWER schema. The version
+/// guard means whichever one loses opens a fresh window instead of crashing,
+/// but losing the windows you had arranged because you ran a test build is
+/// still losing them, and it looks like the app forgot.
+///
+/// Keyed off the optimize mode rather than a flag so it is right without
+/// anyone remembering: plain `zig build` is Debug and gets its own file, while
+/// `scripts/package-macos.sh` builds ReleaseSafe and keeps the real one.
+/// `PHUX_COCKPIT_STATE` still overrides both, which is what to reach for when
+/// two builds of the SAME mode need separating.
+pub const file_name = if (@import("builtin").mode == .Debug)
+    "workspace-dev.state"
+else
+    "workspace.state";
+
+/// The name a packaged build uses, regardless of how THIS build was compiled.
+/// Exposed so a test can prove the two are actually different rather than
+/// asserting the constant against itself.
+pub const release_file_name = "workspace.state";
 
 /// Byte ceiling for a whole state file.
 ///

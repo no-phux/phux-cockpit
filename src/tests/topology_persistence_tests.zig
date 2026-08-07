@@ -535,3 +535,49 @@ test "normalizing topology drops panes whose terminal is gone and collapses empt
     model.normalizeTopology();
     try testing.expect(model.selectedSurface().eql(.web));
 }
+
+test "a debug build does not write the installed app's layout file" {
+    // The installed app and a binary run out of `zig-out/bin` belong to the
+    // same user, so they resolved the same state path — and a dev build is
+    // precisely the one most likely to be running a newer schema. Whichever
+    // lost that race opened a fresh window, which reads to the person using it
+    // as the app having forgotten their windows.
+    //
+    // Asserted against the ACTUAL optimize mode rather than assuming Debug,
+    // so running the suite with -Doptimize=ReleaseSafe checks the release
+    // half of the switch instead of failing on a hardcoded name.
+    try testing.expectEqualStrings("workspace.state", app.release_state_file_name);
+    if (@import("builtin").mode == .Debug) {
+        try testing.expectEqualStrings("workspace-dev.state", app.state_file_name);
+        try testing.expect(!std.mem.eql(u8, app.state_file_name, app.release_state_file_name));
+    } else {
+        // A packaged build (package-macos.sh is ReleaseSafe) must land on the
+        // real file, or an installed app would quietly stop restoring.
+        try testing.expectEqualStrings(app.release_state_file_name, app.state_file_name);
+    }
+
+    // ...and that the difference survives into the RESOLVED path, so the
+    // separation is a real file rather than a name nothing consumes.
+    var dir_storage: [std.fs.max_path_bytes]u8 = undefined;
+    var path_storage: [std.fs.max_path_bytes]u8 = undefined;
+    const path = app.resolveStatePath(
+        .{ .home = "/Users/someone" },
+        null,
+        &dir_storage,
+        &path_storage,
+    ) orelse return error.TestExpectedStatePath;
+    try testing.expect(std.mem.endsWith(u8, path, app.state_file_name));
+    if (@import("builtin").mode == .Debug) {
+        try testing.expect(!std.mem.endsWith(u8, path, "/" ++ app.release_state_file_name));
+    }
+
+    // The explicit override still beats both — the escape hatch for separating
+    // two builds of the same optimize mode.
+    const overridden = app.resolveStatePath(
+        .{ .home = "/Users/someone" },
+        "/tmp/explicit.state",
+        &dir_storage,
+        &path_storage,
+    ) orelse return error.TestExpectedStatePath;
+    try testing.expectEqualStrings("/tmp/explicit.state", overridden);
+}
