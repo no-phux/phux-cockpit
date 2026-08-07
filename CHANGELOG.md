@@ -3,6 +3,31 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/phall1/phux-cockpit/compare/v0.5.0...v0.6.0) (2026-08-07)
+
+
+### Features
+
+* **cockpit:** add the recursive pane layout tree ([63e806a](https://github.com/phall1/phux-cockpit/commit/63e806a100cbcf50a2296c46125be90617723b54))
+* **cockpit:** pack the terminal into one cell grid, and finish the chrome ([b7c7c08](https://github.com/phall1/phux-cockpit/commit/b7c7c08e7f1807d5e98976748694696081ff23f4))
+* **cockpit:** rebuild layout, close semantics, chrome, and terminal fidelity ([20d82dd](https://github.com/phall1/phux-cockpit/commit/20d82dd58719e5294c4d72a99090426f6f7b5cc8))
+* multiple windows, each with its own workspace ([74c9ca6](https://github.com/phall1/phux-cockpit/commit/74c9ca63afbebd36119bffb96b83ebc7c4dec185))
+* restore the GPU path, persist the workspace, and make close mean close ([ff04874](https://github.com/phall1/phux-cockpit/commit/ff04874ea773cfccf05d87ff55afcd06b2171f11))
+* scrollback search, and bold and italic that actually render ([814f447](https://github.com/phall1/phux-cockpit/commit/814f447aa3c496c0daa8581c927f99e824f9175d))
+* **terminal:** carry every SGR attribute into the packed cell ([984fa38](https://github.com/phall1/phux-cockpit/commit/984fa381990951a569758d6436947548dfb7fed7))
+
+
+### Bug Fixes
+
+* repair the production phux provider build ([3544f4c](https://github.com/phall1/phux-cockpit/commit/3544f4c192f417e82c8ae64f8c009fc046ff9c06))
+* retain the copied selection on remote panes ([2fb8927](https://github.com/phall1/phux-cockpit/commit/2fb8927eea3385018002d1f7cdf6458d8953da0d))
+
+
+### Documentation
+
+* describe the terminal that exists now ([d2ff2a2](https://github.com/phall1/phux-cockpit/commit/d2ff2a28172bf185b9fdc9c55ab0df16c5f503f9))
+* rewrite the topology snapshot doc for pane trees ([c8bcb18](https://github.com/phall1/phux-cockpit/commit/c8bcb18b3aac4bbd365563c345633d5630e308b6))
+
 ## [0.5.0](https://github.com/phall1/phux-cockpit/compare/v0.4.0...v0.5.0) (2026-08-05)
 
 
