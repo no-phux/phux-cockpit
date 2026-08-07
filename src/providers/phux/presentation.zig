@@ -158,9 +158,30 @@ fn saturatingU32(value: u64) u32 {
 }
 
 test "dense text is compacted from a hyperlink-heavy remote UTF-8 arena" {
-    const cols: usize = 120;
-    const rows: usize = 96;
+    // The claim is that the projection keeps every visible byte even when the
+    // PAINTER's text store cannot carry them all, so the screen has to
+    // genuinely outgrow that store or the test proves nothing. Both extents
+    // are derived from the SDK's own constants rather than written down: a
+    // fixed 120x96 stopped exceeding the budget the moment the store grew
+    // from 32 KiB to 64 KiB, and the assertion below went quietly vacuous
+    // until CI caught it.
+    // Every cell here inks one three-byte euro sign. Note this is NOT
+    // `max_cell_utf8_bytes` (64) — that is the per-cell CEILING a cluster may
+    // reach, and sizing against it would ask for 20x fewer columns than the
+    // fixture actually needs.
+    const cell_utf8_bytes: usize = 3;
+    const rows: usize = canvas.max_terminal_rows;
+    const cols: usize = @min(
+        canvas.max_terminal_cols,
+        canvas.max_display_list_text_bytes / cell_utf8_bytes / rows + 2,
+    );
     const cell_count = cols * rows;
+    comptime {
+        // The densest grid the projection accepts must still outgrow the
+        // painter's store, or no choice of cols could make this test bite.
+        std.debug.assert(canvas.max_terminal_cols * canvas.max_terminal_rows * cell_utf8_bytes >
+            canvas.max_display_list_text_bytes);
+    }
     const cells = try std.testing.allocator.alloc(c.PhuxTerminalCell, cell_count);
     defer std.testing.allocator.free(cells);
     const visible_len = cell_count * 3;

@@ -47,7 +47,7 @@ pub fn terminalRefAtPoint(model: *const Model, x: f32, y: f32) ?TerminalRef {
 }
 
 fn terminalFrame(model: *const Model, terminal_ref: TerminalRef) ?geometry.RectF {
-    return projection.paneFrameFor(model, model.ws().surface_size, terminal_ref);
+    return projection.paneFrameFor(model, model.wsConst().surface_size, terminal_ref);
 }
 
 pub fn pointerButton(button: u32) MouseButton {
