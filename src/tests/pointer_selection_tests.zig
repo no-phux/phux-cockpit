@@ -222,7 +222,7 @@ test "pointer lifecycle matrix releases live owners once and fences restart gene
 
     // An ended session can still be selected locally; restart cancels that
     // gesture and stale motion cannot select in the replacement generation.
-    try host.inner.effects.feedPtyExit(pane.pty_key, 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
+    try host.inner.effects.feedPtyExit(pane.pty_key, 0, 0, .spawn_failed, 0); // a spawn failure: the one end that leaves the pane standing
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     // The abnormal end pulls the band back, which moves the content area
     // down: re-read the pane's rect before aiming at it again.
@@ -533,9 +533,9 @@ test "secondary report gesture survives process exit cancel without menu takeove
     try testing.expectEqual(hit.id, harness.runtime.views[0].canvas_widget_pressed_id);
     try testing.expectEqual(.ordinary, harness.runtime.views[0].canvas_widget_secondary_gesture_owner);
 
-    try host.inner.effects.feedPtyExit(pane.pty_key, 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
+    try host.inner.effects.feedPtyExit(pane.pty_key, 0, 0, .spawn_failed, 0); // a spawn failure: the one end that leaves the pane standing
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
-    try testing.expectEqual(.ended, pane.phase);
+    try testing.expectEqual(.failed, pane.phase);
     try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(&host.inner.model));
     // The fake executor retires its write-capture window with the transport.
     // These counters prove exit cleanup did not attempt or drop a release.

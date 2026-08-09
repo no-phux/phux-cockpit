@@ -172,6 +172,39 @@ pub const Pane = struct {
     outbound_head: usize = 0,
     outbound_len: usize = 0,
     outbound_dropped: u64 = 0,
+    /// Watermarks for the loss counters above: how much loss the operator has
+    /// already been shown.
+    ///
+    /// The counters themselves are CUMULATIVE and must stay that way — they
+    /// are the evidence in each surface's accessibility label, and a diagnostic
+    /// that resets is a diagnostic that lies. But attention is a different
+    /// question from evidence: "this terminal has ever dropped a byte" is true
+    /// forever after the first drop, and deriving an attention signal straight
+    /// from it latched the tab band permanently open for the life of the
+    /// session. Attention asks "has anything happened SINCE you looked", which
+    /// is what these watermarks answer.
+    acknowledged_outbound_dropped: u64 = 0,
+    acknowledged_response_dropped: u64 = 0,
+    acknowledged_write_refusals: u32 = 0,
+    acknowledged_delivery_failures: u32 = 0,
+
+    /// Loss the operator has not been shown yet.
+    pub fn hasUnacknowledgedLoss(pane: *const Pane) bool {
+        return pane.outbound_dropped > pane.acknowledged_outbound_dropped or
+            pane.session.response_bytes_dropped > pane.acknowledged_response_dropped or
+            pane.write_refusals > pane.acknowledged_write_refusals or
+            pane.native_delivery_failures > pane.acknowledged_delivery_failures;
+    }
+
+    /// Mark everything counted so far as seen. The pane is a handle onto a
+    /// heap-owned session, so this takes a `*Pane` for its own fields and
+    /// reaches through for the session's — the same split `clearBell` has.
+    pub fn acknowledgeLoss(pane: *Pane) void {
+        pane.acknowledged_outbound_dropped = pane.outbound_dropped;
+        pane.acknowledged_response_dropped = pane.session.response_bytes_dropped;
+        pane.acknowledged_write_refusals = pane.write_refusals;
+        pane.acknowledged_delivery_failures = pane.native_delivery_failures;
+    }
 
     pub fn acceptsInput(pane: *const Pane) bool {
         return pane.phase == .starting or pane.phase == .live;

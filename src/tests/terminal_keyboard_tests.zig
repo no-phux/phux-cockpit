@@ -390,7 +390,7 @@ test "consumed app shortcut releases never leak under kitty reporting" {
     try testing.expect(!app_state.model.provider.slots[1].selecting);
     try releaseCanvasKey(harness, app_iface, "enter", .{});
 
-    try app_state.effects.feedPtyExit(app.ptyKey(1), 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .spawn_failed, 0); // a spawn failure: the one end that leaves the pane standing
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
     try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[1].phase);

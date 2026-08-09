@@ -126,12 +126,15 @@ fn recordTerminalSession(
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
-    // The session ends.
-    try app_state.effects.feedPtyExit(1, 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
-    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
-
+    // The recording deliberately stops with the shell STILL RUNNING.
+    //
+    // It used to end by feeding an exit, which was harmless when an abnormal
+    // end left its pane standing. It is not harmless now: an exit closes its
+    // pane at any status, and closing frees the emulator immediately — so a
+    // journal ending in one replays to a workspace with no terminal in it,
+    // and the byte-identical screen this whole test exists to prove has
+    // nothing left to read it from. Exit and close behaviour is covered by
+    // the lifecycle suite; what belongs here is the replay of live state.
     recorder.finish();
     try testing.expect(!recorder.failed);
 
@@ -202,10 +205,11 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     });
     try testing.expect(report.ok());
     try testing.expect(report.checkpoints_verified > 0);
-    // No process ran: the replayed spawn parked, four journaled
-    // results fed (two output batches, the typed input's write-admission
-    // verdict, one exit).
-    try testing.expectEqual(@as(u64, 4), report.effects_fed);
+    // No process ran: the replayed spawn parked, three journaled results
+    // fed (two output batches and the typed input's write-admission
+    // verdict). The recording ends with the shell still live — see
+    // `recordTerminalSession`.
+    try testing.expectEqual(@as(u64, 3), report.effects_fed);
     try testing.expectEqual(recorded.fingerprint, harness.runtime.sessionStateFingerprint());
 
     // The replayed emulator rebuilt the identical screen from the
@@ -213,5 +217,7 @@ test "a recorded terminal session replays byte-identical offline - no shell pres
     const screen = try session.plainText(gpa);
     defer gpa.free(screen);
     try testing.expectEqualStrings(recorded.screen[0..recorded.screen_len], screen[0..recorded.screen_len]);
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    // The replayed terminal is still live, which is what makes the screen
+    // above readable at all.
+    try testing.expectEqual(@as(usize, 1), app_state.model.provider.activeCount());
 }

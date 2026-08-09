@@ -175,9 +175,9 @@ test "session exit counts retained reply bytes as loss, never silent" {
     app_state.model.provider.slots[0].session.feed("\x1b[6n");
     const reply_len = app_state.model.provider.slots[0].session.pendingResponses().len;
     try testing.expect(reply_len > 0);
-    try app_state.effects.feedPtyExit(1, 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
+    try app_state.effects.feedPtyExit(1, 0, 0, .spawn_failed, 0); // a spawn failure: the one end that leaves the pane standing
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.failed, app_state.model.provider.slots[0].phase);
     try testing.expectEqual(@as(u64, reply_len), app_state.model.provider.slots[0].outbound_dropped);
     try testing.expectEqual(@as(usize, 0), app_state.model.provider.slots[0].session.pendingResponses().len);
 }

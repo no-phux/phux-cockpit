@@ -54,11 +54,15 @@ test "restart resets every per-session counter and exit field" {
 
     // The first session ends with transport drops on record: the exit
     // carries them into the model, where the status tally renders them.
+    //
+    // A SPAWN failure, because that is the only end that leaves a pane
+    // standing for a Restart to target — a shell that ran and ended closes its
+    // pane at any status, and a closed pane has no counters left to reset.
     try app_state.effects.feedPtyOutput(1, "demo$ ");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try app_state.effects.feedPtyExit(1, 0, 9, .signaled, 3);
+    try app_state.effects.feedPtyExit(1, 0, 0, .spawn_failed, 3);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.failed, app_state.model.provider.slots[0].phase);
     try testing.expectEqual(@as(u32, 3), app_state.model.provider.slots[0].native_delivery_failures);
     const pane = &app_state.model.provider.slots[0];
     const previous_generation = pane.session_generation;
@@ -78,7 +82,7 @@ test "restart resets every per-session counter and exit field" {
     try testing.expect(pane.output_batches > 0);
     try testing.expect(pane.output_bytes > 0);
     try testing.expectEqual(@as(i32, -1), pane.exit_code);
-    try testing.expectEqual(@as(i32, 9), pane.exit_signal);
+    try testing.expectEqual(@as(i32, 0), pane.exit_signal);
 
     // Cmd+R: the new shell's tally is its own — zero, not the dead
     // session's drops.
@@ -141,7 +145,8 @@ test "a split pane carries its lifecycle in accessibility, not in a pane header"
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try app_state.effects.feedPtyExit(app.ptyKey(1), 9, 0, .exited, 0);
+    // A spawn failure: the end that leaves a pane standing to carry a label.
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
@@ -151,7 +156,7 @@ test "a split pane carries its lifecycle in accessibility, not in a pane header"
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("split-status"), &writer);
     const snapshot = writer.buffered();
     try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1, native terminal, RUNNING") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 2, native terminal, EXIT 9") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 2, native terminal, SPAWN FAILED") != null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "Restart Terminal 2") != null);
     // No pane header text of any kind is painted.
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
@@ -209,7 +214,7 @@ test "lifecycle and loss diagnostics remain visible beside native delivery failu
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 23, 0, .exited, 4);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 4);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     const pane = &app_state.model.provider.slots[0];
     pane.outbound_dropped = 7;
@@ -224,17 +229,18 @@ test "lifecycle and loss diagnostics remain visible beside native delivery failu
     const snapshot = writer.buffered();
     // Every number a screen reader needs is still there, in the one place
     // that keeps it: the accessibility label.
-    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1, native terminal, EXIT 23") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1, native terminal, SPAWN FAILED") != null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "outbound loss 7 bytes") != null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "reply loss 2 bytes") != null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "native delivery failures 4") != null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "copy failed") != null);
 }
 
-test "restart targets the focused pane, and only an abnormal end offers it" {
+test "restart targets the focused pane, and only a failed spawn offers it" {
     // Rewritten for the tree model: a pane is not a placement slot, so
-    // Restart names a TERMINAL. And a CLEAN exit no longer leaves anything
-    // to restart — it closes its pane — so only abnormal ends reach here.
+    // Restart names a TERMINAL. And an EXIT of any status no longer leaves
+    // anything to restart — it closes its pane — so only a pane that never
+    // got a process reaches here.
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
     defer harness.destroy(gpa);
@@ -244,10 +250,10 @@ test "restart targets the focused pane, and only an abnormal end offers it" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 3, 0, .exited, 0);
-    try app_state.effects.feedPtyExit(app.ptyKey(1), 9, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    // Both panes survive an abnormal end.
+    // Both panes survive a spawn that never produced a process.
     try testing.expectEqual(@as(usize, 2), app_state.model.ws().tabs[0].paneCount());
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
@@ -258,7 +264,7 @@ test "restart targets the focused pane, and only an abnormal end offers it" {
     const second_generation = app_state.model.provider.slots[1].session_generation;
     const second_target = rectCenter(second_restart);
     try clickCanvas(harness, app_iface, second_target.x, second_target.y);
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.failed, app_state.model.provider.slots[0].phase);
     try testing.expectEqual(app.Phase.starting, app_state.model.provider.slots[1].phase);
     try testing.expect(app_state.model.provider.slots[1].session_generation != second_generation);
 
@@ -282,12 +288,12 @@ test "terminal exit and selection mode are actionable in native chrome" {
     defer app_state.deinit();
     const app_iface = app_state.app();
 
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 127, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     var saw_missing = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |layout| {
-        if (std.mem.eql(u8, layout.widget.text, "EXIT 127")) {
+        if (std.mem.eql(u8, layout.widget.text, "SPAWN FAILED")) {
             saw_missing = true;
             try testing.expectEqual(canvas.WidgetVariant.destructive, layout.widget.variant);
         }

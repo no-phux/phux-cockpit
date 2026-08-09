@@ -68,9 +68,31 @@ const attention_marker_icon = "circle-dot";
 pub const window_ground_command_id: u64 = 0x0c01;
 pub const header_ground_command_id: u64 = 0x0c02;
 pub const header_rule_command_id: u64 = 0x0c03;
+/// The summoned switcher's geometry. Wide enough for a real shell title
+/// beside its chord, short enough that it reads as a panel over the terminal
+/// rather than as a second window.
+pub const palette_width: f32 = 460;
+pub const palette_row_height: f32 = 30;
+/// The panel's own padding, and the row width inside it.
+pub const palette_padding: f32 = 6;
+pub const palette_row_width: f32 = palette_width - palette_padding * 2;
+/// How far down the content the panel sits. Not centred: a switcher pinned to
+/// the vertical middle covers the prompt, which is the one row the user was
+/// looking at when they summoned it.
+pub const palette_top_inset: f32 = 72;
+/// The scrim behind it — black, for the same reason `dim_scrim` is: it has to
+/// darken whatever the terminal's own background happens to be.
+const palette_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.5);
+
 /// Base for the unfocused-pane scrim, one retained id per resolved pane.
 /// Disjoint from the three above and from `render.paneIdBase` (0x7e21+).
 pub const pane_dim_command_id_base: u64 = 0x0c10;
+/// The focused pane's accent edge: four hairlines, so exactly four ids.
+/// `pane_dim_command_id_base` spans at most `layout.max_panes` (16) ids from
+/// 0x0c10, so 0x0c30 clears it with room.
+pub const pane_focus_command_id_base: u64 = 0x0c30;
+/// The focus edge's thickness, in points.
+pub const pane_focus_edge_thickness: f32 = 1;
 
 /// Phux has one visual register regardless of the system appearance: deep
 /// graphite surfaces, porcelain text, and lime reserved for focus/action.
@@ -200,9 +222,9 @@ fn paneDiagnostics(ui: *TerminalUi, model: *const Model, pane: *const Pane) []co
     );
 }
 
-/// The one piece of pane status that survives as CHROME: a terminal whose
-/// process ended abnormally offers Restart. A clean exit closes its pane, so
-/// it never reaches here.
+/// The one piece of pane status that survives as CHROME: a terminal that never
+/// got a process offers Restart. A shell that RAN and ended closes its pane at
+/// any status, so it never reaches here.
 fn paneStatus(ui: *TerminalUi, model: *const Model, terminal_ref: TerminalRef) TerminalUi.Node {
     if (providerKind(terminal_ref) == .phux) return emptyStatusNode(ui);
     const pane = model.provider.terminalConst(terminal_ref) orelse return emptyStatusNode(ui);
@@ -622,6 +644,114 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
     });
 }
 
+/// The summoned tab switcher.
+///
+/// It FLOATS. Every other piece of chrome in this app takes its room out of
+/// the content rect, because the painter, the hit-test tree and the PTY sizing
+/// pump all derive from `workspaceChrome` and a floating band would leave the
+/// three disagreeing. The palette is the one thing that must not: it is
+/// transient, and taking three rows away from every terminal in the tab for as
+/// long as a switcher is up — then giving them back — is exactly the SIGWINCH
+/// churn this round set out to remove. So it is drawn as an overlay in a
+/// `.stack` above the panes, and `workspaceChrome` never hears about it.
+fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens: canvas.DesignTokens) TerminalUi.Node {
+    var rows: [max_tabs]usize = undefined;
+    const count = projection.paletteRowsIn(model, ws, &rows);
+    const needle = ws.palette.needle();
+    const cursor = if (count == 0) 0 else @min(ws.palette.cursor, count - 1);
+
+    var row_nodes: [max_tabs]TerminalUi.Node = undefined;
+    for (rows[0..count], 0..) |tab_index, offset| {
+        const id = ws.tabTerminal(tab_index) orelse {
+            row_nodes[offset] = ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
+            continue;
+        };
+        const highlighted = offset == cursor;
+        const title = terminalTitle(ui, model, id);
+        row_nodes[offset] = ui.el(.list_item, .{
+            // Explicit, and both levels of it. A `grow` inside a container
+            // that was never told how wide it is has nothing to grow against,
+            // which is what left the chord sitting against the title instead
+            // of at the row's trailing edge.
+            .width = palette_row_width,
+            .height = palette_row_height,
+            .selected = highlighted,
+            .on_press = .{ .select_position = @intCast(tab_index) },
+            .style = .{ .background = if (highlighted) tokens.colors.surface_pressed else tokens.colors.surface },
+            .semantics = .{
+                .role = .tab,
+                .label = ui.fmt("{s}, terminal {d} of {d}{s}", .{
+                    title,
+                    tab_index + 1,
+                    ws.tab_count,
+                    if (highlighted) ", highlighted" else "",
+                }),
+            },
+        }, .{
+            ui.row(.{ .width = palette_row_width, .height = palette_row_height, .gap = 8, .cross = .center, .padding = 8 }, .{
+                tabAttentionMarker(ui, model, id, tokens),
+                ui.text(.{
+                    .grow = 1,
+                    .wrap = false,
+                    .overflow = .ellipsis,
+                    .style = .{ .foreground = if (highlighted) tokens.colors.text else tokens.colors.text_muted },
+                }, title),
+                // The chord that also reaches this tab, for the first five.
+                // Past five there is no chord, and the row says nothing rather
+                // than naming one that does not exist.
+                ui.text(.{
+                    .wrap = false,
+                    .style = .{ .foreground = tokens.colors.text_muted },
+                }, if (tab_index < 5) ui.fmt("CMD+{d}", .{tab_index + 1}) else ""),
+            }),
+        });
+    }
+
+    const body = if (count == 0)
+        ui.el(.stack, .{ .height = palette_row_height, .padding = 8 }, .{
+            ui.text(.{ .style = .{ .foreground = tokens.colors.warning } }, "No terminal matches"),
+        })
+    else
+        ui.list(.{ .gap = 2, .semantics = .{ .label = "Matching terminals" } }, row_nodes[0..count]);
+
+    return ui.column(.{
+        .width = palette_width,
+        .gap = 4,
+        .padding = palette_padding,
+        .style = .{ .background = tokens.colors.surface },
+        .semantics = .{
+            .label = ui.fmt("Go to terminal, {s}, {d} of {d} matching", .{
+                if (needle.len == 0) "type to filter" else needle,
+                count,
+                ws.tab_count,
+            }),
+        },
+    }, .{
+        // The needle, drawn rather than hosted — same reasoning as the
+        // scrollback search field two hundred lines up: the app routes the
+        // keys, so the app draws the caret.
+        ui.row(.{ .width = palette_row_width, .height = palette_row_height, .gap = 6, .cross = .center, .padding = 8 }, .{
+            ui.icon(.{
+                .width = 13,
+                .height = 13,
+                .style = .{ .foreground = tokens.colors.text_muted },
+            }, "search"),
+            ui.text(.{
+                .wrap = false,
+                .overflow = .ellipsis,
+                .style = .{ .foreground = if (needle.len == 0) tokens.colors.text_muted else tokens.colors.text },
+            }, if (needle.len == 0) "Go to terminal…" else needle),
+            ui.el(.stack, .{
+                .width = 7,
+                .height = 15,
+                .style = .{ .background = tokens.colors.accent },
+            }, .{}),
+            ui.spacer(1),
+        }),
+        body,
+    });
+}
+
 /// What a cmd+N at the window ceiling says.
 ///
 /// It says something on purpose. The toolkit budgets four declared windows on
@@ -718,7 +848,13 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
         ui.spacer(1),
     });
 
-    const top_header = if (revealed and model.tab_placement == .top) ui.row(.{ .height = header_height, .gap = 12, .cross = .center, .window_drag = true }, .{
+    // Where the strip lives when the placement is `top`. Riding the titlebar
+    // costs no content height at all; the separate band below it is the
+    // fallback for a window the platform gave no titlebar (fullscreen).
+    const rides_titlebar = projection.tabsRideTitlebarIn(model, ws);
+    const show_top_strip = revealed and model.tab_placement == .top;
+
+    const top_header = if (show_top_strip and !rides_titlebar) ui.row(.{ .height = header_height, .gap = 12, .cross = .center, .window_drag = true }, .{
         tab_strip,
         status,
     })
@@ -770,25 +906,69 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     else
         content;
 
-    const workspace = if (revealed and model.tab_placement == .side)
+    const laid_out = if (revealed and model.tab_placement == .side)
         ui.row(.{ .grow = 1, .gap = side_rail_gap }, .{ side_rail, body })
     else
         ui.column(.{ .grow = 1 }, .{ top_header, body });
+
+    // The palette rides ABOVE the whole workspace, including the side rail, so
+    // it is in the same place whichever placement is active. The wrapper only
+    // exists while it is open — an unconditional stack would change the widget
+    // tree of every frame that has no palette in it.
+    const workspace = if (ws.palette.open)
+        ui.el(.stack, .{ .grow = 1 }, .{
+            laid_out,
+            // A scrim over the grid: the palette is modal to the keyboard, and
+            // chrome that takes the keyboard without saying so is how a user
+            // ends up typing a needle into a shell they thought was focused.
+            ui.el(.stack, .{
+                .grow = 1,
+                .style = .{ .background = palette_scrim },
+                .on_press = .palette_close,
+                .semantics = .{ .label = "Dismiss the terminal switcher" },
+            }, .{}),
+            ui.row(.{ .grow = 1, .main = .center, .cross = .start, .padding = palette_top_inset }, .{
+                palettePanel(ui, model, ws, tokens),
+            }),
+        })
+    else
+        laid_out;
 
     // The hidden-inset titlebar band. It carries `window_drag` UNCONDITIONALLY,
     // because it is the only element that can: the SDK has no
     // movable-by-background fallback, so a frame where nothing declares
     // `window_drag` is a frame where the window cannot be moved at all.
+    //
+    // When the strip rides it, the tabs are CHILDREN of the drag region. That
+    // is the arrangement the separate band already used and it works: a child
+    // with its own `on_press` wins the hit test, so a tab click selects and a
+    // click on the gutter beside it moves the window.
     const inset = windowPadding(model);
     const titlebar_band = @max(0, chrome.titlebar_height - inset);
-    return ui.column(.{ .padding = inset }, .{
+    const titlebar = if (show_top_strip and rides_titlebar) ui.row(.{
+        .height = titlebar_band,
+        .gap = 12,
+        .cross = .center,
+        .window_drag = true,
+        .semantics = .{ .label = "Phux Cockpit window" },
+    }, .{
+        // The traffic lights are platform-drawn and are not in this tree, so
+        // the room for them has to be held explicitly or the first tab lands
+        // under the close button.
         ui.el(.stack, .{
-            .height = titlebar_band,
+            .width = projection.titlebar_tab_leading_reserve,
             .window_drag = true,
-            .semantics = .{ .label = "Phux Cockpit window" },
+            .semantics = .{ .hidden = true },
         }, .{}),
-        workspace,
-    });
+        tab_strip,
+        status,
+    }) else ui.el(.stack, .{
+        .height = titlebar_band,
+        .window_drag = true,
+        .semantics = .{ .label = "Phux Cockpit window" },
+    }, .{});
+
+    return ui.column(.{ .padding = inset }, .{ titlebar, workspace });
 }
 
 /// THE per-window chrome builder, and the one this app registers.
@@ -949,27 +1129,63 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
         // ONLY thing telling you where your keystrokes were going, and a
         // cursor is a few pixels on a screen full of text.
         //
-        // A scrim in the window's own ground color, not a border: a border
-        // costs a row of cells at every pane edge and reads as chrome, which
-        // is exactly what this app spent its last round removing. One pane
-        // never dims — there is nothing to disambiguate — and neither does a
-        // window that does not have key, where nothing is focused at all.
+        // One pane never dims — there is nothing to disambiguate — and
+        // neither does a window that does not have key, where nothing is
+        // focused at all.
         if (count > 1 and window_active and pane.node != focus_node) {
             try builder.fillRect(.{
                 .id = pane_dim_command_id_base + index,
                 .rect = pane.rect,
-                .fill = .{ .color = dimScrim(tokens) },
+                .fill = .{ .color = dim_scrim },
             });
+        }
+    }
+
+    // The focused pane's edge, painted AFTER every pane and every scrim so a
+    // neighbour's dim can never lie on top of it.
+    //
+    // The scrim alone is not enough and never was. It dims toward black, and a
+    // terminal configured black — or one an application put there with OSC 11 —
+    // has nothing left to take away, which is exactly the setup a terminal user
+    // is most likely to be running. The edge is the signal that survives it.
+    if (count > 1 and model.focused and window_index == model.active_window) {
+        for (panes[0..count]) |pane| {
+            if (pane.node != focus_node) continue;
+            if (pane.rect.width <= 0 or pane.rect.height <= 0) continue;
+            const t = @min(pane_focus_edge_thickness, @min(pane.rect.width, pane.rect.height) / 2);
+            const edges = [4]geometry.RectF{
+                geometry.RectF.init(pane.rect.x, pane.rect.y, pane.rect.width, t),
+                geometry.RectF.init(pane.rect.x, pane.rect.y + pane.rect.height - t, pane.rect.width, t),
+                geometry.RectF.init(pane.rect.x, pane.rect.y, t, pane.rect.height),
+                geometry.RectF.init(pane.rect.x + pane.rect.width - t, pane.rect.y, t, pane.rect.height),
+            };
+            for (edges, 0..) |edge, edge_index| {
+                try builder.fillRect(.{
+                    .id = pane_focus_command_id_base + edge_index,
+                    .rect = edge,
+                    .fill = .{ .color = tokens.colors.accent },
+                });
+            }
+            break;
         }
     }
 }
 
-/// The unfocused-pane scrim: the window ground at low alpha, which reads as
-/// "further away" rather than as a tint.
-fn dimScrim(tokens: canvas.DesignTokens) canvas.Color {
-    const ground = tokens.colors.background;
-    return canvas.Color.rgba(ground.r, ground.g, ground.b, 0.36);
-}
+/// The unfocused-pane scrim: BLACK at low alpha, which reads as "further
+/// away" rather than as a tint.
+///
+/// It used to be the window's own ground colour at 0.36, and that was a no-op
+/// in the default configuration and in most others. The scrim is painted over
+/// panes whose background is that same ground, and compositing a colour over
+/// itself yields that colour at every alpha — so the dim drew literally
+/// nothing, and the only thing distinguishing the focused split in a four-way
+/// was a solid-versus-hollow cursor.
+///
+/// Dimming toward black instead makes it independent of what the pane beneath
+/// happens to be: a configured `background`, a theme, or an application's
+/// OSC 11 all darken. The one case it still cannot serve is a terminal that is
+/// already black, which is why `paintWindow` also draws an accent edge.
+const dim_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.42);
 
 /// Frame pump: resize each visible terminal against its actual pane. One
 /// resize message is emitted per frame; further changed panes follow on
@@ -1125,6 +1341,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "pane.previous")) return .{ .cycle_pane = -1 };
     if (std.mem.eql(u8, name, "pane.next")) return .{ .cycle_pane = 1 };
     if (std.mem.eql(u8, name, "surface.web")) return .{ .select_surface = .web };
+    if (std.mem.eql(u8, name, "tabs.palette")) return .palette_open;
     if (std.mem.eql(u8, name, "terminal.copy")) return .copy_selection;
     if (std.mem.eql(u8, name, "terminal.paste")) return .paste_focused;
     if (std.mem.eql(u8, name, "terminal.select-all")) return .select_all;

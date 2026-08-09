@@ -49,18 +49,40 @@ native control environment for large-scale directed machine work. See
   closes local terminals only — a phux terminal's lifetime is not Cockpit's to
   end. Cockpit still does not run the phux TUI.
 
-## Chrome that emerges
+## Chrome that costs nothing
 
 At rest Cockpit is a terminal, not an application frame around one. A single
 healthy terminal gets the whole content area: no tab strip, no toolbar, no
 status banner.
 
-The band appears when the workspace actually has structure to show — a second
-tab, the Web surface, or a terminal that needs attention — and retracts when
-that structure goes away. A split alone does not raise it: two panes in one tab
-are still one tab, and the divider says so. Reveal is driven only by discrete
-state you caused; nothing incidental moves it, because every change to the band
-reflows the content area and resizes a live PTY.
+**Tabs live in the titlebar.** A `hidden_inset_tall` window is already carrying
+~66pt of band that holds three traffic lights and nothing else, and its height
+does not depend on how many tabs exist — so the strip drawn inside it takes no
+content height in any state. This is the difference between chrome that is
+cheap to reveal and chrome there is nothing to reveal: `content.y` does not
+move, so no terminal is resized and no TUI redraws. The old separate 50pt band
+cost every terminal in the tab three rows and a `SIGWINCH` on the way in, and
+another on the way out. It survives only for a window the platform gave no
+titlebar — fullscreen — where the room genuinely has to come from somewhere.
+
+The strip appears when the workspace has structure to show: a second tab, the
+Web surface, or a terminal that needs attention. A split alone does not raise
+it — two panes in one tab are still one tab, and the divider says so. Attention
+is *unacknowledged* state, not cumulative: looking at a terminal clears it, the
+way a bell already worked. The loss counters themselves stay cumulative, because
+they are the evidence in each surface's accessibility label, and a diagnostic
+that resets is a diagnostic that lies.
+
+**`cmd+shift+P` summons a switcher** that floats over the grid instead of taking
+room from it — type to filter by shell title, working directory, or position,
+`enter` to go. It is the path that still works at thirty terminals, where a
+strip has to start windowing and shrinking pills, and it is the seam this app
+grows through toward directing many machines at once.
+
+Tabs can sit in a side rail instead (`tab-placement = side`, or View > Toggle
+Tab Placement) without changing terminal identity, focus, or process state. The
+rail moves the cost onto the columns axis, which reflows far more cheaply than
+rows.
 
 The band is presentation, never the only path: every shortcut in the table below
 reaches the model whether or not it is showing, and the menu bar carries the
@@ -76,14 +98,31 @@ against a 2,048 ceiling, truncating from the bottom without saying so. Where a
 budget does genuinely bind, the painter reports the loss instead of quietly
 dropping rows.
 
-Terminal tabs show an attention dot when a hidden process rings the bell, exits,
-or develops an operational issue, and an exception is itself enough to bring the
-band back when a lone terminal is in trouble. Splits carry no pane header at
-all: the focused pane is the bright one, the others are dimmed by a scrim, and
-that is the whole indication. Byte counts, I/O-loss badges and lifecycle strings
-are not product chrome — they live in each surface's accessibility label, so a
-screen reader keeps every detail the eye is spared. A pane whose process died
-says so where it died, with its **Restart**.
+Terminal tabs show an attention dot when a hidden process rings the bell or
+develops an operational issue, and an exception is itself enough to bring the
+strip back when a lone terminal is in trouble. Splits carry no pane header at
+all: the focused pane wears a hairline accent edge, the others are dimmed by a
+scrim, and that is the whole indication. The scrim dims toward **black**, not
+toward the window's own ground — painting the ground over panes that already
+carry it composited a colour over itself, which changes nothing at any alpha,
+so the dim used to draw literally nothing and a four-way split was told apart
+only by a solid-versus-hollow cursor. The accent edge is what survives the case
+the scrim still cannot serve: a terminal configured black, or put there by an
+application's OSC 11, has no luminance left to take away.
+
+Byte counts, I/O-loss badges and lifecycle strings are not product chrome — they
+live in each surface's accessibility label, so a screen reader keeps every
+detail the eye is spared.
+
+**A shell that ends closes its pane, at any exit status**, and its sibling
+reclaims the rect. Exit code is the child's answer about the last command it
+ran, not a claim about whether the pane is still wanted — and `exit` inherits
+that status, so gating the close on it left an ordinary session ended by an
+ordinary failed command sitting behind a permanent `EXIT 1` husk that never gave
+the space back. The one end that still leaves a pane standing is a spawn that
+never produced a process: there is nothing to close to, and a split that
+vanished on its own would read as a broken `cmd+D`. That pane says so where it
+is, with its **Restart**.
 
 The local provider is a bounded dynamic registry independent from layout. Close
 frees the emulator immediately rather than holding a registry slot against a pty
@@ -163,6 +202,7 @@ attribute and reports that fact in its caveat.
 | `cmd+=` / `cmd+-` / `cmd+0` | Increase, decrease, or reset the terminal font size |
 | `cmd+A` | Select the visible screen |
 | `cmd+K` | Clear the screen and scrollback |
+| `cmd+shift+P` | Go to terminal — the summoned switcher (type to filter, arrows or `ctrl+N`/`ctrl+P` to move, `enter` to go, `esc` to dismiss) |
 | `cmd+shift+B` | Show the Web surface |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |

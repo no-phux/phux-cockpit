@@ -32,6 +32,10 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     .{ .id = "surface.4", .key = "4", .modifiers = .{ .primary = true } },
     .{ .id = "surface.5", .key = "5", .modifiers = .{ .primary = true } },
     .{ .id = "surface.web", .key = "b", .modifiers = .{ .primary = true, .shift = true } },
+    // The summoned tab switcher. Registered globally like every other chord
+    // the app answers, so the platform does not beep at it, and reachable
+    // whatever surface owns the content area.
+    .{ .id = "tabs.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
@@ -130,6 +134,8 @@ const view_menu_items = [_]native_sdk.MenuItem{
 };
 
 const window_menu_items = [_]native_sdk.MenuItem{
+    .{ .label = "Go to Terminal…", .command = "tabs.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
+    .{ .separator = true },
     .{ .label = "Previous Tab", .command = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
     .{ .label = "Next Tab", .command = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
     .{ .separator = true },
