@@ -65,8 +65,8 @@
         // and the field it reported was never filled by anything, so it was a
         // constant false.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/e8bd84886db89ce2ada4a8c7b9fac0137096e3dc.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQuPh4QEi6A1KMfbWF0w10cns3S-erI_4RQEZ0HGK",
+            .url = "https://github.com/phall1/native/archive/f47b029bae6a99fda7919523bd6f31d2078f769f.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQt4g5AEPamhS1VIUxbHEjm1bb7_XZ0wH0PX308BZ",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

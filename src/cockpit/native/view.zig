@@ -82,6 +82,11 @@ pub const palette_row_width: f32 = palette_width - palette_padding * 2;
 pub const palette_top_inset: f32 = 72;
 /// The scrim behind it — black, for the same reason `dim_scrim` is: it has to
 /// darken whatever the terminal's own background happens to be.
+///
+/// Deeper than `dim_scrim` on purpose, and the difference is the point. An
+/// unfocused split is still being read, so its wash has to stay shallow; the
+/// grid behind an open switcher is explicitly NOT being read, and pushing it
+/// back is what stops the palette's own rows competing with a screen of text.
 const palette_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.5);
 
 /// Base for the unfocused-pane scrim, one retained id per resolved pane.
@@ -1185,7 +1190,16 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
 /// happens to be: a configured `background`, a theme, or an application's
 /// OSC 11 all darken. The one case it still cannot serve is a terminal that is
 /// already black, which is why `paintWindow` also draws an accent edge.
-const dim_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.42);
+///
+/// The DEPTH is 0.15, and it is deliberately shallow. Ghostty's
+/// `unfocused-split-opacity` defaults to 0.85 — the same 15% — and that is not
+/// a coincidence of taste: an unfocused split is still a split you are READING,
+/// and a shell prompt is already full of deliberately dim colours that a heavy
+/// wash takes below legibility. The first fix for the no-op overshot to 0.42
+/// and made unfocused panes genuinely hard to read, which traded one real
+/// problem for another. The accent edge carries the signal; the scrim only has
+/// to whisper.
+const dim_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.15);
 
 /// Frame pump: resize each visible terminal against its actual pane. One
 /// resize message is emitted per frame; further changed panes follow on
