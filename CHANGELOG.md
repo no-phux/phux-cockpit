@@ -3,6 +3,13 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1](https://github.com/phall1/phux-cockpit/compare/v0.7.0...v0.7.1) (2026-08-09)
+
+
+### Bug Fixes
+
+* pin the SDK back to the v0.8.1 base, which restores keyboard input ([#22](https://github.com/phall1/phux-cockpit/issues/22)) ([e00b459](https://github.com/phall1/phux-cockpit/commit/e00b4599be2d704e499560e9c64ff4bb03339896))
+
 ## [0.7.0](https://github.com/phall1/phux-cockpit/compare/v0.6.1...v0.7.0) (2026-08-09)
 
 
