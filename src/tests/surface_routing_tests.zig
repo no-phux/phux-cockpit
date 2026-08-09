@@ -72,9 +72,9 @@ test "the Web chord selects accessible Web and non-terminal selection blocks ter
     const bottom = app_state.model.provider.slots[0].session.scrollbar().offset;
     // An ABNORMAL end, so the pane survives: a clean exit closes its pane
     // now, and this test needs the dead terminal to still be there.
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 1, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.failed, app_state.model.provider.slots[0].phase);
 
     // cmd+shift+B, the Web surface's own chord since it left the tab strip.
     try pressCanvasKey(harness, app_iface, "b", .{ .primary = true, .shift = true });
@@ -101,7 +101,7 @@ test "the Web chord selects accessible Web and non-terminal selection blocks ter
     try testing.expectEqual(before0, app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len);
     try testing.expectEqual(before1, app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len);
     try testing.expectEqual(@as(usize, 0), app_state.effects.pendingClipboardCount());
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.failed, app_state.model.provider.slots[0].phase);
     try testing.expectEqual(bottom, app_state.model.provider.slots[0].session.scrollbar().offset);
 
     const buffer = try gpa.alloc(u8, 128 * 1024);

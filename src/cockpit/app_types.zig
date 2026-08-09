@@ -105,6 +105,23 @@ pub const Msg = union(enum) {
     /// is where the user already is, so stepping means walking back through
     /// the log.
     search_step: i8,
+    /// cmd+shift+P: the summoned tab switcher.
+    ///
+    /// It exists because a strip does not scale. The strip windows past what
+    /// fits and shrinks pills before that; the switcher is the path that still
+    /// works at thirty terminals, and it is the seam the product direction's
+    /// "hundreds of agents" eventually arrives through. Idempotent — a second
+    /// chord on an open palette changes nothing.
+    palette_open,
+    /// Escape, a click outside, or a committed pick.
+    palette_close,
+    /// Arrow keys and ctrl+N/P: move the highlight through the FILTERED rows.
+    palette_step: i8,
+    /// Enter: select the highlighted tab and dismiss.
+    palette_commit,
+    /// A typed character reaching the needle rather than the shell.
+    palette_input: []const u8,
+    palette_backspace,
     /// Close a tab by index — what the strip's own `x` presses.
     close_tab: u8,
     /// Pointer entered/left a tab. Only the close affordance reads it.

@@ -172,7 +172,14 @@ pub const visibleTabWindow = projection.visibleTabWindow;
 pub const tab_extent = projection.tab_extent;
 pub const tab_min_extent = projection.tab_min_extent;
 pub const pane_dim_command_id_base = view_module.pane_dim_command_id_base;
+pub const pane_focus_command_id_base = view_module.pane_focus_command_id_base;
 pub const terminalNeedsAttention = projection.terminalNeedsAttention;
+pub const tabsRideTitlebarIn = projection.tabsRideTitlebarIn;
+pub const paletteRowsIn = projection.paletteRowsIn;
+pub const paletteSelectedTabIn = projection.paletteSelectedTabIn;
+pub const palette_width = view_module.palette_width;
+pub const titlebar_tab_leading_reserve = projection.titlebar_tab_leading_reserve;
+pub const titlebar_tab_band_min = projection.titlebar_tab_band_min;
 
 pub const canvas_label = scene.canvas_label;
 pub const webview_label = scene.webview_label;

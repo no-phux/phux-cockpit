@@ -294,16 +294,18 @@ test "one-terminal production accessibility is the terminal alone, and the band 
     try testing.expectEqual(@as(usize, 2), revealed_tabs);
 }
 
-test "a terminal that needs attention pulls the band back even when it is alone" {
+test "a terminal that never spawned pulls the band back even when it is alone" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startProductionCockpit(harness);
     defer stopCockpit(state);
     try testing.expect(!app.chromeRevealed(&state.model));
 
-    // A lone terminal whose process dies is exactly the case where calm must
-    // yield: the band returns so its state and Restart are reachable.
-    try state.effects.feedPtyExit(app.ptyKey(0), 1, 0, .exited, 0);
+    // A lone terminal that never got a process is the case where calm must
+    // yield: it cannot close (there is nothing to close to), so the band
+    // returns and its Restart is reachable. A terminal whose shell RAN and
+    // exited takes the other path entirely — it closes, at any status.
+    try state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
     try testing.expect(app.chromeRevealed(&state.model));
     try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
@@ -313,6 +315,96 @@ test "a terminal that needs attention pulls the band back even when it is alone"
         if (std.mem.eql(u8, node.widget.text, "Restart")) saw_restart = true;
     }
     try testing.expect(saw_restart);
+}
+
+test "a titlebar tall enough to host the strip costs the terminal nothing to reveal" {
+    const session = try createDefaultSession();
+    var model = app.initialModel(session);
+    defer app.deinitModel(&model);
+    const size = native_sdk.geometry.SizeF.init(1100, 640);
+
+    // A real `hidden_inset_tall` window reports ~66pt of titlebar inset. That
+    // band exists whether or not there are tabs in it, so hosting the strip
+    // there is free. Written straight onto the workspace rather than through
+    // the `window_chrome_changed` message: this test is about geometry, and
+    // dispatching would drag the persistence debounce and a real effects
+    // queue in with it.
+    model.ws().chrome_top = 66;
+    try testing.expect(app.tabsRideTitlebarIn(&model, model.wsConst()));
+
+    try testing.expect(!app.chromeRevealed(&model));
+    const at_rest = app.workspaceChrome(&model, size).content;
+
+    // A second tab reveals the strip.
+    const second = try model.provider.createTerminal();
+    _ = model.admitTab(second.id);
+    try testing.expect(app.chromeRevealed(&model));
+    const revealed = app.workspaceChrome(&model, size).content;
+
+    // THE assertion this whole direction exists for. The old separate band
+    // took 50pt off the content rect on reveal, which over a ~17.5pt cell is
+    // three rows and a SIGWINCH for every terminal in the tab — and another on
+    // the way back. Riding the titlebar, the rect does not move at all, so
+    // there is no resize to be cheap or expensive about.
+    try testing.expectApproxEqAbs(at_rest.y, revealed.y, 0.0001);
+    try testing.expectApproxEqAbs(at_rest.height, revealed.height, 0.0001);
+    try testing.expectApproxEqAbs(at_rest.x, revealed.x, 0.0001);
+    try testing.expectApproxEqAbs(at_rest.width, revealed.width, 0.0001);
+    try testing.expectEqual(@as(f32, 0), app.workspaceChrome(&model, size).header.height);
+}
+
+test "a window with no titlebar falls back to the separate band" {
+    const session = try createDefaultSession();
+    var model = app.initialModel(session);
+    defer app.deinitModel(&model);
+    const size = native_sdk.geometry.SizeF.init(1100, 640);
+
+    // Fullscreen takes the titlebar away, and `chrome_top` goes with it. The
+    // room has to come from somewhere then, and pretending otherwise would
+    // paint the strip over the first rows of the grid.
+    model.ws().chrome_top = 0;
+    try testing.expect(!app.tabsRideTitlebarIn(&model, model.wsConst()));
+
+    const at_rest = app.workspaceChrome(&model, size).content;
+    const second = try model.provider.createTerminal();
+    _ = model.admitTab(second.id);
+    const revealed = app.workspaceChrome(&model, size).content;
+
+    try testing.expectApproxEqAbs(at_rest.y + app.header_height, revealed.y, 0.0001);
+    try testing.expectApproxEqAbs(at_rest.height - app.header_height, revealed.height, 0.0001);
+    try testing.expectEqual(app.header_height, app.workspaceChrome(&model, size).header.height);
+}
+
+test "I/O loss on a visible terminal does not pin the band open forever" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startProductionCockpit(harness);
+    defer stopCockpit(state);
+    try testing.expect(!app.chromeRevealed(&state.model));
+
+    // Loss counters are CUMULATIVE — they are the evidence in the surface's
+    // accessibility label and must never reset. Attention derived from them
+    // straight was therefore a one-way latch: a single dropped byte held the
+    // band open for the rest of the session, and every reveal and retraction
+    // of that band resizes a live PTY.
+    const pane = &state.model.provider.slots[0];
+    pane.outbound_dropped += 4;
+    try testing.expect(app.terminalNeedsAttention(&state.model, pane.id));
+
+    // Looking at it is the acknowledgement, exactly as it is for the bell —
+    // and it rides the same seam, so any dispatched message with the window
+    // focused and the pane on screen clears it.
+    try state.effects.feedPtyOutput(app.ptyKey(0), "still here\r\n");
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    try testing.expect(!app.terminalNeedsAttention(&state.model, pane.id));
+    try testing.expect(!app.chromeRevealed(&state.model));
+
+    // The evidence survives the acknowledgement.
+    try testing.expectEqual(@as(u64, 4), pane.outbound_dropped);
+
+    // And NEW loss is news again.
+    pane.outbound_dropped += 1;
+    try testing.expect(app.terminalNeedsAttention(&state.model, pane.id));
 }
 
 test "revealing the band is the only thing that resizes the content area" {

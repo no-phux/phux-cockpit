@@ -214,9 +214,9 @@ test "ADVERSARIAL: a hard reset of pane 0 does not reset pane 1" {
     const app_iface = app_state.app();
     const model = &app_state.model;
 
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 7, 0, .exited, 0); // abnormal: a clean exit now closes the pane
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0); // a spawn failure: the one end that leaves the pane standing
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(app.Phase.ended, model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.failed, model.provider.slots[0].phase);
     try testing.expectEqual(app.Phase.live, model.provider.slots[1].phase);
 
     // cmd+R restarts the FOCUSED (ended) pane; `spawnPane` hard-resets

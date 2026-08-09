@@ -260,7 +260,7 @@ test "Cmd+W closes the focused pane, then the tab, then the window" {
     try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().quit_count);
 }
 
-test "a clean shell exit closes its pane; an abnormal one keeps it for Restart" {
+test "any shell exit closes its pane; only a failed spawn keeps it for Restart" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
     defer harness.destroy(gpa);
@@ -277,14 +277,60 @@ test "a clean shell exit closes its pane; an abnormal one keeps it for Restart" 
     try testing.expectEqual(@as(usize, 1), app_state.model.ws().tabs[0].paneCount());
     try testing.expectEqual(@as(usize, 1), app_state.model.provider.activeCount());
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
+}
 
-    // An abnormal end is different: the pane stays, so its state and
-    // Restart remain reachable.
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 1, 0, .exited, 0);
+test "a non-zero exit closes its pane too, and the sibling reclaims the rect" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const app_state = try startSplitCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    // THE regression this pins. `exit` in a shell inherits the last command's
+    // status, so an ordinary session ended after an ordinary failed command
+    // reports a non-zero code — and that used to leave a dead grid holding a
+    // full pane rect behind an `EXIT 1` badge, permanently, with its sibling
+    // never getting the space back. A shell that ENDED is done at any status.
+    var panes: [app.max_panes_per_tab]app.LayoutPane = undefined;
+    try testing.expectEqual(@as(usize, 2), app.resolvePanes(&app_state.model, surface, &panes));
+    const before_width = panes[0].rect.width;
+
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 1, 0, .exited, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
-    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 1), app_state.model.ws().tabs[0].paneCount());
     try testing.expectEqual(@as(usize, 1), app_state.model.provider.activeCount());
-    try testing.expectEqual(app.Phase.ended, app_state.model.provider.slots[0].phase);
+
+    // The survivor does not merely persist, it GROWS: a promotion that left
+    // the sibling on its old half is the same hole with one fewer occupant.
+    try testing.expectEqual(@as(usize, 1), app.resolvePanes(&app_state.model, surface, &panes));
+    try testing.expect(panes[0].rect.width > before_width);
+
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        try testing.expect(!std.mem.eql(u8, node.widget.text, "Restart"));
+    }
+}
+
+test "a pane that never got a process keeps its Restart" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const app_state = try startSplitCockpit(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    // A SPAWN failure is the one end that still earns a tombstone: there is no
+    // process to have exited and nothing to close to, and a split that
+    // vanished on its own would read as a broken cmd+D.
+    try app_state.effects.feedPtyExit(app.ptyKey(1), 0, 0, .spawn_failed, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try testing.expectEqual(@as(usize, 2), app_state.model.ws().tabs[0].paneCount());
+    try testing.expectEqual(app.Phase.failed, app_state.model.provider.slots[1].phase);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     var saw_restart = false;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {

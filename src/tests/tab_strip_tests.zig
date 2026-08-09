@@ -320,10 +320,10 @@ test "a dead UNFOCUSED pane offers Restart inside its own rect" {
 
     // The split focuses the NEW pane, so pane 0 is the unfocused one. Kill it
     // abnormally: a clean exit closes its pane instead of tombstoning it.
-    try state.effects.feedPtyExit(app.ptyKey(0), 3, 0, .exited, 0);
+    try state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(iface, .wake);
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
-    try testing.expectEqual(app.Phase.ended, state.model.provider.slots[0].phase);
+    try testing.expectEqual(app.Phase.failed, state.model.provider.slots[0].phase);
 
     const dead = app.initialTerminalRef(0);
     const rect = app.paneFrameFor(&state.model, surface, dead) orelse return error.TestExpectedPane;
@@ -469,4 +469,91 @@ test "every registered shortcut resolves to a message" {
         try native_sdk.platform.validateShortcut(shortcut);
         try testing.expect(app.onCommand(shortcut.id) != null);
     }
+}
+
+test "the summoned switcher filters, commits, and never leaks a key to the shell" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(state);
+    defer app.deinitModel(&state.model);
+    defer state.deinit();
+    const app_iface = state.app();
+
+    try testing.expect(!state.model.ws().palette.open);
+    try testing.expectEqual(@as(usize, 0), state.model.ws().selected_tab);
+
+    try pressCanvasKey(harness, app_iface, "p", .{ .primary = true, .shift = true });
+    try testing.expect(state.model.ws().palette.open);
+
+    // An empty needle shows every tab, in tab order.
+    var rows: [app.max_tabs]usize = undefined;
+    try testing.expectEqual(@as(usize, 2), app.paletteRowsIn(&state.model, state.model.wsConst(), &rows));
+
+    // THE gate. While the palette is up, nothing typed reaches the child —
+    // not the needle, not Enter, not an arrow. A switcher that leaks into a
+    // running program is worse than no switcher at all.
+    const before = state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
+    try support.typeCanvasText(harness, app_iface, "2");
+    try pressCanvasKey(harness, app_iface, "arrowdown", .{});
+    try testing.expectEqual(before, state.effects.ptyWrittenBytes(app.ptyKey(0)).len);
+
+    // "2" is the second tab's POSITION, which is the handle a shell without
+    // title integration still gives you.
+    try testing.expectEqualStrings("2", state.model.ws().palette.needle());
+    const matched = app.paletteRowsIn(&state.model, state.model.wsConst(), &rows);
+    try testing.expectEqual(@as(usize, 1), matched);
+    try testing.expectEqual(@as(usize, 1), rows[0]);
+
+    // Enter commits the highlighted row and dismisses.
+    try pressCanvasKey(harness, app_iface, "enter", .{});
+    try testing.expect(!state.model.ws().palette.open);
+    try testing.expectEqual(@as(usize, 1), state.model.ws().selected_tab);
+    try testing.expectEqual(before, state.effects.ptyWrittenBytes(app.ptyKey(0)).len);
+}
+
+test "escape leaves the switcher without moving the selection" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(state);
+    defer app.deinitModel(&state.model);
+    defer state.deinit();
+    const app_iface = state.app();
+
+    try pressCanvasKey(harness, app_iface, "p", .{ .primary = true, .shift = true });
+    try support.typeCanvasText(harness, app_iface, "2");
+    try pressCanvasKey(harness, app_iface, "escape", .{});
+
+    try testing.expect(!state.model.ws().palette.open);
+    // The needle is gone with it: a switcher that reopens holding yesterday's
+    // filter is a switcher that appears broken.
+    try testing.expectEqual(@as(usize, 0), state.model.ws().palette.needle().len);
+    try testing.expectEqual(@as(usize, 0), state.model.ws().selected_tab);
+}
+
+test "the switcher floats and never takes a row from the terminal" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(state);
+    defer app.deinitModel(&state.model);
+    defer state.deinit();
+    const app_iface = state.app();
+
+    const closed = app.workspaceChrome(&state.model, surface).content;
+    try pressCanvasKey(harness, app_iface, "p", .{ .primary = true, .shift = true });
+    const open = app.workspaceChrome(&state.model, surface).content;
+
+    // Every other piece of chrome in this app takes its room out of the
+    // content rect. This one must not: a transient panel that resizes every
+    // PTY under it — and again on dismissal — is the exact churn this round
+    // set out to remove.
+    try testing.expectApproxEqAbs(closed.y, open.y, 0.0001);
+    try testing.expectApproxEqAbs(closed.height, open.height, 0.0001);
+    try testing.expectApproxEqAbs(closed.x, open.x, 0.0001);
+    try testing.expectApproxEqAbs(closed.width, open.width, 0.0001);
 }

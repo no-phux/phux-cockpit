@@ -163,20 +163,28 @@ fn remoteFocusOwner(model: *const Model) ?ReplicaOwner {
     return model.terminalOwner(terminal_ref);
 }
 
-/// A bell on a terminal you are LOOKING at is not news.
+/// Anything that happened on a terminal you are LOOKING at is not news.
 ///
 /// Acknowledged for every pane of the selected tab — not just the focused one
 /// — because every pane of the selected tab is on screen. Skipped entirely
 /// when the window does not have key: a bell that rings while the app is in
 /// the background is exactly the one worth keeping.
-fn acknowledgeVisibleBells(model: *Model) void {
+///
+/// Covers I/O loss as well as the bell. The loss COUNTERS stay cumulative (the
+/// accessibility label reports them, and a diagnostic that resets is a
+/// diagnostic that lies); what is acknowledged is the operator having seen the
+/// current totals. Without this, loss-driven attention was permanent, and
+/// permanent attention pinned the tab band open — which resizes every live PTY
+/// under it.
+fn acknowledgeVisibleAttention(model: *Model) void {
     if (!model.focused) return;
     const current = model.selectedTreeConst() orelse return;
     var refs: [layout.max_panes]TerminalRef = undefined;
     const count = current.terminals(&refs);
     for (refs[0..count]) |id| {
-        const pane = model.provider.terminalConst(id) orelse continue;
+        const pane = model.provider.terminal(id) orelse continue;
         pane.clearBell();
+        pane.acknowledgeLoss();
     }
 }
 
@@ -230,11 +238,34 @@ fn armTopologyPersist(model: *Model, fx: *Fx) void {
     });
 }
 
+/// Retry every pane's refused writes and retained query replies.
+///
+/// A refused `ptyWrite` stays in its pane's ring and is retried "on the next
+/// output, resize, or frame" — but `view.onFrame` returns at most ONE message,
+/// and a pane whose grid no longer matches its rect wins that slot over
+/// `.flush_outbound`. So for as long as ANY pane was mid-resize — the whole of
+/// a live window drag — no pane got its retry, and a child blocked on a DSR
+/// answer it had already been promised stayed blocked until the drag ended.
+///
+/// Draining every pane from the resize arm as well closes that window: the two
+/// messages that can occupy the frame's one slot now both do the retry, so the
+/// pump has no state in which it stops making progress.
+fn drainEveryPane(model: *Model, fx: *Fx) void {
+    for (0..max_terminals) |index| {
+        if (model.provider.states[index] != .active) continue;
+        const pane = model.provider.slot(index);
+        flushOutbound(pane, fx);
+        // The drain may have freed room for query replies a full ring left
+        // retained in the emulator's buffer.
+        moveResponsesToOutbound(pane, fx);
+    }
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const focus_before = remoteFocusTarget(model);
     const owner_before = remoteFocusOwner(model);
     updateModel(model, msg, fx);
-    acknowledgeVisibleBells(model);
+    acknowledgeVisibleAttention(model);
     // Persistence is EDGE triggered off the shape hash, not wired into the
     // dozen arms that can reshape a workspace (new tab, close, reorder,
     // select, split, divider drag, pane focus, placement toggle, a shell
@@ -296,10 +327,18 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                     pane.outbound_head = 0;
                     pane.outbound_len = 0;
                     pane.session.clearResponses();
-                    // Typing `exit` means the pane is DONE. Leaving a dead
-                    // grid behind an "EXIT 0" badge is the zombie the owner
-                    // kept hitting; only an ABNORMAL end earns the tombstone
-                    // and its Restart affordance.
+                    // A shell that ENDED means the pane is done, whatever its
+                    // status. Exit code is the child's answer about the last
+                    // command it ran, not a claim about whether this pane is
+                    // still wanted — and `exit` inherits that status, so
+                    // gating the close on it left an ordinary session behind a
+                    // permanent `EXIT 1` husk that held its rect and never gave
+                    // the space back to its sibling.
+                    //
+                    // Only a pane that never got a process stays (see
+                    // `paneLifecycleFailed`): there is nothing to close to, and
+                    // a split that silently vanished would read as a broken
+                    // `cmd+D`.
                     if (!projection.paneLifecycleFailed(pane)) closePaneForTerminal(model, fx, pane.id, false);
                 },
                 .write => unreachable,
@@ -347,7 +386,16 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .key => |event| handleKey(model, fx, event),
         .text => |event| {
-            if (!model.focused or model.selectedTerminalRef() == null or event.text.len == 0) return;
+            if (!model.focused or event.text.len == 0) return;
+            // The palette is checked BEFORE the terminal gate below, and
+            // before `selectedTerminalRef`: it is a workspace-level mode, so
+            // it must still be typeable over the web surface and over a
+            // workspace whose focused terminal has gone away.
+            if (model.ws().palette.open) {
+                model.ws().palette.append(event.text);
+                return;
+            }
+            if (model.selectedTerminalRef() == null) return;
             const terminal_ref = model.focusedTerminalRef() orelse return;
             if (model.provider.terminal(terminal_ref)) |pane| {
                 // An open search field is where committed text GOES. This is
@@ -397,7 +445,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 pane.rows = size.rows;
                 pane.session.refreshScreenText();
                 fx.ptyResize(pane.pty_key, size.cols, size.rows);
-                flushOutbound(pane, fx);
+                drainEveryPane(model, fx);
                 return;
             }
             const remote = model.phux() orelse return;
@@ -412,16 +460,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             workspace.window_id = surface.window_id;
             if (validScale(surface.scale_factor)) workspace.surface_scale_factor = surface.scale_factor;
         },
-        .flush_outbound => {
-            for (0..max_terminals) |index| {
-                if (model.provider.states[index] != .active) continue;
-                const pane = model.provider.slot(index);
-                flushOutbound(pane, fx);
-                // The drain may have freed room for query replies a full
-                // ring left retained in the emulator's buffer.
-                moveResponsesToOutbound(pane, fx);
-            }
-        },
+        .flush_outbound => drainEveryPane(model, fx),
         .selection_autoscroll => handleSelectionAutoscroll(model, fx),
         // `on_chrome` carries no window identity, so it lands on the window
         // input is currently in. That is right for the case it exists for —
@@ -715,6 +754,48 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .search_step => |delta| {
             const pane = focusedLocalPane(model) orelse return;
             _ = pane.session.searchStep(delta >= 0);
+        },
+        .palette_open => {
+            const workspace = model.ws();
+            // Idempotent, and deliberately: cmd+shift+P on an open palette
+            // must not wipe a needle half typed.
+            if (workspace.palette.open) return;
+            workspace.palette.reset();
+            workspace.palette.open = true;
+        },
+        .palette_close => model.ws().palette.reset(),
+        .palette_step => |delta| {
+            const workspace = model.ws();
+            if (!workspace.palette.open) return;
+            var rows: [model_module.max_tabs]usize = undefined;
+            const count = projection.paletteRowsIn(model, workspace, &rows);
+            if (count == 0) return;
+            // Wraps, because a switcher you can walk off the end of makes the
+            // last row harder to reach than the first.
+            const signed: i32 = @intCast(count);
+            const current: i32 = @intCast(@min(workspace.palette.cursor, count - 1));
+            workspace.palette.cursor = @intCast(@mod(current + delta, signed));
+        },
+        .palette_commit => {
+            const workspace = model.ws();
+            if (!workspace.palette.open) return;
+            const target = projection.paletteSelectedTabIn(model, workspace);
+            workspace.palette.reset();
+            // A commit with nothing matching still DISMISSES. Leaving the
+            // palette up on an Enter that found nothing reads as a stuck
+            // keyboard.
+            const index = target orelse return;
+            updateModel(model, .{ .select_position = @intCast(index) }, fx);
+        },
+        .palette_input => |text| {
+            const workspace = model.ws();
+            if (!workspace.palette.open) return;
+            workspace.palette.append(text);
+        },
+        .palette_backspace => {
+            const workspace = model.ws();
+            if (!workspace.palette.open) return;
+            workspace.palette.backspace();
         },
         .close_tab => |index| closeTab(model, fx, index),
         .hover_tab => |index| model.ws().hovered_tab = index,
@@ -1161,6 +1242,49 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         return;
     }
 
+    // The palette is MODAL, and this gate is what makes it so.
+    //
+    // It sits above every other press arm on purpose. While it is up, no key
+    // reaches the shell — not an arrow, not Enter, not a bare letter — because
+    // a switcher that leaks its needle into a running program is worse than no
+    // switcher. Printable presses are not handled here: they arrive as
+    // committed `.text`, which the arm above routes to the needle. That split
+    // is the same one the scrollback search already uses.
+    if (model.ws().palette.open) {
+        if (keyIs(event.key, "escape")) {
+            updateModel(model, .palette_close, fx);
+            return;
+        }
+        if (keyIs(event.key, "enter") or keyIs(event.key, "return")) {
+            updateModel(model, .palette_commit, fx);
+            return;
+        }
+        if (keyIs(event.key, "backspace") or keyIs(event.key, "delete")) {
+            updateModel(model, .palette_backspace, fx);
+            return;
+        }
+        // Arrows, and the emacs pair every switcher on this platform also
+        // answers, so a hand already on ctrl does not have to leave home row.
+        if (keyIs(event.key, "arrowdown") or (mods.control and keyIs(event.key, "n"))) {
+            updateModel(model, .{ .palette_step = 1 }, fx);
+            return;
+        }
+        if (keyIs(event.key, "arrowup") or (mods.control and keyIs(event.key, "p"))) {
+            updateModel(model, .{ .palette_step = -1 }, fx);
+            return;
+        }
+        // cmd+shift+P again, and the chord's own duplicate delivery, are
+        // absorbed rather than passed down — the palette is already open and
+        // reopening it would clear the needle.
+        if (primary and mods.shift and keyIs(event.key, "p")) {
+            latchAppShortcut(model, event.key);
+            return;
+        }
+        // Everything else is swallowed. A `cmd`-chord while the palette is up
+        // is a chord the user did not mean for the shell.
+        return;
+    }
+
     // A registered app shortcut can reach us through both the platform
     // shortcut channel and the canvas key channel. The first delivery owns
     // the physical edge; a duplicate press is consumed until key-up clears it.
@@ -1276,6 +1400,16 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "b")) {
         latchAppShortcut(model, event.key);
         updateModel(model, .{ .select_surface = .web }, fx);
+        return;
+    }
+    // cmd+shift+P summons the tab switcher. Needed HERE as well as in
+    // `onCommand`: a chord can arrive on the platform shortcut channel or on
+    // the canvas key channel, and a canvas-only delivery — which is what the
+    // app sees whenever the surface has key — would otherwise fall through to
+    // the shell as a bare `p`.
+    if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "p")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .palette_open, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "arrowleft")) {
@@ -1796,6 +1930,7 @@ pub fn appShortcutKeyMask(key: []const u8) u64 {
     if (keyIs(key, "f")) return 1 << 30;
     if (keyIs(key, "g")) return 1 << 31;
     if (keyIs(key, "n")) return 1 << 32;
+    if (keyIs(key, "p")) return 1 << 33;
     return 0;
 }
 

@@ -196,8 +196,72 @@ pub const max_windows: usize = 1 + max_secondary_windows;
 /// than a second model: everything below is per-window by construction, and
 /// everything that stayed on `Model` (the provider, the config, the clipboard
 /// latches, the shortcut latch) is genuinely app-wide.
+/// The longest needle the summoned switcher will hold. A tab is found by a
+/// few characters of its name or by its position; nobody types a sentence at
+/// a switcher, and a fixed buffer keeps the workspace allocation-free.
+pub const max_palette_query_bytes: usize = 64;
+
+/// The summoned tab switcher's state.
+///
+/// It is a WORKSPACE's, not the model's: each window has its own tabs, so each
+/// window has its own switcher, and a palette open in the window behind must
+/// not eat the keys typed in the window in front.
+///
+/// Deliberately shaped like the scrollback search beside it — a drawn field
+/// with an app-routed needle rather than a text-entry widget. The app already
+/// routes every canvas key itself, and the requirement that decides this is
+/// that a keystroke aimed at the switcher can never reach the shell. That is a
+/// property of the routing, so the field is drawn where the routing lives.
+pub const Palette = struct {
+    open: bool = false,
+    query: [max_palette_query_bytes]u8 = [_]u8{0} ** max_palette_query_bytes,
+    query_len: usize = 0,
+    /// An index into the FILTERED list, not into `tabs`. Filtering changes
+    /// what row 0 means on every keystroke, and an index into the unfiltered
+    /// list would silently point at a row the user cannot see.
+    cursor: usize = 0,
+
+    pub fn needle(palette: *const Palette) []const u8 {
+        return palette.query[0..palette.query_len];
+    }
+
+    pub fn reset(palette: *Palette) void {
+        palette.open = false;
+        palette.query_len = 0;
+        palette.cursor = 0;
+    }
+
+    /// Append typed text, dropping anything past the buffer rather than
+    /// truncating mid-codepoint on the next comparison.
+    pub fn append(palette: *Palette, text: []const u8) void {
+        for (text) |byte| {
+            if (byte < 0x20 or byte == 0x7f) continue;
+            if (palette.query_len >= palette.query.len) return;
+            palette.query[palette.query_len] = byte;
+            palette.query_len += 1;
+        }
+        palette.cursor = 0;
+    }
+
+    /// Delete one BYTE, then walk back off any UTF-8 continuation bytes so a
+    /// multi-byte character leaves as one keystroke rather than as four
+    /// mangled ones.
+    pub fn backspace(palette: *Palette) void {
+        if (palette.query_len == 0) return;
+        palette.query_len -= 1;
+        while (palette.query_len > 0 and (palette.query[palette.query_len] & 0xc0) == 0x80) {
+            palette.query_len -= 1;
+        }
+        palette.cursor = 0;
+    }
+};
+
 pub const Workspace = struct {
     tabs: [max_tabs]layout.Tree = [_]layout.Tree{.{}} ** max_tabs,
+    /// The summoned tab switcher. Presentational plus a keyboard mode, and
+    /// deliberately NOT part of `topologySnapshot`: an open switcher is not a
+    /// workspace shape and must never be restored on launch.
+    palette: Palette = .{},
     tab_count: usize = 0,
     selected_tab: usize = 0,
     /// The web surface owns the content area. Independent of `selected_tab`,

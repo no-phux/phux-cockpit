@@ -146,7 +146,7 @@ test "clipboard result after pane exit is a visible paste failure" {
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     // An ABNORMAL end: a clean one closes the pane, and there would be no
     // requesting terminal left to fail the paste against.
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 4, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try app_state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "too late");
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
@@ -283,7 +283,7 @@ test "restart cancels an owned clipboard read and ignores its stale result" {
     try pressCanvasKey(harness, app_iface, "v", .{ .primary = true, .command = true });
     const old_generation = app_state.model.provider.slots[0].session_generation;
     try testing.expect(app_state.model.paste_inflight);
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 4, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
     try testing.expect(app_state.model.provider.slots[0].session_generation != old_generation);
@@ -317,7 +317,7 @@ test "restart cancels an owned clipboard write and ignores its stale result" {
     const old_generation = pane.session_generation;
     try testing.expect(app_state.model.copy_inflight);
 
-    try app_state.effects.feedPtyExit(app.ptyKey(0), 4, 0, .exited, 0);
+    try app_state.effects.feedPtyExit(app.ptyKey(0), 0, 0, .spawn_failed, 0);
     try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
     try pressCanvasKey(harness, app_iface, "r", .{ .primary = true, .command = true });
     try testing.expect(pane.session_generation != old_generation);
