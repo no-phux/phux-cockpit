@@ -3,6 +3,18 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/phall1/phux-cockpit/compare/v0.7.1...v0.8.0) (2026-08-09)
+
+
+### Features
+
+* **release:** report releases to the Linear phux-cockpit pipeline ([#24](https://github.com/phall1/phux-cockpit/issues/24)) ([358b24c](https://github.com/phall1/phux-cockpit/commit/358b24ca23a1f4356d4753bef734c28979b4cd15))
+
+
+### Documentation
+
+* close out the spike lineage and correct what it left behind ([#26](https://github.com/phall1/phux-cockpit/issues/26)) ([0c33d58](https://github.com/phall1/phux-cockpit/commit/0c33d58aa3cc2547418eed2da37fd1147d68a24b))
+
 ## [0.7.1](https://github.com/phall1/phux-cockpit/compare/v0.7.0...v0.7.1) (2026-08-09)
 
 
