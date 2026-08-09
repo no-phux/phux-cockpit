@@ -1,4 +1,18 @@
-# cockpit — spike notes
+# cockpit — spike notes (HISTORICAL)
+
+> **Nothing in this file is a live instruction.** It is the 2026-07-27 spike's
+> working notes, kept for the reasoning it records — the budget-partitioning
+> policy, the keyed-effect space, the focus model, and why each was chosen. The
+> code it describes has since been restructured (`src/terminal/`,
+> `src/providers/`, `src/cockpit/`) and `box.zig` is gone entirely.
+>
+> **For commands that work today, read `README.md` or `AGENTS.md`, not this
+> file.** Every `cd` path below points at a scratch tree that no longer exists,
+> and every absolute `zig` path below points at a nix store entry that has been
+> garbage-collected. `zig` on `PATH` is 0.16.0 and is now the correct one.
+>
+> The spike's own test counts (48 / 54 / 59) are its counts, not this repo's.
+> `main` runs 334 tests, or 342 with `-Dphux-enabled=true`.
 
 Forked verbatim from native-sdk `a7509a7` (v0.6.1) `examples/terminal`.
 
@@ -20,12 +34,10 @@ cites was read at `a7509a7`.
 
 ## Toolchain
 
-Zig 0.16.0, invoked by absolute path. The `zig` on `PATH` is 0.15.2 and is the
-WRONG version — it will not build this.
-
-```
-/nix/store/y6ihamhfl46ybmz49k7c5qs9navb6q1a-zig-0.16.0/bin/zig
-```
+Zig 0.16.0. During the spike that meant an absolute nix-store path, because the
+`zig` on `PATH` was 0.15.2 and would not build this. **That is no longer true**
+— `zig` on `PATH` is 0.16.0, the store path has been garbage-collected, and
+plain `zig build` is correct. Ignore the absolute paths in the commands below.
 
 `zig-pkg/` (561 MB, ghostty already materialized at commit
 `7aa9591746ffa4d2eee458960c76554352832595`) is kept in the working tree and
@@ -58,9 +70,12 @@ cd /Users/phall/workspace/phux-native-spike/cockpit && \
 48 is the baseline test count. Later slices add tests; any run that reports
 fewer than 48 means something in the fork regressed rather than grew.
 
-## Repo rules
+## Repo rules (SUPERSEDED)
 
-Local commits only. There is no remote and one must never be added.
+The spike's rule was "local commits only; there is no remote and one must never
+be added." That applied to the scratch tree. It does **not** apply here: this
+repository has an `origin`, ships tagged releases through release-please, and
+updates a Homebrew cask. Work goes through PRs against `main`.
 
 ---
 

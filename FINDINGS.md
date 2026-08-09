@@ -1,9 +1,13 @@
 # Native cockpit spike: findings
 
 Date: 2026-07-27
-Spike repo: `/Users/phall/workspace/phux-native-spike/cockpit` (local git, no remote)
-Reference clone: `/Users/phall/workspace/phux-native-spike/ref/native-sdk`
-Toolchain: Zig 0.16.0 at `/nix/store/y6ihamhfl46ybmz49k7c5qs9navb6q1a-zig-0.16.0/bin/zig`
+Toolchain: Zig 0.16.0
+
+> **Read this as history.** The spike ran 2026-07-27 to 2026-08-02 in a scratch
+> repo with no remote. Its conclusions were adopted and its code was migrated
+> into this repository, which now ships as a released product. Where a claim
+> below is stated in the present tense about "the spike", it describes that
+> scratch tree, not `main`. Section 9 records what became of it.
 
 ---
 
@@ -332,10 +336,38 @@ estimate for everything after it. It should happen before the ABI work, not afte
 
 ---
 
-## 9. The port, executed (2026-07-27)
+## 9. The port, executed (2026-07-27 to 2026-08-02)
 
-Branch `port/first-party-terminal-grid`, three commits. Steps 1-3 of section 8 are
-done; step 4 (`phux-client-ffi`) is the remaining work.
+All four steps of section 8 were completed on the spike branch
+`port/first-party-terminal-grid`: the first-party painter, the wheel-routing and
+budget work, the glyph-budget calibration, and the production `phux-client-ffi`
+host.
+
+**That branch no longer exists, and nothing is owed to it.** Its work was
+migrated into this repository as PR #7 on 2026-08-03 and has been developed here
+ever since. The branch was removed on 2026-08-09 after a symbol-by-symbol audit
+confirmed the migration was complete; its history is preserved at the annotated
+tag `spike/first-party-terminal-grid`, so every commit cited below is still
+reachable (`git show d4ccb84^:src/box.zig` still works).
+
+The audit is worth recording, because "the spike had a file main does not" is an
+easy and wrong conclusion to draw from a directory listing. The spike's flat
+`src/phux_*.zig` became `src/providers/phux/*.zig`, and 13 of its 75 exported
+symbols appear absent by name. All 13 are renames, not losses:
+
+| Spike | Mainline |
+|---|---|
+| `sendPasteOwned` | `sendPaste` (`providers/phux/host.zig`, re-exported by `provider.zig`) |
+| `clearSelectionOwned` / `releaseAnchorOwned` | `clearSelection` / `releaseAnchor` — the `*Owned` suffix was dropped once `provider.ReplicaOwner` made ownership a parameter type |
+| `finishAttachBarrier` | the `attach_barrier_seen` state machine |
+| `explicitTerminalResize` | `viewportResize` → `phux_client_terminal_resize` |
+| `pruneRemovedPanes` | `pruneRemoved` |
+| `ensurePane` / `findPane` / `indexOfOwner` / `replicaOwner` | subsumed by `provider.ReplicaOwner` and `provider.TerminalRef` |
+| `asC` / `fromC` | per-type converters such as `toCAnchor` |
+
+Mainline additionally carries `providers/phux/presentation.zig` and
+`providers/phux/provider.zig`, which the spike never had, and a
+`max_search_results` cap it never had. The migration was a strict superset.
 
 ### What landed
 
@@ -372,6 +404,39 @@ it widened its per-column command reserve instead.
 - The adversarial id-uniqueness test needed its band arithmetic repointed at the new
   scheme. Instrumented before changing it, to confirm the duplicate-id check itself
   still passed: no duplicates across 616 commands, both pane bands symmetric at 302.
+
+Those are the spike's numbers, at the spike's size. On `main` at `358b24c` the same
+two configurations measure:
+
+```
+zig build test -Dplatform=null                 19/19 steps, 329/334 tests (5 skipped)
+zig build test -Dplatform=null -Dphux-enabled  21/21 steps, 337/342 tests (5 skipped)
+```
+
+Both exit 0. Both still print the stray `failed command: ... --listen=-` line on
+stderr while every step is green — see the corrections below; that line has now
+misled two separate sessions and is not a failure.
+
+### Production host integration (2026-08-02, migrated 2026-08-03)
+
+`src/providers/phux/host.zig` owns the panic-contained C ABI client on the UI
+thread. `src/providers/phux/extension.zig` owns only the TCP/Unix socket worker;
+complete, length-prefixed frames cross bounded reusable queues, and a one-byte
+native-sdk channel wake asks the UI owner to drain them. Borrowed FFI grids are
+copied into reusable projection buffers before the next mutable client call.
+Input and local policy paths cover keyboard/IME, paste, focus, pointer, viewport
+resize/scroll, opaque document-anchor selection, clipboard, and search. Reconnect
+freezes published panes until the replacement attach reaches its ATTACHED
+barrier.
+
+The production build is selected explicitly with `-Dphux-enabled=true` and
+requires the generated header plus the `ffi-release` static-library directory:
+
+```sh
+zig build test -Dplatform=null -Dphux-enabled=true \
+  -Dphux-client-ffi-include-dir=/Users/phall/workspace/phux/crates/phux-client-ffi/include \
+  -Dphux-client-ffi-lib-dir=/Users/phall/workspace/phux/target/ffi-release
+```
 
 ### The glyph budget: measured, and the answer is split
 
