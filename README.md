@@ -399,9 +399,12 @@ pub fn feed(session: *Session, bytes: []const u8) void {
 }
 ```
 
-The rendering spike is complete. Steps 1-3 of `FINDINGS.md` section 8 landed on
-`port/first-party-terminal-grid`, and this repository remains the native host
-validation fixture.
+The rendering spike is complete and closed out. All four steps of `FINDINGS.md`
+section 8 were finished, migrated here as PR #7, and developed further since;
+this repository is the shipping product, not a validation fixture. The spike
+branch was removed on 2026-08-09 and its history preserved at the annotated tag
+`spike/first-party-terminal-grid` — `git show spike/first-party-terminal-grid`
+for the audit that established nothing was left behind.
 
 The section 7 `phux-client-ffi` sketch is historical, not the next API to
 implement. The current phux direction is a versioned libghostty checkpoint
