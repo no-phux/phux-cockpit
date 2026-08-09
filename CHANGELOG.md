@@ -3,6 +3,19 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1](https://github.com/phall1/phux-cockpit/compare/v0.6.0...v0.6.1) (2026-08-09)
+
+
+### Bug Fixes
+
+* stop a dev build from clobbering the installed app's saved layout ([632e584](https://github.com/phall1/phux-cockpit/commit/632e5846b3b5ece4c965e743a89808592bb4fc07))
+* stop chrome resizing terminals, close dead panes, and redesign the tab strip ([#19](https://github.com/phall1/phux-cockpit/issues/19)) ([06c0208](https://github.com/phall1/phux-cockpit/commit/06c0208a35160363d110d788158ee89be5b52945))
+
+
+### Documentation
+
+* describe the dsr local release fallback ([#17](https://github.com/phall1/phux-cockpit/issues/17)) ([6dbe6a2](https://github.com/phall1/phux-cockpit/commit/6dbe6a28d80ba1018c9e29413f230654758adbe9))
+
 ## [0.6.0](https://github.com/phall1/phux-cockpit/compare/v0.5.0...v0.6.0) (2026-08-07)
 
 
