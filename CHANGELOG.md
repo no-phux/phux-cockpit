@@ -3,6 +3,13 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0](https://github.com/phall1/phux-cockpit/compare/v0.6.1...v0.7.0) (2026-08-09)
+
+
+### Features
+
+* move the SDK pin to v0.8.3, soften the split scrim, and make automation drivable ([#20](https://github.com/phall1/phux-cockpit/issues/20)) ([3e825ea](https://github.com/phall1/phux-cockpit/commit/3e825eac9a2cc4a5e005ec6b7203f369fd810ad7))
+
 ## [0.6.1](https://github.com/phall1/phux-cockpit/compare/v0.6.0...v0.6.1) (2026-08-09)
 
 
