@@ -101,7 +101,7 @@ test "the strip shows terminals only and still reaches the web surface" {
     // Kept, not deleted: the surface, its pane declaration and its scene
     // wiring are all still there, and two paths reach it.
     var panes: [2]app.TerminalApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 1), app.webPanes(&state.model, &panes));
+    try testing.expectEqual(@as(usize, 1), app.webPanes(&state.model, support.mainChromeContext(), &panes));
     try testing.expectEqualStrings(app.webview_label, panes[0].label);
     try testing.expect(app.onCommand("surface.web") != null);
 

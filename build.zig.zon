@@ -64,9 +64,38 @@
         // REPORTED `WindowInfo.fullscreen` and had no way to enter or leave —
         // and the field it reported was never filled by anything, so it was a
         // constant false.
+        //
+        // REBASED onto upstream v0.8.4 (`c7e64b6`), and now carries four more
+        // Cockpit fixes:
+        //
+        // - macOS font smoothing is ENABLED for every glyph raster context.
+        //   It is off by default on a transparent backing, and all three of
+        //   the host's contexts use one, so every glyph the app has ever drawn
+        //   rendered thin. Measured at +35% fully-solid stem pixels at 13pt.
+        //   The CPU reference renderer never touches CoreText, so no reference
+        //   screenshot can catch a regression here — re-measure with
+        //   `scripts/measure-glyph-smoothing.m`.
+        // - `web_panes` takes a `ChromeContext`, like `build_window`. Panes
+        //   are reconciled PER WINDOW, so a signature that could not say which
+        //   window it was being asked about made every OTHER window's rebuild
+        //   resolve the webview anchor against a tree without it and log a
+        //   warning. BREAKING: implementors take the context (see
+        //   `view.webPanes`, which now answers only for the main window).
+        // - Automation snapshots drop CLOSED windows. A closed window keeps
+        //   its runtime slot, so the snapshot published ghost `window @wN`
+        //   lines with no views under them, which would quietly pass any smoke
+        //   test asserting a window count.
+        // - `widget-key` emits a paired key_up. The harness sent only
+        //   key_down, so the shortcut latch swallowed every repeated chord —
+        //   driving cmd+G twice did nothing the second time.
+        // - `semantics.decorative` splits announcement from visibility.
+        //   `hidden` suppresses RENDERING (and still reserves layout), which
+        //   is why the search field's magnifier and caret painted nothing
+        //   until it was removed from both; `decorative` paints and hides from
+        //   accessibility instead.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/e8bd84886db89ce2ada4a8c7b9fac0137096e3dc.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQuPh4QEi6A1KMfbWF0w10cns3S-erI_4RQEZ0HGK",
+            .url = "https://github.com/phall1/native/archive/cb8f995fb0d949a38567896d8f3391a3eb5bf846.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQmmD6AFe3XmANeS7Vd4yetIaGo2svnuUBQSf-g2Q",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

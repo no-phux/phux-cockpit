@@ -146,7 +146,13 @@ test "web pane root-navigation bindings are exact" {
     try testing.expectEqualStrings("https://mitchellh.com/writing/superlogical", app.BrowserPage.article.url());
 
     var panes: [1]TerminalApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 1), app.webPanes(&app_state.model, &panes));
+    try testing.expectEqual(@as(usize, 1), app.webPanes(&app_state.model, support.mainChromeContext(), &panes));
+    // A window that hosts no webview answers with none, which is what stops
+    // every secondary window's rebuild logging an unresolvable anchor.
+    var secondary_context = support.mainChromeContext();
+    secondary_context.is_main = false;
+    secondary_context.canvas_label = app.secondary_canvas_labels[0];
+    try testing.expectEqual(@as(usize, 0), app.webPanes(&app_state.model, secondary_context, &panes));
     try testing.expectEqualStrings(app.webview_label, panes[0].label);
     try testing.expectEqualStrings(app.webview_anchor, panes[0].anchor.?);
     try testing.expectEqualStrings(app.BrowserPage.github.url(), panes[0].url);

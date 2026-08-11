@@ -1298,7 +1298,19 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     return null;
 }
 
-pub fn webPanes(model: *const Model, out: []TerminalApp.WebViewPane) usize {
+/// The webview panes belonging to ONE window.
+///
+/// The web surface lives in the main window: its anchor widget is only ever
+/// built into the scene's own canvas. Answering with it for every window made
+/// every secondary window's rebuild resolve the anchor against a widget tree
+/// that does not contain it, logging "no canvas widget carries semantics
+/// label ..." on every rebuild of every other window. The behaviour was always
+/// correct — the pane is found and snapped in the window that owns it — but
+/// the noise buried real warnings.
+///
+/// Zero is the right answer for a window that hosts no webview.
+pub fn webPanes(model: *const Model, context: TerminalApp.ChromeContext, out: []TerminalApp.WebViewPane) usize {
+    if (!context.is_main) return 0;
     out[0] = .{
         .label = webview_label,
         .anchor = webview_anchor,
