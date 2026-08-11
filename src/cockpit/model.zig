@@ -145,6 +145,9 @@ pub const TerminalPointerEvent = struct {
 
 pub const PointerDragMode = enum { local_selection, mouse_report };
 
+/// Destination of an in-flight clipboard read. See `Model.paste_target`.
+pub const PasteTarget = enum { terminal, search_needle };
+
 pub const PointerCapture = struct {
     active: bool = false,
     window_id: native_sdk.platform.WindowId = 0,
@@ -467,6 +470,12 @@ pub const Model = struct {
         .generation = .{},
     },
     paste_failed: bool = false,
+    /// Where the in-flight clipboard read is going to land. A paste issued
+    /// while the scrollback search field is up belongs to the NEEDLE, not to
+    /// the child process, and the two differ in more than destination: a
+    /// needle paste is legitimate against a pane that no longer accepts input,
+    /// because searching a dead session's scrollback is ordinary work.
+    paste_target: PasteTarget = .terminal,
     /// Where the layout snapshot goes and what is owed to it. Disabled by
     /// default so every test and every fixture stays free of disk traffic
     /// until a composition root hands it a real path.

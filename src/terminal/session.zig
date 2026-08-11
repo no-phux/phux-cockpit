@@ -978,6 +978,35 @@ pub const Session = struct {
         return true;
     }
 
+    /// Insert CLIPBOARD text into the needle.
+    ///
+    /// Separate from `searchInput` because typed text and pasted text fail
+    /// differently. A typed control byte is a key that had no business in a
+    /// phrase, so rejecting the press is right. A PASTE carrying one is
+    /// ordinary — copying a word out of a terminal picks up its trailing
+    /// newline almost every time — and rejecting the whole paste for it would
+    /// leave cmd+V looking as inert as it was before it was implemented.
+    ///
+    /// So this takes the first line and drops control bytes from it. A needle
+    /// cannot span rows anyway: the engine matches within a row, so the bytes
+    /// after a newline could never contribute to a match, and silently keeping
+    /// them would search for a phrase the field cannot display.
+    pub fn searchPaste(session: *Session, text: []const u8) bool {
+        if (!session.search.open) return false;
+        var end: usize = 0;
+        while (end < text.len and text[end] != '\n' and text[end] != '\r') end += 1;
+        var wrote = false;
+        for (text[0..end]) |byte| {
+            if (byte < 0x20 or byte == 0x7f) continue;
+            if (session.search.needle_len + 1 > session.search.needle_buf.len) break;
+            session.search.needle_buf[session.search.needle_len] = byte;
+            session.search.needle_len += 1;
+            wrote = true;
+        }
+        if (wrote) session.searchRefresh();
+        return wrote;
+    }
+
     /// Delete the last SCALAR of the needle. Cutting a single byte off a
     /// multi-byte character leaves an invalid needle that matches nothing and
     /// paints as replacement junk.
@@ -1175,6 +1204,31 @@ pub const Session = struct {
         session.pointer_selection.reset(&session.term);
         session.select_anchor = null;
         session.term.screens.active.clearSelection();
+    }
+
+    /// Select the ENTIRE scrollback, not merely the visible screen — what
+    /// Ghostty's `select_all` does, and what someone arriving from it expects
+    /// cmd+A to mean. The engine's own `Screen.selectAll` walks from
+    /// `.screen = .{}` (the top of history, not the top of the viewport) and
+    /// omits surrounding whitespace, so a mostly-empty screen does not hand
+    /// back a copy padded with blank rows.
+    ///
+    /// Deliberately does NOT arm keyboard-selection mode. That mode carries a
+    /// VIEWPORT anchor and head, and the reason scrollback chords pause while
+    /// it is armed is that scrolling would leave the painted caret naming
+    /// different text than a copy returns. This selection is expressed purely
+    /// in absolute pins with no caret at all, so scrolling under it stays
+    /// truthful and the chords can stay live.
+    ///
+    /// False means there was nothing to select — an empty screen — and the
+    /// previous selection is left alone rather than being silently dropped.
+    pub fn selectAllHistory(session: *Session) bool {
+        const screen = session.term.screens.active;
+        const selection = screen.selectAll() orelse return false;
+        session.pointer_selection.reset(&session.term);
+        screen.select(selection) catch return false;
+        session.select_anchor = null;
+        return true;
     }
 
     /// Primary-pointer selection using Ghostty's own cell/word/line gesture.

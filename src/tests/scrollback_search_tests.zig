@@ -431,6 +431,62 @@ test "cmd+F opens the field and nothing typed into it reaches the pty" {
     try testing.expectEqual(@as(u64, 0), pane.outbound_dropped);
 }
 
+test "cmd+V pastes into the needle instead of the shell" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(state);
+    defer destroyModelSessions(&state.model);
+    defer state.deinit();
+    const iface = state.app();
+    const pane = &state.model.provider.slots[0];
+
+    try state.effects.feedPtyOutput(app.ptyKey(0), "alpha NEEDLE one\r\nbeta NEEDLE two\r\n");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+    try pressCanvasKey(harness, iface, "f", .{ .primary = true });
+    try testing.expect(pane.session.search.open);
+    const written_before = state.effects.ptyWrittenBytes(app.ptyKey(0)).len;
+
+    try pressCanvasKey(harness, iface, "v", .{ .primary = true, .command = true });
+    // The trailing newline is what copying a word out of a terminal actually
+    // gives you; it must not cost the paste.
+    try state.effects.feedClipboardResult(app.paste_clipboard_key, .ok, "NEEDLE\n");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+
+    try testing.expectEqualStrings("NEEDLE", pane.session.searchNeedle());
+    try testing.expectEqual(@as(usize, 2), pane.session.searchMatchCount());
+    try testing.expect(!state.model.paste_failed);
+    // THE contract, same as typing: the child heard none of it.
+    try testing.expectEqual(written_before, state.effects.ptyWrittenBytes(app.ptyKey(0)).len);
+}
+
+test "cmd+C still copies the terminal selection while the search field is open" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(state);
+    defer destroyModelSessions(&state.model);
+    defer state.deinit();
+    const iface = state.app();
+    const pane = &state.model.provider.slots[0];
+
+    try state.effects.feedPtyOutput(app.ptyKey(0), "alpha NEEDLE one\r\nbeta NEEDLE two\r\n");
+    try harness.runtime.dispatchPlatformEvent(iface, .wake);
+
+    // A selection made BEFORE cmd+F survives the field opening over it.
+    try pressCanvasKey(harness, iface, "a", .{ .primary = true });
+    try testing.expect(pane.session.selectionActive());
+    try pressCanvasKey(harness, iface, "f", .{ .primary = true });
+    try testing.expect(pane.session.search.open);
+
+    try pressCanvasKey(harness, iface, "c", .{ .primary = true, .command = true });
+    // A write was actually issued, rather than the chord being swallowed.
+    const request = state.effects.pendingClipboardAt(0) orelse return error.TestExpectedClipboardWrite;
+    try testing.expectEqual(native_sdk.EffectClipboardOp.write, request.op);
+}
+
 test "the search band shows the needle, the count, and says when there is nothing" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });

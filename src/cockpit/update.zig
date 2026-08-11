@@ -563,6 +563,13 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 return;
             }
             if (model.provider.terminal(model.paste_owner.terminal_ref)) |pane| {
+                if (model.paste_target == .search_needle) {
+                    // The field may have closed between the request and the
+                    // result; `searchPaste` returns false rather than writing
+                    // into a needle nobody is looking at.
+                    model.paste_failed = !pane.session.searchPaste(result.text);
+                    return;
+                }
                 if (!pane.acceptsInput()) {
                     model.paste_failed = true;
                     return;
@@ -734,7 +741,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         // the pty. Every pane in every tab follows on its next frame.
         .font_size_step => |delta| _ = model.stepFontSize(@floatFromInt(delta)),
         .font_size_reset => _ = model.resetFontSize(),
-        .select_all => selectAllVisible(model),
+        .select_all => selectAllScrollback(model),
         .clear_terminal => clearFocusedTerminal(model, fx),
         .search_open => {
             const pane = focusedLocalPane(model) orelse return;
@@ -913,23 +920,18 @@ fn focusedLocalPane(model: *Model) ?*Pane {
     return model.provider.terminal(terminal_ref);
 }
 
-/// cmd+A: cover the visible screen with a selection the next cmd+C can copy.
+/// cmd+A: cover the whole SCROLLBACK with a selection the next cmd+C can copy.
 ///
-/// Composed from the existing keyboard-selection primitives rather than a new
-/// emulator call: `beginSelection` anchors at the cursor, one clamped
-/// non-extending move drags the anchor to the top-left, and one clamped
-/// extending move drags the head to the bottom-right. It is therefore
-/// VIEWPORT-wide, not scrollback-wide — see the handoff note.
-fn selectAllVisible(model: *Model) void {
+/// This used to compose the keyboard-selection primitives, which are clamped
+/// to the grid, so it could only ever reach the visible screen — and quietly
+/// handed back a fraction of the output someone meant to copy. It now delegates
+/// to the session's absolute-pin primitive; see `selectAllHistory` for why it
+/// leaves keyboard-selection mode disarmed.
+fn selectAllScrollback(model: *Model) void {
     const terminal_ref = model.selectedTerminalRef() orelse return;
     const pane = model.provider.terminal(terminal_ref) orelse return;
-    const session = pane.session;
-    const span_x: i32 = @intCast(session.cols());
-    const span_y: i32 = @intCast(session.rows());
-    session.beginSelection(false);
-    session.moveSelection(-span_x, -span_y, false);
-    session.moveSelection(span_x, span_y, true);
-    pane.selecting = true;
+    if (!pane.session.selectAllHistory()) return;
+    pane.selecting = false;
 }
 
 /// cmd+K: clear the screen and the scrollback.
@@ -1127,7 +1129,21 @@ fn requestPaste(model: *Model, fx: *Fx, terminal_ref: TerminalRef) void {
     if (model.paste_inflight) return;
     model.paste_owner = model.terminalOwner(terminal_ref) orelse return;
     model.paste_failed = false;
+    model.paste_target = .terminal;
     if (model.provider.terminal(terminal_ref)) |pane| {
+        // An open search field is where a paste GOES, for the same reason
+        // committed text does. Deciding it here rather than at the chord
+        // means the menu's Edit > Paste agrees with cmd+V for free, and
+        // that the two can never drift apart.
+        if (pane.session.search.open) {
+            model.paste_target = .search_needle;
+            model.paste_inflight = true;
+            fx.readClipboard(.{
+                .key = paste_clipboard_key,
+                .on_result = Fx.clipboardMsg(.paste_clipboard),
+            });
+            return;
+        }
         if (!pane.acceptsInput()) {
             model.paste_failed = true;
             return;
@@ -1580,11 +1596,31 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
 
 /// Every key press that reaches an OPEN search field.
 ///
-/// Three of them do something and the rest are SWALLOWED, which is the point:
+/// A handful do something and the rest are SWALLOWED, which is the point:
 /// a key with no meaning here is not a key that should fall through to the
 /// child. Printable presses do not arrive here at all — they come through the
 /// text channel (see the `.text` arm) and are appended to the needle there.
 fn handleSearchKey(model: *Model, fx: *Fx, pane: *Pane, event: canvas.WidgetKeyboardEvent) void {
+    const primary = event.modifiers.hasCommandModifier();
+    // cmd+V fills the needle; cmd+C still copies the TERMINAL's selection.
+    //
+    // Both sit above the swallowing arms because the search band is modal
+    // over the terminal, not over the machine: a field that eats the two
+    // chords every Mac app answers reads as broken, and being unable to
+    // paste the very string you are looking for is the worst case of it.
+    // cmd+C keeps its terminal meaning because the needle is not selectable
+    // text — there is nothing else it could copy — and a selection made
+    // before cmd+F survives the field being opened.
+    if (primary and keyIs(event.key, "v")) {
+        latchAppShortcut(model, event.key);
+        requestPaste(model, fx, pane.id);
+        return;
+    }
+    if (primary and keyIs(event.key, "c") and (pane.selecting or pane.session.selectionActive())) {
+        latchAppShortcut(model, event.key);
+        copySelection(model, fx, pane.id);
+        return;
+    }
     if (keyIs(event.key, "escape")) {
         latchAppShortcut(model, event.key);
         updateModel(model, .search_close, fx);

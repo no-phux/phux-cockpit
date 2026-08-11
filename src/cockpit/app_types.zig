@@ -86,7 +86,8 @@ pub const Msg = union(enum) {
     font_size_step: i8,
     font_size_reset,
     /// cmd+A over the focused terminal: arm a selection covering the whole
-    /// visible screen, so the very next cmd+C copies it.
+    /// SCROLLBACK — not merely the visible screen — so the very next cmd+C
+    /// copies all of it.
     select_all,
     /// cmd+K: clear the screen AND the scrollback, the way `clear` does.
     clear_terminal,
