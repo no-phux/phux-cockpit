@@ -20,6 +20,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const vt = @import("ghostty-vt");
+const url_module = @import("url.zig");
 const palette_module = @import("palette.zig");
 
 const canvas = native_sdk.canvas;
@@ -1546,6 +1547,39 @@ pub const Session = struct {
     /// `screenText` pays, once, and only when something actually reads.
     pub fn refreshScreenText(session: *Session) void {
         session.screen_text_dirty = true;
+    }
+
+    /// The URL under a pointer at view-relative `x`/`y`, or null.
+    ///
+    /// Returns a slice into the session's own cached screen text, so it stays
+    /// valid until the next screen change — which is exactly the lifetime a
+    /// hover or a click needs, and no longer.
+    ///
+    /// Heuristic by necessity: terminal output has no author to mark up its
+    /// links. It fails toward "not a link", because a missed URL costs a click
+    /// while a wrong one hands arbitrary program output to the OS to open.
+    pub fn urlAtPoint(session: *Session, x: f32, y: f32) ?[]const u8 {
+        if (session.cell_width <= 0 or session.cell_height <= 0) return null;
+        if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
+        if (x < 0 or y < 0) return null;
+        const coordinate = session.pointerViewportCoordinate(x, y) orelse return null;
+        const text = session.screenText();
+        const row = rowSlice(text, coordinate.y) orelse return null;
+        const offset = url_module.byteOffsetForColumn(row, coordinate.x) orelse return null;
+        const span = url_module.spanAt(row, offset) orelse return null;
+        return span.slice(row);
+    }
+
+    /// Row `index` of a newline-separated viewport dump, without its newline.
+    fn rowSlice(text: []const u8, index: usize) ?[]const u8 {
+        var start: usize = 0;
+        var row: usize = 0;
+        while (row < index) : (row += 1) {
+            const newline = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return null;
+            start = newline + 1;
+        }
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        return text[start..end];
     }
 
     /// The cached viewport text, recomputed on demand when the screen

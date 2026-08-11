@@ -1,0 +1,157 @@
+//! Heuristic URL detection over a row of terminal text.
+//!
+//! Terminal output is not markup: there is no author to tell us where a link
+//! starts and stops, only bytes that a human recognises as a URL because of
+//! their shape. So this is a heuristic, and it is written to fail toward "not
+//! a link" — a missed URL costs a click, a wrong one hands arbitrary terminal
+//! output to the OS as something to open.
+//!
+//! OSC 8 hyperlinks are a separate, EXPLICIT channel the engine already parses;
+//! where one exists it should win over anything found here.
+
+const std = @import("std");
+
+/// Schemes worth linkifying from raw output.
+///
+/// Deliberately short. `file:` is absent because a terminal that prints a
+/// path should not be able to make the OS open a local file on one click, and
+/// `javascript:` because it is not a document at all. The effect layer
+/// validates again — this list is the first of two gates, not the only one.
+const schemes = [_][]const u8{ "https://", "http://", "mailto:" };
+
+/// The longest run this will call a URL. Long enough for any real link,
+/// short enough that a screenful of base64 cannot become one.
+pub const max_url_bytes: usize = 2048;
+
+pub const Span = struct {
+    start: usize,
+    end: usize,
+
+    pub fn slice(self: Span, row: []const u8) []const u8 {
+        return row[self.start..self.end];
+    }
+};
+
+/// Whether `byte` may appear inside a URL body.
+///
+/// RFC 3986's unreserved + reserved sets, minus the ones that in practice end
+/// a URL when it is embedded in prose or in a log line. Whitespace and control
+/// bytes end it; so do quotes, angle brackets, backticks and pipes, which
+/// terminals and humans both use to wrap a link.
+fn isBodyByte(byte: u8) bool {
+    return switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9' => true,
+        '-', '.', '_', '~', ':', '/', '?', '#', '[', ']', '@' => true,
+        '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', '%' => true,
+        else => false,
+    };
+}
+
+/// The RFC 3986 scheme charset. Used only for the word-boundary guard in
+/// `nextFrom` — a scheme preceded by one of these is part of a longer word.
+fn isSchemeByte(byte: u8) bool {
+    return switch (byte) {
+        'a'...'z', 'A'...'Z', '0'...'9', '+', '-', '.' => true,
+        else => false,
+    };
+}
+
+/// Trailing bytes that are almost always punctuation around a link rather than
+/// part of it: `see https://example.com.` and `(https://example.com)`.
+fn trimTrailing(row: []const u8, start: usize, end_in: usize) usize {
+    var end = end_in;
+    while (end > start) {
+        const last = row[end - 1];
+        switch (last) {
+            '.', ',', ';', ':', '!', '?', '\'' => end -= 1,
+            ')', ']' => {
+                // Keep a closing bracket only when the URL opened one, so
+                // `(https://en.wikipedia.org/wiki/Foo_(bar))` keeps its inner
+                // pair and loses the wrapping one.
+                const open: u8 = if (last == ')') '(' else '[';
+                var depth: isize = 0;
+                for (row[start .. end - 1]) |byte| {
+                    if (byte == open) depth += 1;
+                    if (byte == last) depth -= 1;
+                }
+                if (depth > 0) break;
+                end -= 1;
+            },
+            else => break,
+        }
+    }
+    return end;
+}
+
+/// The URL span covering byte offset `at`, or null when that byte is not
+/// inside one.
+pub fn spanAt(row: []const u8, at: usize) ?Span {
+    if (at >= row.len) return null;
+    var index: usize = 0;
+    while (index < row.len) {
+        const found = nextFrom(row, index) orelse return null;
+        if (at < found.start) return null;
+        if (at < found.end) return found;
+        index = if (found.end > index) found.end else index + 1;
+    }
+    return null;
+}
+
+/// The first URL at or after `from`.
+pub fn nextFrom(row: []const u8, from: usize) ?Span {
+    var index = from;
+    while (index < row.len) : (index += 1) {
+        const rest = row[index..];
+        const scheme = matchScheme(rest) orelse continue;
+        // A scheme has to start on a WORD boundary, or `nothttps://x`
+        // linkifies as `https://x` from inside a longer word.
+        //
+        // The guard is the RFC 3986 scheme charset, not the body charset:
+        // brackets and quotes are body bytes (they can appear inside a URL)
+        // but they are also exactly how a link gets wrapped in prose, so
+        // treating them as "inside a word" refused `(https://example.com)`
+        // outright.
+        if (index > 0 and isSchemeByte(row[index - 1])) continue;
+        var end = index + scheme.len;
+        while (end < row.len and isBodyByte(row[end])) end += 1;
+        if (end - index > max_url_bytes) {
+            index = end;
+            continue;
+        }
+        const trimmed = trimTrailing(row, index, end);
+        // Scheme alone is not a link: `https://` with nothing after it has no
+        // host to open.
+        if (trimmed <= index + scheme.len) {
+            index = end;
+            continue;
+        }
+        return .{ .start = index, .end = trimmed };
+    }
+    return null;
+}
+
+fn matchScheme(rest: []const u8) ?[]const u8 {
+    for (schemes) |scheme| {
+        if (rest.len < scheme.len) continue;
+        if (std.ascii.eqlIgnoreCase(rest[0..scheme.len], scheme)) return scheme;
+    }
+    return null;
+}
+
+/// Byte offset of display COLUMN `column` in `row`.
+///
+/// Counts UTF-8 scalars, one per column. Wide (double-width) scalars will
+/// drift a column per occurrence; URLs are ASCII, so this is only reachable
+/// when wide text precedes one on the same row, and the cost is a hover
+/// landing on a neighbouring character rather than a wrong link.
+pub fn byteOffsetForColumn(row: []const u8, column: usize) ?usize {
+    var offset: usize = 0;
+    var seen: usize = 0;
+    while (offset < row.len) {
+        if (seen == column) return offset;
+        const length = std.unicode.utf8ByteSequenceLength(row[offset]) catch 1;
+        offset += @min(length, row.len - offset);
+        seen += 1;
+    }
+    return if (seen == column) offset else null;
+}

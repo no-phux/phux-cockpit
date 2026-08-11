@@ -649,6 +649,7 @@ test "AppKit pointer buttons map to provider mouse buttons" {
 
 test {
     _ = @import("tests/app_contract_tests.zig");
+    _ = @import("tests/url_detection_tests.zig");
     _ = @import("tests/grid_state_tests.zig");
     _ = @import("tests/grid_rendering_tests.zig");
     _ = @import("tests/cell_attribute_tests.zig");
