@@ -239,7 +239,25 @@ pub const Session = struct {
     /// session still costs one page.
     pub const max_scrollback: usize = 50_000_000;
 
+    /// `create` with the default ceiling. Tests and fixtures that do not care
+    /// about scrollback size use this; anything holding a user's config should
+    /// call `createWithScrollback` so `scrollback-limit` is not silently
+    /// ignored.
     pub fn create(gpa: std.mem.Allocator, io: std.Io, initial_cols: u16, initial_rows: u16) !*Session {
+        return createWithScrollback(gpa, io, initial_cols, initial_rows, max_scrollback);
+    }
+
+    /// `max_scrollback_bytes` is a per-SESSION parameter, not the comptime
+    /// constant it used to be. It was a `const` that happened to equal the
+    /// config default, which made `scrollback-limit` parse, store, and do
+    /// nothing at all.
+    pub fn createWithScrollback(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        initial_cols: u16,
+        initial_rows: u16,
+        max_scrollback_bytes: usize,
+    ) !*Session {
         const session = try gpa.create(Session);
         errdefer gpa.destroy(session);
         session.* = .{
@@ -247,7 +265,7 @@ pub const Session = struct {
             .term = try vt.Terminal.init(io, gpa, .{
                 .cols = @intCast(@min(initial_cols, max_cols)),
                 .rows = @intCast(@min(initial_rows, max_rows)),
-                .max_scrollback = max_scrollback,
+                .max_scrollback = max_scrollback_bytes,
             }),
             .stream = undefined,
             .render = .empty,

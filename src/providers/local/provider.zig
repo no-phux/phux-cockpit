@@ -42,6 +42,58 @@ const shell_argv: []const []const u8 = if (builtin.os.tag == .macos)
 else
     default_shell_argv;
 
+/// Storage and argv for a configured `shell` / `command`.
+///
+/// The value is treated as a COMMAND LINE run by the login shell, which is
+/// what `command` means in the terminal these users arrive from: `shell =
+/// /opt/homebrew/bin/fish` and `command = tmux attach` both have to work, and
+/// single-quoting the whole value the way `paneArgvIn` quotes a DIRECTORY
+/// would turn the second into one nonexistent program named "tmux attach".
+///
+/// That asymmetry is deliberate rather than an oversight. `paneArgvIn` quotes
+/// because a working directory arrives from OSC 7 — a remote, hostile-capable
+/// source — and must never become a command. This value arrives from the
+/// user's own config file, which already names the program that is about to
+/// run as them; quoting it would buy no safety and cost the feature.
+///
+/// `exec` so the configured program REPLACES the wrapper shell rather than
+/// running underneath it, which keeps the pty's process the one the user asked
+/// for and makes exit behave.
+pub const ShellCommand = struct {
+    command: [max_cwd_command_bytes]u8 = undefined,
+    slots: [4][]const u8 = undefined,
+    len: usize = 0,
+
+    pub fn isSet(self: *const ShellCommand) bool {
+        return self.len != 0;
+    }
+
+    pub fn argv(self: *const ShellCommand) []const []const u8 {
+        return self.slots[0..self.len];
+    }
+
+    /// Adopt `value`, or leave the built-in shell in place when it is empty,
+    /// carries a NUL (which the SDK rejects and the C boundary would truncate),
+    /// or does not fit. Every rejection degrades to the default shell rather
+    /// than to a pane that cannot open.
+    pub fn set(self: *ShellCommand, value: []const u8) bool {
+        self.len = 0;
+        if (value.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, value, 0) != null) return false;
+        const prefix = "exec ";
+        if (prefix.len + value.len > self.command.len) return false;
+        @memcpy(self.command[0..prefix.len], prefix);
+        @memcpy(self.command[prefix.len..][0..value.len], value);
+        const written = prefix.len + value.len;
+        self.slots[0] = default_shell;
+        self.slots[1] = "-l";
+        self.slots[2] = "-c";
+        self.slots[3] = self.command[0..written];
+        self.len = 4;
+        return true;
+    }
+};
+
 pub fn localRef(id: LocalTerminalId) TerminalRef {
     return .{ .provider_id = .local, .terminal_id = .{ .local = id } };
 }
@@ -271,9 +323,44 @@ pub const LocalProvider = struct {
     states: [max_terminals]RegistryState = @splat(.vacant),
     next_terminal_raw: u64 = first_terminal_raw,
     next_pty_key: u64 = 1,
+    /// Scrollback ceiling handed to every session minted from here. Carried on
+    /// the provider because terminals are created LAZILY, long after the
+    /// config was read — there is nowhere else for a user's `scrollback-limit`
+    /// to wait. Defaults to the session default so a provider built without
+    /// config behaves exactly as before.
+    max_scrollback_bytes: usize = grid.Session.max_scrollback,
+    /// A user-configured `shell` / `command`, built ONCE into provider-owned
+    /// storage. Null means the built-in login shell. One shell serves every
+    /// pane — there has never been a per-slot argv distinction — so a single
+    /// buffer on the provider outlives every `Pane.argv` slice into it.
+    shell_command: ShellCommand = .{},
 
     pub fn create(gpa: std.mem.Allocator, session: *grid.Session) !*LocalProvider {
         return createWithIo(gpa, std.Io.failing, session);
+    }
+
+    /// The argv every new pane spawns with: the configured `shell`/`command`
+    /// when there is one, the built-in login shell otherwise.
+    pub fn defaultArgv(provider: *const LocalProvider) []const []const u8 {
+        if (provider.shell_command.isSet()) return provider.shell_command.argv();
+        return shell_argv;
+    }
+
+    /// Adopt a configured shell. Called once at startup, AFTER the first pane
+    /// exists (the config cannot be read before the model is built), so it
+    /// also re-points panes that are still carrying the built-in argv. Nothing
+    /// has spawned yet at that point — `Pane.argv` is read at `ptySpawn` — so
+    /// this is a fix-up, not a mutation of a running shell.
+    ///
+    /// False means the value was rejected and the built-in shell stands.
+    pub fn setShellCommand(provider: *LocalProvider, value: []const u8) bool {
+        if (!provider.shell_command.set(value)) return false;
+        const configured = provider.shell_command.argv();
+        for (provider.slots[0..], provider.states[0..]) |*pane, state| {
+            if (state == .vacant) continue;
+            if (pane.argv.ptr == shell_argv.ptr) pane.argv = configured;
+        }
+        return true;
     }
 
     /// The window opens with exactly ONE terminal. Every further terminal is
@@ -395,13 +482,13 @@ pub const LocalProvider = struct {
         if (index == max_terminals) return error.TerminalCapacityReached;
         // The session is allocated HERE, at the moment a terminal is asked
         // for, not eagerly at startup for panes that may never exist.
-        const session = try grid.Session.create(provider.gpa, provider.io, 80, 24);
+        const session = try grid.Session.createWithScrollback(provider.gpa, provider.io, 80, 24, provider.max_scrollback_bytes);
         errdefer session.destroy();
         provider.slots[index] = .{
             .id = next_ref,
             .session = session,
             .pty_key = provider.next_pty_key,
-            .argv = shell_argv,
+            .argv = provider.defaultArgv(),
         };
         provider.next_terminal_raw += 1;
         provider.next_pty_key += 1;

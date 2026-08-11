@@ -40,7 +40,37 @@ test "the common settings round-trip" {
     try std.testing.expectEqualStrings("/bin/fish", parsed.shell.slice());
     try std.testing.expectEqual(config.TabPlacement.side, parsed.tab_placement);
     try std.testing.expectApproxEqAbs(@as(f32, 12), parsed.window_padding, 0.001);
-    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostic_count);
+    // `font-family` parses and stores but cannot take effect in this build, so
+    // it is reported. Everything else here is honoured silently.
+    try std.testing.expectEqual(@as(usize, 1), parsed.diagnostic_count);
+    try std.testing.expectEqual(config.Diagnostic.Kind.unsupported_key, parsed.diagnosticSlice()[0].kind);
+    try std.testing.expectEqualStrings("font-family", parsed.diagnosticSlice()[0].text);
+}
+
+test "a key that parses but cannot take effect says so" {
+    // The trap this closes: a knob that accepts a value and silently does
+    // nothing sends someone hunting for a bug in their terminal instead of
+    // reading a line that says the setting is not supported here.
+    const parsed = config.parse(
+        \\font-family = Comic Mono
+        \\selection-foreground = #ff0000
+    );
+    try std.testing.expectEqual(@as(usize, 2), parsed.diagnostic_count);
+    for (parsed.diagnosticSlice()) |diagnostic| {
+        try std.testing.expectEqual(config.Diagnostic.Kind.unsupported_key, diagnostic.kind);
+    }
+    // Still parsed and stored, so the day the capability lands the value is
+    // already there.
+    try std.testing.expectEqualStrings("Comic Mono", parsed.font_family.slice());
+    try std.testing.expect(parsed.selection_foreground != null);
+}
+
+test "an unsupported key with a BAD value reports the value, not the support" {
+    // One diagnostic per line, and the actionable one wins: the user has to
+    // fix the colour before the support question is even interesting.
+    const parsed = config.parse("selection-foreground = not-a-color");
+    try std.testing.expectEqual(@as(usize, 1), parsed.diagnostic_count);
+    try std.testing.expectEqual(config.Diagnostic.Kind.bad_value, parsed.diagnosticSlice()[0].kind);
 }
 
 test "whitespace and blank lines are irrelevant" {
@@ -118,7 +148,9 @@ test "one bad line never costs the rest of the file" {
     // The broken ones kept their defaults rather than taking garbage.
     try std.testing.expectEqual(config.default_font_size, parsed.font_size);
     try std.testing.expectEqual(config.CursorStyle.block, parsed.cursor_style);
-    try std.testing.expectEqual(@as(usize, 4), parsed.diagnostic_count);
+    // Four broken lines, plus the `font-family` line which parses fine but
+    // cannot take effect in this build.
+    try std.testing.expectEqual(@as(usize, 5), parsed.diagnostic_count);
 
     const notes = parsed.diagnosticSlice();
     try std.testing.expectEqual(config.Diagnostic.Kind.bad_value, notes[0].kind);

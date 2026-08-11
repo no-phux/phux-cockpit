@@ -1130,10 +1130,23 @@ pub fn initialProductionModelWithIo(gpa: std.mem.Allocator, io: std.Io, session:
 }
 
 pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopologySnapshot) !Model {
+    return restoreModelWithScrollback(gpa, io, persisted, grid.Session.max_scrollback);
+}
+
+/// Restore with an explicit scrollback ceiling, so a restored window's panes
+/// honour `scrollback-limit` too. Every restored leaf gets a fresh session
+/// built HERE, which is why the limit has to arrive as a parameter rather than
+/// being set on the provider afterwards.
+pub fn restoreModelWithScrollback(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    persisted: PersistedTopologySnapshot,
+    max_scrollback_bytes: usize,
+) !Model {
     const snapshot = try topology.migrateTopologySnapshot(persisted);
     const provider = try gpa.create(LocalProvider);
     errdefer gpa.destroy(provider);
-    provider.* = .{ .gpa = gpa, .io = io };
+    provider.* = .{ .gpa = gpa, .io = io, .max_scrollback_bytes = max_scrollback_bytes };
 
     var model: Model = .{
         .provider = provider,
@@ -1162,7 +1175,7 @@ pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopo
             workspace.tabs[tab_index] = decodeTab(tab);
             for (tab.nodes) |node| {
                 if (node.kind != .leaf or !node.has_terminal) continue;
-                const session = try grid.Session.create(gpa, io, 80, 24);
+                const session = try grid.Session.createWithScrollback(gpa, io, 80, 24, provider.max_scrollback_bytes);
                 errdefer session.destroy();
                 var index: usize = 0;
                 while (index < max_terminals and provider.states[index] != .vacant) : (index += 1) {}

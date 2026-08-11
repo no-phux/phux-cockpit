@@ -155,7 +155,9 @@ both.
 The syntax is Ghostty's — one `key = value` per line, `#` starts a whole-line
 comment, and there are deliberately no trailing comments because `#` is also how
 every colour begins. An unknown key or a malformed value is a diagnostic, not a
-failure: one bad line costs that line, never the rest of the file.
+failure: one bad line costs that line, never the rest of the file. Every
+diagnostic is reported to the log at startup, so a setting that did not take
+effect says so instead of leaving you to wonder.
 
 ```
 font-size = 14
@@ -165,14 +167,20 @@ background = #090b0f
 foreground = #f4f7fb
 palette = 1 = #f38ba8
 scrollback-limit = 50000000
+shell = /opt/homebrew/bin/fish
 inherit-working-directory = true
 tab-placement = top
 ```
 
-`font-family` and `selection-foreground` are parsed but not yet applied: the SDK
-selects faces from a fixed registered set rather than by family name, and a
-terminal grid carries one selection colour rather than a foreground override.
-They are refused honestly rather than silently ignored.
+`shell` (or `command`) is a command LINE, not just a path, so `command = tmux
+attach` keeps its argument. It runs via the login shell with `exec`, so the
+program you name is the pty's own process. A value that is empty, over-long, or
+carries a NUL is refused and the built-in shell stands.
+
+`font-family` and `selection-foreground` are parsed but **cannot** be applied in
+this build: the SDK selects faces from a fixed registered set rather than by
+family name, and a terminal grid carries one selection colour rather than a
+foreground override. Setting either logs a line saying it did nothing.
 
 ## Install
 

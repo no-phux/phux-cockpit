@@ -104,7 +104,12 @@ fn eq(a: []const u8, b: []const u8) bool {
 /// A parse problem, kept rather than thrown. A single bad line must not cost
 /// someone every other setting in the file.
 pub const Diagnostic = struct {
-    pub const Kind = enum { unknown_key, bad_value, missing_separator, too_long };
+    /// `unsupported_key` is NOT `unknown_key`. The key is spelled correctly and
+    /// parses; this build simply cannot honour it, and says so rather than
+    /// letting someone believe a setting took effect. A knob that accepts a
+    /// value and does nothing is worse than one that is missing, because the
+    /// missing one sends you to the docs and the silent one sends you hunting.
+    pub const Kind = enum { unknown_key, bad_value, missing_separator, too_long, unsupported_key };
 
     line: u32 = 0,
     kind: Kind = .bad_value,
@@ -250,7 +255,17 @@ fn applyPair(config: *Config, line: u32, key: []const u8, value: []const u8) voi
     }
 
     if (eq(key, "font-family")) {
-        config.font_family.set(value) catch config.note(line, .too_long, value);
+        // Parsed and STORED, but it cannot take effect: the SDK selects faces
+        // from a fixed set registered at boot by FontId, and mono_font_family
+        // is a 4-value enum rather than a family name. There is no runtime
+        // load-family-by-name to call. Kept in the struct so the value is
+        // still readable (and so this becomes a one-line change the day the
+        // SDK grows the capability), but the user is told it did nothing.
+        config.font_family.set(value) catch {
+            config.note(line, .too_long, value);
+            return;
+        };
+        config.note(line, .unsupported_key, key);
         return;
     }
     if (eq(key, "font-size")) {
@@ -274,7 +289,18 @@ fn applyPair(config: *Config, line: u32, key: []const u8, value: []const u8) voi
     if (eq(key, "foreground")) return setColor(config, line, &config.foreground, value);
     if (eq(key, "cursor-color")) return setColor(config, line, &config.cursor_color, value);
     if (eq(key, "selection-background")) return setColor(config, line, &config.selection_background, value);
-    if (eq(key, "selection-foreground")) return setColor(config, line, &config.selection_foreground, value);
+    if (eq(key, "selection-foreground")) {
+        // Parsed, but inert: canvas.TerminalGrid carries ONE selection_color
+        // and the painter draws a WASH over the cell rather than overriding
+        // the glyph's foreground. Honouring this needs an SDK field.
+        //
+        // Only ONE diagnostic per line: a malformed colour is a bad_value and
+        // that is the more actionable of the two, so the unsupported note is
+        // added only when the value itself was fine.
+        setColor(config, line, &config.selection_foreground, value);
+        if (config.selection_foreground != null) config.note(line, .unsupported_key, key);
+        return;
+    }
 
     if (eq(key, "cursor-style")) {
         config.cursor_style = CursorStyle.parse(value) orelse {
