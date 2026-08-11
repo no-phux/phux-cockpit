@@ -151,6 +151,23 @@ pub const Phase = enum {
     failed,
 };
 
+/// Whether scrollback search matches case-sensitively. ONE rule for every
+/// provider, stated once, because cmd+F is one chord and a chord that matches
+/// differently depending on which kind of terminal happens to be focused is
+/// the sort of inconsistency nobody notices until it wastes their time.
+///
+/// False because the local side cannot currently be anything else: the pinned
+/// `vt.search` matches case-insensitively with no option to change it (see
+/// `sliding_window.zig`, whose matcher is ASCII case-insensitive throughout).
+/// The remote phux side CAN do either, so it is the one that has to be told,
+/// and it reads this rather than taking a caller's bool.
+///
+/// A case TOGGLE is a legitimate future feature. It cannot be built by letting
+/// the two sides diverge here; it needs case sensitivity in the engine first,
+/// at which point this becomes a default rather than a constant. See
+/// phux-cockpit-kxw.
+pub const search_case_sensitive: bool = false;
+
 pub const PixelSize = struct {
     width: u16,
     height: u16,
