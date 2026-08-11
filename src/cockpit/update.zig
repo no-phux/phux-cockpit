@@ -1011,10 +1011,34 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
 /// that flushes the workspace layout still runs.
 fn retireEmptyWindow(model: *Model, fx: *Fx, window_index: usize) void {
     if (window_index == 0) {
-        // The MAIN window has one more state than the others: its web surface
-        // is a real place to be, so an emptied main window that is not the
-        // last window stands there instead of closing.
-        model.primary.web_selected = true;
+        // An emptied MAIN window closes, exactly as a secondary would.
+        //
+        // macOS apps genuinely vary here and this used to stand on the web
+        // surface instead. Closing is the majority behaviour and the one that
+        // keeps a single rule for every window: the thing you emptied is the
+        // thing that goes away. Standing meant cmd+W on the last tab of the
+        // main window left a window on screen showing something the user never
+        // asked for, while the identical gesture in any other window closed it.
+        //
+        // Only when other windows remain. When this is the last window the
+        // tail below owns the outcome, which is to close it AND quit - the
+        // rule that was already correct and is deliberately untouched.
+        var others: usize = 0;
+        for (model.secondary) |slot| {
+            if (slot != null) others += 1;
+        }
+        if (others > 0) {
+            // `model.closeWindow` is what moves input off a window that just
+            // went away (`firstOpenWindow`); doing this by hand would leave
+            // `active_window` naming a closed window. The scene's window is
+            // not declarative like a secondary's, so it also needs the effect.
+            model.closeWindow(window_index);
+            fx.closeWindow(scene.main_window_label);
+        } else {
+            // LAST window: the tail below closes it and quits. Left exactly as
+            // it was — the web surface is the state the app is torn down from.
+            model.primary.web_selected = true;
+        }
     } else {
         // A secondary window is retired DECLARATIVELY: `view.windows` stops
         // naming it and the runtime reconciles it closed. Sending
@@ -1033,8 +1057,13 @@ fn retireEmptyWindow(model: *Model, fx: *Fx, window_index: usize) void {
     if (secondaries > 0) return;
     if (model.primary_open and model.primary.tab_count > 0) return;
 
-    model.primary_open = false;
-    fx.closeWindow(scene.main_window_label);
+    // Guarded because an emptied main window now closes itself above. Closing
+    // it a second time here would be two closes against one label, the second
+    // against a window that is already gone.
+    if (model.primary_open) {
+        model.primary_open = false;
+        fx.closeWindow(scene.main_window_label);
+    }
     fx.quitApp();
 }
 

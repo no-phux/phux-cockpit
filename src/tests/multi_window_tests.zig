@@ -153,13 +153,16 @@ test "the app quits only when the LAST window's last tab closes" {
     app.update(&state.model, .new_window, &state.effects);
 
     // Empty the MAIN window first, while the second window is still open. It
-    // stands on its web surface; the app keeps running.
+    // CLOSES, exactly as a secondary would; the app keeps running.
     app.update(&state.model, .{ .focus_window = 0 }, &state.effects);
     app.update(&state.model, .close_terminal, &state.effects);
     try testing.expectEqual(@as(u32, 0), state.effects.window_action_state.quit_count);
     try testing.expectEqual(@as(usize, 0), state.model.primary.tab_count);
-    try testing.expect(state.model.primary.web_selected);
+    try testing.expect(!state.model.primary_open);
     try testing.expect(state.model.wsAt(1) != null);
+    // Input landed on the window that is still there rather than on the one
+    // that just went away.
+    try testing.expectEqual(@as(usize, 1), state.model.active_window);
 
     // Now the second window's last tab: nothing is left, so this is the quit.
     app.update(&state.model, .{ .focus_window = 1 }, &state.effects);
