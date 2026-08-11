@@ -43,6 +43,14 @@ pub const Msg = union(enum) {
         window: u8 = 0,
         window_id: native_sdk.platform.WindowId = 1,
     },
+    /// One slice of incremental scrollback search, driven by the frame pump.
+    ///
+    /// Scrollback search cannot run on a background thread — `vt.search.Thread`
+    /// is `void` in a library-artifact libghostty-vt — so walking a deep
+    /// history on every keystroke stuttered the dispatch thread. The engine
+    /// makes bounded progress per slice instead, and this is the tick that
+    /// asks for the next one.
+    search_tick,
     clipboard: native_sdk.EffectClipboardResult,
     paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,

@@ -431,6 +431,61 @@ test "cmd+F opens the field and nothing typed into it reaches the pty" {
     try testing.expectEqual(@as(u64, 0), pane.outbound_dropped);
 }
 
+test "a deep scrollback search is incremental, not one long stall" {
+    const session = try makeSession(80, 24);
+    defer session.destroy();
+
+    // Deep enough that walking it whole on a keystroke is the stall this
+    // exists to remove.
+    var line: [48]u8 = undefined;
+    for (0..4000) |index| {
+        session.feed(std.fmt.bufPrint(&line, "row {d} NEEDLE here\r\n", .{index}) catch unreachable);
+    }
+
+    session.searchOpen();
+    try testing.expect(session.searchInput("NEEDLE"));
+
+    // The keystroke did BOUNDED work: the search is still owed slices rather
+    // than having walked 4000 rows inline.
+    try testing.expect(session.searchPending());
+    const after_keystroke = session.searchMatchCount();
+
+    // ...and it already found the matches on the ACTIVE screen, so what the
+    // user is looking at is highlighted on the frame they typed into.
+    try testing.expect(after_keystroke > 0);
+
+    // Pump it the way the frame pump does, until it is done.
+    // Pump the way the frame pump does, but a slice at a time so the streaming
+    // is observable: a full `search_frame_slice_steps` budget finishes a
+    // history this size in one call, which is the point of that number.
+    var slices: usize = 0;
+    while (session.searchPump(2)) : (slices += 1) {
+        if (slices > 10_000) return error.TestSearchNeverCompleted;
+    }
+    try testing.expect(!session.searchPending());
+
+    // It genuinely took several slices, and the completed search found more
+    // than the keystroke did — the streaming actually streamed.
+    try testing.expect(slices > 1);
+    try testing.expect(session.searchMatchCount() > after_keystroke);
+    try testing.expectEqual(@as(usize, 4000), session.searchMatchCount());
+}
+
+test "a search that completes inside one slice owes the pump nothing" {
+    const session = try makeSession(80, 24);
+    defer session.destroy();
+    session.feed("alpha NEEDLE one\r\nbeta NEEDLE two\r\n");
+
+    session.searchOpen();
+    try testing.expect(session.searchInput("NEEDLE"));
+
+    // Two matches on a nearly empty screen: finished inline, so the frame pump
+    // is never woken for it at all.
+    try testing.expect(!session.searchPending());
+    try testing.expectEqual(@as(usize, 2), session.searchMatchCount());
+    try testing.expect(!session.searchPump(64));
+}
+
 test "cmd+V pastes into the needle instead of the shell" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });

@@ -1251,6 +1251,15 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
     // A pane whose metrics the painter has not written yet: propose nothing
     // this frame rather than sizing against metrics that do not exist.
     if (proposals.incomplete) return if (pending) .flush_outbound else null;
+    // Incremental scrollback search, one bounded slice per frame. It sits
+    // BELOW resize convergence — a pane at the wrong grid is a visible defect
+    // and a still-streaming match count is not — and above the surface
+    // bookkeeping only because the `.search_tick` arm drains outbound itself,
+    // so it cannot starve a pane's pending writes the way a bare return would.
+    for (0..max_terminals) |index| {
+        if (model.provider.states[index] != .active) continue;
+        if (model.provider.slotConst(index).session.searchPending()) return .search_tick;
+    }
     if (ws.surface_size.width != frame.size.width or ws.surface_size.height != frame.size.height or
         ws.surface_scale_factor != frame_scale or ws.window_id != frame.window_id)
     {

@@ -4,6 +4,7 @@ const vt = @import("ghostty-vt");
 const provider_contract = @import("provider_contract");
 const support = @import("phux_support.zig");
 const local = @import("../providers/local/provider.zig");
+const grid = @import("../terminal/grid.zig");
 const topology = @import("topology.zig");
 const layout = @import("layout.zig");
 const model_module = @import("model.zig");
@@ -471,6 +472,20 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             workspace.surface_size = surface.size;
             workspace.window_id = surface.window_id;
             if (validScale(surface.scale_factor)) workspace.surface_scale_factor = surface.scale_factor;
+        },
+        .search_tick => {
+            // Every pane with an open search, not just the focused one: a
+            // background tab's search is still owed its results.
+            for (0..model_module.max_terminals) |index| {
+                if (model.provider.states[index] != .active) continue;
+                const pane = model.provider.slot(index);
+                _ = pane.session.searchPump(grid.Session.search_frame_slice_steps);
+            }
+            // Outbound is drained here for the same reason the viewport arm
+            // drains it: this message can be the only one the pump returns for
+            // many consecutive frames, and a search must not starve a pane's
+            // pending writes.
+            drainEveryPane(model, fx);
         },
         .flush_outbound => drainEveryPane(model, fx),
         .selection_autoscroll => handleSelectionAutoscroll(model, fx),
