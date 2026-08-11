@@ -208,7 +208,8 @@ attribute and reports that fact in its caveat.
 | `cmd+[` / `cmd+]` | Focus previous or next pane |
 | `cmd+option+arrows` | Move keyboard focus to the pane in that direction |
 | `cmd+=` / `cmd+-` / `cmd+0` | Increase, decrease, or reset the terminal font size |
-| `cmd+A` | Select the visible screen |
+| `cmd+A` | Select the whole scrollback |
+| `cmd+click` | Open the URL under the pointer |
 | `cmd+K` | Clear the screen and scrollback |
 | `cmd+shift+P` | Go to terminal — the summoned switcher (type to filter, arrows or `ctrl+N`/`ctrl+P` to move, `enter` to go, `esc` to dismiss) |
 | `cmd+shift+B` | Show the Web surface |
@@ -232,7 +233,12 @@ autoscrolls through history. Right-click or control-click opens native Copy and
 Paste actions while Cockpit owns pointer selection or the process has ended.
 While a live TUI enables mouse reporting, it exclusively owns secondary click,
 so the native menu is intentionally unavailable; Shift-drag selection remains
-copyable with `cmd+C`. A copied range remains highlighted until typing or
+copyable with `cmd+C`. `cmd+click` opens a URL under the pointer, and works
+even while a TUI owns mouse reporting — a program that prints links should not
+have to give up mouse input for them to be clickable. It is deliberately a
+heuristic that fails toward "not a link": only `http`, `https` and `mailto` are
+recognised, so a printed `file:` or `javascript:` path is never something the
+OS can be asked to open. A `cmd+click` on ordinary text is an ordinary click. A copied range remains highlighted until typing or
 another selection clears it. Terminal tab reorder remains available through the
 menu command and keyboard shortcut; direct tab dragging is not claimed.
 

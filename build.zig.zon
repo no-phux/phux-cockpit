@@ -93,9 +93,17 @@
         //   is why the search field's magnifier and caret painted nothing
         //   until it was removed from both; `decorative` paints and hides from
         //   accessibility instead.
+        // - `fx.openUrl(url)` opens a URL in the user's default handler from
+        //   `update`. The platform seam already reached NSWorkspace; nothing
+        //   app-facing was wired to it, so the only callers were the webview
+        //   bridge and a runtime path gated on webview link policy. Validated
+        //   against a scheme ALLOWLIST (http, https, mailto) with control
+        //   bytes and whitespace refused whole rather than trimmed — this is
+        //   the second of two gates in front of terminal output, the first
+        //   being Cockpit's own URL detection.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/cb8f995fb0d949a38567896d8f3391a3eb5bf846.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQmmD6AFe3XmANeS7Vd4yetIaGo2svnuUBQSf-g2Q",
+            .url = "https://github.com/phall1/native/archive/f3678832fd282b81241993d0c08105cd5170f39f.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQpCr6AGpDr8RRY-bB4u65npkRIa8DmUIeVk_fC-H",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

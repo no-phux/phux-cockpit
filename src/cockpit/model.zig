@@ -8,6 +8,7 @@ const topology = @import("topology.zig");
 const layout = @import("layout.zig");
 const config_module = @import("../config/config.zig");
 const session_state = @import("session_state.zig");
+const url_module = @import("../terminal/url.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -476,6 +477,14 @@ pub const Model = struct {
     /// needle paste is legitimate against a pane that no longer accepts input,
     /// because searching a dead session's scrollback is ordinary work.
     paste_target: PasteTarget = .terminal,
+    /// The last URL handed to the OS to open, and how many have been handed
+    /// over. Kept on the model rather than being fire-and-forget so the
+    /// gesture is observable — a click that opens the WRONG link, or opens one
+    /// when it should not have, is the failure mode worth being able to assert
+    /// on, and an effect alone leaves nothing to assert against.
+    opened_url_buf: [url_module.max_url_bytes]u8 = undefined,
+    opened_url_len: usize = 0,
+    opened_url_count: u32 = 0,
     /// Where the layout snapshot goes and what is owed to it. Disabled by
     /// default so every test and every fixture stays free of disk traffic
     /// until a composition root hands it a real path.
@@ -488,6 +497,21 @@ pub const Model = struct {
     /// Window 0 is the fallback for an `active_window` whose slot has since
     /// closed: a message that arrives one dispatch after its window went away
     /// must land somewhere real rather than reach through a null.
+    /// The last URL handed to the OS, or empty when none has been.
+    pub fn openedUrl(model: *const Model) []const u8 {
+        return model.opened_url_buf[0..model.opened_url_len];
+    }
+
+    /// Record a URL as handed over. False when it does not fit, in which case
+    /// nothing is recorded and nothing should be opened either.
+    pub fn recordOpenedUrl(model: *Model, value: []const u8) bool {
+        if (value.len == 0 or value.len > model.opened_url_buf.len) return false;
+        @memcpy(model.opened_url_buf[0..value.len], value);
+        model.opened_url_len = value.len;
+        model.opened_url_count += 1;
+        return true;
+    }
+
     pub fn ws(model: *Model) *Workspace {
         return model.wsAt(model.active_window) orelse &model.primary;
     }

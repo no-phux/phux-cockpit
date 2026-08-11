@@ -235,8 +235,28 @@ pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent
                 if (model.selectedTree()) |current| _ = current.focusTerminal(pane.id);
             }
 
-            const slot = freePointerCaptureIndex(model) orelse return;
             const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
+            // Cmd+click opens a link, the chord Ghostty uses and the one that
+            // cannot be confused with a selection drag.
+            //
+            // It sits ABOVE both the selection and the mouse-report arms on
+            // purpose: a TUI that has asked for mouse reporting still prints
+            // URLs, and a chord that works in one pane and silently does
+            // nothing in the next is worse than not having it. It consumes the
+            // press entirely — no capture is taken, so there is no drag to
+            // leave dangling and no selection to half-start.
+            //
+            // Only when a URL is actually under the pointer; a cmd+click on
+            // ordinary text falls through to the normal gesture rather than
+            // being swallowed.
+            if (event.button == 0 and event.modifiers.super and !event.modifiers.shift) {
+                if (pane.session.urlAtPoint(local.x, local.y)) |link| {
+                    if (model.recordOpenedUrl(link)) fx.openUrl(model.openedUrl());
+                    return;
+                }
+            }
+
+            const slot = freePointerCaptureIndex(model) orelse return;
             // An ended child cannot own pointer input. Its last mode flags may
             // still say mouse reporting, but the static viewport must revert to
             // ordinary terminal selection without requiring Shift.
