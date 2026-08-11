@@ -435,24 +435,36 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 workspace.window_id = size.window_id;
                 if (validScale(size.scale_factor)) workspace.surface_scale_factor = size.scale_factor;
             }
-            if (model.provider.terminal(size.terminal_ref)) |pane| {
-                // Commit the new size only once the emulator actually took
-                // it: on an allocation failure the model keeps its old
-                // dimensions and the frame pump retries next frame, so the
-                // emulator and the pty never disagree about the grid.
-                if (!pane.session.resize(size.cols, size.rows)) return;
-                pane.cols = size.cols;
-                pane.rows = size.rows;
-                pane.session.refreshScreenText();
-                fx.ptyResize(pane.pty_key, size.cols, size.rows);
-                drainEveryPane(model, fx);
-                return;
+            // Converge EVERY pane of this window, not just the one the frame
+            // pump named.
+            //
+            // `onFrame` returns at most one Msg and stops at the first pane
+            // whose grid is wrong, so with N panes convergence used to take N
+            // frames. During a live window drag the size moves every frame, so
+            // only one pane ever tracked the window and the other N-1 rendered
+            // at a stale grid for the whole gesture.
+            //
+            // The fix deliberately does NOT batch the panes into the Msg. Msg
+            // is passed BY VALUE through every dispatch and is already 320
+            // bytes; a 16-entry array of (ref, cols, rows) triples would have
+            // roughly doubled that on every message in the app to save a few
+            // frames of latency, which is a plausible regression against the
+            // very latency this is meant to fix (see the size pin in
+            // app_contract_tests). The commit path re-derives instead, through
+            // the SAME `proposedViewportsIn` the frame pump used, and only
+            // when a resize is actually in flight rather than every frame.
+            // The Msg stays AUTHORITATIVE for the terminal it names: it says
+            // what that pane's grid is, and re-deriving over the top would
+            // make its own cols/rows meaningless. The convergence below is
+            // purely additive — it only touches panes the Msg did not name.
+            commitPaneViewport(model, fx, size.terminal_ref, size.cols, size.rows);
+            const workspace = model.wsAt(size.window) orelse &model.primary;
+            const proposals = projection.proposedViewportsIn(model, workspace, size.size);
+            for (proposals.slice()) |proposal| {
+                if (proposal.terminal.eql(size.terminal_ref)) continue;
+                commitPaneViewport(model, fx, proposal.terminal, proposal.cols, proposal.rows);
             }
-            const remote = model.phux() orelse return;
-            remote.viewportResize(size.terminal_ref, .{
-                .cols = size.cols,
-                .rows = size.rows,
-            }) catch {};
+            drainEveryPane(model, fx);
         },
         .surface_resized => |surface| {
             const workspace = model.wsAt(surface.window) orelse return;
@@ -1149,6 +1161,31 @@ fn copySelection(model: *Model, fx: *Fx, terminal_ref: TerminalRef) void {
     // Keep the range highlighted after submission and completion. A failed
     // write remains retryable; a successful copy follows native terminal
     // convention until typing, a new selection, or restart clears it.
+}
+
+/// Commit one pane's grid, local or remote.
+///
+/// A local commit lands only once the EMULATOR actually took the resize: on an
+/// allocation failure the model keeps its old dimensions and the frame pump
+/// retries next frame, so the emulator and the pty never disagree about the
+/// grid. A commit that changes nothing does no work, which is what makes it
+/// safe to call for every pane on every resize dispatch.
+fn commitPaneViewport(model: *Model, fx: *Fx, terminal_ref: TerminalRef, cols: u16, rows: u16) void {
+    if (model.provider.terminal(terminal_ref)) |pane| {
+        if (pane.cols == cols and pane.rows == rows) return;
+        if (!pane.session.resize(cols, rows)) return;
+        pane.cols = cols;
+        pane.rows = rows;
+        pane.session.refreshScreenText();
+        fx.ptyResize(pane.pty_key, cols, rows);
+        return;
+    }
+    const remote = model.phux() orelse return;
+    const viewport: Viewport = .{ .cols = cols, .rows = rows };
+    if (remote.lastViewport(terminal_ref)) |last| {
+        if (last.eql(viewport)) return;
+    }
+    remote.viewportResize(terminal_ref, viewport) catch {};
 }
 
 /// One read in flight: the fixed paste key remains occupied until its result

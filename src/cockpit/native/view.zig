@@ -1225,65 +1225,32 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
         if (pane.outbound_len > 0 or pane.session.response_len > 0) pending = true;
     }
 
-    // The SAME resolve the painter and the widget tree use.
-    var panes: [layout.max_panes]layout.Pane = undefined;
-    const count = projection.resolvePanesIn(model, ws, frame.size, &panes);
-    // Cell metrics for a LOCAL pane come from `session.cell_*`, which the
-    // painter wrote from the live terminal tokens. Deriving them here instead
-    // would be wrong, not merely redundant: only the painter's tokens carry
-    // the runtime's text-measure provider, so a token derivation here falls
-    // back to the `label_size * 0.6` estimate and proposes a different column
-    // count than the one being painted. The cost is that a font-size change
-    // reflows on the frame AFTER the first repaint at the new size, which is
-    // one timer tick.
-    const metrics = canvas.terminalCellMetrics(terminalTokens(model));
-    for (panes[0..count]) |pane| {
-        const inner = pane.rect;
-        if (inner.width <= 0 or inner.height <= 0) continue;
-        if (model.provider.terminalConst(pane.terminal)) |terminal| {
-            const session = terminal.session;
-            if (session.cell_width <= 0 or session.cell_height <= 0) return if (pending) .flush_outbound else null;
-            const proposed = grid.Session.clampGrid(
-                @intFromFloat(@max(2, inner.width / session.cell_width)),
-                @intFromFloat(@max(2, inner.height / session.cell_height)),
-            );
-            if (proposed.x != terminal.cols or proposed.y != terminal.rows) {
-                return .{
-                    .viewport = .{
-                        .terminal_ref = pane.terminal,
-                        .cols = proposed.x,
-                        .rows = proposed.y,
-                        .size = frame.size,
-                        // Carry the real scale: the `.viewport` arm commits
-                        // whatever arrives, and the field's `= 1` default
-                        // would silently reset a Retina surface to 1x.
-                        .scale_factor = frame_scale,
-                        .window = window,
-                        .window_id = frame.window_id,
-                    },
-                };
-            }
-            continue;
-        }
-        const remote = model.phuxConst() orelse continue;
-        if (remote.presentation(pane.terminal) == null) continue;
-        const proposed = grid.Session.clampGrid(
-            @intFromFloat(@max(2, inner.width / metrics.width)),
-            @intFromFloat(@max(2, inner.height / metrics.height)),
-        );
-        const viewport: Viewport = .{ .cols = proposed.x, .rows = proposed.y };
-        if (remote.lastViewport(pane.terminal) == null or !remote.lastViewport(pane.terminal).?.eql(viewport)) {
-            return .{ .viewport = .{
-                .terminal_ref = pane.terminal,
-                .cols = proposed.x,
-                .rows = proposed.y,
+    // The SAME resolve the painter and the widget tree use, through the same
+    // derivation the COMMIT path uses — see `projection.proposedViewportsIn`.
+    // The cost of deriving metrics from the painter's tokens is that a
+    // font-size change reflows on the frame AFTER the first repaint at the new
+    // size, which is one timer tick.
+    const proposals = projection.proposedViewportsIn(model, ws, frame.size);
+    for (proposals.slice()) |proposal| {
+        if (!projection.viewportDiffers(model, proposal)) continue;
+        return .{
+            .viewport = .{
+                .terminal_ref = proposal.terminal,
+                .cols = proposal.cols,
+                .rows = proposal.rows,
                 .size = frame.size,
+                // Carry the real scale: the `.viewport` arm commits whatever
+                // arrives, and the field's `= 1` default would silently reset
+                // a Retina surface to 1x.
                 .scale_factor = frame_scale,
                 .window = window,
                 .window_id = frame.window_id,
-            } };
-        }
+            },
+        };
     }
+    // A pane whose metrics the painter has not written yet: propose nothing
+    // this frame rather than sizing against metrics that do not exist.
+    if (proposals.incomplete) return if (pending) .flush_outbound else null;
     if (ws.surface_size.width != frame.size.width or ws.surface_size.height != frame.size.height or
         ws.surface_scale_factor != frame_scale or ws.window_id != frame.window_id)
     {

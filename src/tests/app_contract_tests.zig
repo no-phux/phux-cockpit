@@ -25,6 +25,26 @@ test "Phux Cockpit identity and macOS pane commands are exact" {
     try testing.expectEqualSlices([]const u8, &.{ "/bin/zsh", "-l", "-c", "cd \"$HOME\" && exec /bin/zsh -i" }, app.paneArgv(1));
 }
 
+test "MEASURED: the Msg union stays small enough to pass by value" {
+    // Every Msg is passed BY VALUE through every dispatch, so the union's size
+    // is a per-message cost paid on the hot path — including by the frame pump
+    // that runs on each window every frame.
+    //
+    // This is pinned because the obvious fix for the one-pane-per-frame resize
+    // convergence is to carry a batch of (ref, cols, rows) triples in the
+    // viewport arm, and a naive 16-entry array of full triples would have
+    // inflated this by ~320 bytes to buy back a few frames of latency — a
+    // plausible regression against the very latency it was meant to fix.
+    //
+    // If this number moves, that is not automatically wrong; it means measure
+    // again and say why in the commit.
+    // 320 bytes, measured before and after the batched-resize work — which is
+    // the point: the convergence fix cost the union nothing, because the batch
+    // lives in the commit path rather than in the message.
+    std.debug.print("\nMEASURED Msg: size={d} align={d}\n", .{ @sizeOf(app.Msg), @alignOf(app.Msg) });
+    try testing.expectEqual(@as(usize, 320), @sizeOf(app.Msg));
+}
+
 test "Phux Cockpit owns its dark graphite and lime visual register" {
     const session = try createSession(80, 24);
     var model = app.initialModel(session);
