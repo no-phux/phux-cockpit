@@ -526,6 +526,14 @@ pub const Model = struct {
     /// re-read on every launch, so "I already saw this" is only true until the
     /// user edits the file, and the state file cannot know that.
     config_notice_dismissed: bool = false,
+    /// A cmd+T or a split was refused because every live shell the effects
+    /// layer can back is already running (see `local.max_live_shells`).
+    ///
+    /// Same latch, same reason, and one worse failure to avoid: before this
+    /// existed the chord did not do nothing, it opened a tab whose pane stayed
+    /// permanently blank because its spawn had been rejected. Cleared by the
+    /// next successful terminal, and by anything that frees a shell.
+    terminal_limit_refused: bool = false,
     tab_placement: TabPlacement = .top,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
@@ -1348,6 +1356,18 @@ pub fn restoreModelWithScrollback(
             workspace.tabs[tab_index] = decodeTab(tab);
             for (tab.nodes) |node| {
                 if (node.kind != .leaf or !node.has_terminal) continue;
+                // The SHELL ceiling applies to a restored layout exactly as it
+                // applies to cmd+T (see `local.max_live_shells`): `initFx`
+                // spawns every pane this loop mints, so a snapshot with more
+                // leaves than the effects layer has ptys would reopen with the
+                // surplus panes permanently blank — which is the bug the
+                // ceiling exists to stop, arriving at launch instead of at a
+                // chord. Refusing the whole restore is deliberate: the caller
+                // (`main.restoreWorkspace`) already falls back to a fresh
+                // single-terminal workspace, and only SHAPE is persisted, so
+                // an over-capacity snapshot written by an older build costs a
+                // layout once rather than dead panes every launch.
+                if (provider.liveShellCount() >= local.max_live_shells) return error.TerminalCapacityReached;
                 const session = try grid.Session.createWithScrollback(gpa, io, 80, 24, provider.max_scrollback_bytes);
                 errdefer session.destroy();
                 var index: usize = 0;

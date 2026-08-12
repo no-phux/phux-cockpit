@@ -327,6 +327,10 @@ pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     // this app has: a cmd+N at the window ceiling reveals it rather than
     // doing nothing at all.
     if (model.window_limit_refused) return true;
+    // Same rule for the shell ceiling, and it matters more at ONE tab: that is
+    // exactly the state a refused cmd+D leaves behind, and with the band
+    // hidden the chord would look unbound rather than refused.
+    if (model.terminal_limit_refused) return true;
     if (workspaceTerminalRef(model, workspace) == null) return true;
     for (0..workspace.tab_count) |index| {
         const current = workspace.treeConst(index) orelse continue;

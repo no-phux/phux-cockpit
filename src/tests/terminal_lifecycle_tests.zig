@@ -311,3 +311,82 @@ test "terminal exit and selection mode are actionable in native chrome" {
         try testing.expect(!std.mem.eql(u8, layout.widget.text, "Arrows move | Shift extends | Enter copies | Esc cancels"));
     }
 }
+
+// ------------------------------------------------------- the shell ceiling
+
+// phux-cockpit-pg1: "Pane renders empty".
+//
+// The fifth cmd+T used to open a tab whose grid stayed blank forever. The
+// effects layer keeps ONE fixed pty table for the whole process
+// (`native_sdk.max_effect_ptys`), so its `ptySpawn` answered `.rejected` and
+// that pane never received a byte — while the tab strip, the pane rect and
+// the accessibility tree all reported an ordinary terminal, and
+// `dispatch_errors` stayed 0 because a refused spawn is a normal exit event
+// rather than an error. Reproduced against the shipped bundle on 2026-08-12:
+// four cmd+T from a fresh workspace leave Terminal 5 at SPAWN REJECTED,
+// filling the content area with no `text=` attribute at all.
+//
+// The invariant pinned here is NOT the number four. It is that cockpit never
+// mints a pane it cannot back with a shell; both bounds are read from the
+// SDK, so a pin that grows the pty table grows this test with it.
+test "cmd+T refuses at the shell ceiling instead of opening a pane no shell can back" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try support.startCockpit(harness);
+    defer support.stopCockpit(state);
+    const app_iface = state.app();
+
+    // One terminal arrives with the workspace, so this asks for the rest of
+    // the table and then two more than it can hold.
+    try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
+    for (0..native_sdk.max_effect_ptys + 1) |_| app.update(&state.model, .new_terminal, &state.effects);
+
+    // The registry holds exactly the terminals that got a pty. Before the fix
+    // it held every chord that was pressed, two of them backed by nothing.
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.effects.pendingPtyCount());
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.liveShellCount());
+
+    // Drain what the effects layer staged: this is where the refused spawns
+    // deliver their `.rejected` exits and strand the dead panes.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    for (support.activeSlots(&state.model)) |pane| {
+        try testing.expect(pane.phase != .failed);
+        try testing.expect(pane.exit_reason != .rejected);
+    }
+
+    // Refused, and VISIBLY: the latch is what `view.terminalLimitNotice` reads,
+    // and the band reveals itself to carry it. Asserted on the model rather
+    // than on the rendered tree because `app.update` is called directly here,
+    // which never tells the runtime the model is dirty — the same reason the
+    // window-limit test next door checks its latch and not its badge.
+    try testing.expect(state.model.terminal_limit_refused);
+    try testing.expect(app.chromeRevealed(&state.model));
+
+    // Closing a terminal gives the slot back, so the refusal stops being true.
+    app.update(&state.model, .close_terminal, &state.effects);
+    try testing.expect(!state.model.terminal_limit_refused);
+}
+
+// The same ceiling reached through cmd+D, which has further to fall: a split
+// divides the focused pane's rect FIRST, so a rejected spawn used to hand
+// half of a working terminal's screen area to a grid that never painted
+// anything at all.
+test "cmd+D refuses at the shell ceiling instead of dividing a pane for a shell that cannot start" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try support.startCockpit(harness);
+    defer support.stopCockpit(state);
+
+    for (0..native_sdk.max_effect_ptys - 1) |_| app.update(&state.model, .split_right, &state.effects);
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
+    try testing.expect(!state.model.terminal_limit_refused);
+
+    var refs: [app.max_panes_per_tab]app.TerminalRef = undefined;
+    const before = state.model.selectedTree().?.terminals(&refs);
+    app.update(&state.model, .split_right, &state.effects);
+    // The tree is untouched: no new leaf, and the sibling keeps its whole rect.
+    try testing.expectEqual(before, state.model.selectedTree().?.terminals(&refs));
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
+    try testing.expect(state.model.terminal_limit_refused);
+}

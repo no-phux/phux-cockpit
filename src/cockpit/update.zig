@@ -692,13 +692,18 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // tab slots and registry slots.
             if (model.ws().tab_count >= max_tabs) return;
             const origin = model.selectedTerminalRef();
-            const pane = model.provider.createTerminal() catch return;
+            const pane = model.provider.createTerminal() catch {
+                // Refused, visibly. See `view.terminalLimitNotice`.
+                model.terminal_limit_refused = true;
+                return;
+            };
             adoptWorkingDirectory(model, origin, pane);
             if (!model.admitTab(pane.id)) {
                 _ = model.provider.destroyTerminal(pane.id);
                 return;
             }
             _ = model.selectTerminal(pane.id);
+            model.terminal_limit_refused = false;
             endHiddenCaptures(model, fx);
             spawnConfiguredPane(model, pane, fx);
         },
@@ -723,8 +728,11 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             const previous = model.active_window;
             model.active_window = index;
             const pane = model.provider.createTerminal() catch {
-                // No registry slot left: the window would open empty and
-                // immediately close itself, so it never opens at all.
+                // No shell to put in it: the window would open empty and
+                // immediately close itself, so it never opens at all. The
+                // notice names the reason that actually stopped it — the
+                // shell ceiling, not the window one.
+                model.terminal_limit_refused = true;
                 model.closeWindow(index);
                 model.active_window = previous;
                 return;
@@ -982,7 +990,12 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
     const target = current.focus;
     if (target == layout.none or current.node(target).kind != .leaf) return;
     const origin = current.focusedTerminal();
-    const pane = model.provider.createTerminal() catch return;
+    const pane = model.provider.createTerminal() catch {
+        // Refused, visibly — cmd+D at the shell ceiling used to divide the
+        // rect and put a permanently blank pane in the new half.
+        model.terminal_limit_refused = true;
+        return;
+    };
     adoptWorkingDirectory(model, origin, pane);
     _ = current.split(target, orientation, pane.id) catch {
         // The tree refused (at its pane ceiling): the terminal minted for it
@@ -990,6 +1003,7 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
         _ = model.provider.destroyTerminal(pane.id);
         return;
     };
+    model.terminal_limit_refused = false;
     endHiddenCaptures(model, fx);
     spawnConfiguredPane(model, pane, fx);
 }
@@ -1098,6 +1112,11 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
 
     if (current.isEmpty()) workspace.dropTab(tab_index);
     endHiddenCaptures(model, fx);
+
+    // A pane closing gives a shell slot back, so whatever the last refused
+    // cmd+T was told is no longer true. Cleared unconditionally: closing a
+    // pane that never held a pty still cannot leave a stale notice up.
+    model.terminal_limit_refused = false;
 
     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
 }

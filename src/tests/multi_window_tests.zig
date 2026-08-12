@@ -202,28 +202,50 @@ test "an OS-initiated window close drains that window's shells and leaves the ot
     try testing.expectEqual(@as(u32, 0), state.effects.window_action_state.quit_count);
 }
 
-test "the sixth window is refused visibly, not silently" {
+// A cmd+N with no shell to put in the window is refused visibly, not silently.
+//
+// This test used to reach `max_windows` and assert the WINDOW ceiling. It
+// cannot any more, and the reason is worth stating rather than hiding: a window
+// needs at least one terminal to stay open (an emptied one retires itself), and
+// the effects layer backs only `native_sdk.max_effect_ptys` live shells for the
+// whole process. One shell arrives with the workspace, so the shell ceiling is
+// always reached BEFORE the window ceiling and `max_windows` is currently
+// unreachable underneath it. `window_limit_refused` and `windowLimitNotice`
+// stay in the code because they become reachable the moment the pty table grows
+// — see phux-cockpit-ipg.
+//
+// What is being pinned here is unchanged and is the point of both latches: the
+// refusal has to be READABLE. Before phux-cockpit-pg1 this chord did something
+// worse than nothing — it opened a window whose only pane was permanently
+// blank, because the spawn behind it had been rejected.
+test "a window with no shell to put in it is refused visibly, not silently" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
     defer stopCockpit(state);
 
-    for (0..app.max_secondary_windows) |_| app.update(&state.model, .new_window, &state.effects);
-    try testing.expectEqual(app.max_windows, state.model.openWindowCount());
+    while (state.model.provider.liveShellCount() < native_sdk.max_effect_ptys) {
+        app.update(&state.model, .new_window, &state.effects);
+    }
     try testing.expect(!state.model.window_limit_refused);
+    try testing.expect(!state.model.terminal_limit_refused);
+    const windows_before = state.model.openWindowCount();
+    const terminals_before = state.model.provider.activeCount();
+    // Precondition, not decoration: the loop must have stopped on the shell
+    // ceiling with window slots still free, or this proves nothing.
+    try testing.expect(windows_before < app.max_windows);
 
-    const before = state.model.provider.activeCount();
     app.update(&state.model, .new_window, &state.effects);
-    // No sixth window, no orphan terminal minted for it, and a latch the
-    // chrome shows so the chord is not indistinguishable from an unbound one.
-    try testing.expectEqual(app.max_windows, state.model.openWindowCount());
-    try testing.expectEqual(before, state.model.provider.activeCount());
-    try testing.expect(state.model.window_limit_refused);
+    // No extra window, no orphan terminal minted for it, and a latch the chrome
+    // shows so the chord is not indistinguishable from an unbound one.
+    try testing.expectEqual(windows_before, state.model.openWindowCount());
+    try testing.expectEqual(terminals_before, state.model.provider.activeCount());
+    try testing.expect(state.model.terminal_limit_refused);
     try testing.expect(app.chromeRevealed(&state.model));
 
-    // Closing a window frees a slot, so the refusal stops being true.
+    // Closing a window frees a shell, so the refusal stops being true.
     app.update(&state.model, .close_terminal, &state.effects);
-    try testing.expect(!state.model.window_limit_refused);
+    try testing.expect(!state.model.terminal_limit_refused);
 }
 
 // -------------------------------------------------------------- declaration

@@ -1157,6 +1157,25 @@ fn windowLimitNotice(ui: *TerminalUi) TerminalUi.Node {
     }, .{});
 }
 
+/// What a cmd+T or cmd+D at the SHELL ceiling says.
+///
+/// The window notice above exists because a chord that quietly does nothing
+/// reads as a chord that is not bound. This one exists because the failure it
+/// replaces was louder and worse: the chord USED to work, opening a tab or
+/// dividing a pane, and then left a grid that stayed blank forever because the
+/// effects layer had refused its spawn (phux-cockpit-pg1). A refusal you can
+/// read beats a tab that lies about being a terminal.
+fn terminalLimitNotice(ui: *TerminalUi) TerminalUi.Node {
+    return ui.el(.badge, .{
+        .variant = .destructive,
+        .text = ui.fmt("{d} SHELL LIMIT", .{local_terminal.max_live_shells}),
+        .semantics = .{ .label = ui.fmt(
+            "Shell limit reached: {d} running terminals is the maximum this app can spawn; close one to open another",
+            .{local_terminal.max_live_shells},
+        ) },
+    }, .{});
+}
+
 fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     return ui.panel(.{
         .width = webkit_parking_extent,
@@ -1211,6 +1230,8 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     const focused_ref = projection.workspaceTerminalRef(model, ws);
     const status = if (model.window_limit_refused)
         windowLimitNotice(ui)
+    else if (model.terminal_limit_refused)
+        terminalLimitNotice(ui)
     else if (focused_ref) |id| paneStatus(ui, model, id) else emptyStatusNode(ui);
 
     const revealed = projection.chromeRevealedIn(model, ws);
