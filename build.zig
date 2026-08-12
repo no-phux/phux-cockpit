@@ -269,12 +269,15 @@ fn addPhuxModules(
 /// order they are added. Reported verbatim in the test verdict, so the verdict
 /// cannot claim more coverage than this list delivers.
 ///
-/// extension.zig is compiled -- phux-provider-tests imports it -- but is not
-/// rooted, so its own tests do not run. See phux-cockpit-iwf: rooting it
-/// hangs forever in extension.writeExact, because the 1s deadline there is
-/// only evaluated between send() calls and macOS does not honour MSG_DONTWAIT
-/// on an AF_UNIX socketpair. Those tests had never run anywhere, including CI.
-const phux_test_module_names = "transport, host, provider, pointer";
+/// extension.zig is now rooted too. It was held out because rooting it hung the
+/// build indefinitely inside extension.writeExact: that function's 1s deadline
+/// is only evaluated between send() calls, and macOS ignores MSG_DONTWAIT on an
+/// AF_UNIX socket that is blocking at the descriptor level, so send() slept
+/// forever and the deadline was unreachable (phux-cockpit-iwf). writeExact now
+/// forces O_NONBLOCK for the duration of the write -- see the derivation in
+/// scripts/measure-send-blocking.c -- so the deadline is enforceable and these
+/// six tests, which had never executed anywhere including CI, run every build.
+const phux_test_module_names = "transport, host, provider, pointer, extension";
 
 /// Compile src/providers/phux/ and run its tests as part of `zig build test`,
 /// regardless of -Dphux-enabled.
@@ -326,13 +329,13 @@ fn addPhuxGraphTests(
     modules.pointer.linkFramework("AppKit", .{});
     modules.pointer.linkSystemLibrary("c", .{});
 
-    // Keep this in step with phux_test_module_names. extension.zig is absent on
-    // purpose and for a recorded reason; see that declaration.
+    // Keep this in step with phux_test_module_names.
     const rooted = [_]struct { name: []const u8, module: *std.Build.Module }{
         .{ .name = "phux-transport-tests", .module = modules.transport },
         .{ .name = "phux-host-tests", .module = modules.host },
         .{ .name = "phux-provider-tests", .module = modules.provider },
         .{ .name = "phux-pointer-tests", .module = modules.pointer },
+        .{ .name = "phux-extension-tests", .module = modules.extension },
     };
     for (rooted) |entry| {
         const tests = b.addTest(.{ .name = entry.name, .root_module = entry.module });

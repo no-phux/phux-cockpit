@@ -221,7 +221,44 @@ fn readExact(worker: *Worker, fd: posix.fd_t, output: []u8, frame_started: *?pos
     return true;
 }
 
+/// Send `input` in full within one second, or give up and report failure.
+///
+/// The one-second budget is this function's contract with its callers: a peer
+/// that has stopped reading must not be able to park the extension worker on a
+/// single frame. That budget can only be evaluated BETWEEN send() calls, so the
+/// contract holds only if send() itself never blocks.
+///
+/// MSG.DONTWAIT does not buy that on macOS. Darwin ignores MSG_DONTWAIT on an
+/// AF_UNIX socket that is blocking at the descriptor level; only O_NONBLOCK
+/// makes the kernel return EAGAIN. Because the flag is present as a decl, the
+/// comptime @hasDecl guard below compiles happily and the code reads as though
+/// it were non-blocking while the syscall sleeps indefinitely. That is exactly
+/// how the deadline came to be unreachable.
+///
+/// Measured by scripts/measure-send-blocking.c (SNDBUF 4096, 16 MiB payload,
+/// peer never reads) on macOS 25.5 / arm64:
+///
+///   blocking fd + MSG_DONTWAIT   still inside send() when a 5s alarm fired
+///   O_NONBLOCK fd                EAGAIN after 0.000s, 4096 bytes written
+///   blocking fd + SO_SNDTIMEO=1s EAGAIN after 2.004s
+///
+/// So SO_SNDTIMEO is rejected as the fix: Darwin overshoots it by a consistent
+/// factor of two (250ms -> 0.503s, 500ms -> 1.004s, 1s -> 2.004s, 2s -> 4.004s),
+/// which would quietly turn this one-second budget into a two-second one.
+/// O_NONBLOCK is exact, so the descriptor is switched for the duration of the
+/// write and put back the way it was found.
+///
+/// Restoring matters as much as setting. connectAddress deliberately hands back
+/// a BLOCKING descriptor, and readExact treats any read error as a dead
+/// connection -- so leaking O_NONBLOCK out of this function would let a benign
+/// EAGAIN on the read side tear down a healthy session.
 fn writeExact(worker: ?*Worker, fd: posix.fd_t, input: []const u8, frame_started: ?posix.timespec) bool {
+    const was_nonblocking = isNonblocking(fd) catch return false;
+    if (!was_nonblocking) setNonblocking(fd, true) catch return false;
+    defer if (!was_nonblocking) {
+        setNonblocking(fd, false) catch {};
+    };
+
     var offset: usize = 0;
     const started = monotonicTime() orelse return false;
     while (offset < input.len) {
@@ -450,6 +487,15 @@ pub fn waitConnected(fd: posix.fd_t, stopping: *const std.atomic.Value(bool)) !v
     return error.Canceled;
 }
 
+/// Read back what setNonblocking would set, so writeExact can leave a
+/// descriptor exactly as it found it rather than assuming it arrived blocking.
+fn isNonblocking(fd: posix.fd_t) !bool {
+    const raw_flags = std.c.fcntl(fd, posix.F.GETFL);
+    if (raw_flags < 0) return error.FcntlFailed;
+    const flags: posix.O = @bitCast(@as(u32, @intCast(raw_flags)));
+    return flags.NONBLOCK;
+}
+
 pub fn setNonblocking(fd: posix.fd_t, enabled: bool) !void {
     const raw_flags = std.c.fcntl(fd, posix.F.GETFL);
     if (raw_flags < 0) return error.FcntlFailed;
@@ -483,7 +529,43 @@ test "a non-reading peer cannot hold one frame writer forever" {
     const payload = try std.testing.allocator.alloc(u8, 16 * 1024 * 1024);
     defer std.testing.allocator.free(payload);
     @memset(payload, 0x5a);
+
+    // Nobody ever reads sockets[1], so this write can never complete. Until
+    // writeExact forced O_NONBLOCK, this call sat inside send() indefinitely
+    // and took the whole test binary with it: rooting extension.zig reported
+    // "5 pass, 1 crash" only after the run was killed at 180 seconds.
+    const started = monotonicTime() orelse return error.SkipZigTest;
     try std.testing.expect(!writeExact(null, sockets[0], payload, null));
+    const elapsed_ns = elapsedNanos(started, monotonicTime() orelse return error.SkipZigTest);
+
+    // Both bounds carry weight. The upper bound is the invariant this test is
+    // named for -- the budget is one second plus at most one 50ms poll, so
+    // crossing three seconds means the deadline has become unreachable again.
+    // The lower bound guards the opposite regression: a writeExact that treated
+    // EAGAIN as fatal would return false immediately, satisfy the assertion
+    // above, and silently fail frames that were merely waiting for buffer.
+    try std.testing.expect(elapsed_ns >= 900 * std.time.ns_per_ms);
+    try std.testing.expect(elapsed_ns < 3 * std.time.ns_per_s);
+}
+
+test "writeExact restores the blocking mode it was handed" {
+    const sockets = try socketPair();
+    defer _ = std.c.close(sockets[0]);
+    defer _ = std.c.close(sockets[1]);
+
+    // connectAddress deliberately hands framed IO a BLOCKING descriptor, and
+    // readExact treats any read error as a dead connection. O_NONBLOCK leaking
+    // out of writeExact would therefore let a benign EAGAIN on the read side
+    // tear down a perfectly healthy session.
+    try std.testing.expectEqual(false, try isNonblocking(sockets[0]));
+    try std.testing.expect(writeExact(null, sockets[0], "frame", null));
+    try std.testing.expectEqual(false, try isNonblocking(sockets[0]));
+
+    // A descriptor that arrives non-blocking has to stay non-blocking; the
+    // restore must put back what was there, not a fixed assumption.
+    try setNonblocking(sockets[0], true);
+    try std.testing.expect(writeExact(null, sockets[0], "frame", null));
+    try std.testing.expectEqual(true, try isNonblocking(sockets[0]));
 }
 
 test "final complete frame remains readable when peer has shut down" {
