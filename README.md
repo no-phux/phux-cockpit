@@ -155,11 +155,15 @@ both.
 The syntax is Ghostty's — one `key = value` per line, `#` starts a whole-line
 comment, and there are deliberately no trailing comments because `#` is also how
 every colour begins. An unknown key or a malformed value is a diagnostic, not a
-failure: one bad line costs that line, never the rest of the file. Every
-diagnostic is reported to the log at startup, so a setting that did not take
-effect says so instead of leaving you to wonder.
+failure: one bad line costs that line, never the rest of the file. A config that
+produced any diagnostic raises **one line of chrome above the terminal naming
+the line numbers**, dismissed by clicking it; the startup log carries the same
+diagnostics in full, with the offending key or value quoted. The band takes no
+keyboard and holds no chord — a setting that did nothing is not a reason to
+stand between you and a prompt.
 
 ```
+theme = nord
 font-size = 14
 cursor-style = bar
 cursor-style-blink = false
@@ -172,6 +176,31 @@ inherit-working-directory = true
 tab-placement = top
 ```
 
+### Themes and the settings surface
+
+`theme = <name>` names one of the built-in sets — `phux-dark`, `phux-light`,
+`high-contrast`, `nord`, `gruvbox-dark`, `solarized-dark`. A theme sets
+`background`, `foreground` and `selection-background`; an explicit key for any
+of those **outranks** it, wherever the two lines happen to sit in the file. It
+deliberately leaves the ANSI-16 palette alone, so a terminal red stays a
+terminal red — see [Decisions](docs/DECISIONS.md).
+
+**`cmd+,`** (or **View > Settings…**) opens the settings surface. Up and down
+preview a theme LIVE against whatever is on screen, `return` saves the choice
+into your config file, and `esc` puts back the one you had. The panel writes
+only the `theme` line: your comments, your spacing, and any key this build has
+never heard of are copied through untouched.
+
+The panel also shows the **contrast ratio** between the foreground and
+background actually being painted, and flags it when it drops below the WCAG AA
+minimum for body text (4.5:1). That readout is there so "I can't read my
+terminal" is something you can see the answer to rather than something that
+needs investigating. Every built-in theme clears the threshold; a test keeps it
+that way.
+
+The panel's own colours are fixed and never follow the theme. A settings page
+you cannot read when the theme is broken is worse than none.
+
 `shell` (or `command`) is a command LINE, not just a path, so `command = tmux
 attach` keeps its argument. It runs via the login shell with `exec`, so the
 program you name is the pty's own process. A value that is empty, over-long, or
@@ -180,7 +209,8 @@ carries a NUL is refused and the built-in shell stands.
 `font-family` and `selection-foreground` are parsed but **cannot** be applied in
 this build: the SDK selects faces from a fixed registered set rather than by
 family name, and a terminal grid carries one selection colour rather than a
-foreground override. Setting either logs a line saying it did nothing.
+foreground override. Setting either raises the notice above, and logs a line,
+saying so.
 
 ## Install
 
@@ -212,6 +242,7 @@ attribute and reports that fact in its caveat.
 | `cmd+click` | Open the URL under the pointer |
 | `cmd+K` | Clear the screen and scrollback |
 | `cmd+shift+P` | Go to terminal — the summoned switcher (type to filter, arrows or `ctrl+N`/`ctrl+P` to move, `enter` to go, `esc` to dismiss) |
+| `cmd+,` | Settings — themes with a live preview and a WCAG contrast readout (arrows or `ctrl+N`/`ctrl+P` to preview, `return` to save, `esc` to cancel) |
 | `cmd+shift+B` | Show the Web surface |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |
@@ -248,10 +279,15 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Zig 0.16.0 and Xcode Command Line Tools for source builds
 - Internet access on the first source build to fetch pinned dependencies
 
-native-sdk is pinned to the v0.8.1-based merge
-[`phall1/native@f7347de`](https://github.com/phall1/native/commit/f7347de1c607dcbe4e4f06dddd172fcf3f9d0507),
-which includes Cockpit's terminal interaction, viewport, and font seams plus the
-packed `cell_grid` canvas command, its AppKit decoder, and wire format v6.
+native-sdk is pinned to
+[`phall1/native@f3678832`](https://github.com/phall1/native/commit/f3678832fd282b81241993d0c08105cd5170f39f),
+the head of that fork's `cockpit/v0.8.4` branch: upstream v0.8.4 plus Cockpit's
+terminal interaction, viewport, and font seams, the packed `cell_grid` canvas
+command with its AppKit decoder and wire format v6, macOS glyph smoothing, the
+per-window `ChromeContext` on `build_window` and `web_panes`, and `fx.openUrl`.
+The pin is a tarball SHA rather than a branch, so a push to the fork can never
+break a checkout of Cockpit — see [docs/SDK_PIN.md](docs/SDK_PIN.md) for how the
+fork and this repo stay in contract, and what to run before moving the pin.
 libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
 Zig 0.16-compatible checkpoint.
@@ -262,6 +298,94 @@ Zig 0.16-compatible checkpoint.
 zig build
 zig build run
 zig build test -Dplatform=null --summary all
+```
+
+### Reading the result of `zig build test`
+
+Two things have to be true for a test run to mean anything: it has to have
+passed, and it has to have compiled the code you changed. `zig build test`
+now answers both, in that order.
+
+**Did it pass?** The exit code, and only the exit code.
+
+```sh
+zig build test > /tmp/t.log 2>&1; echo "exit=$?"
+```
+
+Do not judge from a log line. A green run used to end with
+
+```
+failed command: ./.zig-cache/o/<hash>/test --cache-dir=./.zig-cache ... --listen=-
+```
+
+which read as a failure and was not one. That line came from tests calling
+`std.debug.print` on the happy path: Zig 0.16's build runner prints a
+step-failure report — including `failed command:` — for any step whose captured
+stderr is non-empty, whether or not the step failed. Those prints are now behind
+`-Dmeasure=true` (see `src/tests/measured.zig`), so a passing run is quiet.
+
+**What did it compile?** The last thing the run prints is a verdict:
+
+```
+------------------------------------------------------------------
+zig build test: PASS
+  phux provider: COMPILED AND TESTED (transport, host, provider, pointer)
+    ffi include: /Users/you/workspace/phux/crates/phux-client-ffi/include
+    ffi lib:     /Users/you/workspace/phux/target/ffi-release
+    found via:   ../phux sibling checkout
+  app graph:     local terminal provider (-Dphux-enabled defaults to false)
+------------------------------------------------------------------
+```
+
+The verdict is a build step that depends on every test step, so it prints only
+when all of them succeeded. **No verdict means the run was not green.**
+
+The named modules are the ones rooted as test artifacts. `extension.zig` is
+compiled but not rooted: its tests have never run anywhere, and rooting them
+hangs the build. See phux-cockpit-iwf and the comment on
+`phux_test_module_names` in `build.zig`.
+
+`src/providers/phux/` needs the phux client FFI, so `zig build test` looks for
+`phux/client.h` and `libphux_client_ffi.a` in four places, in order:
+
+1. `-Dphux-client-ffi-include-dir` / `-Dphux-client-ffi-lib-dir`
+2. `$PHUX_CLIENT_FFI_INCLUDE_DIR` / `$PHUX_CLIENT_FFI_LIB_DIR`
+3. `./.phux/crates/phux-client-ffi/include` and `./.phux/target/ffi-release`
+4. `../phux/crates/phux-client-ffi/include` and `../phux/target/ffi-release`
+
+If it finds them, the provider is compiled and its tests run — regardless of
+`-Dphux-enabled`. If it does not, everything else still runs and passes, and the
+verdict says `PASS, INCOMPLETE` and names what was left out. Without that line, a
+signature change to `PhuxProvider.search` or `Host.search` passes a local run
+without ever being compiled.
+
+Being in the build graph is not the same as being compiled: Zig analyzes only
+what is referenced, and nothing in Cockpit calls `PhuxProvider.search`. Each
+rooted module therefore ends with
+
+```zig
+test "every declaration in this module is compiled, not merely reachable" {
+    @import("phux_ref").refAllDeclsRecursive(@This());
+}
+```
+
+which is what makes the verdict's "COMPILED" claim true.
+
+To build the FFI for a sibling checkout:
+
+```sh
+cargo build --locked --profile ffi-release -p phux-client-ffi \
+  --manifest-path ../phux/Cargo.toml
+```
+
+`-Dphux-enabled=true` is a separate question: it swaps the **app** graph from the
+local terminal provider to the phux provider. It requires the FFI and now fails
+loudly rather than building a local-terminal app under a phux flag:
+
+```sh
+zig build test -Dphux-enabled=true \
+  -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
+  -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release"
 ```
 
 Tabs start at the top by default. Set `PHUX_COCKPIT_TABS=side` (or `sidebar`)

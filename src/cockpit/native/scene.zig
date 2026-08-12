@@ -36,6 +36,10 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     // the app answers, so the platform does not beep at it, and reachable
     // whatever surface owns the content area.
     .{ .id = "tabs.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
+    // cmd+, — the settings chord every macOS app answers. Registered globally
+    // like the rest so the platform does not beep at it, and so the menu item
+    // below has a real equivalent rather than a decorative one.
+    .{ .id = "settings.open", .key = ",", .modifiers = .{ .primary = true } },
     .{ .id = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "tab.next", .key = "]", .modifiers = .{ .primary = true, .shift = true } },
     .{ .id = "terminal.new", .key = "t", .modifiers = .{ .primary = true } },
@@ -123,6 +127,16 @@ const edit_menu_items = [_]native_sdk.MenuItem{
 /// `toggleFullscreenWindow` are that verb, so the item names a command the app
 /// can now answer, against the FOCUSED window rather than always the main one.
 const view_menu_items = [_]native_sdk.MenuItem{
+    // Settings lives in VIEW rather than in the app menu, where macOS
+    // convention puts it, because the app menu is the toolkit's: supplying
+    // custom menus replaces File/Edit/View/Window and `appkit_host.m` rebuilds
+    // `mainMenu` as the STOCK app menu plus these, so there is no seam to add
+    // an item to the app menu through. View is the next most honest home — it
+    // is where font size and tab placement already live, and everything in
+    // this panel is appearance. The cmd+, equivalent is the platform's
+    // regardless of which menu carries it.
+    .{ .label = "Settings…", .command = "settings.open", .key = ",", .modifiers = .{ .primary = true } },
+    .{ .separator = true },
     .{ .label = "Enter Full Screen", .command = "window.fullscreen", .key = "f", .modifiers = .{ .primary = true, .control = true } },
     .{ .separator = true },
     .{ .label = "Increase Font Size", .command = "view.font-larger", .key = "=", .modifiers = .{ .primary = true } },

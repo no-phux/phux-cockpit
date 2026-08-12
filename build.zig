@@ -1,6 +1,20 @@
-// The local Cockpit remains the default graph. The production Phux lane is
-// materialized only under -Dphux-enabled=true, so default builds never resolve
-// its C header, static archive, Objective-C source, or AppKit.
+// The local Cockpit remains the default APP graph. The production Phux lane is
+// materialized into the app under -Dphux-enabled=true, so default `zig build`
+// and `zig build run` never resolve its C header, static archive, Objective-C
+// source, or AppKit, and never swap the local terminal provider out.
+//
+// `zig build test` is deliberately different. Independently of -Dphux-enabled,
+// it compiles and runs the phux provider's own modules whenever the phux client
+// FFI can be found on this machine (see resolvePhuxFfi). Before that, a
+// signature change to PhuxProvider.search and Host.search passed a local
+// `zig build test` cleanly while never being compiled at all, because
+// -Dphux-enabled defaults to false. CI caught it later; the local run had
+// reported a false green.
+//
+// Whatever the outcome of that lookup, the test step ends by printing a verdict
+// naming exactly what was compiled -- see addTestVerdict. The exit code is
+// still the only authority on pass/fail; the verdict answers "was the run
+// real", which the exit code cannot.
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 
@@ -36,81 +50,207 @@ fn addProviderContractModules(
     }
 }
 
+// ---------------------------------------------------------------- phux FFI
+
+/// A validated location for the phux client FFI: a directory holding
+/// `phux/client.h` and a directory holding `libphux_client_ffi.a`.
+const PhuxFfi = struct {
+    include_dir: []const u8,
+    lib_dir: []const u8,
+    /// Human-readable provenance, printed in the test verdict so the reader
+    /// knows which of the four lookups won.
+    origin: []const u8,
+};
+
+fn rootPath(b: *std.Build, sub_path: []const u8) []const u8 {
+    const root = b.build_root.path orelse ".";
+    return b.pathJoin(&.{ root, sub_path });
+}
+
+/// `path` may be absolute or relative to the build root; Io.Dir.access resolves
+/// a relative sub-path against the directory handle and ignores it for an
+/// absolute one.
+fn fileExists(b: *std.Build, path: []const u8) bool {
+    b.build_root.handle.access(b.graph.io, path, .{}) catch return false;
+    return true;
+}
+
+/// The two files scripts/package-macos.sh refuses to package without
+/// (scripts/package-macos.sh:81 and :85). Same check, same failure mode, so a
+/// location that satisfies the test graph also satisfies packaging.
+fn ffiComplete(b: *std.Build, include_dir: []const u8, lib_dir: []const u8) bool {
+    return fileExists(b, b.pathJoin(&.{ include_dir, "phux", "client.h" })) and
+        fileExists(b, b.pathJoin(&.{ lib_dir, "libphux_client_ffi.a" }));
+}
+
+/// Where the phux client FFI can be, in precedence order. Every entry is
+/// validated by ffiComplete before it is accepted, so a half-present checkout
+/// is treated as absent rather than exploding mid-build.
+///
+///   1. -Dphux-client-ffi-include-dir / -Dphux-client-ffi-lib-dir
+///   2. $PHUX_CLIENT_FFI_INCLUDE_DIR / $PHUX_CLIENT_FFI_LIB_DIR
+///      (the pair scripts/package-macos.sh and both workflows already use)
+///   3. ./.phux/...        -- the CI checkout layout, .github/workflows/ci.yml
+///   4. ../phux/...        -- the sibling-checkout layout documented in README
+fn resolvePhuxFfi(
+    b: *std.Build,
+    opt_include: ?[]const u8,
+    opt_lib: ?[]const u8,
+) ?PhuxFfi {
+    if (opt_include) |include_dir| {
+        if (opt_lib) |lib_dir| {
+            if (ffiComplete(b, include_dir, lib_dir)) return .{
+                .include_dir = include_dir,
+                .lib_dir = lib_dir,
+                .origin = "-Dphux-client-ffi-include-dir / -Dphux-client-ffi-lib-dir",
+            };
+        }
+    }
+
+    if (b.graph.environ_map.get("PHUX_CLIENT_FFI_INCLUDE_DIR")) |include_dir| {
+        if (b.graph.environ_map.get("PHUX_CLIENT_FFI_LIB_DIR")) |lib_dir| {
+            if (ffiComplete(b, include_dir, lib_dir)) return .{
+                .include_dir = include_dir,
+                .lib_dir = lib_dir,
+                .origin = "$PHUX_CLIENT_FFI_INCLUDE_DIR / $PHUX_CLIENT_FFI_LIB_DIR",
+            };
+        }
+    }
+
+    const layouts = [_]struct { root: []const u8, origin: []const u8 }{
+        .{ .root = ".phux", .origin = "./.phux checkout" },
+        .{ .root = "../phux", .origin = "../phux sibling checkout" },
+    };
+    for (layouts) |layout| {
+        const include_dir = rootPath(b, b.pathJoin(&.{ layout.root, "crates/phux-client-ffi/include" }));
+        const lib_dir = rootPath(b, b.pathJoin(&.{ layout.root, "target/ffi-release" }));
+        if (ffiComplete(b, include_dir, lib_dir)) return .{
+            .include_dir = include_dir,
+            .lib_dir = lib_dir,
+            .origin = layout.origin,
+        };
+    }
+
+    return null;
+}
+
+// ------------------------------------------------------------ phux modules
+
+const PhuxModules = struct {
+    transport: *std.Build.Module,
+    extension: *std.Build.Module,
+    host: *std.Build.Module,
+    provider: *std.Build.Module,
+    pointer: *std.Build.Module,
+};
+
+/// The whole of src/providers/phux/, wired the same way whether it is going
+/// into the app graph or into standalone test artifacts. One definition, so
+/// the graph the tests compile cannot drift from the graph the app ships.
+fn createPhuxModules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    sdk_module: *std.Build.Module,
+    provider_contract: *std.Build.Module,
+    ffi: PhuxFfi,
+) PhuxModules {
+    // ref.zig is shared by every module below and must be a MODULE, not a
+    // relative @import. These files are compiled into several artifacts at
+    // once, and a plain `@import("ref.zig")` from two of them puts the same
+    // file in two modules, which Zig rejects with
+    // "file exists in modules 'root' and 'phux_transport'".
+    const ref_module = b.createModule(.{
+        .root_source_file = b.path("src/providers/phux/ref.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const transport_module = b.createModule(.{
+        .root_source_file = b.path("src/providers/phux/transport.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transport_module.addImport("phux_ref", ref_module);
+    const extension_module = b.createModule(.{
+        .root_source_file = b.path("src/providers/phux/extension.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    extension_module.addImport("native_sdk", sdk_module);
+    extension_module.addImport("phux_transport", transport_module);
+
+    const host_module = b.createModule(.{
+        .root_source_file = b.path("src/providers/phux/host.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    host_module.addImport("provider_contract", provider_contract);
+    host_module.addImport("native_sdk", sdk_module);
+    host_module.addImport("phux_transport", transport_module);
+    host_module.addImport("phux_ref", ref_module);
+    host_module.addIncludePath(.{ .cwd_relative = ffi.include_dir });
+    host_module.addObjectFile(.{
+        .cwd_relative = b.pathJoin(&.{ ffi.lib_dir, "libphux_client_ffi.a" }),
+    });
+    host_module.linkSystemLibrary("c", .{});
+
+    const provider_module = b.createModule(.{
+        .root_source_file = b.path("src/providers/phux/provider.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    provider_module.addImport("native_sdk", sdk_module);
+    provider_module.addImport("provider_contract", provider_contract);
+    provider_module.addImport("phux_host", host_module);
+    provider_module.addImport("phux_transport", transport_module);
+    provider_module.addImport("phux_extension", extension_module);
+    provider_module.addImport("phux_ref", ref_module);
+
+    const pointer_module = b.createModule(.{
+        .root_source_file = b.path("src/providers/phux/pointer.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pointer_module.addImport("native_sdk", sdk_module);
+    pointer_module.addImport("phux_ref", ref_module);
+
+    return .{
+        .transport = transport_module,
+        .extension = extension_module,
+        .host = host_module,
+        .provider = provider_module,
+        .pointer = pointer_module,
+    };
+}
+
 fn addPhuxModules(
     b: *std.Build,
     artifacts: native_sdk.AppArtifacts,
+    ffi: PhuxFfi,
 ) void {
-    const include_dir = b.option(
-        []const u8,
-        "phux-client-ffi-include-dir",
-        "Directory containing phux/client.h (required with -Dphux-enabled=true)",
-    ) orelse @panic("-Dphux-enabled=true requires -Dphux-client-ffi-include-dir=<dir>");
-    const lib_dir = b.option(
-        []const u8,
-        "phux-client-ffi-lib-dir",
-        "Directory containing libphux_client_ffi.a (required with -Dphux-enabled=true)",
-    ) orelse @panic("-Dphux-enabled=true requires -Dphux-client-ffi-lib-dir=<dir>");
-
     const roots = [_]*std.Build.Module{
         artifacts.exe.root_module,
         artifacts.tests.root_module,
     };
     for (roots, 0..) |root, index| {
         if (index == 1 and root == artifacts.exe.root_module) continue;
-        const target = root.resolved_target.?;
-        const optimize = root.optimize.?;
         const sdk_module = root.import_table.get("native_sdk") orelse
             @panic("native-sdk app graph did not expose its root module");
         const provider_contract = root.import_table.get("provider_contract") orelse
             @panic("cockpit graph did not expose its provider contract module");
 
-        const transport_module = b.createModule(.{
-            .root_source_file = b.path("src/providers/phux/transport.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const extension_module = b.createModule(.{
-            .root_source_file = b.path("src/providers/phux/extension.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        extension_module.addImport("native_sdk", sdk_module);
-        extension_module.addImport("phux_transport", transport_module);
+        const modules = createPhuxModules(
+            b,
+            root.resolved_target.?,
+            root.optimize.?,
+            sdk_module,
+            provider_contract,
+            ffi,
+        );
 
-        const host_module = b.createModule(.{
-            .root_source_file = b.path("src/providers/phux/host.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        host_module.addImport("provider_contract", provider_contract);
-        host_module.addImport("native_sdk", sdk_module);
-        host_module.addImport("phux_transport", transport_module);
-        host_module.addIncludePath(.{ .cwd_relative = include_dir });
-        host_module.addObjectFile(.{
-            .cwd_relative = b.pathJoin(&.{ lib_dir, "libphux_client_ffi.a" }),
-        });
-        host_module.linkSystemLibrary("c", .{});
-
-        const provider_module = b.createModule(.{
-            .root_source_file = b.path("src/providers/phux/provider.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        provider_module.addImport("native_sdk", sdk_module);
-        provider_module.addImport("provider_contract", provider_contract);
-        provider_module.addImport("phux_host", host_module);
-        provider_module.addImport("phux_transport", transport_module);
-        provider_module.addImport("phux_extension", extension_module);
-
-        const pointer_module = b.createModule(.{
-            .root_source_file = b.path("src/providers/phux/pointer.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        pointer_module.addImport("native_sdk", sdk_module);
-
-        root.addImport("phux_provider", provider_module);
-        root.addImport("phux_pointer", pointer_module);
+        root.addImport("phux_provider", modules.provider);
+        root.addImport("phux_pointer", modules.pointer);
         root.addCSourceFile(.{
             .file = b.path("src/providers/phux/pointer_macos.m"),
             .flags = &.{ "-fobjc-arc", "-fblocks" },
@@ -122,21 +262,183 @@ fn addPhuxModules(
         }
         root.linkFramework("AppKit", .{});
         root.linkSystemLibrary("c", .{});
-
-        // Zig runs tests only from a compilation's root module. Exercise the
-        // production FFI adapter itself when that graph is enabled instead of
-        // merely proving that importing it compiles.
-        if (index == 1) {
-            const host_tests = b.addTest(.{
-                .name = "phux-host-tests",
-                .root_module = host_module,
-            });
-            if (b.top_level_steps.get("test")) |test_step| {
-                test_step.step.dependOn(&b.addRunArtifact(host_tests).step);
-            }
-        }
     }
 }
+
+/// Names of the phux modules whose own tests the `test` step runs, in the
+/// order they are added. Reported verbatim in the test verdict, so the verdict
+/// cannot claim more coverage than this list delivers.
+///
+/// extension.zig is compiled -- phux-provider-tests imports it -- but is not
+/// rooted, so its own tests do not run. See phux-cockpit-iwf: rooting it
+/// hangs forever in extension.writeExact, because the 1s deadline there is
+/// only evaluated between send() calls and macOS does not honour MSG_DONTWAIT
+/// on an AF_UNIX socketpair. Those tests had never run anywhere, including CI.
+const phux_test_module_names = "transport, host, provider, pointer";
+
+/// Compile src/providers/phux/ and run its tests as part of `zig build test`,
+/// regardless of -Dphux-enabled.
+///
+/// Zig runs tests only from a compilation's ROOT module, so importing these
+/// modules into the app graph -- which is all -Dphux-enabled=true did -- type
+/// checks them but runs only host.zig's tests. Rooting a test artifact at each
+/// module both compiles the whole provider and runs the tests in transport.zig,
+/// provider.zig and pointer.zig, which never ran anywhere, including CI.
+fn addPhuxGraphTests(
+    b: *std.Build,
+    artifacts: native_sdk.AppArtifacts,
+    test_step: *std.Build.Step,
+    ffi: PhuxFfi,
+) void {
+    // The TEST root, not the exe root: these artifacts must be built the way
+    // the rest of `zig build test` is built. The exe root is optimized for
+    // shipping, and compiling tests that way silently drops the safety checks
+    // the assertions are relying on.
+    const root = artifacts.tests.root_module;
+    const target = root.resolved_target.?;
+    const optimize = root.optimize.?;
+    const sdk_module = root.import_table.get("native_sdk") orelse
+        @panic("native-sdk app graph did not expose its root module");
+
+    // A contract module of its own: the app graph's copy belongs to the app
+    // graph, and these artifacts must not depend on the app being built.
+    const provider_contract = b.createModule(.{
+        .root_source_file = b.path("src/providers/contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    provider_contract.addImport("native_sdk", sdk_module);
+
+    const modules = createPhuxModules(b, target, optimize, sdk_module, provider_contract, ffi);
+
+    // pointer.zig declares phux_pointer_monitor_start/stop, which live in
+    // pointer_macos.m. The app graph adds that source to its own root; a
+    // standalone test artifact has to carry it.
+    modules.pointer.addCSourceFile(.{
+        .file = b.path("src/providers/phux/pointer_macos.m"),
+        .flags = &.{ "-fobjc-arc", "-fblocks" },
+    });
+    if (b.sysroot) |sysroot| {
+        modules.pointer.addFrameworkPath(.{
+            .cwd_relative = b.pathJoin(&.{ sysroot, "System/Library/Frameworks" }),
+        });
+    }
+    modules.pointer.linkFramework("AppKit", .{});
+    modules.pointer.linkSystemLibrary("c", .{});
+
+    // Keep this in step with phux_test_module_names. extension.zig is absent on
+    // purpose and for a recorded reason; see that declaration.
+    const rooted = [_]struct { name: []const u8, module: *std.Build.Module }{
+        .{ .name = "phux-transport-tests", .module = modules.transport },
+        .{ .name = "phux-host-tests", .module = modules.host },
+        .{ .name = "phux-provider-tests", .module = modules.provider },
+        .{ .name = "phux-pointer-tests", .module = modules.pointer },
+    };
+    for (rooted) |entry| {
+        const tests = b.addTest(.{ .name = entry.name, .root_module = entry.module });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+}
+
+// --------------------------------------------------------------- verdict
+
+/// Print, as the last thing `zig build test` does, an unambiguous statement of
+/// (a) that the run passed and (b) what was actually compiled.
+///
+/// This step is wired to depend on every step `test` already depended on, and
+/// `test` is then made to depend on it. So it runs last, and it runs ONLY if
+/// everything before it succeeded -- which is what licenses it to print PASS.
+/// The corollary is the important half: no verdict line means the run was not
+/// green. The process exit code remains the authority either way.
+///
+/// stdio is .inherit on purpose. A run step's captured output lands in
+/// `Step.result_stderr`, and Zig 0.16's build runner prints a step-failure
+/// report -- including `failed command: ...` -- for any step with non-empty
+/// result_stderr, pass or fail (build_runner.zig:1381). Capturing the verdict
+/// would make the verdict itself look like a failure.
+fn addTestVerdict(b: *std.Build, test_step: *std.Build.Step, verdict: []const u8) void {
+    const previous = b.allocator.dupe(*std.Build.Step, test_step.dependencies.items) catch @panic("OOM");
+    const run = b.addSystemCommand(&.{ "/usr/bin/printf", "%s\n", verdict });
+    run.stdio = .inherit;
+    run.has_side_effects = true; // never cached away; the verdict must print every run
+    for (previous) |dependency| run.step.dependOn(dependency);
+    test_step.dependOn(&run.step);
+}
+
+fn buildVerdict(
+    b: *std.Build,
+    phux_enabled: bool,
+    ffi: ?PhuxFfi,
+) []const u8 {
+    const rule = "------------------------------------------------------------------";
+
+    // Which TREE this exit code describes.
+    //
+    // Not decoration. On 2026-08-12 a subagent's `zig build test` silently ran
+    // in a sibling git worktree instead of its own: the exit code was real, it
+    // just described somebody else's code. Nothing in the output distinguished
+    // it, and it surfaced only because a later run happened to starve on the
+    // shared Zig cache lock. That is the same failure class this whole verdict
+    // exists for — a green result that does not describe what you changed —
+    // and it is the harder one to spot, because a correct-looking PASS from
+    // the wrong tree is identical to a correct one. Printing the resolved
+    // build root costs a line and makes it visible in every future log.
+    // See phux-cockpit-2ml.11.
+    const source_root = b.build_root.path orelse ".";
+
+    if (ffi) |found| {
+        return b.fmt(
+            \\{s}
+            \\zig build test: PASS
+            \\  source root:   {s}
+            \\  phux provider: COMPILED AND TESTED ({s})
+            \\    ffi include: {s}
+            \\    ffi lib:     {s}
+            \\    found via:   {s}
+            \\  app graph:     {s}
+            \\{s}
+        , .{
+            rule,
+            source_root,
+            phux_test_module_names,
+            found.include_dir,
+            found.lib_dir,
+            found.origin,
+            if (phux_enabled)
+                "phux provider (-Dphux-enabled=true)"
+            else
+                "local terminal provider (-Dphux-enabled defaults to false)",
+            rule,
+        });
+    }
+    return b.fmt(
+            \\{s}
+            \\zig build test: PASS, INCOMPLETE
+            \\  source root:   {s}
+            \\  phux provider: NOT COMPILED. src/providers/phux/ was not in this
+            \\                 build at all, so a change to it is NOT verified by
+            \\                 this run, however green it looks.
+            \\  reason:        the phux client FFI was not found. Looked for
+            \\                 phux/client.h and libphux_client_ffi.a under, in order:
+            \\                   -Dphux-client-ffi-include-dir / -Dphux-client-ffi-lib-dir
+            \\                   $PHUX_CLIENT_FFI_INCLUDE_DIR / $PHUX_CLIENT_FFI_LIB_DIR
+            \\                   {s}
+            \\                   {s}
+            \\  to include it: cargo build --locked --profile ffi-release \
+            \\                   -p phux-client-ffi --manifest-path ../phux/Cargo.toml
+            \\                 then re-run zig build test
+            \\  app graph:     local terminal provider (-Dphux-enabled defaults to false)
+            \\{s}
+    , .{
+        rule,
+        source_root,
+        rootPath(b, ".phux"),
+        rootPath(b, "../phux"),
+        rule,
+    });
+}
+
+// ----------------------------------------------------------------- build
 
 pub fn build(b: *std.Build) void {
     const dependency = b.dependency("native_sdk", .{});
@@ -150,11 +452,51 @@ pub fn build(b: *std.Build) void {
         "phux-enabled",
         "Build the production Phux provider instead of the local terminal provider",
     ) orelse false;
+    const opt_include = b.option(
+        []const u8,
+        "phux-client-ffi-include-dir",
+        "Directory containing phux/client.h (required with -Dphux-enabled=true)",
+    );
+    const opt_lib = b.option(
+        []const u8,
+        "phux-client-ffi-lib-dir",
+        "Directory containing libphux_client_ffi.a (required with -Dphux-enabled=true)",
+    );
+    const measure = b.option(
+        bool,
+        "measure",
+        "Print MEASURED diagnostics from tests (see src/tests/measured.zig)",
+    ) orelse false;
+
+    const ffi = resolvePhuxFfi(b, opt_include, opt_lib);
+
+    // -Dphux-enabled=true is a promise that the app graph will contain the real
+    // provider. Refuse to build a local-terminal app under that flag: silently
+    // downgrading is exactly the lie this build is meant to stop telling.
+    if (phux_enabled and ffi == null) {
+        std.log.err(
+            \\-Dphux-enabled=true, but the phux client FFI was not found.
+            \\Both of these must exist:
+            \\  <include-dir>/phux/client.h
+            \\  <lib-dir>/libphux_client_ffi.a
+            \\Pass -Dphux-client-ffi-include-dir=<dir> -Dphux-client-ffi-lib-dir=<dir>,
+            \\or set PHUX_CLIENT_FFI_INCLUDE_DIR and PHUX_CLIENT_FFI_LIB_DIR,
+            \\or place the checkout at {s} or {s} and build it with:
+            \\  cargo build --locked --profile ffi-release -p phux-client-ffi
+        , .{ rootPath(b, ".phux"), rootPath(b, "../phux") });
+        std.process.exit(1);
+    }
+
     const phux_options = b.addOptions();
     phux_options.addOption(bool, "enabled", phux_enabled);
     addImportToArtifacts(artifacts, "phux_options", phux_options.createModule());
+
+    const test_options = b.addOptions();
+    test_options.addOption(bool, "measure", measure);
+    addImportToArtifacts(artifacts, "test_options", test_options.createModule());
+
     addProviderContractModules(b, artifacts);
-    if (phux_enabled) addPhuxModules(b, artifacts);
+    if (phux_enabled) addPhuxModules(b, artifacts, ffi.?);
 
     const ghostty = b.dependency("ghostty", .{
         .target = app_module.resolved_target.?,
@@ -165,4 +507,10 @@ pub fn build(b: *std.Build) void {
     });
     const vt = ghostty.module("ghostty-vt");
     addImportToArtifacts(artifacts, "ghostty-vt", vt);
+
+    if (b.top_level_steps.get("test")) |top_level| {
+        const test_step = &top_level.step;
+        if (ffi) |found| addPhuxGraphTests(b, artifacts, test_step, found);
+        addTestVerdict(b, test_step, buildVerdict(b, phux_enabled, ffi));
+    }
 }

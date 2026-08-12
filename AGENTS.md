@@ -38,12 +38,68 @@ product structure, identity, navigation, or orchestration boundaries.
 - Do not fake detach, restoration, durability, or visibility when an underlying
   runtime seam is missing. Establish the seam and test its invariants first.
 
+## Rendering Evidence
+
+`native automate screenshot` renders through the SDK's CPU reference renderer,
+not through the real macOS rasterizer. It cannot see anything CoreText does,
+which is why a 35% text-weight defect once survived three diagnoses. Never
+conclude "the text renders correctly" from a screenshot. Read
+[docs/RENDER_FIDELITY.md](docs/RENDER_FIDELITY.md) before writing any test that
+claims to check what the terminal looks like.
+
 ## Quality Bar
 
 Every change should reduce cognitive load, preserve input and lifecycle
 correctness, remain keyboard-fast and pointer-natural, and keep the interface
 calm under concurrency. If a feature adds another surface to monitor without
 compressing operational complexity, it is pointed in the wrong direction.
+
+## The Gate
+
+```sh
+zig build test > /tmp/t.log 2>&1; echo "exit=$?"
+```
+
+**Judge the run by the exit code.** Never by a log line. Nothing printed to
+stdout or stderr is authoritative, and a green run has previously ended with a
+line reading `failed command: .../test --listen=-`.
+
+**Then read the verdict.** The run ends with a block naming what it compiled:
+
+```
+------------------------------------------------------------------
+zig build test: PASS
+  phux provider: COMPILED AND TESTED (transport, host, provider, pointer)
+  ...
+------------------------------------------------------------------
+```
+
+The verdict step depends on every test step, so it prints only when all of
+them succeeded. **No verdict block means the run was not green**, whatever
+else the output says.
+
+A verdict that says `PASS, INCOMPLETE` means `src/providers/phux/` was not
+compiled, because the phux client FFI was not found on this machine. The rest
+of the run is real; a change under `src/providers/phux/` is not verified by it.
+The verdict prints the four locations it searched and how to fix it. Do not
+report such a run as verifying a phux change.
+
+The full phux-inclusive invocation, when the FFI lives outside the four
+searched locations:
+
+```sh
+zig build test \
+  -Dphux-enabled=true \
+  -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
+  -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release"
+```
+
+`-Dphux-enabled=true` additionally swaps the *app* graph onto the phux
+provider. It is not needed just to compile and test `src/providers/phux/` —
+discovering the FFI is enough for that.
+
+See README.md, "Reading the result of `zig build test`", for the search order
+and the reasoning.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker

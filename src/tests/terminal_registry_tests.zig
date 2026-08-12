@@ -140,7 +140,15 @@ test "terminal key release from an ended generation cannot reach its replacement
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-test "the registry mints unique terminals up to its raised ceiling" {
+// Rewritten for phux-cockpit-pg1. This test used to keep pressing cmd+T to
+// `max_tabs` and assert 16 live terminals, on the strength of the registry
+// having been raised from 4 slots to 32 in 20d82dd. The registry was the wrong
+// thing to count: the effects layer backs only `native_sdk.max_effect_ptys`
+// live ptys for the whole process, so terminals 5..16 came up SPAWN REJECTED
+// with permanently blank grids — which is the bug itself, asserted here as
+// though it were the feature. The identity claims it makes are real and are
+// kept; the ceiling they run to is now the one the app can actually reach.
+test "the registry mints unique terminals up to the shells it can back" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
@@ -158,12 +166,12 @@ test "the registry mints unique terminals up to its raised ceiling" {
     } });
     try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
 
-    // Four terminals is what the fake pty executor can hold in flight, so
-    // that is where the identity checks run.
-    while (state.model.ws().tab_count < 4) app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
-    try testing.expectEqual(@as(usize, 4), state.model.provider.activeCount());
-    try testing.expectEqual(@as(usize, 4), state.effects.pendingPtyCount());
+    // The pty table is what the identity checks run to: it is both what the
+    // fake executor holds in flight and what the real one does.
+    while (state.model.ws().tab_count < native_sdk.max_effect_ptys) app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.ws().tab_count);
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.effects.pendingPtyCount());
 
     var seen: [app.max_tabs]app.TerminalRef = undefined;
     for (0..state.model.ws().tab_count) |index| {
@@ -175,17 +183,16 @@ test "the registry mints unique terminals up to its raised ceiling" {
         seen[index] = id;
     }
 
-    // The old ceiling was FOUR terminals for the whole app. Keep going: the
-    // registry now holds 32 and the tab list 16.
-    while (state.model.ws().tab_count < app.max_tabs) app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
-    try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
-
-    // Past the tab ceiling nothing is minted, and no orphan terminal is left
-    // behind in the registry either.
+    // Past the ceiling nothing is minted, no orphan terminal is left behind in
+    // the registry, and — the part that matters — no pane exists that no shell
+    // will ever write to. The registry's own 32 slots and the tab list's 16 are
+    // both still far above this; neither is reachable until the pty table grows
+    // (phux-cockpit-ipg).
+    try testing.expect(native_sdk.max_effect_ptys < app.max_tabs);
     app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
-    try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.ws().tab_count);
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.effects.pendingPtyCount());
 
     // Cmd+W over the Web surface owns no terminal, so it closes nothing.
     app.update(&state.model, .{ .select_surface = .web }, &state.effects);
@@ -196,7 +203,7 @@ test "the registry mints unique terminals up to its raised ceiling" {
         .modifiers = .{ .primary = true },
     } });
     try testing.expect(state.model.selectedSurface().eql(.web));
-    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.ws().tab_count);
     try testing.expect(app.onCommand("terminal.new") != null);
     try testing.expect(app.onCommand("terminal.close") != null);
     try testing.expect(app.onCommand("pane.split-right") != null);

@@ -11,6 +11,7 @@ const app = @import("../main.zig");
 const grid = @import("../terminal/grid.zig");
 const vt = @import("ghostty-vt");
 const support = @import("support.zig");
+const measured = @import("measured.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -570,7 +571,7 @@ test "ADVERSARIAL: the selected terminal command envelope genuinely binds" {
     const bounded_len = bounded.displayList().commands.len;
     const bounded_rows = paintedRows(bounded.displayList());
 
-    std.debug.print(
+    measured.print(
         "\nMEASURED budget bind: unbounded={d}/{d} rows bounded={d}/{d} rows budget={d}\n",
         .{ unbounded_len, unbounded_rows, bounded_len, bounded_rows, app.chrome_command_envelope },
     );
@@ -650,7 +651,7 @@ test "ADVERSARIAL: the packed cell budget genuinely binds a dense screen" {
     });
     const bounded_rows = paintedRows(bounded.displayList());
 
-    std.debug.print(
+    measured.print(
         "\nMEASURED cell bind: unbounded={d} rows bounded={d} rows store={d} cells\n",
         .{ unbounded_rows, bounded_rows, canvas.max_display_list_cells },
     );
@@ -720,7 +721,7 @@ test "ADVERSARIAL: either selected tab gets the same full hostile-content budget
         // satisfied by both of them losing the same rows.
         try testing.expectEqual(@as(?canvas.DisplayListDegradation, null), builder.degradation);
     }
-    std.debug.print(
+    measured.print(
         "\nMEASURED selected symmetry: rows={{ {d}, {d} }} commands={{ {d}, {d} }} envelope={d}\n",
         .{ painted[0], painted[1], used[0], used[1], app.chrome_command_envelope },
     );
@@ -793,7 +794,7 @@ test "ADVERSARIAL: the focus chord itself never leaks a byte to either child" {
         .key = "2",
         .modifiers = .{},
     } });
-    std.debug.print(
+    measured.print(
         "\nMEASURED chord leak: pane0={d} bytes pane1={d} bytes\n",
         .{ app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len, app_state.effects.ptyWrittenBytes(app.ptyKey(1)).len },
     );
@@ -845,7 +846,7 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
             .delta_y = cell_h,
         } });
     }
-    std.debug.print(
+    measured.print(
         "\nMEASURED rail wheel isolation: pane0 {d}->{d}  pane1 {d}->{d}\n",
         .{ bottom0, model.provider.slots[0].session.scrollbar().offset, bottom1, model.provider.slots[1].session.scrollbar().offset },
     );

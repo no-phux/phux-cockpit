@@ -70,6 +70,105 @@ The last-window case is unchanged: it closes **and** quits.
 
 ---
 
+## Config diagnostics get a dismissible band, never a modal
+
+**Decided 2026-08-12.** A config that produced diagnostics raises one line of
+chrome above the terminal, naming the LINE NUMBERS, dismissed by a press
+anywhere in it. The startup log keeps every diagnostic in full sentences.
+
+The log alone was the bug. From a bundled `.app` `std.log` lands in the unified
+log, so a mistyped key produced a terminal that quietly behaved differently and
+a user with no reason to open Console. But the opposite failure is worse and is
+the one a dialog would have caused: most diagnostics are **benign** —
+`unsupported_key` fires for `font-family` on a config that is otherwise
+perfect — and nothing about a setting that did not apply justifies standing
+between someone and a prompt. So the band takes no keyboard, holds no chord,
+and leaves Escape to the search field, the palette, and the shell.
+
+It NAMES LINE NUMBERS because that is the only part a user can act on; "your
+config has a problem" sends them back to the file to hunt. With exactly one
+problem there is room to name the problem too, and it does.
+
+It takes its room out of the **content rect**, exactly as the scrollback search
+band does, rather than floating like the palette. Painter, hit-test tree, and
+PTY sizing pump all derive from `workspaceChromeIn`, and the palette floats only
+because it is transient enough that two SIGWINCHes per summon would be the
+larger cost. This band appears once per launch at most, so the honest layout is
+worth its one resize — and taking room is also what guarantees no press can fall
+through it into a grid painted underneath.
+
+Dismissal is **for the launch, not forever**. Persisting "seen it" would need
+state on disk that a re-read config file silently invalidates: the file is
+parsed fresh every start, so the only honest memory of a notice is one that dies
+with the process.
+
+A second finding came out of building it, recorded here because it explains why
+`Diagnostic` owns its bytes: the text used to be a slice borrowed from the
+source, and `main.readConfig` reads the file into a buffer local to the read and
+returns the `Config` **by value** — so every quoted key in the startup log was
+read out of a dead stack frame, before the band existed to make it worse. It is
+a bounded copy now. See `config_tests.zig`'s "a diagnostic outlives the bytes it
+was parsed from".
+## The settings surface paints in fixed colours, never in the theme's
+
+**Decided 2026-08-12.** `view.zig`'s `settings_*` constants are literals, and
+they must stay literals.
+
+The settings panel is what you open when the terminal has become unreadable.
+Painting it with the tokens the user is trying to fix would mean the one
+configuration it exists to rescue — text you cannot see — makes the rescue
+itself invisible. That is not hypothetical: `phux-cockpit-aht` is four rounds
+of "the text is see-through or black or something".
+
+Today `cockpitTokens` is already independent of the user's config; only
+`terminalTokensFrom` applies `foreground`/`background`, and only the grids
+paint with those. That is **not** a reason to lean on the tokens in the panel.
+A theming feature is precisely the change that starts colouring the chrome, and
+on the day it does, every other panel can afford to follow the theme and this
+one still cannot.
+
+Every colour in the block is measured against the ground it sits on with the
+same WCAG formula the panel reports, and clears AA (4.5:1) on both grounds:
+ink 19.03, muted ink 9.08, pass green 12.38, fail red 7.55 on `#101010`. The
+invariant is pinned by `settings_theme_tests.zig`, "the settings surface stays
+readable when the theme is broken", which measures the tree rather than
+comparing against the constants — so a future palette swap still has to keep it
+readable.
+
+---
+
+## A theme sets three colours, and the ANSI-16 palette is not among them
+
+**Decided 2026-08-12.** `theme = <name>` carries `background`, `foreground`,
+and `selection_background` only.
+
+Those three reach the terminal through the **design tokens**, which
+`terminalTokensFrom` rebuilds from `model.config` on every frame and
+`Session.snapshot` pushes into the emulator's defaults on every frame. That is
+what makes a theme change repaint LIVE with nothing to invalidate — there is no
+stored copy of a theme colour anywhere for a stale value to hide in. Verified
+on the real Metal surface: no theme samples `0xff090b0f`, `theme = phux-light`
+samples `0xfffbfcfe`, and `theme = phux-light` plus `background = #0000ff`
+samples `0xff0000ff`.
+
+The palette, the cursor colour and the cursor style are excluded because they
+land in the **emulator** (`applySessionConfig`) rather than in the tokens: they
+are written once per session, so a theme change would need an explicit
+re-apply — and the re-apply has an unsolved half, since switching from a theme
+that sets slot 1 to one that does not cannot un-set it. The dynamic palette
+takes overrides and offers no revert. A knob that applies but cannot un-apply
+is the trap `Diagnostic.Kind.unsupported_key` exists to avoid. The ANSI-16
+slots are also libghostty's own defaults read back verbatim, and a terminal red
+should stay a terminal red.
+
+**Explicit keys outrank the theme**, and the precedence is resolved at the READ
+site (`Config.resolvedForeground` and friends) rather than at parse time.
+Deciding at parse time would make the file order-sensitive: `foreground` above
+`theme` would lose and the same two lines swapped would win, which is a rule
+nobody can hold in their head and nothing in the file makes visible.
+
+---
+
 ## Glyph rasterization enables macOS font smoothing
 
 **Decided 2026-08-10**, in the SDK fork rather than here.

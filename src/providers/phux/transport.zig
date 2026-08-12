@@ -341,3 +341,9 @@ test "frame queue byte ceiling rejects the crossing frame without exceeding rete
     try testing.expectEqual(max_queued_bytes, queue.pending_bytes);
     try testing.expectEqual(DisconnectReason.queue_overflow, queue.takeDisconnect().?);
 }
+
+test "every declaration in this module is compiled, not merely reachable" {
+    // Zig analyzes only what is referenced, so a module can sit in the build
+    // graph with its signatures never checked. See ref.zig.
+    @import("phux_ref").refAllDeclsRecursive(@This());
+}

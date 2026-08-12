@@ -80,6 +80,68 @@ pub const StatePersistence = struct {
     }
 };
 
+/// Where the CONFIG file lives, for writing a choice back to it.
+///
+/// Separate storage from `StatePersistence` above, and deliberately so: layout
+/// is state nobody hand-writes and it is rewritten on every split, while this
+/// is a file a person edits. They must never be confused for each other, and
+/// giving them one shared type would be the first step toward that.
+///
+/// Empty means "no config file could be resolved", which disables writing
+/// rather than failing anything — and which is the default, so every test and
+/// every fixture is free of disk traffic until a composition root hands over a
+/// real path.
+pub const ConfigFile = struct {
+    path_storage: [max_state_path_bytes]u8 = undefined,
+    path_len: usize = 0,
+
+    pub fn path(file: *const ConfigFile) []const u8 {
+        return file.path_storage[0..file.path_len];
+    }
+
+    pub fn enabled(file: *const ConfigFile) bool {
+        return file.path_len != 0;
+    }
+
+    pub fn setPath(file: *ConfigFile, value: ?[]const u8) void {
+        const resolved = value orelse "";
+        if (resolved.len == 0 or resolved.len > max_state_path_bytes) {
+            file.path_len = 0;
+            return;
+        }
+        @memcpy(file.path_storage[0..resolved.len], resolved);
+        file.path_len = resolved.len;
+    }
+};
+
+/// The in-app settings surface's state.
+///
+/// A WORKSPACE's, not the model's, for exactly the reason `Palette` is: it
+/// takes the keyboard while it is up, and a surface open in the window behind
+/// must not eat the keys typed in the window in front. What it EDITS is
+/// app-wide (`Model.config`), and that asymmetry is the point — one config,
+/// one live preview, but modality per window.
+///
+/// `restore_theme` is what makes the preview safe. Moving the cursor applies a
+/// theme immediately, because being able to SEE the effect while choosing is
+/// the entire reason this surface exists; Escape then has to be able to put
+/// back what was in effect when it opened, and this is the copy that lets it.
+pub const Settings = struct {
+    open: bool = false,
+    /// Row index into `theme.builtins`.
+    cursor: usize = 0,
+    /// The theme name in effect when the surface opened, restored on cancel.
+    /// Empty means "no theme was named", which is itself a state Escape has to
+    /// be able to return to.
+    restore_theme: config_module.ThemeName = config_module.ThemeName.init(""),
+
+    pub fn reset(settings: *Settings) void {
+        settings.open = false;
+        settings.cursor = 0;
+        settings.restore_theme = config_module.ThemeName.init("");
+    }
+};
+
 /// Sentinel for "the pointer is over no tab". `max_tabs` is a valid index in
 /// no tab list, so it can never collide with a real hover.
 pub const no_hovered_tab: usize = std.math.maxInt(usize);
@@ -266,6 +328,9 @@ pub const Workspace = struct {
     /// deliberately NOT part of `topologySnapshot`: an open switcher is not a
     /// workspace shape and must never be restored on launch.
     palette: Palette = .{},
+    /// The settings surface. Not part of `topologySnapshot` for the same
+    /// reason the palette is not: an open panel is not a workspace shape.
+    settings: Settings = .{},
     tab_count: usize = 0,
     selected_tab: usize = 0,
     /// The web surface owns the content area. Independent of `selected_tab`,
@@ -453,6 +518,22 @@ pub const Model = struct {
     /// that is not bound. The chrome reads it, and the next successful window
     /// open — or any other window closing — clears it.
     window_limit_refused: bool = false,
+    /// The startup config notice has been read and dismissed.
+    ///
+    /// A latch on the MODEL, not on a workspace: the config is app-wide, and a
+    /// notice that had to be dismissed once per window would be four dismissals
+    /// for one typo. It is deliberately not persisted either — a config file is
+    /// re-read on every launch, so "I already saw this" is only true until the
+    /// user edits the file, and the state file cannot know that.
+    config_notice_dismissed: bool = false,
+    /// A cmd+T or a split was refused because every live shell the effects
+    /// layer can back is already running (see `local.max_live_shells`).
+    ///
+    /// Same latch, same reason, and one worse failure to avoid: before this
+    /// existed the chord did not do nothing, it opened a tab whose pane stayed
+    /// permanently blank because its spawn had been rejected. Cleared by the
+    /// next successful terminal, and by anything that frees a shell.
+    terminal_limit_refused: bool = false,
     tab_placement: TabPlacement = .top,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
@@ -489,6 +570,10 @@ pub const Model = struct {
     /// default so every test and every fixture stays free of disk traffic
     /// until a composition root hands it a real path.
     state: StatePersistence = .{},
+    /// Where the config file this session loaded from lives, so a choice made
+    /// in the settings surface can be written back to it. Disabled by default,
+    /// same as `state`.
+    config_file: ConfigFile = .{},
 
     // -------------------------------------------------------- windows
 
@@ -843,6 +928,13 @@ pub const Model = struct {
         for (refs[0..count]) |terminal_ref| _ = model.remoteUi(terminal_ref);
     }
 
+    /// Whether the config band is up: there is something to say and nobody has
+    /// said "seen it" yet. Derived, with no second flag to drift — an empty
+    /// diagnostic list can never show a band, whatever the latch says.
+    pub fn configNoticeVisible(model: *const Model) bool {
+        return model.config.diagnostic_count != 0 and !model.config_notice_dismissed;
+    }
+
     /// The LIVE terminal type size. `font_size_offset` is the live delta the
     /// cmd+= / cmd+- chords own; the config's own size is the origin cmd+0
     /// returns to, which is why the two are separate — resetting to a
@@ -998,6 +1090,71 @@ pub const Model = struct {
         const encoded = session_state.serialize(&snapshot, &bytes) catch return;
         const cwd = std.Io.Dir.cwd();
         const path = model.state.path();
+        if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(io, parent) catch return;
+        cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return;
+    }
+
+    /// Write the live `theme` choice back into the user's config file, leaving
+    /// every other byte of it alone.
+    ///
+    /// SYNCHRONOUS, through the provider's own `Io`, rather than through
+    /// `fx.writeFile`. The write is a READ-MODIFY-WRITE — `config.setKey`
+    /// needs the file's current bytes to preserve the comments and unknown
+    /// keys in it — and the effect queue offers a write but no paired read, so
+    /// posting this would mean serializing a model back over a person's file.
+    /// It runs once per Enter in a settings panel, not per frame.
+    ///
+    /// A LEAF on purpose: two `max_config_bytes` buffers is 128 KB of stack,
+    /// and the SDK copies nothing here, so they must exist at the bottom of
+    /// the dispatch frame and nowhere up it.
+    ///
+    /// Silent at every failure, exactly like `writeWorkspaceState`: a theme
+    /// that could not be written down is still applied live, and refusing to
+    /// change the colour because a file was read-only would be a worse answer
+    /// than changing it for this run.
+    pub fn writeConfigTheme(model: *const Model, io: std.Io) void {
+        if (!model.config_file.enabled()) return;
+        // `theme = ` with nothing after it is a `bad_value` to the parser that
+        // reads it back. There is no gesture that reaches here with no theme
+        // named — the settings cursor always sits on a real one — and this is
+        // the guard that keeps it that way rather than trusting it.
+        if (model.config.theme.slice().len == 0) return;
+        const path = model.config_file.path();
+
+        var source_bytes: [config_module.max_config_bytes]u8 = undefined;
+        var rewritten: [config_module.max_config_bytes]u8 = undefined;
+        const cwd = std.Io.Dir.cwd();
+
+        // A missing file is the ORDINARY case, not an error: most people have
+        // never written one, and the first thing this app ever writes for them
+        // should be a one-line config rather than a refusal.
+        const source: []const u8 = read: {
+            var file = cwd.openFile(io, path, .{}) catch break :read "";
+            defer file.close(io);
+            const read_len = file.readPositionalAll(io, &source_bytes, 0) catch break :read "";
+            break :read source_bytes[0..read_len];
+        };
+
+        const encoded = config_module.setKey(
+            source,
+            "theme",
+            model.config.theme.slice(),
+            &rewritten,
+        ) catch return;
+        // WRITE FIRST, create the directory only if that fails.
+        //
+        // Not an optimization — a correctness fix, measured. The obvious
+        // order (createDirPath, then write) silently wrote NOTHING for a
+        // config under `/tmp` on macOS, because `/tmp` is a symlink to
+        // `/private/tmp` and `createDirPath` on it fails; the `catch return`
+        // then swallowed the whole save. Reproduced by
+        // `settings_theme_tests.zig`, "return keeps the previewed theme and
+        // writes it to the config file", which wrote a file, committed a
+        // theme, and read the file back unchanged. Trying the write first
+        // means the ordinary case — a directory that already exists, in every
+        // shape — never consults the directory at all, and the mkdir is
+        // reserved for the first-run case it is actually for.
+        if (cwd.writeFile(io, .{ .sub_path = path, .data = encoded })) |_| return else |_| {}
         if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(io, parent) catch return;
         cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return;
     }
@@ -1199,6 +1356,18 @@ pub fn restoreModelWithScrollback(
             workspace.tabs[tab_index] = decodeTab(tab);
             for (tab.nodes) |node| {
                 if (node.kind != .leaf or !node.has_terminal) continue;
+                // The SHELL ceiling applies to a restored layout exactly as it
+                // applies to cmd+T (see `local.max_live_shells`): `initFx`
+                // spawns every pane this loop mints, so a snapshot with more
+                // leaves than the effects layer has ptys would reopen with the
+                // surplus panes permanently blank — which is the bug the
+                // ceiling exists to stop, arriving at launch instead of at a
+                // chord. Refusing the whole restore is deliberate: the caller
+                // (`main.restoreWorkspace`) already falls back to a fresh
+                // single-terminal workspace, and only SHAPE is persisted, so
+                // an over-capacity snapshot written by an older build costs a
+                // layout once rather than dead panes every launch.
+                if (provider.liveShellCount() >= local.max_live_shells) return error.TerminalCapacityReached;
                 const session = try grid.Session.createWithScrollback(gpa, io, 80, 24, provider.max_scrollback_bytes);
                 errdefer session.destroy();
                 var index: usize = 0;

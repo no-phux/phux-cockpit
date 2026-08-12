@@ -14,6 +14,7 @@ const runtime = @import("terminal_runtime.zig");
 const pointer_input = @import("pointer_input.zig");
 const projection = @import("native/workspace_projection.zig");
 const scene = @import("native/scene.zig");
+const theme_module = @import("../config/theme.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -227,6 +228,16 @@ fn writeTopologySnapshot(model: *Model, fx: *Fx) void {
     });
 }
 
+/// Write the chosen theme into the user's config file.
+///
+/// A one-line wrapper so the arm above reads as one verb, and so the 128 KB of
+/// buffers `writeConfigTheme` needs stays in a LEAF frame rather than in the
+/// already-deep `updateModel` one. Synchronous rather than an effect, and
+/// silent on failure — see `Model.writeConfigTheme` for both reasons.
+fn persistThemeChoice(model: *Model) void {
+    model.writeConfigTheme(model.provider.io);
+}
+
 /// Re-arm the debounce. Starting a timer key that is already active REPLACES
 /// it in place, so a burst of changes leaves exactly one pending expiry.
 fn armTopologyPersist(model: *Model, fx: *Fx) void {
@@ -396,6 +407,12 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 model.ws().palette.append(event.text);
                 return;
             }
+            // The settings surface has no text field, and that is precisely
+            // why committed text has to be SWALLOWED here rather than fall
+            // through. A panel with nothing to type into is the easiest kind
+            // to leak from: without this line, every character typed while it
+            // is up would reach the shell underneath it.
+            if (model.ws().settings.open) return;
             if (model.selectedTerminalRef() == null) return;
             const terminal_ref = model.focusedTerminalRef() orelse return;
             if (model.provider.terminal(terminal_ref)) |pane| {
@@ -675,13 +692,18 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // tab slots and registry slots.
             if (model.ws().tab_count >= max_tabs) return;
             const origin = model.selectedTerminalRef();
-            const pane = model.provider.createTerminal() catch return;
+            const pane = model.provider.createTerminal() catch {
+                // Refused, visibly. See `view.terminalLimitNotice`.
+                model.terminal_limit_refused = true;
+                return;
+            };
             adoptWorkingDirectory(model, origin, pane);
             if (!model.admitTab(pane.id)) {
                 _ = model.provider.destroyTerminal(pane.id);
                 return;
             }
             _ = model.selectTerminal(pane.id);
+            model.terminal_limit_refused = false;
             endHiddenCaptures(model, fx);
             spawnConfiguredPane(model, pane, fx);
         },
@@ -706,8 +728,11 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             const previous = model.active_window;
             model.active_window = index;
             const pane = model.provider.createTerminal() catch {
-                // No registry slot left: the window would open empty and
-                // immediately close itself, so it never opens at all.
+                // No shell to put in it: the window would open empty and
+                // immediately close itself, so it never opens at all. The
+                // notice names the reason that actually stopped it — the
+                // shell ceiling, not the window one.
+                model.terminal_limit_refused = true;
                 model.closeWindow(index);
                 model.active_window = previous;
                 return;
@@ -831,6 +856,73 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             if (!workspace.palette.open) return;
             workspace.palette.backspace();
         },
+        // One-way, and for this launch only. The band is the app's single
+        // chance to say a setting did not apply; re-raising it on the next
+        // frame would make it nagware, and re-raising it never would need
+        // state on disk that a re-read config file can invalidate.
+        .config_notice_dismissed => model.config_notice_dismissed = true,
+        .settings_open => {
+            const workspace = model.ws();
+            // Idempotent, for the same reason `palette_open` is — but here the
+            // cost of not being would be worse than a lost needle: reopening
+            // would re-snapshot `restore_theme` from the PREVIEWED theme, and
+            // Escape would then "cancel" back to the preview instead of to
+            // what the user actually had.
+            if (workspace.settings.open) return;
+            // Two modal surfaces cannot both own the keyboard. The one the
+            // user just asked for wins, and the other is dismissed rather than
+            // left open behind it holding a half-typed needle.
+            workspace.palette.reset();
+            workspace.settings.reset();
+            workspace.settings.open = true;
+            workspace.settings.restore_theme = model.config.theme;
+            // Open ON the theme in effect, so the first arrow key is a step
+            // away from where the user is rather than a jump to row zero.
+            workspace.settings.cursor = theme_module.indexOf(model.config.theme.slice()) orelse 0;
+        },
+        .settings_close => {
+            const workspace = model.ws();
+            if (!workspace.settings.open) return;
+            // Put the previewed theme back. `setTheme` refuses an unknown
+            // name, and the empty string — "no theme was named" — is the one
+            // value it accepts that is not a theme, which is exactly the state
+            // a first-time user opened the panel in.
+            _ = model.config.setTheme(workspace.settings.restore_theme.slice());
+            workspace.settings.reset();
+        },
+        .settings_step => |delta| {
+            const workspace = model.ws();
+            if (!workspace.settings.open) return;
+            const count = theme_module.builtins.len;
+            // Wraps, for the reason the palette's step wraps: a list you can
+            // walk off the end of makes the last row harder to reach than the
+            // first.
+            const signed: i32 = @intCast(count);
+            const current: i32 = @intCast(@min(workspace.settings.cursor, count - 1));
+            workspace.settings.cursor = @intCast(@mod(current + delta, signed));
+            // APPLY, right now. Nothing else is needed to repaint: the design
+            // tokens are rebuilt from `model.config` on every frame and
+            // `Session.snapshot` pushes them into the emulator's defaults on
+            // every frame, so the next frame is already the new colour.
+            _ = model.config.setTheme(theme_module.builtins[workspace.settings.cursor].name);
+        },
+        .settings_select => |index| {
+            const workspace = model.ws();
+            if (!workspace.settings.open) return;
+            if (index >= theme_module.builtins.len) return;
+            workspace.settings.cursor = index;
+            _ = model.config.setTheme(theme_module.builtins[index].name);
+        },
+        .settings_commit => {
+            const workspace = model.ws();
+            if (!workspace.settings.open) return;
+            _ = model.config.setTheme(theme_module.builtins[@min(
+                workspace.settings.cursor,
+                theme_module.builtins.len - 1,
+            )].name);
+            workspace.settings.reset();
+            persistThemeChoice(model);
+        },
         .close_tab => |index| closeTab(model, fx, index),
         .hover_tab => |index| model.ws().hovered_tab = index,
         .unhover_tab => model.ws().hovered_tab = model_module.no_hovered_tab,
@@ -898,7 +990,12 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
     const target = current.focus;
     if (target == layout.none or current.node(target).kind != .leaf) return;
     const origin = current.focusedTerminal();
-    const pane = model.provider.createTerminal() catch return;
+    const pane = model.provider.createTerminal() catch {
+        // Refused, visibly — cmd+D at the shell ceiling used to divide the
+        // rect and put a permanently blank pane in the new half.
+        model.terminal_limit_refused = true;
+        return;
+    };
     adoptWorkingDirectory(model, origin, pane);
     _ = current.split(target, orientation, pane.id) catch {
         // The tree refused (at its pane ceiling): the terminal minted for it
@@ -906,6 +1003,7 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
         _ = model.provider.destroyTerminal(pane.id);
         return;
     };
+    model.terminal_limit_refused = false;
     endHiddenCaptures(model, fx);
     spawnConfiguredPane(model, pane, fx);
 }
@@ -1014,6 +1112,11 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
 
     if (current.isEmpty()) workspace.dropTab(tab_index);
     endHiddenCaptures(model, fx);
+
+    // A pane closing gives a shell slot back, so whatever the last refused
+    // cmd+T was told is no longer true. Cleared unconditionally: closing a
+    // pane that never held a pty still cannot leave a stale notice up.
+    model.terminal_limit_refused = false;
 
     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
 }
@@ -1339,6 +1442,44 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         return;
     }
 
+    // The settings surface is MODAL, on the same terms the palette below is
+    // and for a sharper reason: it is the surface you reach for when the
+    // terminal is unreadable, so the one thing it must never do is send the
+    // keys meant for it into a shell the user cannot currently see.
+    //
+    // It sits ABOVE the palette gate because `settings_open` dismisses the
+    // palette, so the two can never both be open — and if a bug ever made them
+    // both open, the one that just took the keyboard should be the one holding
+    // it.
+    if (model.ws().settings.open) {
+        if (keyIs(event.key, "escape")) {
+            updateModel(model, .settings_close, fx);
+            return;
+        }
+        if (keyIs(event.key, "enter") or keyIs(event.key, "return")) {
+            updateModel(model, .settings_commit, fx);
+            return;
+        }
+        if (keyIs(event.key, "arrowdown") or (mods.control and keyIs(event.key, "n"))) {
+            updateModel(model, .{ .settings_step = 1 }, fx);
+            return;
+        }
+        if (keyIs(event.key, "arrowup") or (mods.control and keyIs(event.key, "p"))) {
+            updateModel(model, .{ .settings_step = -1 }, fx);
+            return;
+        }
+        // cmd+, again, and the chord's own duplicate delivery, are absorbed:
+        // the panel is already open, and `settings_open` is idempotent anyway.
+        if (primary and keyIs(event.key, ",")) {
+            latchAppShortcut(model, event.key);
+            return;
+        }
+        // Everything else is swallowed, including every cmd-chord. A chord
+        // pressed while the settings panel is up is not a chord the user meant
+        // for the shell.
+        return;
+    }
+
     // The palette is MODAL, and this gate is what makes it so.
     //
     // It sits above every other press arm on purpose. While it is up, no key
@@ -1507,6 +1648,18 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "p")) {
         latchAppShortcut(model, event.key);
         updateModel(model, .palette_open, fx);
+        return;
+    }
+    // cmd+, opens settings — the chord macOS reserves for exactly this, in
+    // every app on the platform. Needed HERE as well as in `onCommand` for the
+    // same reason cmd+shift+P is: a canvas-only delivery would otherwise fall
+    // through to the shell as a bare comma.
+    //
+    // Shift is TOLERATED (`<` is the same physical key) but alt and control are
+    // not, so this cannot swallow a ctrl+, or opt+, a program is listening for.
+    if (primary and !mods.alt and !mods.control and keyIs(event.key, ",")) {
+        latchAppShortcut(model, event.key);
+        updateModel(model, .settings_open, fx);
         return;
     }
     if (primary and mods.shift and !mods.alt and !mods.control and keyIs(event.key, "arrowleft")) {
@@ -2048,6 +2201,10 @@ pub fn appShortcutKeyMask(key: []const u8) u64 {
     if (keyIs(key, "g")) return 1 << 31;
     if (keyIs(key, "n")) return 1 << 32;
     if (keyIs(key, "p")) return 1 << 33;
+    // `,` and `<` are ONE physical key, the same way `=` and `+` are above:
+    // cmd+, and cmd+shift+, can report either name, and both edges have to
+    // clear the same latch or the key wedges held forever.
+    if (keyIs(key, ",") or keyIs(key, "<")) return 1 << 34;
     return 0;
 }
 

@@ -7,6 +7,8 @@ const model_module = @import("../model.zig");
 const topology = @import("../topology.zig");
 const layout = @import("../layout.zig");
 const scene = @import("scene.zig");
+const config_module = @import("../../config/config.zig");
+const theme_module = @import("../../config/theme.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -192,13 +194,63 @@ pub fn terminalTokensFrom(base: canvas.DesignTokens, model: *const Model) canvas
     tokens.typography.label_size = model.fontSize();
     // Background/foreground land in the emulator's own DEFAULTS through
     // `Session.snapshot`, so an application's OSC 10/11 still wins over them.
-    if (cfg.background) |color| tokens.colors.background = canvas.Color.rgb8(color.r, color.g, color.b);
-    if (cfg.foreground) |color| tokens.colors.text = canvas.Color.rgb8(color.r, color.g, color.b);
+    //
+    // RESOLVED, not raw: `theme = <name>` fills these in and an explicit
+    // `background`/`foreground` key outranks it. The precedence lives in
+    // `Config.resolvedBackground` and friends so this site cannot hold a
+    // second, differing copy of the rule. Because this whole function runs
+    // again on every frame, changing either the theme or a colour repaints
+    // LIVE — there is no cached token set to invalidate.
+    if (cfg.resolvedBackground()) |color| tokens.colors.background = canvas.Color.rgb8(color.r, color.g, color.b);
+    if (cfg.resolvedForeground()) |color| tokens.colors.text = canvas.Color.rgb8(color.r, color.g, color.b);
     // The selection wash reads `colors.accent` (see `palette.Palette.init`).
     // The cursor does NOT come through here — `applySessionConfig` gives it
     // the emulator's override channel so the two knobs stay independent.
-    if (cfg.selection_background) |color| tokens.colors.accent = canvas.Color.rgb8(color.r, color.g, color.b);
+    if (cfg.resolvedSelectionBackground()) |color| tokens.colors.accent = canvas.Color.rgb8(color.r, color.g, color.b);
     return tokens;
+}
+
+/// What the terminal's text and ground ACTUALLY are, and how far apart they
+/// are, right now.
+///
+/// THE INSTRUMENT. `phux-cockpit-aht` cost four rounds of "the text is
+/// see-through or black or something" precisely because nothing in the app
+/// could answer "how legible is this" without an agent measuring pixels. This
+/// reads the same `DesignTokens` the painter is about to paint with — not the
+/// config, not the theme table — so it cannot report a colour the screen is
+/// not showing. A colour that reaches the tokens reaches this, and a colour
+/// that does not reach the tokens is exactly the bug worth seeing.
+pub const Legibility = struct {
+    foreground: canvas.Color,
+    background: canvas.Color,
+    /// WCAG 2.x contrast ratio, 1.0 (identical) through 21.0 (black on white).
+    ratio: f32,
+    grade: theme_module.Legibility,
+
+    pub fn readable(self: Legibility) bool {
+        return self.grade.readable();
+    }
+};
+
+pub fn legibility(model: *const Model) Legibility {
+    return legibilityOf(terminalTokens(model));
+}
+
+/// The same derivation over an already-resolved token set, so the painter and
+/// a test can both ask about the exact tokens in hand.
+pub fn legibilityOf(tokens: canvas.DesignTokens) Legibility {
+    const fg = tokens.colors.text;
+    const bg = tokens.colors.background;
+    const ratio = theme_module.contrastRatioLuminance(
+        theme_module.relativeLuminance(fg.r, fg.g, fg.b),
+        theme_module.relativeLuminance(bg.r, bg.g, bg.b),
+    );
+    return .{
+        .foreground = fg,
+        .background = bg,
+        .ratio = ratio,
+        .grade = theme_module.Legibility.of(ratio),
+    };
 }
 
 /// The band must be able to contain the tab triggers it hosts. The register
@@ -275,6 +327,10 @@ pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     // this app has: a cmd+N at the window ceiling reveals it rather than
     // doing nothing at all.
     if (model.window_limit_refused) return true;
+    // Same rule for the shell ceiling, and it matters more at ONE tab: that is
+    // exactly the state a refused cmd+D leaves behind, and with the band
+    // hidden the chord would look unbound rather than refused.
+    if (model.terminal_limit_refused) return true;
     if (workspaceTerminalRef(model, workspace) == null) return true;
     for (0..workspace.tab_count) |index| {
         const current = workspace.treeConst(index) orelse continue;
@@ -317,11 +373,85 @@ pub fn searchRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     return pane.session.search.open;
 }
 
+/// The config band's height. The SEARCH band's height, deliberately: two bands
+/// that can be on screen at once, stacked over one grid, at two different
+/// heights read as a layout accident, and this metric is already proven to hold
+/// a line of chrome text plus its controls.
+pub const config_notice_height: f32 = search_bar_height;
+
+/// Whether the config band is up.
+///
+/// It takes no workspace, unlike every other reveal here, and that IS the
+/// design: a config file belongs to the app, so the band is drawn in every open
+/// window and dismissed in all of them at once. A per-window answer would mean
+/// four dismissals for one typo, and a notice you can miss by looking at the
+/// other window.
+pub fn configNoticeRevealed(model: *const Model) bool {
+    return model.configNoticeVisible();
+}
+
+/// The longest line `configNoticeLine` can produce, DERIVED rather than picked:
+/// whichever of the two forms is longer, at their worst inputs.
+pub const config_notice_bytes: usize = @max(
+    // "Config line 4294967295: understood, but does nothing in this build 'x…'"
+    "Config line 4294967295: ".len + longest_summary + " ''".len + config_module.max_diagnostic_text_bytes,
+    // "Config: 16 lines were not applied (lines 4294967295, …)"
+    "Config: 16 lines were not applied (lines )".len +
+        config_module.max_diagnostics * "4294967295, ".len,
+);
+
+const longest_summary = blk: {
+    var longest: usize = 0;
+    for (std.enums.values(config_module.Diagnostic.Kind)) |kind| {
+        longest = @max(longest, kind.summary().len);
+    }
+    break :blk longest;
+};
+
+/// What the config band says, in one line.
+///
+/// ONE derivation, called by the band that draws it and by the tests that pin
+/// it. The line NAMES LINE NUMBERS, because that is the only thing that turns
+/// "something in your config did not apply" into an edit someone can make — and
+/// for a single problem it names the problem too, since there is room.
+///
+/// Returns a slice of `out`; `out` must be `config_notice_bytes` long. An empty
+/// answer means there is nothing to say.
+pub fn configNoticeLine(model: *const Model, out: []u8) []const u8 {
+    const notes = model.config.diagnosticSlice();
+    if (notes.len == 0) return "";
+    var writer = std.Io.Writer.fixed(out);
+    if (notes.len == 1) {
+        const only = notes[0];
+        // A `missing_separator` carries the WHOLE line as its text, and the
+        // line number has already located that for the user — quoting it back
+        // spends the band's one line on something they can see in their editor.
+        // Every other kind carries a key or a value, which is the part that is
+        // not obvious from the line number alone.
+        const detail = if (only.kind == .missing_separator) "" else only.text();
+        if (detail.len == 0) {
+            writer.print("Config line {d}: {s}", .{ only.line, only.kind.summary() }) catch {};
+        } else {
+            writer.print("Config line {d}: {s} '{s}'", .{ only.line, only.kind.summary(), detail }) catch {};
+        }
+        return writer.buffered();
+    }
+    writer.print("Config: {d} lines were not applied (lines ", .{notes.len}) catch {};
+    for (notes, 0..) |diagnostic, index| {
+        writer.print("{s}{d}", .{ if (index == 0) "" else ", ", diagnostic.line }) catch {};
+    }
+    writer.print(")", .{}) catch {};
+    return writer.buffered();
+}
+
 pub const WorkspaceChrome = struct {
     titlebar_height: f32,
     /// The band's own rect, so the header ground and its separator paint
     /// exactly where the strip is laid out. Zero-height when at rest.
     header: geometry.RectF,
+    /// The config-diagnostic band. Zero-height once dismissed, and when the
+    /// config had nothing to complain about — which is almost every launch.
+    notice: geometry.RectF,
     /// The scrollback-search band. Zero-height when no search is open.
     search: geometry.RectF,
     content: geometry.RectF,
@@ -436,6 +566,14 @@ pub fn workspaceChromeIn(model: *const Model, workspace: *const Workspace, size:
         header_height
     else
         0;
+    // The config band takes its room out of the content rect exactly as the
+    // search band does, and for the same reason: the painter, the hit-test
+    // tree, and the PTY sizing pump all derive from here, so a band that
+    // floated over the grid would leave the three disagreeing about how tall
+    // the terminal is. It sits ABOVE the search band because it is about the
+    // whole app rather than about the focused pane, and because the search
+    // band has to stay adjacent to the grid it is searching.
+    const notice_extent = if (configNoticeRevealed(model)) config_notice_height else 0;
     const search_extent = if (searchRevealedIn(model, workspace)) search_bar_height else 0;
     const body_width = @max(0, size.width - inset * 2 - side_extent);
     return .{
@@ -446,17 +584,23 @@ pub fn workspaceChromeIn(model: *const Model, workspace: *const Workspace, size:
             @max(0, size.width - inset * 2),
             top_extent,
         ),
-        .search = geometry.RectF.init(
+        .notice = geometry.RectF.init(
             inset + side_extent,
             titlebar + top_extent,
+            body_width,
+            notice_extent,
+        ),
+        .search = geometry.RectF.init(
+            inset + side_extent,
+            titlebar + top_extent + notice_extent,
             body_width,
             search_extent,
         ),
         .content = geometry.RectF.init(
             inset + side_extent,
-            titlebar + top_extent + search_extent,
+            titlebar + top_extent + notice_extent + search_extent,
             body_width,
-            @max(0, size.height - titlebar - top_extent - search_extent - inset),
+            @max(0, size.height - titlebar - top_extent - notice_extent - search_extent - inset),
         ),
     };
 }

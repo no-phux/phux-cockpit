@@ -989,3 +989,10 @@ test "reordered remote enumeration retains stable refs and lookup" {
     try std.testing.expect(host.contains(initial[1]));
     try std.testing.expect(!initial[0].eql(initial[1]));
 }
+
+test "every declaration in this module is compiled, not merely reachable" {
+    // Zig analyzes only what is referenced, so a module can sit in the build
+    // graph with its signatures never checked. Nothing calls Host.search.
+    // See ref.zig.
+    @import("phux_ref").refAllDeclsRecursive(@This());
+}

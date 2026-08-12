@@ -330,3 +330,9 @@ test "motion coalescing is consecutive and does not cross a transition" {
     try std.testing.expectEqual(@as(f64, 3), queue.take().?.x);
     try std.testing.expect(queue.take() == null);
 }
+
+test "every declaration in this module is compiled, not merely reachable" {
+    // Zig analyzes only what is referenced, so a module can sit in the build
+    // graph with its signatures never checked. See ref.zig.
+    @import("phux_ref").refAllDeclsRecursive(@This());
+}

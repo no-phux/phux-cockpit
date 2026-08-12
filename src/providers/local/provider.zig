@@ -16,6 +16,30 @@ pub const Phase = provider_contract.Phase;
 /// what a person keeps alive and still leaves the registry a flat, scannable
 /// array.
 pub const max_terminals: usize = 32;
+
+/// How many local terminals can hold a LIVE SHELL at one time. This is a
+/// different question from `max_terminals` above, which sizes the registry
+/// array and the persistable topology, and it is much smaller.
+///
+/// The effects layer keeps ONE fixed pty table for the whole process
+/// (`Effects.pty_slots`, sized by `native_sdk.max_effect_ptys`), so the
+/// (N+1)-th `ptySpawn` is refused with a `.rejected` exit no matter how much
+/// registry room is left. A pane minted past that ceiling is born DEAD: its
+/// emulator never receives a byte, so it paints an empty grid with a cursor at
+/// the origin and nothing else, forever. That is the whole of
+/// phux-cockpit-pg1 — five tabs, a blank fifth pane, `dispatch_errors=0`,
+/// because a refused spawn is a normal exit event and not an error.
+///
+/// DERIVED, never restated as a literal: the ceiling belongs to the pinned
+/// SDK, and a second copy of it here would go stale the first time the pin
+/// moves and hand the symptom straight back. Measured against the shipped
+/// bundle on 2026-08-12 — four `cmd+T` from a fresh workspace, then:
+///
+///   native automate snapshot | grep -o 'Terminal [0-9]*, native terminal, [A-Z ]*'
+///
+/// which reports Terminal 1..4 RUNNING and Terminal 5 SPAWN REJECTED.
+pub const max_live_shells: usize = native_sdk.max_effect_ptys;
+
 pub const first_terminal_raw: u64 = @intFromEnum(LocalTerminalId.terminal_1);
 pub const clipboard_key: u64 = 100;
 pub const paste_clipboard_key: u64 = 101;
@@ -415,6 +439,24 @@ pub const LocalProvider = struct {
         return provider.activeCount();
     }
 
+    /// How many registry slots are holding — or are about to hold — a pty of
+    /// their own, which is what the effects layer's fixed pty table actually
+    /// counts. NOT `activeCount`: a `.failed` or `.ended` pane still owns a
+    /// registry slot but owns no pty, so counting those would wedge the app at
+    /// its ceiling with dead husks and refuse a shell there was room for.
+    ///
+    /// `acceptsInput` is exactly the right predicate and is reused rather than
+    /// re-spelled — a pane takes typed bytes precisely when a child is there
+    /// to read them.
+    pub fn liveShellCount(provider: *const LocalProvider) usize {
+        var count: usize = 0;
+        for (provider.states, 0..) |state, index| {
+            if (state != .active) continue;
+            if (provider.slots[index].acceptsInput()) count += 1;
+        }
+        return count;
+    }
+
     pub fn slotIndex(provider: *const LocalProvider, terminal_ref: TerminalRef) ?usize {
         if (!provider_contract.isLocal(terminal_ref)) return null;
         for (0..max_terminals) |index| {
@@ -468,6 +510,13 @@ pub const LocalProvider = struct {
     }
 
     pub fn createTerminal(provider: *LocalProvider) !*Pane {
+        // The SHELL ceiling is checked first and refuses hardest, because it
+        // is the one a person actually reaches. A pane minted past it gets a
+        // `.rejected` spawn and an empty grid nobody can type into, so the
+        // honest answer is to refuse the pane here — where every caller
+        // already handles a refusal — rather than to hand back a husk that
+        // looks like a working tab until you click it. See `max_live_shells`.
+        if (provider.liveShellCount() >= max_live_shells) return error.TerminalCapacityReached;
         if (provider.activeCount() >= max_terminals) return error.TerminalCapacityReached;
         if (provider.next_terminal_raw >= std.math.maxInt(u64) - 1 or provider.next_pty_key >= std.math.maxInt(u64) - 1) return error.TerminalIdentityExhausted;
         const next_ref = localRef(@enumFromInt(provider.next_terminal_raw));
