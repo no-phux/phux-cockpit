@@ -368,6 +368,37 @@ fn addTestVerdict(b: *std.Build, test_step: *std.Build.Step, verdict: []const u8
     test_step.dependOn(&run.step);
 }
 
+/// Which Zig global cache this run used, and whether anybody else is in it.
+///
+/// The other half of phux-cockpit-2ml.11. A cache entry is guarded by an
+/// EXCLUSIVE lock on its manifest in `<global cache>/h/<hash>.txt`, held for as
+/// long as the entry takes to produce, and the manifests that land there are
+/// project-independent -- a hello-world and this repo were measured writing the
+/// same one. So with the default `~/.cache/zig`, every worktree on the machine
+/// queues on the same file, and a build runner that outlives its session holds
+/// it forever. Measured: a deliberately held lock blocked a shared-cache build
+/// past 45s while an isolated-cache build finished in 3s.
+///
+/// This line does not prevent that -- `scripts/zig-build.sh` does, by giving
+/// each worktree its own cache with only the package directory shared. What
+/// this line does is make the exposure legible in the log of every run,
+/// including the ones that call `zig build` directly.
+fn globalCacheNote(b: *std.Build, source_root: []const u8) []const u8 {
+    const reported = b.graph.global_cache_root.path orelse return "(unknown)";
+
+    // Zig hands this back RELATIVE to the build root whenever the cache lives
+    // under it -- `--global-cache-dir <abs path>/.zig-global-cache` came back
+    // as plain `.zig-global-cache`. The first version of this function compared
+    // the reported string against the absolute source root, so the one
+    // configuration it was written to certify -- a worktree-private cache --
+    // was the one it called SHARED. Caught by reading the output of the first
+    // run that used it, which is the only reason it is not still wrong.
+    const absolute = if (std.fs.path.isAbsolute(reported)) reported else b.pathFromRoot(reported);
+    if (std.mem.startsWith(u8, absolute, source_root)) return b.fmt("{s} (worktree-private)", .{absolute});
+    const path = absolute;
+    return b.fmt("{s}\n                 SHARED with every other checkout on this machine; one\n                 stuck build runner in any of them can starve this one.\n                 Use scripts/zig-build.sh to get a private cache.", .{path});
+}
+
 fn buildVerdict(
     b: *std.Build,
     phux_enabled: bool,
@@ -388,12 +419,14 @@ fn buildVerdict(
     // build root costs a line and makes it visible in every future log.
     // See phux-cockpit-2ml.11.
     const source_root = b.build_root.path orelse ".";
+    const global_cache = globalCacheNote(b, source_root);
 
     if (ffi) |found| {
         return b.fmt(
             \\{s}
             \\zig build test: PASS
             \\  source root:   {s}
+            \\  global cache:  {s}
             \\  phux provider: COMPILED AND TESTED ({s})
             \\    ffi include: {s}
             \\    ffi lib:     {s}
@@ -403,6 +436,7 @@ fn buildVerdict(
         , .{
             rule,
             source_root,
+            global_cache,
             phux_test_module_names,
             found.include_dir,
             found.lib_dir,
@@ -418,6 +452,7 @@ fn buildVerdict(
             \\{s}
             \\zig build test: PASS, INCOMPLETE
             \\  source root:   {s}
+            \\  global cache:  {s}
             \\  phux provider: NOT COMPILED. src/providers/phux/ was not in this
             \\                 build at all, so a change to it is NOT verified by
             \\                 this run, however green it looks.
@@ -435,6 +470,7 @@ fn buildVerdict(
     , .{
         rule,
         source_root,
+        global_cache,
         rootPath(b, ".phux"),
         rootPath(b, "../phux"),
         rule,

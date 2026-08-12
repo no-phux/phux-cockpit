@@ -87,8 +87,18 @@ compressing operational complexity, it is pointed in the wrong direction.
 ## The Gate
 
 ```sh
-zig build test > /tmp/t.log 2>&1; echo "exit=$?"
+./scripts/zig-build.sh test > /tmp/t.log 2>&1; echo "exit=$?"
 ```
+
+Plain `zig build test` still works and is still judged the same way. The
+wrapper exists because several worktrees share one machine, and it does three
+things `zig build` will not: it gives this worktree its own Zig global cache
+(sharing only the package directory, by symlink), it kills build runners
+orphaned by a dead session in THIS tree before starting, and it refuses to run
+when your shell is standing in a different checkout than the one it would
+build. A held lock on the shared global cache was measured blocking a build
+past 45 seconds while an isolated one finished in 3; `scripts/zig-cache-isolation-check.sh`
+reproduces that A/B on demand. See phux-cockpit-2ml.11.
 
 **Judge the run by the exit code.** Never by a log line. Nothing printed to
 stdout or stderr is authoritative, and a green run has previously ended with a
@@ -99,10 +109,18 @@ line reading `failed command: .../test --listen=-`.
 ```
 ------------------------------------------------------------------
 zig build test: PASS
+  source root:   /path/to/the/worktree/you/think/you/are/in
+  global cache:  /path/to/that/worktree/.zig-global-cache (worktree-private)
   phux provider: COMPILED AND TESTED (transport, host, provider, pointer)
   ...
 ------------------------------------------------------------------
 ```
+
+**Check that `source root` names YOUR worktree.** A subagent's `zig build test`
+once ran in a sibling worktree: the exit code was real, it just described
+somebody else's code, and nothing else in the output distinguished it.
+`global cache` says whether this run could be starved by a stuck build runner
+somewhere else on the machine.
 
 The verdict step depends on every test step, so it prints only when all of
 them succeeded. **No verdict block means the run was not green**, whatever
