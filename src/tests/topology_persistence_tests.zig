@@ -409,6 +409,66 @@ test "the debounced write carries the live layout and a second one waits for it"
     try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
 }
 
+test "the shutdown flush writes through a symlinked parent directory" {
+    // The layout has to survive a state path whose PARENT is a symlink to a
+    // directory, because that is the ordinary shape of the place people put
+    // one: `/tmp` is a symlink to `/private/tmp` on macOS, and a platform
+    // state directory can be reached through one too.
+    //
+    // The fixture builds its own symlink rather than leaning on `/tmp` being
+    // one, so the hazard is present on every platform this ever runs on
+    // instead of only where the OS happens to supply it.
+    const root = ".zig-cache/phux-cockpit-state-symlink-tests";
+    const real_dir = root ++ "/real";
+    const link_dir = root ++ "/link";
+    const path = link_dir ++ "/workspace.state";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing.io, root) catch {};
+    defer cwd.deleteTree(testing.io, root) catch {};
+    try cwd.createDirPath(testing.io, real_dir);
+    try cwd.symLink(testing.io, "real", link_dir, .{});
+
+    // The HAZARD is asserted, not assumed. `createDirPath` stats each existing
+    // component without following symlinks, so a symlink to a directory comes
+    // back `.sym_link`, not `.directory`, and the call fails — while a write
+    // straight through the same link succeeds. A fixture whose symlink
+    // `createDirPath` happily accepted would pass on either ordering and would
+    // prove nothing at all.
+    //
+    // `NotDir` rather than a looser "it failed somehow" because the error is
+    // the evidence that the SYMLINK is what stopped it. It comes from
+    // `Threaded.dirCreateDirPath`, which answers `PathAlreadyExists` by
+    // checking `filePathKind` with `SYMLINK_NOFOLLOW` and rejects anything
+    // that is not a directory. The same call against a plain existing
+    // directory succeeds, and `createDirPath(io, "/tmp")` fails identically on
+    // macOS -- both measured before this test was written.
+    try testing.expectError(error.NotDir, cwd.createDirPath(testing.io, link_dir));
+
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    state.model.state.setPath(path);
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .split_right, &state.effects);
+
+    // ABSENT: nothing is on disk yet, so the read below cannot be satisfied by
+    // a leftover from an earlier run or by the fixture itself.
+    try testing.expectError(error.FileNotFound, cwd.openFile(testing.io, path, .{}));
+
+    app.update(&state.model, .shutdown, &state.effects);
+
+    // PRESENT, and byte-for-byte the live layout: a save that reached the disk
+    // but dropped the split would satisfy "the file exists" and nothing more.
+    var bytes: [app.max_state_bytes]u8 = undefined;
+    var file = try cwd.openFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    const read = try file.readPositionalAll(testing.io, &bytes, 0);
+    var parsed: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(bytes[0..read], &parsed));
+    try testing.expectEqualDeep(try state.model.topologySnapshot(), try app.migrateTopologySnapshot(parsed));
+}
+
 test "the shutdown message puts the layout on disk without waiting for the debounce" {
     // The one claim that cannot be made without real IO: quitting inside the
     // debounce window still saves. Nothing else drains an effect queue after

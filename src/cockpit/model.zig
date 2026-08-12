@@ -1190,6 +1190,21 @@ pub const Model = struct {
         const encoded = session_state.serialize(&snapshot, &bytes) catch return;
         const cwd = std.Io.Dir.cwd();
         const path = model.state.path();
+        // WRITE FIRST, create the directory only if that fails — the same
+        // correction `writeConfigTheme` carries, and for the same measured
+        // reason. `createDirPath` stats each existing component WITHOUT
+        // following symlinks, so a parent that is a symlink to a directory
+        // comes back `.sym_link` rather than `.directory` and the call fails
+        // with `error.NotDir`; the `catch return` then swallowed the entire
+        // save even though a write straight through that same link would have
+        // succeeded. `/tmp` -> `/private/tmp` on macOS is exactly that shape,
+        // and `PHUX_COCKPIT_STATE` pointing anywhere under one — or a platform
+        // state directory reached through one — lost every layout silently.
+        //
+        // Trying the write first also means the ordinary case, a directory
+        // that already exists in any shape, never consults the directory at
+        // all; the mkdir is reserved for the first-run case it is for.
+        if (cwd.writeFile(io, .{ .sub_path = path, .data = encoded })) |_| return else |_| {}
         if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(io, parent) catch return;
         cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return;
     }
