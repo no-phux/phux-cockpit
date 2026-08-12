@@ -117,6 +117,12 @@ expect_change() {
     'kind=gpu_surface' \
     'role=textbox name="Terminal 1' \
     'dispatch_errors=0'
+# The terminal must reach glass through the PACKET path, where the AppKit host
+# rasterizes with CoreText. A fallback to `pixels` silently moves every glyph
+# onto the CPU reference renderer - the app then looks like its own
+# screenshots, which is exactly the failure no screenshot can report. See
+# docs/RENDER_FIDELITY.md.
+"$NATIVE" automate assert 'gpu_present_path=packet'
 "$NATIVE" automate assert --absent 'error event='
 printf 'structure: ok\n'
 

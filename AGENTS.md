@@ -38,6 +38,15 @@ product structure, identity, navigation, or orchestration boundaries.
 - Do not fake detach, restoration, durability, or visibility when an underlying
   runtime seam is missing. Establish the seam and test its invariants first.
 
+## Rendering Evidence
+
+`native automate screenshot` renders through the SDK's CPU reference renderer,
+not through the real macOS rasterizer. It cannot see anything CoreText does,
+which is why a 35% text-weight defect once survived three diagnoses. Never
+conclude "the text renders correctly" from a screenshot. Read
+[docs/RENDER_FIDELITY.md](docs/RENDER_FIDELITY.md) before writing any test that
+claims to check what the terminal looks like.
+
 ## Quality Bar
 
 Every change should reduce cognitive load, preserve input and lifecycle
