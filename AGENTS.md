@@ -77,6 +77,28 @@ installed app — three days of bug reports once went to a build a week older
 than `main` exactly that way. `./scripts/dev-isolation-check.sh` is the proof
 and README explains the mechanisms.
 
+## Regression Tests Must Be Shown Failing
+
+A test that claims to guard a fix must be watched failing WITHOUT that fix,
+before it is committed. This is not a formality. A regression test here once
+passed against the exact bug it was written to catch — it allowed "a few more
+frames" to settle, and the broken code needed exactly four for four panes,
+inside the allowance. Reading it revealed nothing; only disabling the fix did.
+
+So: remove the fix, run
+
+```sh
+scripts/guard-red-run.sh --record <name> --test "the zig test name" <path>
+```
+
+mark the test with `// GUARD: <name>` on the line above it, and say so in the
+commit message. The script refuses to record anything it did not watch fail,
+and it distinguishes a genuine red from a break that merely stopped the tree
+compiling. `zig build test` then keeps the bookkeeping honest on every run.
+
+Read [docs/GUARDS.md](docs/GUARDS.md) for the ritual, the two scripts, and —
+more usefully — what the mechanism still does not prove.
+
 ## Quality Bar
 
 Every change should reduce cognitive load, preserve input and lifecycle

@@ -393,6 +393,7 @@ test "a background window's frames resize its own terminals, not the front windo
     }) == null);
 }
 
+// GUARD: one-frame-convergence
 test "every pane converges on ONE frame, not one pane per frame" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
