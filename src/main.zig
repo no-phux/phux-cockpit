@@ -20,6 +20,7 @@ const scene = @import("cockpit/native/scene.zig");
 const view_module = @import("cockpit/native/view.zig");
 const host = @import("cockpit/native/host.zig");
 const config_module = @import("config/config.zig");
+const theme_module = @import("config/theme.zig");
 
 const geometry = native_sdk.geometry;
 
@@ -211,6 +212,25 @@ pub const ConfigTabPlacement = config_module.TabPlacement;
 pub const configPath = config_module.joinPath;
 pub const parseConfig = config_module.parse;
 pub const loadConfigOrDefault = config_module.loadOrDefault;
+pub const setConfigKey = config_module.setKey;
+pub const max_config_bytes = config_module.max_config_bytes;
+pub const Theme = theme_module.Theme;
+pub const builtin_themes = theme_module.builtins;
+pub const themeByName = theme_module.byName;
+pub const themeIndexOf = theme_module.indexOf;
+pub const contrastRatio = theme_module.contrastRatio;
+pub const contrastRatioLuminance = theme_module.contrastRatioLuminance;
+pub const relativeLuminance = theme_module.relativeLuminance;
+pub const wcag_aa_body_text = theme_module.wcag_aa_body_text;
+pub const wcag_aaa_body_text = theme_module.wcag_aaa_body_text;
+pub const Legibility = theme_module.Legibility;
+pub const legibility = projection.legibility;
+pub const legibilityOf = projection.legibilityOf;
+pub const Settings = model_module.Settings;
+pub const ConfigFile = model_module.ConfigFile;
+pub const settings_width = view_module.settings_width;
+pub const settings_panel_label = view_module.settings_panel_label;
+pub const settings_sample_label = view_module.settings_sample_label;
 pub const paneArgvIn = local.paneArgvIn;
 pub const CwdArgv = local.CwdArgv;
 
@@ -346,26 +366,82 @@ pub fn resolveDotfileConfigPath(env: native_sdk.app_dirs.Env, path_storage: []u8
 /// malformed LINE is already a diagnostic rather than a failure inside the
 /// parser. There is exactly one way this function does not produce a usable
 /// Config, and that is never.
-fn loadUserConfig(io: std.Io, init: std.process.Init) Config {
+/// The loaded config plus WHERE it came from.
+///
+/// The path is now part of the answer because the settings surface writes a
+/// theme choice back into that same file, and `update` has no environment to
+/// re-resolve it from — the same reason `StatePersistence` carries the layout
+/// path. `path_len` is zero when no location could be resolved at all, which
+/// disables the write rather than failing anything.
+pub const LoadedConfig = struct {
+    config: Config,
+    path_storage: [std.fs.max_path_bytes]u8 = undefined,
+    path_len: usize = 0,
+
+    pub fn path(self: *const LoadedConfig) []const u8 {
+        return self.path_storage[0..self.path_len];
+    }
+
+    fn setPath(self: *LoadedConfig, value: []const u8) void {
+        if (value.len == 0 or value.len > self.path_storage.len) {
+            self.path_len = 0;
+            return;
+        }
+        @memcpy(self.path_storage[0..value.len], value);
+        self.path_len = value.len;
+    }
+};
+
+fn loadUserConfig(io: std.Io, init: std.process.Init) LoadedConfig {
     var dir_storage: [std.fs.max_path_bytes]u8 = undefined;
     var path_storage: [std.fs.max_path_bytes]u8 = undefined;
     var dotfile_storage: [std.fs.max_path_bytes]u8 = undefined;
     const env = native_sdk.debug.envFromMap(init.environ_map);
     const override = init.environ_map.get("PHUX_COCKPIT_CONFIG");
 
-    // An explicit override answers on its own. Otherwise the dotfile location
-    // is tried first and the platform location second — first file that opens
-    // wins, so someone who has never heard of `~/Library/Preferences` and
-    // someone who expects a Mac app to live there are both right.
+    var loaded: LoadedConfig = .{ .config = .{} };
+
+    // An explicit override answers on its own — including for WRITING. A
+    // wrapper or a test that named a file is naming the file the app should
+    // edit too, whether or not it exists yet.
     if (override) |explicit| {
-        if (readConfig(io, explicit)) |parsed| return parsed;
-        return .{};
+        loaded.setPath(explicit);
+        if (readConfig(io, explicit)) |parsed| loaded.config = parsed;
+        return loaded;
     }
+    // Otherwise the dotfile location is tried first and the platform location
+    // second — first file that opens wins, so someone who has never heard of
+    // `~/Library/Preferences` and someone who expects a Mac app to live there
+    // are both right.
     if (resolveDotfileConfigPath(env, &dotfile_storage)) |dotfile| {
-        if (readConfig(io, dotfile)) |parsed| return parsed;
+        if (readConfig(io, dotfile)) |parsed| {
+            loaded.config = parsed;
+            loaded.setPath(dotfile);
+            return loaded;
+        }
     }
-    const path = resolveConfigPath(env, null, &dir_storage, &path_storage) orelse return .{};
-    return readConfig(io, path) orelse .{};
+    const path = resolveConfigPath(env, null, &dir_storage, &path_storage) orelse {
+        // No file opened anywhere and no platform directory either. A write
+        // still needs somewhere to go, and the dotfile path is the one this
+        // audience expects — see `resolveDotfileConfigPath`.
+        if (resolveDotfileConfigPath(env, &dotfile_storage)) |dotfile| loaded.setPath(dotfile);
+        return loaded;
+    };
+    if (readConfig(io, path)) |parsed| {
+        loaded.config = parsed;
+        loaded.setPath(path);
+        return loaded;
+    }
+    // NO config file exists yet, which is the ordinary first-run state. The
+    // write target is the DOTFILE location rather than the platform one for
+    // the same reason the read tries it first: it is where this audience will
+    // look for it afterwards.
+    if (resolveDotfileConfigPath(env, &dotfile_storage)) |dotfile| {
+        loaded.setPath(dotfile);
+        return loaded;
+    }
+    loaded.setPath(path);
+    return loaded;
 }
 
 /// Read and parse one candidate. Null means "there was no usable file here",
@@ -508,7 +584,8 @@ pub fn main(init: std.process.Init) !void {
     // ceiling is fixed at `vt.Terminal.init` and cannot be changed afterwards.
     // Reading it later is exactly how `scrollback-limit` came to parse, store,
     // and do nothing.
-    const user_config = loadUserConfig(init.io, init);
+    const loaded_config = loadUserConfig(init.io, init);
+    const user_config = loaded_config.config;
     reportConfigDiagnostics(&user_config);
     const max_scrollback_bytes: usize = @intCast(@min(
         user_config.scrollback_bytes,
@@ -548,6 +625,9 @@ pub fn main(init: std.process.Init) !void {
     // changes nothing writes nothing.
     model.state.fingerprint = model.topologyFingerprint();
     model.config = user_config;
+    // Where a theme chosen in the settings surface gets written back. Resolved
+    // ONCE here, because `update` has no environment to resolve it from later.
+    model.config_file.setPath(loaded_config.path());
     model.tab_placement = switch (model.config.tab_placement) {
         .top => .top,
         .side => .side,
@@ -674,6 +754,7 @@ test {
     _ = @import("tests/config_tests.zig");
     _ = @import("tests/shell_identity_tests.zig");
     _ = @import("tests/config_wiring_tests.zig");
+    _ = @import("tests/settings_theme_tests.zig");
     _ = @import("tests/tab_strip_tests.zig");
     _ = @import("tests/scrollback_search_tests.zig");
     _ = @import("tests/multi_window_tests.zig");

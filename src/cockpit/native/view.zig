@@ -11,6 +11,7 @@ const app_types = @import("../app_types.zig");
 const pointer_input = @import("../pointer_input.zig");
 const projection = @import("workspace_projection.zig");
 const scene_module = @import("scene.zig");
+const theme_module = @import("../../config/theme.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -88,6 +89,76 @@ pub const palette_top_inset: f32 = 72;
 /// grid behind an open switcher is explicitly NOT being read, and pushing it
 /// back is what stops the palette's own rows competing with a screen of text.
 const palette_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.5);
+
+/// The settings surface's geometry. Wider than the switcher because each row
+/// carries a name, a one-line summary, and its measured contrast, and none of
+/// the three is worth eliding.
+pub const settings_width: f32 = 560;
+pub const settings_row_height: f32 = 34;
+pub const settings_padding: f32 = 10;
+pub const settings_row_width: f32 = settings_width - settings_padding * 2;
+/// How far down the content the panel sits — the same reasoning as
+/// `palette_top_inset`, one row lower because this panel is taller.
+pub const settings_top_inset: f32 = 56;
+
+/// THE SETTINGS SURFACE'S OWN COLOURS, AND WHY THEY ARE LITERALS.
+///
+/// This panel is what you open when the terminal has become unreadable. If it
+/// painted with the tokens the user is trying to FIX, then the one
+/// configuration it exists to rescue — text you cannot see — would make the
+/// rescue itself invisible. A settings page you cannot read when things are
+/// wrong is worse than no settings page at all, because it costs someone the
+/// time to find it before it fails them. That is not hypothetical here:
+/// `phux-cockpit-aht` is four rounds of "I can't see the text".
+///
+/// Today `cockpitTokens` happens to be independent of the user's config — only
+/// `terminalTokensFrom` applies `foreground`/`background`, and only the grids
+/// paint with those. That is NOT a reason to lean on the tokens here. A theming
+/// feature is precisely the change that starts colouring the chrome; it is the
+/// obvious next request, and on the day it lands every other panel can afford
+/// to follow the theme and this one still cannot. Pinning the values AT THE
+/// SITE makes wiring this panel to a theme something a person has to
+/// deliberately undo rather than something they can do by accident.
+///
+/// These four are also not chosen by eye. Every one is measured against the
+/// ground it sits on with the same WCAG formula the panel itself reports, and
+/// every one clears AA (4.5:1) on BOTH grounds. Derived with:
+///
+///   python3 -c 'def L(h):
+///    c=[int(h[i:i+2],16)/255 for i in (1,3,5)]
+///    f=lambda x: x/12.92 if x<=0.03928 else ((x+0.055)/1.055)**2.4
+///    r,g,b=[f(x) for x in c]; return .2126*r+.7152*g+.0722*b
+///   cr=lambda a,b:(max(L(a),L(b))+.05)/(min(L(a),L(b))+.05)
+///   print([round(cr(x,"#101010"),2) for x in ("#ffffff","#b3b3b3","#7ee787","#ff7b72")])'
+///
+///                       on #101010   on #262626
+///   settings_ink          19.03         15.13
+///   settings_ink_muted     9.08          7.22
+///   settings_pass         12.38          9.85
+///   settings_fail          7.55          6.00
+///
+/// `settings_border` is a hairline and not text, so no text threshold applies
+/// to it.
+const settings_ground: canvas.Color = canvas.Color.rgb8(0x10, 0x10, 0x10);
+const settings_ground_raised: canvas.Color = canvas.Color.rgb8(0x26, 0x26, 0x26);
+const settings_ink: canvas.Color = canvas.Color.rgb8(0xff, 0xff, 0xff);
+const settings_ink_muted: canvas.Color = canvas.Color.rgb8(0xb3, 0xb3, 0xb3);
+const settings_pass: canvas.Color = canvas.Color.rgb8(0x7e, 0xe7, 0x87);
+const settings_fail: canvas.Color = canvas.Color.rgb8(0xff, 0x7b, 0x72);
+const settings_border: canvas.Color = canvas.Color.rgb8(0x3d, 0x3d, 0x3d);
+/// The scrim behind the panel. Deeper than the palette's, because the grid
+/// behind a settings panel may be the very thing that is illegible and pushing
+/// it further back is what stops it competing with the readout.
+const settings_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.62);
+
+/// The spoken name of the panel itself. Also the handle a test uses to find
+/// the panel's own ground, so the "this stays readable" invariant can be
+/// measured against the colour actually painted rather than a copy of it.
+pub const settings_panel_label = "Settings";
+/// The spoken name of the two swatches that deliberately paint in the USER's
+/// colours. They are the only text in the panel exempt from its own legibility
+/// invariant, because showing an unreadable pair is precisely their job.
+pub const settings_sample_label = "colour sample";
 
 /// Base for the unfocused-pane scrim, one retained id per resolved pane.
 /// Disjoint from the three above and from `render.paneIdBase` (0x7e21+).
@@ -820,6 +891,253 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
     });
 }
 
+/// A canvas colour written the way a config file spells it, so what the panel
+/// reports can be pasted straight back into `~/.config/phux-cockpit/config`.
+/// Rounded rather than truncated: 0xf4/255 * 255 is not exactly 244 in f32,
+/// and a readout that says `#f3f6fa` for a colour written `#f4f7fb` would send
+/// somebody hunting for a bug that is not there.
+fn colorHex(ui: *TerminalUi, color: canvas.Color) []const u8 {
+    return ui.fmt("#{x:0>2}{x:0>2}{x:0>2}", .{
+        channelByte(color.r),
+        channelByte(color.g),
+        channelByte(color.b),
+    });
+}
+
+fn channelByte(channel: f32) u8 {
+    return @intFromFloat(std.math.clamp(@round(channel * 255), 0, 255));
+}
+
+/// THE LEGIBILITY READOUT: what the terminal's own text-on-ground contrast
+/// currently is, in a panel that is guaranteed to be readable while it says so.
+///
+/// This is the instrument `phux-cockpit-aht` needed and did not have. Four
+/// rounds went into "the text is see-through or black or something" and every
+/// one of them was an agent measuring pixels, because nothing in the running
+/// app could answer the question. It reads `projection.legibility`, which
+/// derives from the SAME `DesignTokens` the painter is about to paint the
+/// grid with — not from the config, not from the theme table — so it cannot
+/// report a colour the screen is not actually showing.
+fn legibilityReadout(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+    const reading = projection.legibility(model);
+    const verdict_color = if (reading.readable()) settings_pass else settings_fail;
+    const verdict = switch (reading.grade) {
+        .fails_aa => "BELOW AA - needs 4.5:1 for body text",
+        .passes_aa => "passes WCAG AA (4.5:1)",
+        .passes_aaa => "passes WCAG AAA (7:1)",
+    };
+    return ui.row(.{
+        .width = settings_row_width,
+        .height = settings_row_height + 8,
+        .gap = 10,
+        .cross = .center,
+        .padding = 6,
+        .style = .{ .background = settings_ground_raised },
+        .semantics = .{ .label = ui.fmt(
+            "Legibility: foreground {s} on background {s}, contrast ratio {d:.2} to 1, {s}",
+            .{ colorHex(ui, reading.foreground), colorHex(ui, reading.background), reading.ratio, verdict },
+        ) },
+    }, .{
+        // A LIVE SAMPLE, painted with the terminal's actual pair. The panel
+        // around it stays legible by construction, so this swatch is the one
+        // place on screen where "what does my text look like" is answerable by
+        // looking rather than by squinting at a whole screen of it.
+        ui.el(.stack, .{
+            .width = 46,
+            .height = settings_row_height - 4,
+            .style = .{ .background = reading.background },
+        }, .{
+            ui.row(.{ .grow = 1, .main = .center, .cross = .center }, .{
+                ui.text(.{
+                    .wrap = false,
+                    .style = .{ .foreground = reading.foreground },
+                    .semantics = .{ .label = settings_sample_label },
+                }, "Aa"),
+            }),
+        }),
+        ui.column(.{ .grow = 1, .gap = 2 }, .{
+            ui.text(.{
+                .wrap = false,
+                .style = .{ .foreground = verdict_color },
+            }, ui.fmt("{d:.2}:1  {s}", .{ reading.ratio, verdict })),
+            ui.text(.{
+                .wrap = false,
+                .overflow = .ellipsis,
+                .style = .{ .foreground = settings_ink_muted },
+            }, ui.fmt("text {s} on {s}", .{
+                colorHex(ui, reading.foreground),
+                colorHex(ui, reading.background),
+            })),
+        }),
+    });
+}
+
+/// A hairline between the panel's sections.
+///
+/// Deliberately carries NO `semantics.hidden`. That flag suppresses RENDERING
+/// as well as the accessibility node (`widget_render.zig` returns early on it),
+/// so a "hidden from assistive tech" rule is simply a rule that never paints —
+/// the same trap the search band's icon comment records. It stays unnamed
+/// instead, which is what a decoration should be.
+fn settingsRule(ui: *TerminalUi) TerminalUi.Node {
+    return ui.el(.stack, .{
+        .width = settings_row_width,
+        .height = 1,
+        .style = .{ .background = settings_border },
+    }, .{});
+}
+
+/// One theme row: its name, its one-line summary, and the contrast it would
+/// produce. The ratio is shown per row so the choice can be made on evidence
+/// rather than on the name — which is the difference between a theme picker
+/// and this.
+fn settingsThemeRow(ui: *TerminalUi, index: usize, highlighted: bool, active: bool) TerminalUi.Node {
+    const entry = &theme_module.builtins[index];
+    const ratio = theme_module.contrastRatio(entry.foreground, entry.background);
+    return ui.el(.list_item, .{
+        .width = settings_row_width,
+        .height = settings_row_height,
+        .selected = highlighted,
+        .on_press = .{ .settings_select = @intCast(index) },
+        .style = .{ .background = if (highlighted) settings_ground_raised else settings_ground },
+        .semantics = .{
+            .role = .tab,
+            .label = ui.fmt("{s}: {s}; contrast {d:.2} to 1{s}{s}", .{
+                entry.name,
+                entry.summary,
+                ratio,
+                if (active) ", in effect" else "",
+                if (highlighted) ", highlighted" else "",
+            }),
+        },
+    }, .{
+        ui.row(.{ .width = settings_row_width, .height = settings_row_height, .gap = 8, .cross = .center, .padding = 7 }, .{
+            // The theme's own pair, as a swatch. Two colours are faster to
+            // compare than two hex strings.
+            ui.el(.stack, .{
+                .width = 22,
+                .height = 16,
+                .style = .{ .background = canvas.Color.rgb8(entry.background.r, entry.background.g, entry.background.b) },
+            }, .{
+                ui.row(.{ .grow = 1, .main = .center, .cross = .center }, .{
+                    ui.text(.{
+                        .wrap = false,
+                        .style = .{ .foreground = canvas.Color.rgb8(entry.foreground.r, entry.foreground.g, entry.foreground.b) },
+                        // NAMED as a sample, which is what lets the panel's own
+                        // legibility invariant be checked: this is the one text
+                        // in the tree deliberately painted in colours that may
+                        // be unreadable, because showing them is the job.
+                        .semantics = .{ .label = settings_sample_label },
+                    }, "A"),
+                }),
+            }),
+            ui.text(.{
+                .wrap = false,
+                .style = .{ .foreground = if (highlighted) settings_ink else settings_ink_muted },
+            }, entry.name),
+            ui.text(.{
+                .grow = 1,
+                .wrap = false,
+                .overflow = .ellipsis,
+                .style = .{ .foreground = settings_ink_muted },
+            }, entry.summary),
+            ui.text(.{
+                .wrap = false,
+                .style = .{ .foreground = if (ratio >= theme_module.wcag_aa_body_text) settings_pass else settings_fail },
+            }, ui.fmt("{d:.1}:1", .{ratio})),
+        }),
+    });
+}
+
+/// The in-app settings surface.
+///
+/// It FLOATS, for the same reason the palette does: it is transient, and taking
+/// rows away from every terminal in the tab while it is up — then giving them
+/// back — is a SIGWINCH per pane per open. See the comment on `palettePanel`.
+///
+/// Every colour in here is a literal from the `settings_*` block above rather
+/// than a token. That is the whole point of the surface and the reasoning is
+/// written down at the constants.
+fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) TerminalUi.Node {
+    const count = theme_module.builtins.len;
+    const cursor = @min(ws.settings.cursor, count - 1);
+    const active_name = model.config.theme.slice();
+
+    var rows: [theme_module.builtins.len]TerminalUi.Node = undefined;
+    for (0..count) |index| {
+        rows[index] = settingsThemeRow(
+            ui,
+            index,
+            index == cursor,
+            std.ascii.eqlIgnoreCase(theme_module.builtins[index].name, active_name),
+        );
+    }
+    // An explicit slice: `rows[0..count]` with a comptime-known `count` is a
+    // pointer-to-array, and `Ui.el` takes a Node, a `[]const Node`, or a tuple.
+    const row_slice: []const TerminalUi.Node = &rows;
+
+    return ui.column(.{
+        .width = settings_width,
+        .gap = 6,
+        .padding = settings_padding,
+        .style = .{ .background = settings_ground },
+        .semantics = .{ .label = settings_panel_label },
+    }, .{
+        ui.row(.{ .width = settings_row_width, .gap = 8, .cross = .center }, .{
+            ui.text(.{ .wrap = false, .style = .{ .foreground = settings_ink } }, "Settings"),
+            ui.spacer(1),
+            ui.text(.{
+                .wrap = false,
+                .style = .{ .foreground = settings_ink_muted },
+            }, "up/down preview   return save   esc cancel"),
+        }),
+        settingsRule(ui),
+        legibilityReadout(ui, model),
+        settingsRule(ui),
+        ui.list(.{ .gap = 1, .semantics = .{ .label = "Themes" } }, row_slice),
+        settingsRule(ui),
+        // Where the choice lands. Said out loud because "it did not persist"
+        // and "it persisted somewhere you are not looking" are the two failure
+        // modes of a settings page, and only one of them is a bug.
+        ui.text(.{
+            .wrap = false,
+            .overflow = .ellipsis,
+            .style = .{ .foreground = settings_ink_muted },
+        }, if (model.config_file.enabled())
+            ui.fmt("saves to {s}", .{model.config_file.path()})
+        else
+            "no config file location could be resolved, so this run only"),
+        // A pointer path to both verbs. The panel is keyboard-first, but a
+        // surface reachable only by keys is one a pointer user cannot finish.
+        ui.row(.{ .width = settings_row_width, .gap = 8, .cross = .center }, .{
+            ui.spacer(1),
+            settingsAction(ui, "Cancel", .settings_close, false),
+            settingsAction(ui, "Save", .settings_commit, true),
+        }),
+    });
+}
+
+/// A footer verb. Built from a `.stack` with explicit colours rather than from
+/// `ui.button`, because the register's button variants take their fill and
+/// their label colour from the DESIGN TOKENS — which is the one thing nothing
+/// on this panel is allowed to do.
+fn settingsAction(ui: *TerminalUi, label: []const u8, msg: Msg, emphasis: bool) TerminalUi.Node {
+    return ui.el(.stack, .{
+        .width = 84,
+        .height = 26,
+        .on_press = msg,
+        .style = .{ .background = if (emphasis) settings_ground_raised else settings_ground },
+        .semantics = .{ .role = .button, .label = label },
+    }, .{
+        ui.row(.{ .grow = 1, .main = .center, .cross = .center }, .{
+            ui.text(.{
+                .wrap = false,
+                .style = .{ .foreground = if (emphasis) settings_ink else settings_ink_muted },
+            }, label),
+        }),
+    });
+}
+
 /// What a cmd+N at the window ceiling says.
 ///
 /// It says something on purpose. The toolkit budgets four declared windows on
@@ -993,7 +1311,25 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     // it is in the same place whichever placement is active. The wrapper only
     // exists while it is open — an unconditional stack would change the widget
     // tree of every frame that has no palette in it.
-    const workspace = if (ws.palette.open)
+    const workspace = if (ws.settings.open)
+        // The settings surface rides above everything, on the same terms as
+        // the palette below, and takes precedence over it in the tree because
+        // `settings_open` dismisses the palette — the two can never both be
+        // open, and if a bug ever made them so, the one that just took the
+        // keyboard is the one that should be on top.
+        ui.el(.stack, .{ .grow = 1 }, .{
+            laid_out,
+            ui.el(.stack, .{
+                .grow = 1,
+                .style = .{ .background = settings_scrim },
+                .on_press = .settings_close,
+                .semantics = .{ .label = "Dismiss settings without saving" },
+            }, .{}),
+            ui.row(.{ .grow = 1, .main = .center, .cross = .start, .padding = settings_top_inset }, .{
+                settingsPanel(ui, model, ws),
+            }),
+        })
+    else if (ws.palette.open)
         ui.el(.stack, .{ .grow = 1 }, .{
             laid_out,
             // A scrim over the grid: the palette is modal to the keyboard, and
@@ -1417,6 +1753,7 @@ pub fn onCommand(name: []const u8) ?Msg {
     if (std.mem.eql(u8, name, "pane.next")) return .{ .cycle_pane = 1 };
     if (std.mem.eql(u8, name, "surface.web")) return .{ .select_surface = .web };
     if (std.mem.eql(u8, name, "tabs.palette")) return .palette_open;
+    if (std.mem.eql(u8, name, "settings.open")) return .settings_open;
     if (std.mem.eql(u8, name, "terminal.copy")) return .copy_selection;
     if (std.mem.eql(u8, name, "terminal.paste")) return .paste_focused;
     if (std.mem.eql(u8, name, "terminal.select-all")) return .select_all;

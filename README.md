@@ -163,6 +163,7 @@ keyboard and holds no chord — a setting that did nothing is not a reason to
 stand between you and a prompt.
 
 ```
+theme = nord
 font-size = 14
 cursor-style = bar
 cursor-style-blink = false
@@ -174,6 +175,31 @@ shell = /opt/homebrew/bin/fish
 inherit-working-directory = true
 tab-placement = top
 ```
+
+### Themes and the settings surface
+
+`theme = <name>` names one of the built-in sets — `phux-dark`, `phux-light`,
+`high-contrast`, `nord`, `gruvbox-dark`, `solarized-dark`. A theme sets
+`background`, `foreground` and `selection-background`; an explicit key for any
+of those **outranks** it, wherever the two lines happen to sit in the file. It
+deliberately leaves the ANSI-16 palette alone, so a terminal red stays a
+terminal red — see [Decisions](docs/DECISIONS.md).
+
+**`cmd+,`** (or **View > Settings…**) opens the settings surface. Up and down
+preview a theme LIVE against whatever is on screen, `return` saves the choice
+into your config file, and `esc` puts back the one you had. The panel writes
+only the `theme` line: your comments, your spacing, and any key this build has
+never heard of are copied through untouched.
+
+The panel also shows the **contrast ratio** between the foreground and
+background actually being painted, and flags it when it drops below the WCAG AA
+minimum for body text (4.5:1). That readout is there so "I can't read my
+terminal" is something you can see the answer to rather than something that
+needs investigating. Every built-in theme clears the threshold; a test keeps it
+that way.
+
+The panel's own colours are fixed and never follow the theme. A settings page
+you cannot read when the theme is broken is worse than none.
 
 `shell` (or `command`) is a command LINE, not just a path, so `command = tmux
 attach` keeps its argument. It runs via the login shell with `exec`, so the
@@ -216,6 +242,7 @@ attribute and reports that fact in its caveat.
 | `cmd+click` | Open the URL under the pointer |
 | `cmd+K` | Clear the screen and scrollback |
 | `cmd+shift+P` | Go to terminal — the summoned switcher (type to filter, arrows or `ctrl+N`/`ctrl+P` to move, `enter` to go, `esc` to dismiss) |
+| `cmd+,` | Settings — themes with a live preview and a WCAG contrast readout (arrows or `ctrl+N`/`ctrl+P` to preview, `return` to save, `esc` to cancel) |
 | `cmd+shift+B` | Show the Web surface |
 | `cmd+shift+space` | Enter or leave keyboard selection mode |
 | Arrow keys | Move the selection caret |

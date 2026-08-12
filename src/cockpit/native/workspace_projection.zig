@@ -8,6 +8,7 @@ const topology = @import("../topology.zig");
 const layout = @import("../layout.zig");
 const scene = @import("scene.zig");
 const config_module = @import("../../config/config.zig");
+const theme_module = @import("../../config/theme.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -193,13 +194,63 @@ pub fn terminalTokensFrom(base: canvas.DesignTokens, model: *const Model) canvas
     tokens.typography.label_size = model.fontSize();
     // Background/foreground land in the emulator's own DEFAULTS through
     // `Session.snapshot`, so an application's OSC 10/11 still wins over them.
-    if (cfg.background) |color| tokens.colors.background = canvas.Color.rgb8(color.r, color.g, color.b);
-    if (cfg.foreground) |color| tokens.colors.text = canvas.Color.rgb8(color.r, color.g, color.b);
+    //
+    // RESOLVED, not raw: `theme = <name>` fills these in and an explicit
+    // `background`/`foreground` key outranks it. The precedence lives in
+    // `Config.resolvedBackground` and friends so this site cannot hold a
+    // second, differing copy of the rule. Because this whole function runs
+    // again on every frame, changing either the theme or a colour repaints
+    // LIVE — there is no cached token set to invalidate.
+    if (cfg.resolvedBackground()) |color| tokens.colors.background = canvas.Color.rgb8(color.r, color.g, color.b);
+    if (cfg.resolvedForeground()) |color| tokens.colors.text = canvas.Color.rgb8(color.r, color.g, color.b);
     // The selection wash reads `colors.accent` (see `palette.Palette.init`).
     // The cursor does NOT come through here — `applySessionConfig` gives it
     // the emulator's override channel so the two knobs stay independent.
-    if (cfg.selection_background) |color| tokens.colors.accent = canvas.Color.rgb8(color.r, color.g, color.b);
+    if (cfg.resolvedSelectionBackground()) |color| tokens.colors.accent = canvas.Color.rgb8(color.r, color.g, color.b);
     return tokens;
+}
+
+/// What the terminal's text and ground ACTUALLY are, and how far apart they
+/// are, right now.
+///
+/// THE INSTRUMENT. `phux-cockpit-aht` cost four rounds of "the text is
+/// see-through or black or something" precisely because nothing in the app
+/// could answer "how legible is this" without an agent measuring pixels. This
+/// reads the same `DesignTokens` the painter is about to paint with — not the
+/// config, not the theme table — so it cannot report a colour the screen is
+/// not showing. A colour that reaches the tokens reaches this, and a colour
+/// that does not reach the tokens is exactly the bug worth seeing.
+pub const Legibility = struct {
+    foreground: canvas.Color,
+    background: canvas.Color,
+    /// WCAG 2.x contrast ratio, 1.0 (identical) through 21.0 (black on white).
+    ratio: f32,
+    grade: theme_module.Legibility,
+
+    pub fn readable(self: Legibility) bool {
+        return self.grade.readable();
+    }
+};
+
+pub fn legibility(model: *const Model) Legibility {
+    return legibilityOf(terminalTokens(model));
+}
+
+/// The same derivation over an already-resolved token set, so the painter and
+/// a test can both ask about the exact tokens in hand.
+pub fn legibilityOf(tokens: canvas.DesignTokens) Legibility {
+    const fg = tokens.colors.text;
+    const bg = tokens.colors.background;
+    const ratio = theme_module.contrastRatioLuminance(
+        theme_module.relativeLuminance(fg.r, fg.g, fg.b),
+        theme_module.relativeLuminance(bg.r, bg.g, bg.b),
+    );
+    return .{
+        .foreground = fg,
+        .background = bg,
+        .ratio = ratio,
+        .grade = theme_module.Legibility.of(ratio),
+    };
 }
 
 /// The band must be able to contain the tab triggers it hosts. The register

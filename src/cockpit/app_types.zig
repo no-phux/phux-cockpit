@@ -138,6 +138,27 @@ pub const Msg = union(enum) {
     /// prompt — so it holds no chord, and Escape keeps belonging to the search
     /// field, the palette, and the shell.
     config_notice_dismissed,
+    /// cmd+, — the settings surface, on the chord every Mac app uses.
+    ///
+    /// It exists because `phux-cockpit-aht` spent four rounds on "the text is
+    /// see-through or black or something" without the owner ever being able to
+    /// simply change the colour and look. Idempotent, like `palette_open`: a
+    /// second chord on an open panel must not throw away the preview state.
+    settings_open,
+    /// Escape, or a click outside: dismiss AND put back the theme that was in
+    /// effect when the panel opened. Cancelling a preview has to actually
+    /// cancel it, or previewing would be a trap.
+    settings_close,
+    /// Arrow keys and ctrl+N/P: move the highlight, and APPLY the theme under
+    /// it immediately. Live preview is the whole point — a settings page you
+    /// have to commit to before you can see it is a form, not an instrument.
+    settings_step: i8,
+    /// Enter: keep the previewed theme and write it to the config file.
+    settings_commit,
+    /// A pointer press on a theme row: put the highlight there and preview it,
+    /// which is exactly what an arrow key does. The commit stays a separate
+    /// gesture so a click cannot write the file by accident.
+    settings_select: u8,
     /// Close a tab by index — what the strip's own `x` presses.
     close_tab: u8,
     /// Pointer entered/left a tab. Only the close affordance reads it.

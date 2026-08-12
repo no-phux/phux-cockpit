@@ -15,6 +15,10 @@
 //! can be embedded directly in the model.
 
 const std = @import("std");
+const theme_module = @import("theme.zig");
+
+pub const Theme = theme_module.Theme;
+pub const builtin_themes = theme_module.builtins;
 
 /// Bounds. These are generous for their purpose and keep `Config` a plain
 /// value type that can be copied without an allocator.
@@ -99,6 +103,18 @@ pub const Rgb = struct {
         }
     }
 };
+
+/// `theme.Rgb` and `Rgb` are the same three bytes declared in two modules —
+/// `theme.zig` cannot import this one without a cycle. This is the one
+/// crossing point between them.
+fn fromThemeRgb(color: theme_module.Rgb) Rgb {
+    return .{ .r = color.r, .g = color.g, .b = color.b };
+}
+
+/// The reverse crossing, for callers measuring a resolved colour's contrast.
+pub fn toThemeRgb(color: Rgb) theme_module.Rgb {
+    return .{ .r = color.r, .g = color.g, .b = color.b };
+}
 
 fn hexDigit(c: u8) ?u8 {
     return switch (c) {
@@ -228,11 +244,23 @@ pub const max_scrollback_bytes: u64 = 2 * 1024 * 1024 * 1024;
 pub const Config = struct {
     font_family: FontFamily = FontFamily.init(""),
     font_size: f32 = default_font_size,
+    /// The name from `theme = <name>`, empty for "no theme named". Only ever
+    /// holds a name `theme.byName` recognizes: an unrecognized one is a
+    /// `bad_value` diagnostic and is NOT stored, so nothing downstream has to
+    /// re-check whether the name means anything.
     theme: ThemeName = ThemeName.init(""),
 
     /// Null means "the palette the terminal engine ships", which is a real
     /// terminal palette. Only an explicit `palette = N=#rrggbb` overrides it.
+    ///
+    /// Deliberately NOT reached by `theme` — see the module comment on
+    /// `theme.zig` for why the ANSI-16 slots stay the emulator's.
     palette: [palette_len]?Rgb = [_]?Rgb{null} ** palette_len,
+    /// The EXPLICIT `background` / `foreground` keys. Null means the user did
+    /// not write one, which is not the same as "black": it is what lets a
+    /// theme fill in underneath, and what lets an explicit key outrank one.
+    /// Everything downstream reads `resolvedBackground` / `resolvedForeground`
+    /// rather than these, so the precedence lives in ONE place.
     background: ?Rgb = null,
     foreground: ?Rgb = null,
     cursor_color: ?Rgb = null,
@@ -262,6 +290,60 @@ pub const Config = struct {
 
     pub fn fontSize(config: *const Config) f32 {
         return std.math.clamp(config.font_size, min_font_size, max_font_size);
+    }
+
+    /// The built-in theme this config names, or null when it names none.
+    pub fn resolvedTheme(config: *const Config) ?*const Theme {
+        const name = config.theme.slice();
+        if (name.len == 0) return null;
+        return theme_module.byName(name);
+    }
+
+    /// THE colour precedence, stated once.
+    ///
+    ///   1. an explicit `foreground` / `background` / `selection-background`
+    ///      key, because someone who wrote a hex value meant that hex value;
+    ///   2. the named theme's own colour;
+    ///   3. null — meaning "the app's own register", which the design tokens
+    ///      already hold.
+    ///
+    /// Resolved HERE rather than at parse time on purpose. Doing it at parse
+    /// time would make the file ORDER-SENSITIVE: `foreground = #ff0000` above
+    /// `theme = nord` would lose and the same two lines swapped would win,
+    /// which is a rule nobody can hold in their head and nothing in the file
+    /// makes visible. Keeping both and deciding at the read site means an
+    /// explicit key outranks a theme wherever the two happen to sit.
+    ///
+    /// Every one of the three flows on to the terminal through the design
+    /// tokens (`terminalTokensFrom`), which are rebuilt every frame — so a
+    /// mutation of `Model.config` repaints on the next frame with nothing to
+    /// invalidate.
+    pub fn resolvedForeground(config: *const Config) ?Rgb {
+        if (config.foreground) |explicit| return explicit;
+        const active = config.resolvedTheme() orelse return null;
+        return fromThemeRgb(active.foreground);
+    }
+
+    pub fn resolvedBackground(config: *const Config) ?Rgb {
+        if (config.background) |explicit| return explicit;
+        const active = config.resolvedTheme() orelse return null;
+        return fromThemeRgb(active.background);
+    }
+
+    pub fn resolvedSelectionBackground(config: *const Config) ?Rgb {
+        if (config.selection_background) |explicit| return explicit;
+        const active = config.resolvedTheme() orelse return null;
+        return fromThemeRgb(active.selection_background);
+    }
+
+    /// Adopt a theme by name, dropping an unknown one rather than storing it.
+    /// False means nothing changed, which is what the settings surface needs
+    /// to know before it decides whether to write the file.
+    pub fn setTheme(config: *Config, name: []const u8) bool {
+        if (name.len != 0 and theme_module.byName(name) == null) return false;
+        if (eq(config.theme.slice(), name)) return false;
+        config.theme.set(name) catch return false;
+        return true;
     }
 
     /// Font sizing steps by whole points, which is what cmd+= / cmd+- do in
@@ -352,6 +434,15 @@ fn applyPair(config: *Config, line: u32, key: []const u8, value: []const u8) voi
         return;
     }
     if (eq(key, "theme")) {
+        // A name this build does not ship is a `bad_value` and is NOT stored.
+        // Storing it would leave `Config.theme` holding a string that resolves
+        // to nothing, so every reader downstream would have to re-check
+        // whether the name means anything — and the settings surface would
+        // show a theme that does not exist as the one in effect.
+        if (theme_module.byName(value) == null) {
+            config.note(line, .bad_value, value);
+            return;
+        }
         config.theme.set(value) catch config.note(line, .too_long, value);
         return;
     }
@@ -512,3 +603,105 @@ pub fn joinPath(config_dir: []const u8, output: []u8) error{NoSpaceLeft}![]const
 pub fn loadOrDefault(bytes: ?[]const u8) Config {
     return parse(bytes orelse return .{});
 }
+
+// ------------------------------------------------------------------ writing
+
+/// Rewrite a config file's bytes so that `key` reads `value`, touching as
+/// little else as it possibly can.
+///
+/// THE RULE THIS FUNCTION EXISTS TO OBEY: this file is hand-written. Someone's
+/// comments, their spacing, their ordering, and every key this build has never
+/// heard of are all THEIRS, and an app that rewrites a person's file by
+/// serializing its own parsed model back out would silently delete all of it —
+/// including keys a NEWER build understands and this one does not. So the file
+/// is edited as TEXT: every byte that is not the one line being set is copied
+/// through verbatim, line terminators included.
+///
+/// The two things it does change, and why:
+///
+///   * a matching key's line is REPLACED IN PLACE, so the setting keeps the
+///     position in the file its author gave it;
+///   * a SECOND and later line naming the same key is DROPPED. The parser is
+///     last-wins, so leaving a later duplicate would mean this function
+///     returned successfully and the setting still did not take effect — a
+///     silent no-op, which is the exact failure this whole round exists to
+///     end. A duplicate key is already a bug in the file; collapsing it to the
+///     one line that now holds the value is the honest repair.
+///
+/// A key that appears nowhere is APPENDED, with a newline first when the file
+/// does not already end in one. Nothing else is added — no banner, no
+/// "written by" comment, no reordering.
+///
+/// Comment lines are matched by the same rule the parser uses (`stripComment`:
+/// a `#` in the first non-blank column), so a commented-out `# theme = nord`
+/// is left exactly where it is and the live key is added separately. That is
+/// the conservative reading: the user commented it out on purpose.
+pub fn setKey(
+    source: []const u8,
+    key: []const u8,
+    value: []const u8,
+    output: []u8,
+) error{NoSpaceLeft}![]const u8 {
+    var writer = Writer{ .buffer = output };
+    var replaced = false;
+
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        // The line INCLUDING its terminator, so `\r\n` and a final line with
+        // no newline at all both survive a rewrite unchanged.
+        const newline = std.mem.indexOfScalarPos(u8, source, cursor, '\n');
+        const end = if (newline) |index| index + 1 else source.len;
+        const whole = source[cursor..end];
+        cursor = end;
+
+        if (!lineNamesKey(whole, key)) {
+            try writer.write(whole);
+            continue;
+        }
+        if (replaced) continue; // A later duplicate; see the comment above.
+        replaced = true;
+        try writer.write(key);
+        try writer.write(" = ");
+        try writer.write(value);
+        // Keep whatever terminator the original line had, so a CRLF file
+        // stays a CRLF file and a final line without a newline stays one.
+        if (std.mem.endsWith(u8, whole, "\r\n")) {
+            try writer.write("\r\n");
+        } else if (std.mem.endsWith(u8, whole, "\n")) {
+            try writer.write("\n");
+        }
+    }
+
+    if (!replaced) {
+        if (writer.len != 0 and output[writer.len - 1] != '\n') try writer.write("\n");
+        try writer.write(key);
+        try writer.write(" = ");
+        try writer.write(value);
+        try writer.write("\n");
+    }
+    return output[0..writer.len];
+}
+
+/// Whether a raw line is a live `key = ...` assignment for `key`. Comments,
+/// blank lines, and separator-less lines are all "no" — they are somebody
+/// else's bytes and are copied through untouched.
+fn lineNamesKey(raw_line: []const u8, key: []const u8) bool {
+    const line = trim(stripComment(std.mem.trimEnd(u8, raw_line, "\n")));
+    if (line.len == 0) return false;
+    const separator = std.mem.indexOfScalar(u8, line, '=') orelse return false;
+    return eq(trim(line[0..separator]), key);
+}
+
+/// A bounds-checked append into a caller-owned buffer. The whole rewriter is
+/// allocation-free for the same reason the parser is: it runs from `update`,
+/// which has no allocator.
+const Writer = struct {
+    buffer: []u8,
+    len: usize = 0,
+
+    fn write(self: *Writer, bytes: []const u8) error{NoSpaceLeft}!void {
+        if (self.len + bytes.len > self.buffer.len) return error.NoSpaceLeft;
+        @memcpy(self.buffer[self.len..][0..bytes.len], bytes);
+        self.len += bytes.len;
+    }
+};
