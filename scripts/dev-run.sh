@@ -134,10 +134,21 @@ dev_app_wait_named "$staged_executable" "$DEV_APP_PID"
 # Front it by name. This is the activation phux-cockpit-2ml.10 records as
 # unreliable-by-name with two instances up -- which is exactly what the renamed
 # executable fixes: "phux-cockpit-dev" cannot resolve to the installed app.
-# Failure here is not fatal; System Events needs an accessibility grant that a
-# fresh machine will not have.
-osascript -e "tell application \"System Events\" to set frontmost of process \"${staged_executable}\" to true" >/dev/null 2>&1 || \
-    printf 'note: could not front the window (System Events needs Accessibility permission)\n'
+#
+# Retried, because the process exists (pgrep sees it) several seconds before
+# System Events does, and a single attempt right after launch fails on a
+# perfectly healthy app -- it reported "needs Accessibility permission" on a
+# machine that had the grant. Failure after the deadline is still not fatal: a
+# machine without the grant cannot be activated this way at all, and the app is
+# already running.
+front_deadline=$((SECONDS + 15))
+until osascript -e "tell application \"System Events\" to set frontmost of process \"${staged_executable}\" to true" >/dev/null 2>&1; do
+    if [[ "$SECONDS" -ge "$front_deadline" ]]; then
+        printf 'note: could not front the window in 15s (System Events may need an Accessibility grant)\n'
+        break
+    fi
+    sleep 0.5
+done
 
 if [[ "$AUTOMATION" == "1" ]]; then
     printf '\nautomation is on. The dropbox is resolved against the app CWD, which\n'
