@@ -64,7 +64,7 @@
 @end
 
 // The row under test. Fixed on purpose: the numbers this prints are pinned in
-// docs/GPU_INK_BASELINE.md, so the content may not drift.
+// docs/RENDER_FIDELITY.md and asserted by CI, so the content may not drift.
 static NSString *const kSampleText = @"the quick brown fox jumps over the lazy dog $ ls";
 
 static const CGFloat kFontSize = 13.0;

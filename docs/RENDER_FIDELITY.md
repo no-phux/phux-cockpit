@@ -247,9 +247,79 @@ Nerd Font Mono Regular, 13pt, backing scale 2, 48 columns:
 
 Deriving command: `./scripts/host-raster-check.sh`
 
-`--min-solid 4000` is the floor to assert in CI: roughly 4% under the measured
-value, and well clear of the 3081 a smoothing regression produces. Re-derive it,
-do not adjust it by feel, if the font, the size or the sample row changes.
+### The floor CI asserts, and how it was chosen
+
+`.github/workflows/ci.yml` runs the check on every push and pull request, after
+`scripts/build-automation-cli.sh --checkout-only` materializes the pinned SDK
+source:
+
+```
+./scripts/host-raster-check.sh --min-solid 4000
+```
+
+**The number does not jitter.** Twenty consecutive runs, each recompiling the
+harness against the pinned host:
+
+```
+for i in $(seq 1 20); do ./scripts/host-raster-check.sh; done | sort | uniq -c
+  20 kind=cell_grid width=768 height=36 mean_luma=45.7978 solid=4179 lit=5103
+  20 kind=draw_text width=768 height=36 mean_luma=36.5460 solid=4068 lit=5021
+```
+
+Twenty out of twenty identical, integers and all four decimal places. An
+`-arch x86_64` build of the same harness, run under Rosetta on the same
+machine, returns the same three numbers, so the measurement does not even
+depend on the ISA it was compiled for.
+
+So the 4.3% between 4179 and 4000 is **not** slack for noise; there is no
+noise. It covers the one variable that cannot be measured from a developer
+machine: the runner's CoreText, on a macOS build nothing here has ever
+rasterized against. The margin costs nothing in power — the defect class this
+check exists for lands 4179 → 3081, a 26.3% loss — so no regression that a
+floor of 4179 would catch escapes a floor of 4000.
+
+Tighten it only against numbers the CI job has actually printed; the step prints
+all six statistics on every run, green or red. Re-derive it, do not adjust it by
+feel, if the font, the size or the sample row changes.
+
+### Why a constant and not a stored baseline
+
+The obvious alternative is to check the six numbers into the repo and compare
+for equality. It was rejected on three counts:
+
+- An equality check is a claim that a machine this repo has never measured
+  produces this laptop's numbers. Nothing above supports that. The first CI run
+  would be the experiment, and its failure would be indistinguishable from a
+  regression.
+- The defect has a direction. Thinner is the bug; thicker never is. An equality
+  check goes red on an SDK bump that *improves* glyph weight, and the only
+  available remedy is to edit the baseline — which teaches everyone to edit the
+  baseline, and that is how a ratchet dies.
+- It would be a third place the pinned rasterizer's output is written down,
+  beside this file and the CI floor, and the only thing it buys — noticing a
+  change that is not a regression — arrives anyway, because the CI step prints
+  every statistic into the log on every run, green or red.
+
+### One thing that moves the number and is not a Cockpit regression
+
+`AppleFontSmoothing = 0` in the running user's defaults suppresses smoothing
+even when the host explicitly asks for it. Measured against the unmodified pin,
+whose three `CGContextSetShouldSmoothFonts(ctx, true)` calls are intact:
+
+| user defaults | mean_luma | solid | lit |
+|---|---|---|---|
+| unset (this machine — a runner is assumed, not measured) | 45.7978 | 4179 | 5103 |
+| `-AppleFontSmoothing 0` | 37.1124 | 3081 | 4272 |
+| `-AppleFontSmoothing 1`, `3` | 45.7978 | 4179 | 5103 |
+| `-CGFontRenderingFontSmoothingDisabled YES` | 45.7978 | 4179 | 5103 |
+
+Those are the same numbers as flipping the host's smoothing calls to `false`,
+which is worth stating plainly: **the user default overrides the SDK's call.**
+The fix in section 1 cannot protect a machine whose owner has turned font
+smoothing off. That is a second reason the CI step prints
+`defaults -currentHost read -g AppleFontSmoothing` before measuring — a red run
+on a runner image that changed its defaults can be told apart from a real
+regression by reading the log once, instead of by bisecting the SDK.
 
 ### What it cannot see
 

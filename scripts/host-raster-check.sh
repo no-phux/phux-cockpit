@@ -28,8 +28,12 @@
 # It is not a screenshot of the app. It proves the RASTERIZER, not the frame:
 # it cannot see a layout mistake, a wrong colour chosen upstream, or a command
 # that was never emitted. Reference screenshots remain the instrument for
-# those. See docs/GPU_INK_BASELINE.md for what each instrument can and cannot
-# see, and for the evidence behind that split.
+# those. See docs/RENDER_FIDELITY.md for what each instrument can and cannot
+# see, for the evidence behind that split, and for how the CI floor was derived.
+#
+# .github/workflows/ci.yml runs this on every push and pull request with
+# `--min-solid 4000`, after `scripts/build-automation-cli.sh --checkout-only`
+# materializes the pin it insists on below.
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

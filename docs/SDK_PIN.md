@@ -25,13 +25,19 @@ The SDK's own suite passed on a full gate. Cockpit did not compile. That was
 discovered by hand-building Cockpit against the fork, because nothing else
 would have.
 
-## The three checks
+## The four checks
 
 | Check | Where | Answers |
 |---|---|---|
 | Build against the pin | `.github/workflows/ci.yml`, every push and PR | Does Cockpit compile and pass against the SDK it claims to use? |
 | Build against the branch head | `.github/workflows/sdk-head.yml`, daily at 07:17 UTC and on dispatch | Has the fork moved somewhere Cockpit cannot follow? |
 | Pin documentation agrees | `scripts/check-sdk-pin.sh`, run first in CI | Does README describe the sha that is actually built? |
+| Glyph weight holds | `scripts/host-raster-check.sh --min-solid 4000`, every push and PR | Does the pinned host still ink text as thickly as it did? |
+
+The last one is aimed squarely at a pin bump. Compiling proves the SDK's API did
+not move; it says nothing about what CoreText draws, and no screenshot this repo
+can take is able to see the difference — see docs/RENDER_FIDELITY.md. A bump
+that thins every glyph in the terminal passes the other three checks.
 
 CI covers **both** build graphs — the default local-terminal graph and the
 production Phux provider under `-Dphux-enabled=true`. That matters, because

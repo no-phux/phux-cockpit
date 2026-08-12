@@ -31,6 +31,53 @@ jobs:
       # shipped once; the sha a reader trusts has to be the sha that is built.
       - name: Check dependency pin documentation
         run: ./scripts/check-sdk-pin.sh
+      # The SDK source the rasterizer check measures, materialized from the sha
+      # in build.zig.zon rather than from a ref repeated here - a second copy of
+      # the pin in this file would be one more thing a bump has to remember, and
+      # the drift it caused would be a wrong measurement rather than an error.
+      # `--checkout-only` stops before the SDK's own `zig build cli`, which this
+      # job has no use for: the check compiles the host's source itself.
+      - name: Materialize the pinned SDK source
+        run: ./scripts/build-automation-cli.sh --checkout-only
+      # `native automate screenshot` is drawn by the SDK's CPU reference
+      # renderer, which never calls CoreText, so no screenshot this repo can
+      # take is able to see the real macOS rasterizer get thinner. That blind
+      # spot is most of why phux-cockpit-aht survived three diagnoses. This
+      # check rasterizes one fixed terminal row through the pinned host's own
+      # raster builder, needing no window, no focus and no Screen Recording
+      # permission - which is exactly why it can run here when a capture cannot.
+      # See docs/RENDER_FIDELITY.md for what it can and cannot see.
+      #
+      # On most PRs this number cannot move: it is a property of the pinned SDK
+      # and the runner's CoreText, neither of which a Cockpit change touches.
+      # The step earns its place on the two PRs that CAN move it - an SDK pin
+      # bump and a runner image bump - and those are precisely the two nobody
+      # thinks to inspect for glyph weight.
+      #
+      # THE FLOOR. Measured on the pin: cell_grid solid=4179. Derived with
+      #     for i in $(seq 1 20); do ./scripts/host-raster-check.sh; done
+      # which returned mean_luma=45.7978 solid=4179 lit=5103 on all 20 runs,
+      # each one recompiling the harness (macOS 26.5.1, arm64). An x86_64 build
+      # of the same harness under Rosetta returned the same three numbers. There
+      # is no jitter here to leave room for.
+      #
+      # The 4.3% between 4179 and 4000 is therefore not slack for noise. It
+      # covers the one variable that could not be measured from a developer
+      # machine: the runner's CoreText, on a macOS build this repo has never
+      # rasterized against. It costs nothing in power either - the defect class
+      # this exists for lands 4179 -> 3081, a 26.3% loss - so no regression that
+      # a floor of 4179 would catch escapes a floor of 4000. Tighten it only
+      # against numbers this job has actually printed.
+      - name: Check the host rasterizer's glyph weight
+        run: |
+          # A machine whose user defaults switch font smoothing off measures
+          # solid=3081 with the pinned SDK unmodified - the default overrides
+          # the host's own CGContextSetShouldSmoothFonts(ctx, true), measured,
+          # not assumed. Print the runner's setting so a red run can be told
+          # apart from a real regression by reading the log once.
+          defaults -currentHost read -g AppleFontSmoothing 2>/dev/null \
+            || echo 'AppleFontSmoothing: unset (the state the floor was derived on)'
+          ./scripts/host-raster-check.sh --min-solid 4000
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: phall1/phux

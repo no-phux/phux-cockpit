@@ -12,6 +12,7 @@
 # Usage:
 #   ./scripts/build-automation-cli.sh            # build, print the binary path
 #   eval "$(./scripts/build-automation-cli.sh --export)"   # ...and set NATIVE
+#   ./scripts/build-automation-cli.sh --checkout-only     # just the SDK source
 #
 # Then, from the app's working directory, with the app running under
 # `zig build -Dautomation=true`:
@@ -24,7 +25,16 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 CACHE="${PHUX_COCKPIT_SDK_CACHE:-${ROOT}/.zig-cache/pinned-sdk}"
 EXPORT_ONLY=0
-[[ "${1:-}" == "--export" ]] && EXPORT_ONLY=1
+# Resolving the pin and building the CLI are separable, and CI wants only the
+# first half: scripts/host-raster-check.sh #includes the host's appkit_host.m
+# and compiles that translation unit itself, so a full SDK build would be
+# minutes spent producing a binary the rasterizer check never runs. Keeping
+# both halves in this script is what keeps the pin read in one place.
+CHECKOUT_ONLY=0
+case "${1:-}" in
+    --export) EXPORT_ONLY=1 ;;
+    --checkout-only) CHECKOUT_ONLY=1 ;;
+esac
 
 log() { [[ "${EXPORT_ONLY}" == "1" ]] || printf '%s\n' "$*" >&2; }
 
@@ -70,6 +80,11 @@ current="$(git -C "${CACHE}" rev-parse HEAD 2>/dev/null || true)"
 if [[ "${current}" != "${sha}" ]]; then
     log "checking out ${sha:0:9}"
     git -C "${CACHE}" checkout --quiet --detach "${sha}"
+fi
+
+if [[ "${CHECKOUT_ONLY}" == "1" ]]; then
+    printf '%s\n' "${CACHE}"
+    exit 0
 fi
 
 log "building the CLI (this is a full SDK build the first time)"
