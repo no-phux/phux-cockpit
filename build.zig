@@ -372,10 +372,25 @@ fn buildVerdict(
 ) []const u8 {
     const rule = "------------------------------------------------------------------";
 
+    // Which TREE this exit code describes.
+    //
+    // Not decoration. On 2026-08-12 a subagent's `zig build test` silently ran
+    // in a sibling git worktree instead of its own: the exit code was real, it
+    // just described somebody else's code. Nothing in the output distinguished
+    // it, and it surfaced only because a later run happened to starve on the
+    // shared Zig cache lock. That is the same failure class this whole verdict
+    // exists for — a green result that does not describe what you changed —
+    // and it is the harder one to spot, because a correct-looking PASS from
+    // the wrong tree is identical to a correct one. Printing the resolved
+    // build root costs a line and makes it visible in every future log.
+    // See phux-cockpit-2ml.11.
+    const source_root = b.build_root.path orelse ".";
+
     if (ffi) |found| {
         return b.fmt(
             \\{s}
             \\zig build test: PASS
+            \\  source root:   {s}
             \\  phux provider: COMPILED AND TESTED ({s})
             \\    ffi include: {s}
             \\    ffi lib:     {s}
@@ -384,6 +399,7 @@ fn buildVerdict(
             \\{s}
         , .{
             rule,
+            source_root,
             phux_test_module_names,
             found.include_dir,
             found.lib_dir,
@@ -398,6 +414,7 @@ fn buildVerdict(
     return b.fmt(
             \\{s}
             \\zig build test: PASS, INCOMPLETE
+            \\  source root:   {s}
             \\  phux provider: NOT COMPILED. src/providers/phux/ was not in this
             \\                 build at all, so a change to it is NOT verified by
             \\                 this run, however green it looks.
@@ -414,6 +431,7 @@ fn buildVerdict(
             \\{s}
     , .{
         rule,
+        source_root,
         rootPath(b, ".phux"),
         rootPath(b, "../phux"),
         rule,
