@@ -650,6 +650,31 @@ fn dispatchInitialFrame(harness: anytype, app_iface: native_sdk.App) !void {
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 }
 
+/// Paint one frame for `label` through the REAL runtime path.
+///
+/// Tests that mint panes (`.new_window`, a split) and then read
+/// `proposedViewportsIn` need this, because a pane that has never been painted
+/// has no measured cell box and the proposer correctly declines to size it —
+/// see `grid.CellBox`. The runtime path matters: it is what stamps the
+/// text-measure provider onto the tokens, so the painter records the mono
+/// face's real advance rather than the estimator's guess. Calling
+/// `app.buildChromeWindow` with hand-built tokens would paint, and would
+/// record a measurement that is wrong in exactly the way this all exists to
+/// prevent.
+///
+/// The real app never needs this: a model change rebuilds and repaints before
+/// the next frame arrives.
+pub fn pumpPaint(harness: anytype, app_iface: native_sdk.App, label: []const u8, size: geometry.SizeF) !void {
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = label,
+        .size = size,
+        .scale_factor = 2,
+        .frame_index = 2,
+        .timestamp_ns = 2_000_000,
+    } });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+}
+
 pub fn stopCockpit(state: *TerminalApp) void {
     state.deinit();
     app.deinitModel(&state.model);

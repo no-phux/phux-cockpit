@@ -111,8 +111,8 @@ test "a weighted row occupies exactly the same cells as a plain one" {
 
     // ...and the session's own metrics, which the PTY sizing pump and the
     // pointer hit test both derive from, are one number for the pane.
-    try testing.expectEqual(session.cell_width, first.width);
-    try testing.expectEqual(session.cell_height, first.height);
+    try testing.expectEqual(session.measuredCell().?.width, first.width);
+    try testing.expectEqual(session.measuredCell().?.height, first.height);
 }
 
 test "italic reaches the cell as a flag" {

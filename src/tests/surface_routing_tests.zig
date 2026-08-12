@@ -95,7 +95,7 @@ test "the Web chord selects accessible Web and non-terminal selection blocks ter
             .kind = .scroll,
             .x = x,
             .y = 300,
-            .delta_y = app_state.model.provider.slots[0].session.cell_height * 4,
+            .delta_y = app_state.model.provider.slots[0].session.measuredCell().?.height * 4,
         } });
     }
     try testing.expectEqual(before0, app_state.effects.ptyWrittenBytes(app.ptyKey(0)).len);

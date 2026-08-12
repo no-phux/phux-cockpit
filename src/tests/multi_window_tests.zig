@@ -352,6 +352,26 @@ test "a background window's frames resize its own terminals, not the front windo
     app.update(&state.model, .new_window, &state.effects);
     app.update(&state.model, .{ .focus_window = 0 }, &state.effects);
     const second = state.model.wsAt(1) orelse return error.TestExpectedWindow;
+    // The new window's terminal has never been painted, so its cell box has
+    // never been measured, and the proposer declines to size an unmeasured
+    // pane (see `grid.CellBox`) — there would be no viewport Msg to route and
+    // this test would have nothing to say about routing. The runtime paints
+    // every window it owns; `.new_window` here went straight to the model, so
+    // no surface for canvas 1 was ever created and the paint has to be driven.
+    //
+    // `tokensWithTextMeasure` is the load-bearing part. Painting with bare
+    // `cockpitTokens` would also fill in a measurement — the WRONG one, the
+    // proportional estimate this file's sibling fix exists to eliminate — and
+    // the test would then assert against a cell width the app never uses.
+    var window_commands: [512]canvas.CanvasCommand = undefined;
+    var window_builder = canvas.Builder.init(&window_commands);
+    try app.buildChromeWindow(&state.model, &window_builder, .{
+        .canvas_label = app.canvasLabelFor(1),
+        .window_id = 9,
+        .size = geometry.SizeF.init(980, 640),
+        .tokens = harness.runtime.tokensWithTextMeasure(app.cockpitTokens(&state.model)),
+        .is_main = false,
+    });
 
     // A frame for the SECOND window's canvas while the FIRST is active.
     const msg = app.onFrame(&state.model, .{
@@ -386,6 +406,14 @@ test "every pane converges on ONE frame, not one pane per frame" {
     app.update(&state.model, .split_right, &state.effects);
     app.update(&state.model, .split_down, &state.effects);
     app.update(&state.model, .split_right, &state.effects);
+    // The splits minted three panes nothing has painted, and an unmeasured
+    // pane is one the proposer refuses to size (see `grid.CellBox`). The real
+    // app repaints on every model change before the next frame; this test
+    // drives `onFrame` by hand, so it has to.
+    // Deliberately at the STARTING size, not the size under test: this pump
+    // exists only to measure the new panes, and pumping it at 1301x807 would
+    // also converge them there, leaving the frame below with nothing to say.
+    try support.pumpPaint(harness, state.app(), app.canvas_label, geometry.SizeF.init(980, 640));
 
     const frame: native_sdk.platform.GpuFrame = .{
         .label = app.canvas_label,

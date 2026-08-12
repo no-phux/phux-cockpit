@@ -184,10 +184,16 @@ pub fn terminalTokens(model: *const Model) canvas.DesignTokens {
 /// stamps its text-measure provider onto the tokens it hands the chrome
 /// builder, and `canvas.terminalCellMetrics` measures the mono face's real
 /// advance through that provider. Rebuilding from `cockpitTokens` inside the
-/// painter would silently drop it and fall back to the `label_size * 0.6`
-/// estimate — a cell width nothing else in the app agrees with, which is
-/// exactly how a default-config launch would start reporting mouse positions
-/// against a grid it is not painting.
+/// painter would silently drop it and fall back to the estimator — a cell
+/// width nothing else in the app agrees with, which is exactly how a
+/// default-config launch would start reporting mouse positions against a grid
+/// it is not painting.
+///
+/// That fallback is NOT `label_size * 0.6`, which this comment claimed until
+/// 2026-08-12 and which made the hazard sound survivable. `0.6` is what the
+/// estimator returns for `canvas.default_mono_font_id`; cockpit's face is
+/// registered at 64, so the estimator uses its proportional SANS table
+/// instead and comes out 46 percent wide. See `terminalCellMetricsFor`.
 pub fn terminalTokensFrom(base: canvas.DesignTokens, model: *const Model) canvas.DesignTokens {
     var tokens = base;
     const cfg = &model.config;
@@ -251,6 +257,45 @@ pub fn legibilityOf(tokens: canvas.DesignTokens) Legibility {
         .ratio = ratio,
         .grade = theme_module.Legibility.of(ratio),
     };
+}
+
+/// `canvas.terminalCellMetrics`, corrected for the case the comment above
+/// describes: tokens that carry NO text-measure provider.
+///
+/// Use this everywhere outside the painter. The painter has the runtime's
+/// provider and should keep calling `canvas.terminalCellMetrics` directly.
+///
+/// WHY THIS EXISTS. Without a provider the SDK estimates, and its estimator
+/// is keyed by FONT ID: `estimateTextAdvanceForBytes` returns the 0.6 em mono
+/// pitch only for `canvas.default_mono_font_id` (2) and otherwise walks a
+/// per-character SANS advance table. Cockpit's terminal face is registered at
+/// `canvas.min_registered_font_id` (64), so the estimator has no way to know
+/// it is looking at a monospace face and prices it as proportional text. The
+/// probe the SDK measures with is "MMMM..." — the widest capital — so the
+/// error is not small:
+///
+///   font-size 26, tokens with no provider, mono_font_id = 64
+///     estimated cell width  22.802 pt   (26 * 0.877 em, Geist sans 'M')
+///     true mono cell width  15.600 pt   (26 * 0.6 em)
+///     ratio                 1.4617      -> 46.2 percent too wide
+///
+/// Measured on 2026-08-12 by printing both from `terminalTokens(&model)` with
+/// `font-size = 26`; the bead's estimate of "roughly 35 percent" was low.
+/// Remote (phux) panes sized through that number, so every one of them was
+/// told it had about a third fewer columns than it had room for.
+///
+/// The correction is to ask the estimator about the id whose metrics class it
+/// actually knows. That is sound rather than a fudge because cockpit's
+/// terminal face IS a 0.6 em monospace: with a real provider stamped,
+/// measuring font 64 at size 13 returns 7.800001, and 13 * 0.6 = 7.8. The
+/// test "the registered terminal face is a 0.6 em monospace" pins that, so a
+/// font swap to a different pitch fails there instead of quietly re-opening
+/// this bug.
+pub fn terminalCellMetricsFor(tokens: canvas.DesignTokens) canvas.TerminalCellMetrics {
+    if (tokens.text_measure != null) return canvas.terminalCellMetrics(tokens);
+    var estimating = tokens;
+    estimating.typography.mono_font_id = canvas.default_mono_font_id;
+    return canvas.terminalCellMetrics(estimating);
 }
 
 /// The band must be able to contain the tab triggers it hosts. The register
@@ -659,25 +704,40 @@ pub fn proposedViewportsIn(
     var result: ProposedViewports = .{};
     var panes: [layout.max_panes]layout.Pane = undefined;
     const count = resolvePanesIn(model, workspace, size, &panes);
-    // Cell metrics for a LOCAL pane come from `session.cell_*`, which the
-    // painter wrote from the live terminal tokens. Deriving them here instead
-    // would be wrong, not merely redundant: only the painter's tokens carry the
-    // runtime's text-measure provider, so a token derivation here falls back to
-    // the `label_size * 0.6` estimate and proposes a different column count
-    // than the one being painted.
-    const metrics = canvas.terminalCellMetrics(terminalTokens(model));
+    // Cell metrics for a LOCAL pane come from the session's MEASURED box,
+    // which the painter wrote from the live terminal tokens. Deriving them
+    // here instead would be wrong, not merely redundant: only the painter's
+    // tokens carry the runtime's text-measure provider, so a token derivation
+    // here estimates and proposes a different column count than the one being
+    // painted.
+    //
+    // `metrics` below is that estimate, and it is used ONLY for REMOTE panes,
+    // which have no local session to have measured. It goes through
+    // `terminalCellMetricsFor` rather than `canvas.terminalCellMetrics` so the
+    // estimate is at least the right metrics CLASS — this line used to hand
+    // remote panes a proportional cell 46 percent too wide.
+    const metrics = terminalCellMetricsFor(terminalTokens(model));
     for (panes[0..count]) |pane| {
         const inner = pane.rect;
         if (inner.width <= 0 or inner.height <= 0) continue;
         if (model.provider.terminalConst(pane.terminal)) |terminal| {
             const session = terminal.session;
-            if (session.cell_width <= 0 or session.cell_height <= 0) {
+            // Nothing has painted this pane yet, so its cell box has never
+            // been measured. Propose NOTHING rather than a column count
+            // derived from a guess: the proposal is committed straight to the
+            // pty as a SIGWINCH, and a wrong first one makes the shell redraw
+            // its prompt at a width it is about to be told to abandon.
+            //
+            // This is the guard that used to read `cell_width <= 0` and could
+            // never fire, because the fields defaulted to 8 and 18. It fires
+            // now — see `grid.CellBox`.
+            const cell = session.measuredCell() orelse {
                 result.incomplete = true;
                 return result;
-            }
+            };
             const proposed = grid.Session.clampGrid(
-                @intFromFloat(@max(2, inner.width / session.cell_width)),
-                @intFromFloat(@max(2, inner.height / session.cell_height)),
+                @intFromFloat(@max(2, inner.width / cell.width)),
+                @intFromFloat(@max(2, inner.height / cell.height)),
             );
             result.items[result.count] = .{ .terminal = pane.terminal, .cols = proposed.x, .rows = proposed.y };
             result.count += 1;

@@ -82,8 +82,8 @@ test "pointer drag selects Ghostty cells and Shift overrides TUI mouse reporting
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     const frame = terminalInteractionFrame(harness, "alpha beta") orelse return error.TestExpectedTerminalInteractionSurface;
-    const start = geometry.PointF.init(frame.x + pane.session.cell_width * 0.25, frame.y + pane.session.cell_height * 0.5);
-    const finish = geometry.PointF.init(frame.x + pane.session.cell_width * 4.75, start.y);
+    const start = geometry.PointF.init(frame.x + pane.session.measuredCell().?.width * 0.25, frame.y + pane.session.measuredCell().?.height * 0.5);
+    const finish = geometry.PointF.init(frame.x + pane.session.measuredCell().?.width * 4.75, start.y);
     const shift = native_sdk.platform.ShortcutModifiers{ .shift = true };
     try pointerInput(harness, app_iface, .pointer_down, start, 0, shift, 0);
     try pointerInput(harness, app_iface, .pointer_drag, finish, 0, shift, 0);

@@ -75,8 +75,12 @@ pub const PaintOptions = struct {
 pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions) !void {
     const metrics = canvas.terminalCellMetrics(options.tokens);
     session.font_size = metrics.font_size;
-    session.cell_width = metrics.width;
-    session.cell_height = metrics.height;
+    // The ONLY writer of the measured cell box in the app, and deliberately
+    // so: `options.tokens` are the runtime's, with its text-measure provider
+    // stamped on, so `metrics.width` is the mono face's real advance. Anywhere
+    // else in the app those tokens are unavailable and the same call silently
+    // degrades to an estimate — see `workspace_projection.terminalCellMetricsFor`.
+    session.setMeasuredCell(metrics.width, metrics.height);
 
     const snap = try session.snapshot(options.tokens, options.running, options.selecting);
     try paintTerminalGrid(snap, builder, options);

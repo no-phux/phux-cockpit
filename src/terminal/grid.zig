@@ -8,6 +8,7 @@ pub const max_rows = session.max_rows;
 pub const max_cells = session.max_cells;
 pub const snapshot_text_capacity = session.snapshot_text_capacity;
 pub const Session = session.Session;
+pub const CellBox = session.CellBox;
 
 pub const PaintOptions = render.PaintOptions;
 pub const paneIdBase = render.paneIdBase;

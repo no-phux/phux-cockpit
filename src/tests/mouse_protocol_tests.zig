@@ -33,13 +33,13 @@ test "TUI mouse reports exact SGR press motion release and wheel cells" {
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
     const frame = terminalInteractionFrame(harness, "mouse") orelse return error.TestExpectedTerminalInteractionSurface;
-    const cell = pane.session;
-    const down = geometry.PointF.init(frame.x + cell.cell_width * 3.25, frame.y + cell.cell_height * 2.25);
-    const moved = geometry.PointF.init(frame.x + cell.cell_width * 4.25, down.y);
+    const cell = pane.session.measuredCell() orelse return error.TestExpectedMeasuredCell;
+    const down = geometry.PointF.init(frame.x + cell.width * 3.25, frame.y + cell.height * 2.25);
+    const moved = geometry.PointF.init(frame.x + cell.width * 4.25, down.y);
     try pointerInput(harness, app_iface, .pointer_down, down, 0, .{}, 0);
     try pointerInput(harness, app_iface, .pointer_drag, moved, 0, .{}, 0);
     try pointerInput(harness, app_iface, .pointer_up, moved, 0, .{}, 0);
-    try pointerInput(harness, app_iface, .scroll, moved, 0, .{}, cell.cell_height);
+    try pointerInput(harness, app_iface, .scroll, moved, 0, .{}, cell.height);
 
     try testing.expectEqualStrings(
         "\x1b[<0;4;3M\x1b[<32;5;3M\x1b[<0;5;3m\x1b[<64;5;3M",
@@ -113,8 +113,8 @@ test "mouse protocols cover X10 UTF-8 SGR URXVT modes modifiers and both wheel a
 
     before = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
     try pointerInputAdvanced(harness, iface, .scroll, point, .{
-        .delta_x = pane.session.cell_width,
-        .delta_y = pane.session.cell_height,
+        .delta_x = pane.session.measuredCell().?.width,
+        .delta_y = pane.session.measuredCell().?.height,
     });
     try testing.expectEqualStrings("\x1b[<64;3;4M\x1b[<66;3;4M", host.inner.effects.ptyWrittenBytes(pane.pty_key)[before..]);
 }
@@ -185,7 +185,7 @@ test "mouse protocol transitions reset motion dedupe and wheel residue" {
     try pointerInput(harness, iface, .pointer_move, point, 0, .{}, 0);
     try testing.expect(host.inner.effects.ptyWrittenBytes(pane.pty_key).len > one_motion);
 
-    const half = pane.session.cell_height / 2;
+    const half = pane.session.measuredCell().?.height / 2;
     try pointerInputAdvanced(harness, iface, .scroll, point, .{ .delta_y = half });
     before = host.inner.effects.ptyWrittenBytes(pane.pty_key).len;
     try host.inner.effects.feedPtyOutput(pane.pty_key, "\x1b[?1006l\x1b[?1015h");
@@ -207,7 +207,7 @@ test "wheel reporting is axis-fair and does not consume local residue" {
     const pane = host.inner.model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
     const frame = app.paneFrames(&host.inner.model, size)[0];
     const point = terminalCellPoint(pane, frame, 2, 2);
-    try pointerInputAdvanced(harness, iface, .scroll, point, .{ .delta_y = pane.session.cell_height / 2 });
+    try pointerInputAdvanced(harness, iface, .scroll, point, .{ .delta_y = pane.session.measuredCell().?.height / 2 });
     const local_residue = pane.scrollback_wheel_accum;
     try testing.expect(local_residue > 0);
 
@@ -222,8 +222,8 @@ test "wheel reporting is axis-fair and does not consume local residue" {
     try testing.expectEqual(@as(usize, 32), std.mem.count(u8, reports, "\x1b[<64;"));
     try testing.expectEqual(@as(usize, 32), std.mem.count(u8, reports, "\x1b[<66;"));
     try testing.expectEqual(local_residue, pane.scrollback_wheel_accum);
-    try testing.expect(pane.mouse_wheel_y_accum >= pane.session.cell_height);
-    try testing.expect(pane.mouse_wheel_x_accum >= pane.session.cell_width);
+    try testing.expect(pane.mouse_wheel_y_accum >= pane.session.measuredCell().?.height);
+    try testing.expect(pane.mouse_wheel_x_accum >= pane.session.measuredCell().?.width);
 }
 
 test "mouse capture is fenced by its press protocol fingerprint" {

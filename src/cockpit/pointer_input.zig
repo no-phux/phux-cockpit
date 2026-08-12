@@ -9,6 +9,7 @@ const topology = @import("topology.zig");
 const app_types = @import("app_types.zig");
 const runtime = @import("terminal_runtime.zig");
 const projection = @import("native/workspace_projection.zig");
+const grid = @import("../terminal/grid.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -377,17 +378,21 @@ pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent
             const finite_y = std.math.isFinite(event.delta.dy);
             if ((!finite_x or event.delta.dx == 0) and (!finite_y or event.delta.dy == 0)) return;
             syncMouseProtocol(pane);
+            // A wheel over a pane nothing has painted yet has no row height to
+            // quantize against. Dropping the event is right: the pane is not
+            // on screen for the user to have aimed at.
+            const cell = pane.session.measuredCell() orelse return;
             const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
             if (pane.acceptsInput() and pane.session.term.flags.mouse_event != .none and !event.modifiers.shift) {
                 pane.selecting = false;
                 pane.session.clearSelection();
-                accumulateWheel(&pane.mouse_wheel_y_accum, if (finite_y) event.delta.dy else 0, pane.session.cell_height);
-                accumulateWheel(&pane.mouse_wheel_x_accum, if (finite_x) event.delta.dx else 0, pane.session.cell_width);
-                flushMouseWheels(model, pane, fx, local, event.frame, event.modifiers);
+                accumulateWheel(&pane.mouse_wheel_y_accum, if (finite_y) event.delta.dy else 0, cell.height);
+                accumulateWheel(&pane.mouse_wheel_x_accum, if (finite_x) event.delta.dx else 0, cell.width);
+                flushMouseWheels(model, pane, fx, cell, local, event.frame, event.modifiers);
                 return;
             }
             if (pane.selecting or !finite_y) return;
-            const cell_h = finiteQuantum(pane.session.cell_height);
+            const cell_h = finiteQuantum(cell.height);
             accumulateWheel(&pane.scrollback_wheel_accum, event.delta.dy, cell_h);
             const report_bound: f32 = @floatFromInt(max_mouse_reports_per_event);
             const rows = std.math.clamp(@trunc(pane.scrollback_wheel_accum / cell_h), -report_bound, report_bound);
@@ -540,14 +545,18 @@ fn encodeMouseReport(
         boundedMouseDimension(scaled_height)
     else
         session.rows();
+    // Only the CELL protocol needs a cell box; `sgr_pixels` reports device
+    // pixels and must keep working on a pane that has not been measured, so
+    // the measurement is required inside the branch that divides by it and
+    // nowhere else.
     const x = if (pixel_protocol)
         boundedMouseCoordinate(scaled_x)
     else
-        boundedMouseCoordinate(local.x / finiteQuantum(session.cell_width));
+        boundedMouseCoordinate(local.x / (session.measuredCell() orelse return false).width);
     const y = if (pixel_protocol)
         boundedMouseCoordinate(scaled_y)
     else
-        boundedMouseCoordinate(local.y / finiteQuantum(session.cell_height));
+        boundedMouseCoordinate(local.y / (session.measuredCell() orelse return false).height);
 
     var options: vt.input.MouseEncodeOptions = .{
         .event = session.term.flags.mouse_event,
@@ -644,10 +653,14 @@ fn flushMouseWheelOnce(
     return true;
 }
 
+/// `cell` is passed in rather than re-read from the session so the whole flush
+/// quantizes against the SAME box the accumulation used. Re-reading would be
+/// harmless today and wrong the first time a repaint lands mid-flush.
 fn flushMouseWheels(
     model: *const Model,
     pane: *Pane,
     fx: *Fx,
+    cell: grid.CellBox,
     local: geometry.PointF,
     frame: geometry.RectF,
     modifiers: PointerModifiers,
@@ -656,15 +669,15 @@ fn flushMouseWheels(
     while (budget > 0) : (budget -= 1) {
         const horizontal_first = pane.mouse_wheel_next_horizontal;
         const first = if (horizontal_first)
-            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, pane.session.cell_width, local, frame, modifiers)
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, cell.width, local, frame, modifiers)
         else
-            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_y_accum, .four, .five, pane.session.cell_height, local, frame, modifiers);
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_y_accum, .four, .five, cell.height, local, frame, modifiers);
         const second = if (first)
             false
         else if (horizontal_first)
-            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_y_accum, .four, .five, pane.session.cell_height, local, frame, modifiers)
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_y_accum, .four, .five, cell.height, local, frame, modifiers)
         else
-            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, pane.session.cell_width, local, frame, modifiers);
+            flushMouseWheelOnce(model, pane, fx, &pane.mouse_wheel_x_accum, .six, .seven, cell.width, local, frame, modifiers);
         if (!first and !second) return;
         pane.mouse_wheel_next_horizontal = !horizontal_first;
     }

@@ -85,8 +85,8 @@ pub fn pointerInputAdvanced(
 
 pub fn terminalCellPoint(pane: *const app.Pane, frame: geometry.RectF, col: usize, row: usize) geometry.PointF {
     return geometry.PointF.init(
-        frame.x + (@as(f32, @floatFromInt(col)) + 0.25) * pane.session.cell_width,
-        frame.y + (@as(f32, @floatFromInt(row)) + 0.25) * pane.session.cell_height,
+        frame.x + (@as(f32, @floatFromInt(col)) + 0.25) * pane.session.measuredCell().?.width,
+        frame.y + (@as(f32, @floatFromInt(row)) + 0.25) * pane.session.measuredCell().?.height,
     );
 }
 

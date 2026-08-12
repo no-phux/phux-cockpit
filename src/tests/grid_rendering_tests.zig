@@ -161,7 +161,7 @@ test "a styled wide character's background covers both of its cells" {
         .running = true,
         .selecting = false,
     });
-    const cell_w = session.cell_width;
+    const cell_w = session.measuredCell().?.width;
     // ANSI 41 is the engine's own red now, not the destructive design token,
     // so the background is identified by the palette entry the emulator
     // actually resolves. What is under test here is the GEOMETRY — that the
@@ -488,8 +488,8 @@ test "box-drawing cells render as edge-to-edge geometry, never glyphs" {
         .running = true,
         .selecting = false,
     });
-    const cell_w = session.cell_width;
-    const cell_h = session.cell_height;
+    const cell_w = session.measuredCell().?.width;
+    const cell_h = session.measuredCell().?.height;
     var box_texts: usize = 0;
     var merged_bar = false;
     var full_height_bar = false;
@@ -549,8 +549,8 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     // grid background. The first text row starts at the grid origin;
     // sample generously across the first cell row.
     const session = app_state.model.provider.slots[0].session;
-    const cell_w: usize = @intFromFloat(@max(1, session.cell_width));
-    const cell_h: usize = @intFromFloat(@max(1, session.cell_height));
+    const cell_w: usize = @intFromFloat(@max(1, session.measuredCell().?.width));
+    const cell_h: usize = @intFromFloat(@max(1, session.measuredCell().?.height));
     const pane_frame = app.paneFrames(&app_state.model, geometry.SizeF.init(@floatFromInt(width), @floatFromInt(height)))[0];
     const grid_x: usize = @intFromFloat(pane_frame.x);
     const grid_y: usize = @intFromFloat(pane_frame.y);
@@ -582,11 +582,11 @@ test "painted-output oracle: the prompt and caret reach the surface as pixels" {
     // (ii) The caret cell paints distinguishably: the cursor sits right
     // after "demo$ " (column 6) and its wash differs from both the
     // background and the row's empty cells.
-    const caret_x: usize = @intFromFloat(pane_frame.x + 6.5 * session.cell_width);
+    const caret_x: usize = @intFromFloat(pane_frame.x + 6.5 * session.measuredCell().?.width);
     const caret_y = grid_y + cell_h / 2;
     const caret_offset = (caret_y * width + caret_x) * 4;
     const caret_value = std.mem.readInt(u32, shot.rgba8[caret_offset..][0..4], .little);
-    const empty_x: usize = @intFromFloat(pane_frame.x + 40.0 * session.cell_width);
+    const empty_x: usize = @intFromFloat(pane_frame.x + 40.0 * session.measuredCell().?.width);
     const empty_offset = (caret_y * width + empty_x) * 4;
     const empty_value = std.mem.readInt(u32, shot.rgba8[empty_offset..][0..4], .little);
     try testing.expect(caret_value != empty_value);
