@@ -222,9 +222,29 @@ fi
 
 # LaunchServices' own answer, not the plist read back to itself: this is what
 # the Dock, the app switcher and `open -b` are keying off for the LIVE process.
-registered_bundle_id() { lsappinfo info -only bundleid "$1" 2>/dev/null | sed -E 's/.*="(.*)"/\1/'; }
-installed_registered="$(registered_bundle_id "$INSTALLED_PID" || true)"
-dev_registered="$(registered_bundle_id "$DEV_PID" || true)"
+#
+# POLLED, not read once. A process exists (pgrep sees it) well before
+# LaunchServices has registered it, and reading too early returns
+# `"CFBundleIdentifier"=[ NULL ]` for both -- which compares equal and reads as
+# "one bundle id for two processes". That is a false failure of the strongest
+# assertion in this script, and it happened on the second run of it.
+registered_bundle_id() {
+    local raw
+    raw="$(lsappinfo info -only bundleid "$1" 2>/dev/null || true)"
+    # Only a quoted value is an answer; `[ NULL ]` means not yet registered.
+    printf '%s' "$raw" | sed -nE 's/.*="([^"]+)".*/\1/p'
+}
+wait_registered_bundle_id() {
+    local pid="$1" deadline=$((SECONDS + 30)) value
+    while :; do
+        value="$(registered_bundle_id "$pid")"
+        if [[ -n "$value" ]]; then printf '%s\n' "$value"; return 0; fi
+        [[ "$SECONDS" -ge "$deadline" ]] && return 1
+        sleep 0.5
+    done
+}
+installed_registered="$(wait_registered_bundle_id "$INSTALLED_PID" || true)"
+dev_registered="$(wait_registered_bundle_id "$DEV_PID" || true)"
 printf '  lsappinfo: installed=%s dev=%s\n' "${installed_registered:-<none>}" "${dev_registered:-<none>}"
 if [[ -n "$installed_registered" && "$installed_registered" != "$dev_registered" ]]; then
     ok 'LaunchServices registered the two live processes under different bundle ids'
@@ -235,21 +255,36 @@ fi
 # System Events is the surface phux-cockpit-2ml.10 is about: activation is
 # global and BY NAME. A grant-less machine cannot answer, which is a skip, not a
 # pass -- saying so is the difference between evidence and an empty result.
-if events_names="$(osascript -e 'tell application "System Events" to get name of every process whose name contains "phux"' 2>/dev/null)"; then
-    printf '  System Events sees: %s\n' "$events_names"
-    # Membership on the split list, not a substring test: "phux-cockpit" is a
-    # prefix of "phux-cockpit-dev", so a substring test passes on a list that
-    # contains only the dev build -- an assertion that cannot fail for the
-    # reason it claims to check.
-    events_list="$(printf '%s' "$events_names" | tr ',' '\n' | sed 's/^ *//; s/ *$//')"
+# Membership on the split list, not a substring test: "phux-cockpit" is a prefix
+# of "phux-cockpit-dev", so a substring test passes on a list that contains only
+# the dev build -- an assertion that cannot fail for the reason it claims to
+# check. Polled for the same reason as lsappinfo above: a process appears in
+# System Events only once it has a UI session, which is after pgrep can see it.
+system_events_phux() {
+    osascript -e 'tell application "System Events" to get name of every process whose name contains "phux"' 2>/dev/null |
+        tr ',' '\n' | sed 's/^ *//; s/ *$//' | grep -v '^$' || true
+}
+events_deadline=$((SECONDS + 30))
+while :; do
+    events_list="$(system_events_phux)"
     if printf '%s\n' "$events_list" | grep -qx 'phux-cockpit-dev' &&
        printf '%s\n' "$events_list" | grep -qx 'phux-cockpit'; then
-        ok 'System Events can name each instance separately'
-    else
-        bad "System Events did not list both process names distinctly: ${events_names}"
+        break
     fi
-else
+    [[ "$SECONDS" -ge "$events_deadline" ]] && break
+    sleep 0.5
+done
+printf '  System Events sees: %s\n' "$(printf '%s' "$events_list" | tr '\n' ' ')"
+if [[ -z "$events_list" ]] && ! osascript -e 'tell application "System Events" to get name of first process' >/dev/null 2>&1; then
+    # No answer at all AND the surface itself refuses: a missing Accessibility
+    # grant, which is a skip. Saying so is the difference between evidence and
+    # an empty result reported as a pass.
     printf '  SKIPPED: System Events refused (needs an Accessibility grant). Not a pass.\n'
+elif printf '%s\n' "$events_list" | grep -qx 'phux-cockpit-dev' &&
+     printf '%s\n' "$events_list" | grep -qx 'phux-cockpit'; then
+    ok 'System Events can name each instance separately'
+else
+    bad "System Events did not list both process names distinctly: ${events_list}"
 fi
 
 for pid in "$INSTALLED_PID" "$DEV_PID"; do kill "$pid" 2>/dev/null || true; done
@@ -306,16 +341,22 @@ if wait_for_file "$DEV_MARKER"; then
 else
     bad 'the dev config was never read; the rest of arm A proves nothing'
 fi
-sleep 3
 if [[ -e "$REAL_MARKER" ]]; then
     bad 'the dev run read the user-level config'
 else
     ok 'the user-level config was NOT read'
 fi
+
+# The layout is written on SHUTDOWN, not while running: an app killed here after
+# 30s of uptime still has no state file, and the file appears within a second of
+# the SIGTERM. (Measured both ways: waiting 30s with the app up fails, waiting
+# after the kill passes.) So settle, kill, then look -- and give the look a real
+# deadline rather than a fixed sleep, which is what made an earlier version of
+# this assertion fail intermittently.
+sleep 3
 kill "$ARM_A_PID" 2>/dev/null || true
 PIDS=()
-sleep 2
-if wait_for_file "${WORK}/devhome/workspace.state" 10; then
+if wait_for_file "${WORK}/devhome/workspace.state" 20; then
     ok 'workspace layout was written into the dev home'
 else
     bad 'no workspace state in the dev home; the state seam did not take'
@@ -343,10 +384,10 @@ if wait_for_file "$REAL_MARKER"; then
 else
     bad 'even unisolated it never read the user-level config: the marker cannot move, so arm A proved nothing'
 fi
+sleep 3
 kill "$ARM_B_PID" 2>/dev/null || true
 PIDS=()
-sleep 2
-if wait_for_file "$FAKE_PLATFORM_STATE" 10; then
+if wait_for_file "$FAKE_PLATFORM_STATE" 20; then
     ok 'without the variables it writes the platform state file, as it must'
 else
     bad 'even unisolated it never wrote the platform state file: that absence cannot move either'
