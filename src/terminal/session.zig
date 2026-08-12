@@ -221,8 +221,55 @@ pub const Session = struct {
     bell_rung: bool = false,
     /// This terminal's scrollback search. See `Search`.
     search: Search = .{},
+    /// The last link `linkAtPoint` resolved, COPIED here.
+    ///
+    /// Both sources need it. An OSC 8 href lives in PAGE memory, which the
+    /// next feed may reflow, prune, or move outright; the heuristic's slice
+    /// points into the cached screen text, which the next screen change
+    /// rewrites. Neither is a lifetime a caller can reason about, and both
+    /// callers (the click that opens, the frame that underlines) read after
+    /// the fact. One session-owned copy gives every caller the same rule: the
+    /// slice is valid until the next `linkAtPoint`.
+    link_buf: [url_module.max_url_bytes]u8 = undefined,
+    link_len: usize = 0,
+    /// Where the pointer is while the link chord is held over this pane, in
+    /// widget-relative canvas points, or null when nothing should be
+    /// underlined.
+    ///
+    /// A POINT, not a resolved span, and that is the whole design. The
+    /// underline is resolved inside `snapshot`, against the same live state
+    /// the frame is painting, so output that scrolls under a stationary
+    /// pointer moves the underline with the text instead of leaving it on the
+    /// cells the link used to occupy.
+    hover_point: ?HoverPoint = null,
 
     pub const CellPos = struct { x: u16 = 0, y: u16 = 0 };
+
+    pub const HoverPoint = struct { x: f32, y: f32 };
+
+    /// Where a resolved link came from.
+    ///
+    /// Worth carrying rather than collapsing to a URL, because the two have
+    /// different trust stories and the caller may want to say so: `.osc8` is a
+    /// target the PROGRAM named, `.text` is one this app recognised in bytes
+    /// the user can see.
+    pub const LinkSource = enum { osc8, text };
+
+    /// A link under a point: what would open, and which cells say so.
+    ///
+    /// `url` is session-owned (see `link_buf`). The column range is the
+    /// viewport row and half-open column span the link OCCUPIES, which for
+    /// `.text` is the matched run and for `.osc8` is only the cell that was
+    /// hit — an OSC 8 run is found by walking cells, not by measuring text,
+    /// so `snapshot` re-derives the full extent by target equality rather
+    /// than trusting a range computed at hover time.
+    pub const Link = struct {
+        url: []const u8,
+        source: LinkSource,
+        row: u16,
+        start_col: u16,
+        end_col: u16,
+    };
 
     pub const PointerSelectionEvent = struct {
         phase: canvas.WidgetPointerPhase,
@@ -359,6 +406,33 @@ pub const Session = struct {
         // AFTER the render update (which rebuilds — and so clears — the rows
         // it touched) and BEFORE the cell loop reads them.
         session.applySearchHighlights();
+        // The hover underline, resolved HERE rather than carried in from the
+        // pointer event that armed it, so it is answered against the very
+        // state this frame paints. `applySearchHighlights` is the model the
+        // bead named, and this deliberately does NOT go through
+        // `RenderState.updateHighlightsFlattened`: that channel takes
+        // `highlight.Flattened` values, and the pinned libghostty-vt cannot
+        // build one — `highlight.Flattened.init` returns a struct literal with
+        // an `end_x` field the type does not have, so the call fails to
+        // compile. The search path only reaches that channel because the
+        // SEARCH engine hands out already-built highlights. A hover span has
+        // no such source, and inventing one to satisfy a channel we then read
+        // back out in the same function would be ceremony, not safety.
+        const hover = session.hoverLink();
+        // Split by SOURCE because the two are found differently. A text link
+        // is a column range on one row — the run that was matched. An OSC 8
+        // link is wherever its target is, which is a property of the CELLS:
+        // the run may wrap, and the same target may appear more than once, so
+        // the extent is re-derived per cell by comparing targets rather than
+        // trusting a range measured at hover time.
+        const hover_span: ?Link = if (hover) |link|
+            (if (link.source == .text) link else null)
+        else
+            null;
+        const hover_href: ?[]const u8 = if (hover) |link|
+            (if (link.source == .osc8) link.url else null)
+        else
+            null;
         const rs = &session.render;
         const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
 
@@ -467,6 +541,31 @@ pub const Session = struct {
                     projected.bg = if (current) palette.search_current else palette.search_match;
                     projected.fg = if (current) palette.search_current_text else palette.search_match_text;
                     break;
+                }
+
+                // The hover affordance. An underline rather than a colour
+                // because it is the convention every terminal and browser
+                // already trained the user on, and because it composes: a
+                // hovered cell keeps its own foreground, its own background,
+                // and any search wash it happens to be under.
+                //
+                // Only the FLAG is forced. A cell that already carries an SGR
+                // underline keeps its own style and colour — a curly
+                // spell-check underline under the pointer should not
+                // straighten out because the pointer arrived.
+                if (hover_span) |span| {
+                    if (row_index == @as(usize, span.row) and
+                        x >= @as(usize, span.start_col) and
+                        x < @as(usize, span.end_col))
+                    {
+                        projected.underline = true;
+                    }
+                } else if (hover_href) |href| {
+                    if (cell.raw.hyperlink) {
+                        if (cellHyperlinkUri(row.pin, x)) |uri| {
+                            if (std.mem.eql(u8, uri, href)) projected.underline = true;
+                        }
+                    }
                 }
 
                 // A box-drawing cell carries no cluster: the painter
@@ -1625,22 +1724,165 @@ pub const Session = struct {
 
     /// The URL under a pointer at view-relative `x`/`y`, or null.
     ///
-    /// Returns a slice into the session's own cached screen text, so it stays
-    /// valid until the next screen change — which is exactly the lifetime a
-    /// hover or a click needs, and no longer.
-    ///
-    /// Heuristic by necessity: terminal output has no author to mark up its
-    /// links. It fails toward "not a link", because a missed URL costs a click
-    /// while a wrong one hands arbitrary program output to the OS to open.
+    /// The convenience form of `linkAtPoint` for callers that only need
+    /// somewhere to go; the same lifetime rule applies (see `link_buf`).
     pub fn urlAtPoint(session: *Session, x: f32, y: f32) ?[]const u8 {
+        const link = session.linkAtPoint(x, y) orelse return null;
+        return link.url;
+    }
+
+    /// The link under a pointer at view-relative `x`/`y`, from either channel.
+    ///
+    /// Two channels, and they are not equal. An OSC 8 hyperlink is EXPLICIT —
+    /// the program told the emulator "these cells are this target" — so where
+    /// one exists it beats a shape this app guessed from the text. The
+    /// heuristic (`url.zig`) is the fallback for the overwhelming majority of
+    /// output, which carries no markup at all.
+    ///
+    /// Two things stop the explicit channel from becoming a way for program
+    /// output to pick what the OS opens:
+    ///
+    ///  1. The href passes `url.isAllowedTarget` — the same allowlist the
+    ///     heuristic can only ever produce by construction. A refused href is
+    ///     not repaired and does not disable linking on that cell; the row
+    ///     falls back to the heuristic, so a `javascript:` href wrapped around
+    ///     visible link text still opens the VISIBLE link and nothing else.
+    ///
+    ///  2. When the display text under the pointer is ITSELF a URL and it
+    ///     disagrees with the href, the DISPLAY TEXT WINS. This is the
+    ///     phishing shape OSC 8 makes possible: the sequence chooses both what
+    ///     you read and where you go, so `\x1b]8;;https://evil.example\x1b\\`
+    ///     wrapped around the text `https://bank.example` reads as one
+    ///     destination and navigates to another. Cockpit has no hover preview
+    ///     to show the real target with, so the invariant it can actually keep
+    ///     is that a link which LOOKS like a URL goes where it looks. A
+    ///     mismatch costs the program its indirection; it never costs the user
+    ///     a surprise destination. Where the display text is not a URL
+    ///     (`click here`, a file name, an issue number) there is nothing to
+    ///     disagree with and the href is used as written.
+    ///
+    /// The emulator is read LIVE here rather than through the render state:
+    /// this runs on pointer input, arbitrarily long after the last paint, and
+    /// the render state's row pins are only valid until the terminal next
+    /// changes.
+    pub fn linkAtPoint(session: *Session, x: f32, y: f32) ?Link {
         if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
         if (x < 0 or y < 0) return null;
         const coordinate = session.pointerViewportCoordinate(x, y) orelse return null;
+        return session.linkAtCell(coordinate);
+    }
+
+    /// `linkAtPoint` once the point is already a viewport cell.
+    fn linkAtCell(session: *Session, coordinate: vt.Coordinate) ?Link {
+        const shown = session.textLinkAtCell(coordinate);
+        if (session.hyperlinkUriAtCell(coordinate)) |href| explicit: {
+            if (!url_module.isAllowedTarget(href)) break :explicit;
+            // The display text claims a different destination — see (2) above.
+            if (shown) |text_link| {
+                if (!std.mem.eql(u8, text_link.url, href)) break :explicit;
+            }
+            return .{
+                .url = session.rememberLink(href) orelse return null,
+                .source = .osc8,
+                .row = @intCast(coordinate.y),
+                .start_col = @intCast(coordinate.x),
+                .end_col = @intCast(coordinate.x + 1),
+            };
+        }
+        const text_link = shown orelse return null;
+        return .{
+            .url = session.rememberLink(text_link.url) orelse return null,
+            .source = .text,
+            .row = text_link.row,
+            .start_col = text_link.start_col,
+            .end_col = text_link.end_col,
+        };
+    }
+
+    /// The heuristic link at a viewport cell. Its `url` points into the cached
+    /// screen text and is only safe until the caller copies it.
+    fn textLinkAtCell(session: *Session, coordinate: vt.Coordinate) ?Link {
         const text = session.screenText();
         const row = rowSlice(text, coordinate.y) orelse return null;
         const offset = url_module.byteOffsetForColumn(row, coordinate.x) orelse return null;
         const span = url_module.spanAt(row, offset) orelse return null;
-        return span.slice(row);
+        return .{
+            .url = span.slice(row),
+            .source = .text,
+            .row = @intCast(coordinate.y),
+            .start_col = @intCast(url_module.columnForByteOffset(row, span.start)),
+            .end_col = @intCast(url_module.columnForByteOffset(row, span.end)),
+        };
+    }
+
+    /// The OSC 8 target on a viewport cell, as a slice into PAGE memory.
+    ///
+    /// Valid only until the terminal state next changes, which is why every
+    /// caller copies. Reads the LIVE screen, so it is safe to call at any
+    /// time — unlike `cellHyperlinkUri`, which goes through a render-state
+    /// pin and is only safe inside a paint.
+    fn hyperlinkUriAtCell(session: *Session, coordinate: vt.Coordinate) ?[]const u8 {
+        const screen = session.term.screens.active;
+        const list_cell = screen.pages.getCell(.{ .viewport = .{
+            .x = coordinate.x,
+            .y = coordinate.y,
+        } }) orelse return null;
+        if (!list_cell.cell.hyperlink) return null;
+        const page = list_cell.node.page();
+        const id = page.lookupHyperlink(list_cell.cell) orelse return null;
+        return page.hyperlink_set.get(page.memory, id).uri.slice(page.memory);
+    }
+
+    /// The OSC 8 target on the cell at column `x` of the row `pin` names, as a
+    /// slice into PAGE memory.
+    ///
+    /// Takes a render-state row pin, so it is only safe to call while that
+    /// state is current — inside `snapshot`, between the render update and the
+    /// next terminal change. This is the same contract libghostty's own
+    /// `RenderState.linkCells` states, and for the same reason: the pin's node
+    /// must not be dereferenced once the terminal has moved on.
+    fn cellHyperlinkUri(pin: vt.Pin, x: usize) ?[]const u8 {
+        const page = pin.node.page();
+        if (x >= page.size.cols) return null;
+        const rac = page.getRowAndCell(@intCast(x), pin.y);
+        if (!rac.cell.hyperlink) return null;
+        const id = page.lookupHyperlink(rac.cell) orelse return null;
+        return page.hyperlink_set.get(page.memory, id).uri.slice(page.memory);
+    }
+
+    /// Copy a resolved target into session storage. Null when it does not fit,
+    /// which is also a refusal to return a link at all — a truncated URL is a
+    /// DIFFERENT destination, never a shorter version of the same one.
+    fn rememberLink(session: *Session, value: []const u8) ?[]const u8 {
+        if (value.len == 0 or value.len > session.link_buf.len) return null;
+        @memcpy(session.link_buf[0..value.len], value);
+        session.link_len = value.len;
+        return session.link_buf[0..session.link_len];
+    }
+
+    /// Arm the hover underline at a widget-relative point, or disarm it.
+    ///
+    /// The caller owns the POLICY (Ghostty's is: pointer over a pane with the
+    /// link chord held); the session owns only where the pointer is. Returns
+    /// whether the armed state changed, so a caller can decide whether the
+    /// frame is worth repainting.
+    pub fn setHoverPoint(session: *Session, point: ?HoverPoint) bool {
+        const before = session.hover_point;
+        session.hover_point = point;
+        if (before == null and point == null) return false;
+        if (before) |old| {
+            if (point) |new| return old.x != new.x or old.y != new.y;
+        }
+        return true;
+    }
+
+    /// The link the hover point resolves to right now, or null.
+    ///
+    /// Called from `snapshot` immediately after the render update, so the
+    /// answer is about the state being painted.
+    fn hoverLink(session: *Session) ?Link {
+        const point = session.hover_point orelse return null;
+        return session.linkAtPoint(point.x, point.y);
     }
 
     /// Row `index` of a newline-separated viewport dump, without its newline.

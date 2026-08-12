@@ -58,6 +58,7 @@ const handleTerminalPointer = pointer_input.handleTerminalPointer;
 const endCapturesForTerminal = pointer_input.endCapturesForTerminal;
 const endMismatchedMouseCaptures = pointer_input.endMismatchedMouseCaptures;
 const endAllCaptures = pointer_input.endAllCaptures;
+const clearHoverLinks = pointer_input.clearHoverLinks;
 const endHiddenCaptures = pointer_input.endHiddenCaptures;
 const handleSelectionAutoscroll = pointer_input.handleSelectionAutoscroll;
 const terminalRefAtPoint = pointer_input.terminalRefAtPoint;
@@ -531,6 +532,11 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // only the focused one's.
             if (!focused) {
                 endAllCaptures(model, fx);
+                // The hover underline is armed by a HELD modifier, and a blur
+                // is exactly how that key stops being held without this app
+                // ever seeing the release. Leaving it armed underlines a link
+                // in a window the pointer has left.
+                clearHoverLinks(model);
                 for (0..max_terminals) |index| {
                     if (model.provider.states[index] == .active) model.provider.slot(index).macos_natural_keys_held = 0;
                 }
