@@ -248,10 +248,15 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Zig 0.16.0 and Xcode Command Line Tools for source builds
 - Internet access on the first source build to fetch pinned dependencies
 
-native-sdk is pinned to the v0.8.1-based merge
-[`phall1/native@f7347de`](https://github.com/phall1/native/commit/f7347de1c607dcbe4e4f06dddd172fcf3f9d0507),
-which includes Cockpit's terminal interaction, viewport, and font seams plus the
-packed `cell_grid` canvas command, its AppKit decoder, and wire format v6.
+native-sdk is pinned to
+[`phall1/native@f3678832`](https://github.com/phall1/native/commit/f3678832fd282b81241993d0c08105cd5170f39f),
+the head of that fork's `cockpit/v0.8.4` branch: upstream v0.8.4 plus Cockpit's
+terminal interaction, viewport, and font seams, the packed `cell_grid` canvas
+command with its AppKit decoder and wire format v6, macOS glyph smoothing, the
+per-window `ChromeContext` on `build_window` and `web_panes`, and `fx.openUrl`.
+The pin is a tarball SHA rather than a branch, so a push to the fork can never
+break a checkout of Cockpit — see [docs/SDK_PIN.md](docs/SDK_PIN.md) for how the
+fork and this repo stay in contract, and what to run before moving the pin.
 libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
 Zig 0.16-compatible checkpoint.

@@ -1,0 +1,104 @@
+# CI (ci.yml) builds Cockpit against the SDK sha that build.zig.zon pins today.
+# That pin is a tarball sha, not a branch, so a push to the fork can never break
+# a checkout of Cockpit — it defers the breakage to whoever next bumps the pin,
+# which is where the signal is worth the least.
+#
+# This workflow builds Cockpit against the fork's CURRENT cockpit branch head
+# instead, so an SDK change that Cockpit cannot compile against is visible while
+# it is still the SDK's change. It is the only automated consumer test the fork
+# has: the fork's own suite passes on changes that break its only downstream app
+# (observed 2026-08-11, when `web_panes` gained a ChromeContext parameter).
+#
+# A failure here means the fork moved, not that Cockpit is broken. Cockpit's own
+# PRs stay green until someone runs scripts/repoint-sdk.sh. See docs/SDK_PIN.md.
+name: SDK HEAD
+
+on:
+  schedule:
+    # Daily. The fork's cockpit branch is rebased in bursts, so a weekly cadence
+    # would routinely report a week's worth of SDK commits as one failure with
+    # nothing to bisect. Minute 17 because GitHub delays scheduled runs that
+    # queue on the hour, and the fork is pushed from US hours, so 07:17 UTC
+    # reads the previous day's work.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'SDK ref to build against ("auto" = newest cockpit/v* branch)'
+        required: false
+        default: auto
+        type: string
+
+permissions:
+  contents: read
+
+# Never cancel in progress: a scheduled run that a dispatch cancels reports no
+# result at all, which is indistinguishable from the failure this job exists to
+# catch.
+concurrency:
+  group: sdk-head
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Cockpit vs SDK branch head
+    runs-on: macos-26
+    # 45 minutes, matching ci.yml. Measured against the run that is a superset
+    # of every step below except packaging:
+    #   gh api repos/phall1/phux-cockpit/actions/runs/31617082301/jobs \
+    #     --jq '.jobs[].steps[] | {name, started_at, completed_at}'
+    # Cold job total 12m23s: setup 26s, phux-client-ffi 4m23s, null-platform
+    # tests 2m28s, phux-provider tests 1m55s, package+soak 2m45s. This job drops
+    # packaging and adds two exe builds, so it lands in the same band, and the
+    # ceiling is there to kill a hung run rather than to bound a healthy one.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+      # Resolve and repoint before the FFI build, so a fork that renamed its
+      # cockpit branches fails in 5 seconds rather than after 4 minutes of cargo.
+      # This step also writes the run summary — pin, branch head, and the command
+      # to bump — because everything a reader of a FAILED run needs is known
+      # here, before the build, rather than from a trailing step that would have
+      # to survive the failure it reports on. `inputs` is empty on a schedule
+      # event; the script treats an empty ref as `auto` regardless.
+      - name: Repoint the SDK dependency at the fork's branch head
+        run: ./scripts/repoint-sdk.sh --ref "${SDK_REF}"
+        env:
+          SDK_REF: ${{ inputs.ref || 'auto' }}
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: phall1/phux
+          ref: 5b5c67a90f9501352bc9b7063c0611480f0fa2a6 # v0.12.0
+          path: .phux
+          persist-credentials: false
+      - name: Build the pinned Phux client FFI
+        working-directory: .phux
+        run: cargo build --locked --profile ffi-release -p phux-client-ffi
+      - name: Test with the null platform
+        run: zig build test -Dplatform=null --summary all
+      - name: Test the production Phux provider
+        run: |
+          zig build test \
+            -Dplatform=null \
+            -Dphux-enabled=true \
+            -Dphux-client-ffi-include-dir="$PWD/.phux/crates/phux-client-ffi/include" \
+            -Dphux-client-ffi-lib-dir="$PWD/.phux/target/ffi-release" \
+            --summary all
+      # `zig build test` compiles the test root, not the macOS executable, and
+      # the platform layer is where an SDK signature change lands. Build the real
+      # arm64 binary on both graphs so a break in AppKit-only code is caught here
+      # rather than by the next person to run `zig build`.
+      - name: Build the macOS executable, local terminal graph
+        run: zig build --summary all
+      - name: Build the macOS executable, production Phux graph
+        run: |
+          zig build \
+            -Dphux-enabled=true \
+            -Dphux-client-ffi-include-dir="$PWD/.phux/crates/phux-client-ffi/include" \
+            -Dphux-client-ffi-lib-dir="$PWD/.phux/target/ffi-release" \
+            --summary all

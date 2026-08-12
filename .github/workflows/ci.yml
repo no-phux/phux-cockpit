@@ -26,6 +26,11 @@ jobs:
           persist-credentials: false
       - name: Check release version synchronization
         run: ./scripts/check-release-version.sh
+      # Offline and instant, so it runs before anything is fetched or built.
+      # A pin bump that leaves README describing the previous sha has already
+      # shipped once; the sha a reader trusts has to be the sha that is built.
+      - name: Check dependency pin documentation
+        run: ./scripts/check-sdk-pin.sh
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: phall1/phux
