@@ -13,7 +13,7 @@
 # because it is written at font-size 26. A test at the default font could not.
 #
 test: a pane proposes no viewport until its cell box has been measured
-red: 2026-08-12 at 5bccbd2
+red: 2026-08-12 at ff16fa2
 diff --git a/src/terminal/session.zig b/src/terminal/session.zig
 index bfb06b2..b4c0001 100644
 --- a/src/terminal/session.zig

@@ -11,7 +11,7 @@
 # before. Measured, not guessed: the ratio is recorded in the test.
 #
 test: a pane sized without a text-measure provider uses the mono cell, not a sans estimate
-red: 2026-08-12 at 5bccbd2
+red: 2026-08-12 at ff16fa2
 diff --git a/src/cockpit/native/workspace_projection.zig b/src/cockpit/native/workspace_projection.zig
 index 38ffa7e..0094d0c 100644
 --- a/src/cockpit/native/workspace_projection.zig

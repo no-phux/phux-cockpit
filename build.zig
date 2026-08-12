@@ -368,7 +368,6 @@ fn addTestVerdict(b: *std.Build, test_step: *std.Build.Step, verdict: []const u8
     test_step.dependOn(&run.step);
 }
 
-<<<<<<< HEAD
 /// Which Zig global cache this run used, and whether anybody else is in it.
 ///
 /// The other half of phux-cockpit-2ml.11. A cache entry is guarded by an

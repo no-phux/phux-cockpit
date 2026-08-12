@@ -11,7 +11,7 @@
 # still earns a tombstone, because there is nothing to close to.
 #
 test: a non-zero exit closes its pane too, and the sibling reclaims the rect
-red: 2026-08-12 at 5bccbd2
+red: 2026-08-12 at ff16fa2
 diff --git a/src/cockpit/update.zig b/src/cockpit/update.zig
 index b435be2..dcced5e 100644
 --- a/src/cockpit/update.zig

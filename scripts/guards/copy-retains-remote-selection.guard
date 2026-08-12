@@ -11,7 +11,7 @@
 # the test is pinning.
 #
 test: a successful copy ends selection mode on a remote pane and keeps its range
-red: 2026-08-12 at 5bccbd2
+red: 2026-08-12 at ff16fa2
 diff --git a/src/cockpit/update.zig b/src/cockpit/update.zig
 index b435be2..98de393 100644
 --- a/src/cockpit/update.zig

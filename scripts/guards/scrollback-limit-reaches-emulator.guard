@@ -11,7 +11,7 @@
 # the tree compiling and prove nothing.
 #
 test: scrollback-limit reaches the emulator instead of being stored and ignored
-red: 2026-08-12 at 5bccbd2
+red: 2026-08-12 at ff16fa2
 diff --git a/src/terminal/session.zig b/src/terminal/session.zig
 index bfb06b2..1a7187d 100644
 --- a/src/terminal/session.zig
