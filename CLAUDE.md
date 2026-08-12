@@ -60,18 +60,127 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
+The gate. **Judge it by the exit code and nothing else** — a fully green run has
+previously ended with a line reading `failed command: .../test --listen=-`.
 
-```bash
-# Example:
-# npm install
-# npm test
+```sh
+zig build test > /tmp/t.log 2>&1; echo "exit=$?"
 ```
+
+Then read the verdict block, which the run prints last. Two fields in it are
+load-bearing:
+
+- **`source root:`** must name the worktree you edited. On 2026-08-12 a
+  subagent's build silently ran in a sibling worktree; the exit code was real
+  and described someone else's code, and nothing else in the output said so.
+  Confirm `pwd` and `git rev-parse --show-toplevel` before treating any exit
+  code as evidence.
+- **`PASS, INCOMPLETE`** means `src/providers/phux/` was not in the build at
+  all, because the phux client FFI was not found. The rest of the run is real;
+  a change under that directory is not verified by it.
+
+No verdict block at all means the run was not green, whatever else printed.
+
+`-Dphux-enabled=true` swaps the *app* graph onto the phux provider. It is **not**
+what compiles `src/providers/phux/` — FFI discovery is, and the flag alone never
+was sufficient. Zig analyzes only what is referenced and nothing in Cockpit calls
+`PhuxProvider.search`, so a 2026-08-10 signature drift passed at exit 0 under
+every invocation including the full phux one. `src/providers/phux/ref.zig` plus a
+`refAllDeclsRecursive` test in each rooted module is what forces the analysis.
+
+README.md, "Reading the result of `zig build test`", has the FFI search order.
+
+### Running it
+
+<!-- PLACEHOLDER: scripts/dev-run.sh was in flight on 2026-08-12 and is the
+     answer to "how do I run this". Replace this block with its invocation
+     once it lands, rather than guessing its flags here. -->
+
+Whatever you run, check what binary a bug report is actually about. On
+2026-08-12 `/Applications` held 0.7.1 built three days earlier while `main` was
+0.8.0, so nothing merged in those three days had ever been in front of the
+person filing render bugs.
+
+### The other entry points
+
+| Script | Answers |
+|---|---|
+| `scripts/automate-smoke.sh` | does the real bundle come up, present through the packet path, and respond to driven input? |
+| `scripts/drive-shell-ceiling.sh --want N` | how many concurrent shells does the shipped bundle actually reach before one is refused? |
+| `scripts/host-raster-check.sh` | does the host's real CoreText rasterizer still ink glyphs as thickly as the pinned baseline? |
+| `scripts/host-raster-compare.sh <ref>` | did an SDK change move glyph pixels between two commits that both shipped? |
+| `scripts/check-sdk-pin.sh` | does README name the sha `build.zig.zon` actually resolves? |
+| `scripts/build-automation-cli.sh` | builds the only `native` CLI that can drive this app; the npm one is fingerprint-refused and always will be. |
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+A Zig macOS app on the Native SDK fork
+[`phall1/native`](https://github.com/phall1/native), pinned in `build.zig.zon`
+by tarball sha. Cockpit is that fork's only real consumer, which is why breakage
+arrives all at once at a pin bump — docs/SDK_PIN.md has the pre-bump checklist.
+
+- `src/cockpit/` — model, update, topology, layout, session state.
+  `src/cockpit/native/` is the host/scene/view boundary.
+- `src/providers/` — `contract.zig` holds provider-neutral identity; `local/`
+  runs PTYs in-process, `phux/` reaches a remote phux across an FFI ABI.
+- `src/terminal/` — one `libghostty-vt` session per terminal, projected into a
+  canvas grid. The emulator owns cell state, damage, scrollback and selection.
+- `src/config/`, `src/tests/`.
+
+Three invariants that shape most changes:
+
+- **Identity is provider-backed.** Tab, pane, window, PID and effect-key
+  position are never durable identity.
+- **One geometry.** `layout.resolve()` is the single source of pane rects for
+  the painter, the hit-test widget tree and the PTY sizing pump. They were three
+  independent derivations once, and had already drifted.
+- **Two rasterizers.** On glass the AppKit host decodes the packet path and
+  draws with CoreText. `native automate screenshot` runs a pure-Zig CPU
+  reference renderer that never calls CoreText. Only one of them is on screen.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+**An assertion you have not seen fail is not evidence.** Assert absent, act,
+assert present. A merged and publicly retracted "automation input is broken"
+finding came from an assertion that could not move: it counted
+`role=textbox name="Terminal`, which only ever matches the SELECTED tab, so a
+new tab could not shift it however perfectly the key was delivered. The
+`expect_change` helper in `scripts/automate-smoke.sh` encodes the shape. Give
+any assertion you add its before-half too.
+
+**Never compare against a counterfactual you authored.** The font-smoothing fix
+was validated by hand-editing the SDK into a state no build was ever in; against
+the real prior commit it moves zero pixels. Compare two things that shipped —
+`scripts/host-raster-compare.sh` exists for exactly this.
+
+**A screenshot cannot answer a glyph question.** The automation screenshot path
+is structurally blind to everything CoreText does: outlines, hinting, smoothing,
+CG blend arithmetic, device colour space. Never conclude "the text renders
+correctly" from one. Read docs/RENDER_FIDELITY.md before writing any test that
+claims to check what the terminal looks like.
+
+**Live-app automation is serial-only** (`phux-cockpit-2ml.10`). The automation
+dropbox is per-user rather than per-process and activation targets a process by
+NAME, so a second bundle silently steals the channel, and a snapshot of a dead
+instance returns an empty widget tree instead of an error. Assert
+`publisher_pid` is the pid you launched before believing anything. Guard with
+`pgrep -x <exename>` or `pgrep -f "[p]attern"`; plain `pgrep -f` matches the
+shell running it, which is fatal inside a wait loop and quietly wrong outside
+one.
+
+**Measure constants, never pick them**, and keep the deriving command beside the
+number — `--min-solid 4000` and the 32-shell pty ceiling both carry theirs.
+
+**Show every regression test failing first.** Disable the fix, watch red,
+restore, watch green, and report what you disabled.
+
+Settled questions live in docs/DECISIONS.md; reopen one by adding information,
+not by re-litigating it. Track work with `bd` and keep durable knowledge in
+`bd remember`. No emoji in committed files. This codebase writes substantial WHY
+comments rather than restating code — match that density.
+
+**AGENTS.md and this file are independent**, not symlinked, and they have
+already drifted: AGENTS.md carried the product contract, the rendering-evidence
+warning and the test gate while this file was still scaffold placeholders.
+AGENTS.md remains the product contract and quality bar; this file is the build,
+the map and the working rules. Mirror substantive changes into both.

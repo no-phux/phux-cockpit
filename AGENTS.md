@@ -148,6 +148,12 @@ The verdict step depends on every test step, so it prints only when all of
 them succeeded. **No verdict block means the run was not green**, whatever
 else the output says.
 
+**`source root:` must name the tree you edited.** On 2026-08-12 a subagent's
+build silently ran in a sibling git worktree: the exit code was real, it just
+described someone else's code, and nothing else in the output distinguished it.
+Confirm `pwd` and `git rev-parse --show-toplevel` before treating any exit code
+as evidence.
+
 A verdict that says `PASS, INCOMPLETE` means `src/providers/phux/` was not
 compiled, because the phux client FFI was not found on this machine. The rest
 of the run is real; a change under `src/providers/phux/` is not verified by it.
@@ -170,6 +176,82 @@ discovering the FFI is enough for that.
 
 See README.md, "Reading the result of `zig build test`", for the search order
 and the reasoning.
+
+## The Map
+
+A Zig macOS app on the Native SDK fork
+[`phall1/native`](https://github.com/phall1/native), pinned in `build.zig.zon`
+by tarball sha. Cockpit is that fork's only real consumer, so breakage arrives
+all at once at a pin bump; [docs/SDK_PIN.md](docs/SDK_PIN.md) has the checklist.
+
+- `src/cockpit/` — model, update, topology, layout, session state.
+  `src/cockpit/native/` is the host/scene/view boundary.
+- `src/providers/` — `contract.zig` holds provider-neutral identity; `local/`
+  runs PTYs in-process, `phux/` reaches a remote phux across an FFI ABI.
+- `src/terminal/` — one `libghostty-vt` session per terminal, projected into a
+  canvas grid. The emulator owns cell state, damage, scrollback and selection.
+- `src/config/`, `src/tests/`.
+
+**One geometry.** `layout.resolve()` is the single source of pane rects for the
+painter, the hit-test widget tree and the PTY sizing pump. They were three
+independent derivations once, and had already drifted.
+
+**Two rasterizers.** On glass the AppKit host decodes the packet path and draws
+with CoreText; `native automate screenshot` runs a CPU reference renderer that
+never calls CoreText. See "Rendering Evidence" above.
+
+### Entry points beyond the gate
+
+<!-- PLACEHOLDER: scripts/dev-run.sh was in flight on 2026-08-12 and is the
+     answer to "how do I run this". Add its invocation here once it lands,
+     rather than guessing its flags. -->
+
+| Script | Answers |
+|---|---|
+| `scripts/automate-smoke.sh` | does the real bundle come up, present through the packet path, and respond to driven input? |
+| `scripts/drive-shell-ceiling.sh --want N` | how many concurrent shells does the shipped bundle reach before one is refused? |
+| `scripts/host-raster-check.sh` | does the host's real CoreText rasterizer still ink glyphs as thickly as the pinned baseline? |
+| `scripts/host-raster-compare.sh <ref>` | did an SDK change move glyph pixels between two commits that both shipped? |
+| `scripts/check-sdk-pin.sh` | does README name the sha `build.zig.zon` actually resolves? |
+| `scripts/build-automation-cli.sh` | builds the only `native` CLI that can drive this app; the npm one is fingerprint-refused and always will be. |
+
+Check what binary a bug report is about before diagnosing it. On 2026-08-12
+`/Applications` held 0.7.1 built three days earlier while `main` was 0.8.0, so
+nothing merged in those three days had been in front of the person reporting.
+
+## Evidence Rules
+
+**An assertion you have not seen fail is not evidence.** Assert absent, act,
+assert present. A merged and publicly retracted "automation input is broken"
+finding came from an assertion that could not move: it counted
+`role=textbox name="Terminal`, which only ever matches the SELECTED tab, so a
+new tab could not shift it however perfectly the key was delivered. The
+`expect_change` helper in `scripts/automate-smoke.sh` encodes the shape.
+
+**Never compare against a counterfactual you authored.** The font-smoothing fix
+was validated by hand-editing the SDK into a state no build was ever in; against
+the real prior commit it moves zero pixels. Compare two things that shipped —
+`scripts/host-raster-compare.sh` exists for exactly this.
+
+**Live-app automation is serial-only** (`phux-cockpit-2ml.10`). The automation
+dropbox is per-user rather than per-process and activation targets a process by
+NAME, so a second bundle silently steals the channel, and a snapshot of a dead
+instance returns an empty widget tree instead of an error. Assert
+`publisher_pid` is the pid you launched. Guard with `pgrep -x <exename>` or
+`pgrep -f "[p]attern"`; plain `pgrep -f` matches the shell running it, which is
+fatal inside a wait loop and quietly wrong outside one.
+
+**Measure constants, never pick them**, and keep the deriving command beside the
+number. **Show every regression test failing first**: disable the fix, watch
+red, restore, watch green, and report what you disabled.
+
+Settled questions live in [docs/DECISIONS.md](docs/DECISIONS.md); reopen one by
+adding information, not by re-litigating it.
+
+**AGENTS.md and CLAUDE.md are independent files**, not symlinked, and they have
+already drifted: this file carried the product contract, the rendering warning
+and the test gate while CLAUDE.md was still scaffold placeholders. CLAUDE.md is
+the build, the map and the working rules. Mirror substantive changes into both.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
