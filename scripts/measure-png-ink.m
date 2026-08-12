@@ -11,9 +11,17 @@
 // glyphs from its own TrueType outline filler and never touches CoreText. A
 // defect in the REAL rasterizer - macOS font smoothing off, a wrong blend, a
 // wrong colour space - cannot appear in a reference screenshot by
-// construction. scripts/capture-gpu-ink.sh captures the real composited Metal
-// texture as well, and this tool is what turns both PNGs into numbers that can
-// be compared without arguing about eyes.
+// construction. This tool turns a PNG into numbers that can be compared
+// without arguing about eyes.
+//
+// It used to name a companion, scripts/capture-gpu-ink.sh, that would capture
+// the real composited Metal texture. That script does not exist and was never
+// written: docs/RENDER_FIDELITY.md section 2 records why, having evaluated
+// every capture path the SDK offers and found each one either TCC-gated or,
+// in the case of NATIVE_SDK_GPU_SHOT_DIR, silently replacing the rasterizer it
+// was supposed to photograph. So the only inputs here are reference
+// screenshots, and the reference-vs-GPU comparison the paragraph below warns
+// about cannot currently be made at all.
 //
 // THE BASIS, stated once so both sides of any comparison keep it:
 //   * Pixels are read from the PNG's own decoded bytes via the CGImage data

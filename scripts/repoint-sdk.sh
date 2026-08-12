@@ -12,6 +12,8 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "${ROOT}/scripts/lib/measure.sh"
+
 ZON="${ROOT}/build.zig.zon"
 
 # The fork tracks upstream by rebasing onto each release, and names the result
@@ -58,14 +60,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-pinned_url="$(awk '
-    /\.native_sdk = \.\{/ { inside = 1; next }
-    inside && /\.url = "/ {
-        match($0, /"[^"]+"/)
-        print substr($0, RSTART + 1, RLENGTH - 2)
-        exit
-    }
-' "${ZON}")"
+# `|| true` so the shape check below stays the one that reports a malformed
+# pin. The library also prints its own named refusal first, which is what
+# distinguishes "there is no url because the dependency is a local .path
+# override" from "the url is there and wrong" (phux-cockpit-yo5).
+pinned_url="$(measure_zon_dependency_url native_sdk "${ZON}" || true)"
 
 if [[ ! "${pinned_url}" =~ ^https://github\.com/([^/]+/[^/]+)/archive/([0-9a-f]{40})\.tar\.gz$ ]]; then
     printf 'error: build.zig.zon native_sdk url is not a sha-pinned github archive: %s\n' \

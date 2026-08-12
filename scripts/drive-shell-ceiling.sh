@@ -34,9 +34,12 @@
 # per-process: a second bundle steals the channel. This script refuses to
 # start if one is already running, and asserts `publisher_pid` is the pid it
 # launched before believing a single assertion.
+# measures: how many concurrent shells the shipped bundle actually reaches, and what each costs
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "${ROOT}/scripts/lib/measure.sh"
+
 WORK="${TMPDIR:-/tmp}/phux-cockpit-ceiling.$$"
 WANT=8
 KEEP=0
@@ -46,18 +49,12 @@ while [[ $# -gt 0 ]]; do
         --want) WANT="$2"; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --measure) MEASURE=1; shift ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
 
-# `pgrep -f` would match this script's OWN command line and report a hit every
-# time. `-x` matches the executable name, which cannot self-match.
-if pgrep -x phux-cockpit >/dev/null 2>&1; then
-    printf 'REFUSING TO RUN: a phux-cockpit is already running.\n' >&2
-    printf 'Automation is serial-only; a second bundle steals the dropbox.\n' >&2
-    exit 1
-fi
+measure_require_serial_automation
 
 mkdir -p "$WORK"
 APP_PID=""
@@ -97,26 +94,15 @@ HOLD
 chmod +x "${WORK}/hold.sh"
 printf 'command = /bin/sh %s\nfont-size = 13\n' "${WORK}/hold.sh" >"${WORK}/config"
 
-printf 'packaging with automation...\n'
-( cd "$ROOT" && zig build package -Dautomation=true >/dev/null )
-
-PHUX_COCKPIT_CONFIG="${WORK}/config" \
-PHUX_COCKPIT_STATE="${WORK}/workspace.state" \
-    "${ROOT}/zig-out/package/phux-cockpit.app/Contents/MacOS/phux-cockpit" >"${WORK}/app.log" 2>&1 &
-APP_PID=$!
+measure_launch_isolated "${WORK}/config" "${WORK}/workspace.state" "${WORK}/app.log"
+APP_PID="${MEASURE_APP_PID}"
 
 "$NATIVE" automate wait >/dev/null
 
 # The instance under test must be the instance we launched. A sibling agent's
 # bundle answering these assertions would produce a perfectly clean transcript
 # about someone else's binary.
-publisher="$("$NATIVE" automate snapshot | grep -o 'publisher_pid=[0-9]*' | head -1 | cut -d= -f2)"
-if [[ "$publisher" != "$APP_PID" ]]; then
-    printf 'REFUSING TO ASSERT: the dropbox publisher is %s, not the pid we launched (%s).\n' \
-        "${publisher:-<none>}" "$APP_PID" >&2
-    exit 1
-fi
-printf 'publisher_pid: %s (ours)\n' "$APP_PID"
+measure_require_publisher "$APP_PID"
 
 # The compiled-in ceiling, read back out of the running binary.
 report_ceiling() {
@@ -129,20 +115,10 @@ report_ceiling() {
 }
 report_ceiling
 
-expect_change() {
-    local what="$1" pattern="$2"; shift 2
-    if ! "$NATIVE" automate assert --absent "$pattern" >/dev/null 2>&1; then
-        printf 'NEGATIVE CONTROL FAILED: %s already matches before the action.\n' "$pattern" >&2
-        printf 'This assertion cannot prove %s did anything. Fix the assertion.\n' "$what" >&2
-        return 1
-    fi
-    "$@" >/dev/null
-    if ! "$NATIVE" automate assert --timeout-ms 5000 "$pattern" >/dev/null; then
-        printf 'FAILED: %s did not produce %s\n' "$what" "$pattern" >&2
-        return 1
-    fi
-    printf '  ok: %s\n' "$what"
-}
+# `expect_change` comes from scripts/lib/measure.sh. The trap it guards against
+# here is specific: `role=tab name="Terminal 5` is a SUFFIX-open pattern, so it
+# also matches "Terminal 5" inside a longer name, and every tab that already
+# exists would satisfy a sloppier pattern.
 
 # `role=tab` widgets exist only once there is more than one tab, so the
 # single-tab starting state is asserted through the rendered pane instead.
@@ -154,9 +130,19 @@ printf 'structure: ok (Terminal 1 RUNNING)\n'
 # behind the pty ceiling: a table size is only defensible against a measured
 # per-shell cost, never against a preference. `ps` reports rss in KiB and
 # `lsof` counts open descriptors; both are read from the pid we launched.
+# The `MEASURED shells=...` line format is quoted verbatim in
+# docs/sdk-patches/README.md, so it stays byte-identical. What is added is the
+# basis line above it: the same numbers a month later are only re-derivable if
+# the run says which machine, which shell, and which command produced them.
 measure() {
     [[ "$MEASURE" == "1" ]] || return 0
     local shells="$1" rss threads fds
+    if [[ -z "${MEASURE_BASIS_PRINTED:-}" ]]; then
+        MEASURE_BASIS_PRINTED=1
+        measure_basis shell_cost \
+            "one /bin/sh that prints once then execs cat, per tab; rss from ps, fds from lsof, both on pid ${APP_PID}" \
+            "./scripts/drive-shell-ceiling.sh --want ${WANT} --measure"
+    fi
     rss="$(ps -o rss= -p "$APP_PID" | tr -d ' ')"
     threads="$(ps -M -p "$APP_PID" | tail -n +2 | wc -l | tr -d ' ')"
     fds="$(lsof -p "$APP_PID" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"

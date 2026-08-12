@@ -31,6 +31,13 @@ jobs:
       # shipped once; the sha a reader trusts has to be the sha that is built.
       - name: Check dependency pin documentation
         run: ./scripts/check-sdk-pin.sh
+      # The pin reader that step depends on is shared with the measurement
+      # scripts, and its previous per-script copies silently resolved the WRONG
+      # dependency under a local .path override (phux-cockpit-yo5). Hermetic
+      # and sub-second, so it runs here rather than being a thing someone
+      # remembers to run.
+      - name: Test the measurement harness library
+        run: ./scripts/lib/measure_test.sh
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: phall1/phux

@@ -32,10 +32,13 @@
 # The control was synthetic. A synthetic control can only tell you the knob is
 # wired up; it cannot tell you the knob was ever in the other position. This
 # script compares two REAL commits, so the before side is a state that shipped.
+# measures: host rasterizer ink at two SDK commits that both shipped, on one basis
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-PIN_CACHE="${PHUX_COCKPIT_SDK_CACHE:-${ROOT}/.zig-cache/pinned-sdk}"
+. "${ROOT}/scripts/lib/measure.sh"
+
+PIN_CACHE="$(measure_sdk_cache)"
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
     sed -n '2,10p' "$0"
@@ -48,8 +51,7 @@ if [[ ! -d "${PIN_CACHE}/.git" ]]; then
     exit 1
 fi
 
-pinned_sha="$(awk '/\.native_sdk = \.\{/ { found = 1 } found && /\.url = / { print; exit }' "${ROOT}/build.zig.zon" \
-    | sed -E 's#.*/archive/([0-9a-f]+)\.tar\.gz.*#\1#')"
+pinned_sha="$(measure_zon_dependency_sha native_sdk)"
 
 BEFORE="$1"
 AFTER="${2:-$pinned_sha}"

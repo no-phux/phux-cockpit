@@ -34,9 +34,12 @@
 #   new tab            role=tab name="Terminal N
 #   rendered pane      role=textbox name="Terminal        (SELECTED tab only)
 #   scrollback search  role=group name="Scrollback search
+# measures: structure and driven interaction of the real bundle; with --profile, host frame stages
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "${ROOT}/scripts/lib/measure.sh"
+
 WORK="${TMPDIR:-/tmp}/phux-cockpit-smoke.$$"
 PROFILE=0
 KEEP=0
@@ -44,10 +47,17 @@ for arg in "$@"; do
     case "$arg" in
         --profile) PROFILE=1 ;;
         --keep) KEEP=1 ;;
-        -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,37p' "$0"; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$arg" >&2; exit 2 ;;
     esac
 done
+
+# The automation dropbox is per-user, not per-process, so a second bundle takes
+# over the channel and every assertion below would be about someone else's
+# binary. drive-shell-ceiling.sh has refused this since phux-cockpit-2ml.10;
+# this script had the same exposure and no check, which is precisely the kind of
+# gap a per-script copy of the harness produces.
+measure_require_serial_automation
 
 mkdir -p "$WORK"
 APP_PID=""
@@ -81,34 +91,19 @@ REPAINT
 chmod +x "${WORK}/repaint.sh"
 printf 'command = /bin/sh %s\nfont-size = 13\n' "${WORK}/repaint.sh" >"${WORK}/config"
 
-printf 'packaging with automation...\n'
-( cd "$ROOT" && zig build package -Dautomation=true >/dev/null )
-
-PHUX_COCKPIT_CONFIG="${WORK}/config" \
-PHUX_COCKPIT_STATE="${WORK}/workspace.state" \
-    "${ROOT}/zig-out/package/phux-cockpit.app/Contents/MacOS/phux-cockpit" >"${WORK}/app.log" 2>&1 &
-APP_PID=$!
+measure_launch_isolated "${WORK}/config" "${WORK}/workspace.state" "${WORK}/app.log"
+APP_PID="${MEASURE_APP_PID}"
 
 "$NATIVE" automate wait >/dev/null
 
-# Assert a pattern is absent, run the action, then assert it is present. The
-# absent half is the negative control: it proves this assertion can tell the
-# two states apart, so a later PRESENT result means the action worked rather
-# than meaning the pattern was always there.
-expect_change() {
-    local what="$1" pattern="$2"; shift 2
-    if ! "$NATIVE" automate assert --absent "$pattern" >/dev/null 2>&1; then
-        printf 'NEGATIVE CONTROL FAILED: %s already matches before the action.\n' "$pattern" >&2
-        printf 'This assertion cannot prove %s did anything. Fix the assertion.\n' "$what" >&2
-        return 1
-    fi
-    "$@" >/dev/null
-    if ! "$NATIVE" automate assert --timeout-ms 5000 "$pattern" >/dev/null; then
-        printf 'FAILED: %s did not produce %s\n' "$what" "$pattern" >&2
-        return 1
-    fi
-    printf '  ok: %s\n' "$what"
-}
+# The instance under test must be the instance we launched. Without this a
+# sibling agent's bundle answers everything below and the transcript is
+# spotless and about the wrong binary.
+measure_require_publisher "$APP_PID"
+
+# `expect_change` comes from scripts/lib/measure.sh: assert ABSENT, act, assert
+# PRESENT. Its negative control is why this script's findings are believable;
+# the reasoning is in the library beside the code.
 
 # Structural assertions. These read published runtime state.
 "$NATIVE" automate assert \
@@ -168,16 +163,21 @@ if [[ "$PROFILE" == "1" ]]; then
         drawn="${drawn:-0}"
         [[ "$drawn" -ge "$min_samples" ]] && break
         if [[ "$SECONDS" -ge "$deadline" ]]; then
-            printf 'REFUSING TO REPORT: only %s host_draw samples after 60s (wanted %s).\n' \
-                "$drawn" "$min_samples" >&2
-            printf 'Percentiles over that few samples are not percentiles. See phux-cockpit-jw4.\n' >&2
-            exit 1
+            # The refusal itself lives in the library so every measurement in
+            # scripts/ refuses on the same rule rather than on whichever floor
+            # its author happened to think of.
+            measure_require_sample_floor 'host_draw' "$drawn" "$min_samples" \
+                'It had 60s of four continuously repainting panes to produce them.' || exit 1
+            break
         fi
         sleep 1
     done
     printf '  host_draw samples: %s\n' "$drawn"
 
     printf '\n--- frame profile (4 panes, continuous repaint) ---\n'
+    measure_basis frame_profile \
+        "4 panes, 45-row full-screen repaint loop, font-size 13, ${drawn} host_draw samples" \
+        './scripts/automate-smoke.sh --profile'
     "$NATIVE" automate snapshot | grep -o 'frame_profile.*' | tr ' ' '\n' | grep -E '_p50_us=|_p90_us=|_n=' || true
     printf '\nNOTE: check the _n= counts before believing any percentile. A stage\n'
     printf 'with a handful of samples describes a near-idle app, not load.\n'

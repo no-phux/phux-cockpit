@@ -28,46 +28,30 @@
 # It is not a screenshot of the app. It proves the RASTERIZER, not the frame:
 # it cannot see a layout mistake, a wrong colour chosen upstream, or a command
 # that was never emitted. Reference screenshots remain the instrument for
-# those. See docs/GPU_INK_BASELINE.md for what each instrument can and cannot
+# those. See docs/RENDER_FIDELITY.md for what each instrument can and cannot
 # see, and for the evidence behind that split.
+# measures: host rasterizer ink for one terminal row, through the pinned SDK's own appkit_host.m
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-PIN_CACHE="${PHUX_COCKPIT_SDK_CACHE:-${ROOT}/.zig-cache/pinned-sdk}"
+. "${ROOT}/scripts/lib/measure.sh"
+
 ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --min-solid|--png-prefix) ARGS+=("$1" "$2"); shift 2 ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
         *) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
 done
 
 # The SDK source must be the one the app is PINNED to, or the numbers describe
-# a rasterizer the app does not ship. Resolve it the way
-# scripts/build-automation-cli.sh does, and refuse a checkout at any other
-# commit rather than measuring it quietly.
-SDK_SRC="${PHUX_COCKPIT_SDK_SRC:-}"
-if [[ -z "$SDK_SRC" ]]; then
-    if [[ ! -d "${PIN_CACHE}/.git" ]]; then
-        printf 'error: no pinned SDK checkout at %s\n' "$PIN_CACHE" >&2
-        printf '       run ./scripts/build-automation-cli.sh first, or set PHUX_COCKPIT_SDK_SRC\n' >&2
-        exit 1
-    fi
-    url="$(awk '/\.native_sdk = \.\{/ { found = 1 } found && /\.url = / { print; exit }' "${ROOT}/build.zig.zon" \
-        | sed -E 's/.*"(.*)".*/\1/')"
-    sha="$(printf '%s' "${url}" | sed -E 's#.*/archive/([0-9a-f]+)\.tar\.gz$#\1#')"
-    have="$(git -C "$PIN_CACHE" rev-parse HEAD)"
-    if [[ "$have" != "$sha" ]]; then
-        printf 'error: %s is at %s, but build.zig.zon pins %s\n' "$PIN_CACHE" "${have:0:9}" "${sha:0:9}" >&2
-        printf '       run ./scripts/build-automation-cli.sh to re-checkout the pin\n' >&2
-        exit 1
-    fi
-    SDK_SRC="$PIN_CACHE"
-    printf 'sdk: %s at %s (pinned)\n' "$PIN_CACHE" "${have:0:9}"
-else
-    printf 'sdk: %s (PHUX_COCKPIT_SDK_SRC override - NOT the pin)\n' "$SDK_SRC"
-fi
+# a rasterizer the app does not ship. measure_require_pinned_sdk refuses a
+# checkout at any other commit rather than measuring it quietly, and it is the
+# same resolution build-automation-cli.sh uses, so the two cannot disagree
+# about which SDK "the pin" means.
+measure_require_pinned_sdk
+SDK_SRC="${MEASURE_SDK_SRC}"
 
 HOST_M="${SDK_SRC}/src/platform/macos/appkit_host.m"
 if [[ ! -f "$HOST_M" ]]; then

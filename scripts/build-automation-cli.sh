@@ -22,28 +22,21 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-CACHE="${PHUX_COCKPIT_SDK_CACHE:-${ROOT}/.zig-cache/pinned-sdk}"
+. "${ROOT}/scripts/lib/measure.sh"
+
+CACHE="$(measure_sdk_cache)"
 EXPORT_ONLY=0
 [[ "${1:-}" == "--export" ]] && EXPORT_ONLY=1
 
 log() { [[ "${EXPORT_ONLY}" == "1" ]] || printf '%s\n' "$*" >&2; }
 
 # The pin is read from build.zig.zon rather than restated here, so this script
-# cannot drift from what the app actually links against.
-url="$(awk '/\.native_sdk = \.\{/ { found = 1 } found && /\.url = / { print; exit }' "${ROOT}/build.zig.zon" \
-    | sed -E 's/.*"(.*)".*/\1/')"
-if [[ -z "${url}" ]]; then
-    printf 'error: could not read the .native_sdk url from build.zig.zon\n' >&2
-    exit 1
-fi
-
-# https://github.com/<owner>/<repo>/archive/<sha>.tar.gz
-repo="$(printf '%s' "${url}" | sed -E 's#^(https://github.com/[^/]+/[^/]+)/archive/.*#\1#').git"
-sha="$(printf '%s' "${url}" | sed -E 's#.*/archive/([0-9a-f]+)\.tar\.gz$#\1#')"
-if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
-    printf 'error: the .native_sdk url does not pin a full commit sha: %s\n' "${url}" >&2
-    exit 1
-fi
+# cannot drift from what the app actually links against. The reader lives in
+# scripts/lib/measure.sh because this script's own copy of it was
+# phux-cockpit-yo5: under a local `.path` override it fell through to the NEXT
+# dependency and fetched ghostty's sha into the SDK clone, silently.
+repo="$(measure_zon_dependency_repo native_sdk)"
+sha="$(measure_zon_dependency_sha native_sdk)"
 
 if [[ ! -d "${CACHE}/.git" ]]; then
     log "cloning ${repo}"

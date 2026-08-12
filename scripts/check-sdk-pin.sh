@@ -8,31 +8,20 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# This script's block-scoped .zon reader is now the one in the library, because
+# three other scripts carried an unscoped copy of it that walked off the end of
+# a `.path`-overridden block into the next dependency (phux-cockpit-yo5). One
+# reader, one behaviour.
+. "${ROOT}/scripts/lib/measure.sh"
+
 ZON="${ROOT}/build.zig.zon"
 README="${ROOT}/README.md"
-
-# Read one dependency's archive URL out of the .zon. The .zon is not JSON and
-# has no offline parser here, so scope the search to the block that opens with
-# `.<name> = .{` and read the first `.url` inside it.
-dependency_url() {
-    local name="$1"
-    awk -v name="${name}" '
-        $0 ~ "\\." name " = \\.\\{" { inside = 1; next }
-        inside && /\.url = "/ {
-            match($0, /"[^"]+"/)
-            print substr($0, RSTART + 1, RLENGTH - 2)
-            exit
-        }
-        inside && /^[[:space:]]*\},[[:space:]]*$/ { inside = 0 }
-    ' "${ZON}"
-}
 
 status=0
 
 check_pin() {
     local name="$1" url slug sha
-    url="$(dependency_url "${name}")"
-    if [[ -z "${url}" ]]; then
+    if ! url="$(measure_zon_dependency_url "${name}" "${ZON}")"; then
         printf 'error: build.zig.zon has no .%s dependency with a .url\n' "${name}" >&2
         status=1
         return
