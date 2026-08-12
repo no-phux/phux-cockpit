@@ -19,7 +19,7 @@ pub const max_terminals: usize = 32;
 
 /// How many local terminals can hold a LIVE SHELL at one time. This is a
 /// different question from `max_terminals` above, which sizes the registry
-/// array and the persistable topology, and it is much smaller.
+/// array and the persistable topology.
 ///
 /// The effects layer keeps ONE fixed pty table for the whole process
 /// (`Effects.pty_slots`, sized by `native_sdk.max_effect_ptys`), so the
@@ -32,12 +32,19 @@ pub const max_terminals: usize = 32;
 ///
 /// DERIVED, never restated as a literal: the ceiling belongs to the pinned
 /// SDK, and a second copy of it here would go stale the first time the pin
-/// moves and hand the symptom straight back. Measured against the shipped
-/// bundle on 2026-08-12 — four `cmd+T` from a fresh workspace, then:
+/// moves and hand the symptom straight back.
 ///
-///   native automate snapshot | grep -o 'Terminal [0-9]*, native terminal, [A-Z ]*'
+/// phux-cockpit-ipg raised the SDK's table from 4 to 32 (see
+/// `docs/sdk-patches/`), which is what makes this an upper bound rather than
+/// THE bound: at 32 it equals `max_terminals` above, and the ceiling a person
+/// actually reaches is `topology.max_tabs` (16) or `layout.max_panes` (16) —
+/// both of them Cockpit's own, both of them nameable. Re-measure against the
+/// shipped bundle with:
 ///
-/// which reports Terminal 1..4 RUNNING and Terminal 5 SPAWN REJECTED.
+///   ./scripts/drive-shell-ceiling.sh --want 8 --measure
+///
+/// which drives the real app and reports what it reached, plus the rss,
+/// thread and descriptor cost of every shell it opened.
 pub const max_live_shells: usize = native_sdk.max_effect_ptys;
 
 pub const first_terminal_raw: u64 = @intFromEnum(LocalTerminalId.terminal_1);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const app = @import("../main.zig");
+const local = @import("../providers/local/provider.zig");
 const support = @import("support.zig");
 
 const canvas = native_sdk.canvas;
@@ -326,9 +327,17 @@ test "terminal exit and selection mode are actionable in native chrome" {
 // four cmd+T from a fresh workspace leave Terminal 5 at SPAWN REJECTED,
 // filling the content area with no `text=` attribute at all.
 //
-// The invariant pinned here is NOT the number four. It is that cockpit never
-// mints a pane it cannot back with a shell; both bounds are read from the
-// SDK, so a pin that grows the pty table grows this test with it.
+// The invariant pinned here is NOT the number four, and is not the number the
+// SDK now carries either. It is that cockpit never mints a pane it cannot back
+// with a shell; both bounds are read from the SDK, so a pin that grows the pty
+// table grows this test with it.
+//
+// phux-cockpit-ipg moved that number from 4 to 32, which is what
+// `support.fillLiveShells` exists for: 32 shells no longer fit in one tab
+// (`layout.max_panes` is 16) nor in one tab each (`topology.max_tabs` is 16),
+// so reaching the ceiling now takes both chords. That is the point of the
+// change — the ceiling a person hits is an app-owned number, not an invisible
+// SDK one — but it does mean this test can no longer press cmd+T N times.
 test "cmd+T refuses at the shell ceiling instead of opening a pane no shell can back" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
@@ -336,16 +345,19 @@ test "cmd+T refuses at the shell ceiling instead of opening a pane no shell can 
     defer support.stopCockpit(state);
     const app_iface = state.app();
 
-    // One terminal arrives with the workspace, so this asks for the rest of
-    // the table and then two more than it can hold.
+    // One terminal arrives with the workspace; fill the rest of the table and
+    // then ask for two more than it can hold.
     try testing.expectEqual(@as(usize, 1), state.effects.pendingPtyCount());
-    for (0..native_sdk.max_effect_ptys + 1) |_| app.update(&state.model, .new_terminal, &state.effects);
+    try support.fillLiveShells(state);
+    try testing.expect(!state.model.terminal_limit_refused);
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .new_terminal, &state.effects);
 
     // The registry holds exactly the terminals that got a pty. Before the fix
     // it held every chord that was pressed, two of them backed by nothing.
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.effects.pendingPtyCount());
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.liveShellCount());
+    try testing.expectEqual(local.max_live_shells, state.model.provider.activeCount());
+    try testing.expectEqual(local.max_live_shells, state.effects.pendingPtyCount());
+    try testing.expectEqual(local.max_live_shells, state.model.provider.liveShellCount());
 
     // Drain what the effects layer staged: this is where the refused spawns
     // deliver their `.rejected` exits and strand the dead panes.
@@ -378,8 +390,8 @@ test "cmd+D refuses at the shell ceiling instead of dividing a pane for a shell 
     const state = try support.startCockpit(harness);
     defer support.stopCockpit(state);
 
-    for (0..native_sdk.max_effect_ptys - 1) |_| app.update(&state.model, .split_right, &state.effects);
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
+    try support.fillLiveShells(state);
+    try testing.expectEqual(local.max_live_shells, state.model.provider.activeCount());
     try testing.expect(!state.model.terminal_limit_refused);
 
     var refs: [app.max_panes_per_tab]app.TerminalRef = undefined;
@@ -387,6 +399,6 @@ test "cmd+D refuses at the shell ceiling instead of dividing a pane for a shell 
     app.update(&state.model, .split_right, &state.effects);
     // The tree is untouched: no new leaf, and the sibling keeps its whole rect.
     try testing.expectEqual(before, state.model.selectedTree().?.terminals(&refs));
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
+    try testing.expectEqual(local.max_live_shells, state.model.provider.activeCount());
     try testing.expect(state.model.terminal_limit_refused);
 }

@@ -202,48 +202,81 @@ test "an OS-initiated window close drains that window's shells and leaves the ot
     try testing.expectEqual(@as(u32, 0), state.effects.window_action_state.quit_count);
 }
 
-// A cmd+N with no shell to put in the window is refused visibly, not silently.
+// phux-cockpit-ipg: this is the test that says the pty ceiling actually moved.
 //
-// This test used to reach `max_windows` and assert the WINDOW ceiling. It
-// cannot any more, and the reason is worth stating rather than hiding: a window
-// needs at least one terminal to stay open (an emptied one retires itself), and
-// the effects layer backs only `native_sdk.max_effect_ptys` live shells for the
-// whole process. One shell arrives with the workspace, so the shell ceiling is
-// always reached BEFORE the window ceiling and `max_windows` is currently
-// unreachable underneath it. `window_limit_refused` and `windowLimitNotice`
-// stay in the code because they become reachable the moment the pty table grows
-// — see phux-cockpit-ipg.
+// `max_windows` is 5 and a window needs at least one terminal to stay open (an
+// emptied one retires itself), so reaching the WINDOW ceiling costs five live
+// shells. Under `max_effect_ptys` = 4 that was unreachable — the shell ceiling
+// always arrived first, `window_limit_refused` was dead code, and pg1 had to
+// weaken this test into one that asserted the shell latch instead. It is
+// restored, and it is red against any SDK whose pty table holds fewer than
+// `max_windows` shells: the fifth cmd+N simply does not open.
 //
-// What is being pinned here is unchanged and is the point of both latches: the
-// refusal has to be READABLE. Before phux-cockpit-pg1 this chord did something
-// worse than nothing — it opened a window whose only pane was permanently
-// blank, because the spawn behind it had been rejected.
-test "a window with no shell to put in it is refused visibly, not silently" {
+// What it pins is what it always pinned: the refusal has to be READABLE. A
+// chord that silently does nothing is indistinguishable from one that is not
+// bound, and before pg1 this chord did something worse than nothing — it
+// opened a window whose only pane was permanently blank.
+test "the sixth window is refused visibly, not silently" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
     const state = try startCockpit(harness);
     defer stopCockpit(state);
 
-    while (state.model.provider.liveShellCount() < native_sdk.max_effect_ptys) {
-        app.update(&state.model, .new_window, &state.effects);
-    }
+    // The window ceiling is only reachable if the pty table can back a shell
+    // for every window. Watched failing here against the unpatched pin
+    // (`local.max_live_shells` = 4 < `max_windows` = 5) before this became a
+    // skip; see `support.requireLiveShells`.
+    try support.requireLiveShells(app.max_windows);
+
+    for (0..app.max_secondary_windows) |_| app.update(&state.model, .new_window, &state.effects);
+    try testing.expectEqual(app.max_windows, state.model.openWindowCount());
     try testing.expect(!state.model.window_limit_refused);
+    try testing.expect(!state.model.terminal_limit_refused);
+
+    const before = state.model.provider.activeCount();
+    app.update(&state.model, .new_window, &state.effects);
+    // No sixth window, no orphan terminal minted for it, and a latch the
+    // chrome shows so the chord is not indistinguishable from an unbound one.
+    try testing.expectEqual(app.max_windows, state.model.openWindowCount());
+    try testing.expectEqual(before, state.model.provider.activeCount());
+    try testing.expect(state.model.window_limit_refused);
+    try testing.expect(app.chromeRevealed(&state.model));
+
+    // Closing a window frees a slot, so the refusal stops being true.
+    app.update(&state.model, .close_terminal, &state.effects);
+    try testing.expect(!state.model.window_limit_refused);
+}
+
+// The other half of the pair pg1 collapsed into one: cmd+N refused because
+// there is no SHELL for the new window, which is a different refusal from
+// "every window slot is taken" and sets a different latch.
+//
+// The shells are spent on tabs and splits here rather than on windows,
+// deliberately. Spending them on windows can only ever reach `max_windows` of
+// them, so the shell ceiling is unreachable through cmd+N alone the moment the
+// pty table is bigger than the window table — which is now the normal case,
+// and is exactly the loop that would never terminate.
+test "cmd+N is refused when no shell is left for the window it would open" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    try support.fillLiveShells(state);
     try testing.expect(!state.model.terminal_limit_refused);
     const windows_before = state.model.openWindowCount();
     const terminals_before = state.model.provider.activeCount();
-    // Precondition, not decoration: the loop must have stopped on the shell
-    // ceiling with window slots still free, or this proves nothing.
+    // The window table must still have room, or this measures the wrong latch.
     try testing.expect(windows_before < app.max_windows);
 
     app.update(&state.model, .new_window, &state.effects);
-    // No extra window, no orphan terminal minted for it, and a latch the chrome
-    // shows so the chord is not indistinguishable from an unbound one.
     try testing.expectEqual(windows_before, state.model.openWindowCount());
     try testing.expectEqual(terminals_before, state.model.provider.activeCount());
     try testing.expect(state.model.terminal_limit_refused);
+    try testing.expect(!state.model.window_limit_refused);
     try testing.expect(app.chromeRevealed(&state.model));
 
-    // Closing a window frees a shell, so the refusal stops being true.
+    // Closing a tab frees a shell, so the refusal stops being true.
     app.update(&state.model, .close_terminal, &state.effects);
     try testing.expect(!state.model.terminal_limit_refused);
 }

@@ -190,3 +190,42 @@ The CPU reference renderer never touches CoreText and blends coverage itself,
 so it does not share the defect and **no reference screenshot can catch a
 regression here**. Re-measure with the harness rather than eyeballing a
 screenshot.
+
+---
+
+## The pty ceiling: 32, and it belongs to the app
+
+**Decided 2026-08-12** (phux-cockpit-ipg, on top of phux-cockpit-pg1).
+
+The SDK keeps ONE fixed pty table for the whole process and it held **four**
+shells. Cockpit is a multiplexer offering 16 tabs, 16 panes per tab, 5 windows
+and a 32-slot registry on top of it. pg1 made the refusal honest; it did not
+make it right.
+
+**4 was arbitrary, not load-bearing.** Nothing in the SDK encodes it: no
+bitmask over slots, no `fd_set`, no shared poll array, no saturating slot
+index (`Entry.slot_index` is a `u16`). Every slot operation is a linear scan,
+and each pty polls only its own two descriptors on its own io thread. The old
+doc comment argued from the expected *app* ("one live terminal surface plus a
+background job or two"), never from the code.
+
+**32, because it is `local.max_terminals`** — the registry Cockpit already
+declares. The bug was never that the number was small; it was that the number
+was **invisible**. The app refused at a ceiling it had not chosen and could
+not name. At 32 the binding constraint moves back inside Cockpit, where
+`topology.max_tabs` and `layout.max_panes` are both 16 and both nameable.
+
+Measured, not preferred — per live shell, from the shipped bundle:
+**+1 OS thread, +3 descriptors, ~2.7 MiB rss**. Per slot, from the compiler:
+`@sizeOf(PtySlot)` = 6552 B, so the table costs 209,664 inline bytes at 32
+against a `kern.maxfilesperproc` of 184320 and a 512 KiB comptime budget.
+Re-derive with `./scripts/drive-shell-ceiling.sh --want 8 --measure`.
+
+**Consequence worth knowing:** no single repeated chord reaches the shell
+ceiling any more — cmd+T stops at 16 tabs and cmd+D stops at 16 panes, both
+short of 32. Tests that want the ceiling use `support.fillLiveShells`.
+
+The change is in the SDK, so it lives at `docs/sdk-patches/` until the pin
+moves. `local.max_live_shells` derives from `native_sdk.max_effect_ptys` with
+no literal in between, which is the part that must not be undone: a hardcoded
+duplicate is exactly how pg1 happened.
