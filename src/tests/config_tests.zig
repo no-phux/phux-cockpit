@@ -44,7 +44,7 @@ test "the common settings round-trip" {
     // it is reported. Everything else here is honoured silently.
     try std.testing.expectEqual(@as(usize, 1), parsed.diagnostic_count);
     try std.testing.expectEqual(config.Diagnostic.Kind.unsupported_key, parsed.diagnosticSlice()[0].kind);
-    try std.testing.expectEqualStrings("font-family", parsed.diagnosticSlice()[0].text);
+    try std.testing.expectEqualStrings("font-family", parsed.diagnosticSlice()[0].text());
 }
 
 test "a key that parses but cannot take effect says so" {
@@ -206,6 +206,62 @@ test "an over-long value is reported instead of truncating silently" {
     try std.testing.expectEqual(@as(usize, 0), parsed.font_family.len);
     try std.testing.expectEqual(@as(usize, 1), parsed.diagnostic_count);
     try std.testing.expectEqual(config.Diagnostic.Kind.too_long, parsed.diagnosticSlice()[0].kind);
+}
+
+test "a diagnostic outlives the bytes it was parsed from" {
+    // The bug this pins: `Diagnostic.text` used to be a slice BORROWED from the
+    // source, and nothing that reads a diagnostic is alive while the source is.
+    // `main.readConfig` reads the file into a buffer local to the read and
+    // returns the `Config` by value, so every quoted key in the startup log —
+    // and now every one in the in-app notice, which is held for the life of the
+    // process — was read out of a dead stack frame.
+    //
+    // Overwriting the source in place is the deterministic form of that: a
+    // borrowed slice reports the new bytes, an owned copy reports what was
+    // parsed. Nothing here depends on stack layout or on undefined behaviour
+    // happening to bite.
+    var source: [64]u8 = undefined;
+    const text = std.fmt.bufPrint(&source, "font-familly = Comic Mono\n", .{}) catch unreachable;
+    const parsed = config.parse(text);
+    try std.testing.expectEqual(@as(usize, 1), parsed.diagnostic_count);
+    try std.testing.expectEqual(config.Diagnostic.Kind.unknown_key, parsed.diagnosticSlice()[0].kind);
+
+    @memset(&source, '?');
+    try std.testing.expectEqualStrings("font-familly", parsed.diagnosticSlice()[0].text());
+}
+
+test "an over-long value is quoted back truncated rather than dropped" {
+    // A diagnostic's whole job is context. Refusing to carry the text because
+    // the offending value was long would lose it at the one moment it matters,
+    // so the copy truncates to `max_diagnostic_text_bytes` and keeps going.
+    var value: [config.max_shell_bytes + 8]u8 = undefined;
+    @memset(&value, 'x');
+    var source: [value.len + 32]u8 = undefined;
+    const text = std.fmt.bufPrint(&source, "shell = {s}", .{value}) catch unreachable;
+    const parsed = config.parse(text);
+    try std.testing.expectEqual(@as(usize, 1), parsed.diagnostic_count);
+    try std.testing.expectEqual(config.Diagnostic.Kind.too_long, parsed.diagnosticSlice()[0].kind);
+    try std.testing.expectEqual(config.max_diagnostic_text_bytes, parsed.diagnosticSlice()[0].text().len);
+}
+
+test "a truncated diagnostic never ends mid-codepoint" {
+    // The text lands in a log line and an accessibility label, and a label with
+    // half a UTF-8 sequence in it is a label with an invalid byte in it. The
+    // needle is a 3-byte codepoint straddling the ceiling.
+    var source: [512]u8 = undefined;
+    var written: usize = 0;
+    const prefix = "theme = ";
+    @memcpy(source[0..prefix.len], prefix);
+    written = prefix.len;
+    while (written < prefix.len + config.max_diagnostic_text_bytes + 8) {
+        @memcpy(source[written..][0..3], "\u{2014}");
+        written += 3;
+    }
+    const parsed = config.parse(source[0..written]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.diagnostic_count);
+    const carried = parsed.diagnosticSlice()[0].text();
+    try std.testing.expect(carried.len <= config.max_diagnostic_text_bytes);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(carried));
 }
 
 test "the diagnostic list is bounded and does not overflow on a hostile file" {

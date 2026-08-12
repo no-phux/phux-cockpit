@@ -131,6 +131,13 @@ pub const Msg = union(enum) {
     /// A typed character reaching the needle rather than the shell.
     palette_input: []const u8,
     palette_backspace,
+    /// The startup config band was read: put it away for this launch.
+    ///
+    /// A press, never a key. The band is deliberately NOT modal — the whole
+    /// point is that a benign diagnostic must not stand between someone and a
+    /// prompt — so it holds no chord, and Escape keeps belonging to the search
+    /// field, the palette, and the shell.
+    config_notice_dismissed,
     /// Close a tab by index — what the strip's own `x` presses.
     close_tab: u8,
     /// Pointer entered/left a tab. Only the close affordance reads it.

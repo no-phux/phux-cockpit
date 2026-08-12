@@ -453,6 +453,14 @@ pub const Model = struct {
     /// that is not bound. The chrome reads it, and the next successful window
     /// open — or any other window closing — clears it.
     window_limit_refused: bool = false,
+    /// The startup config notice has been read and dismissed.
+    ///
+    /// A latch on the MODEL, not on a workspace: the config is app-wide, and a
+    /// notice that had to be dismissed once per window would be four dismissals
+    /// for one typo. It is deliberately not persisted either — a config file is
+    /// re-read on every launch, so "I already saw this" is only true until the
+    /// user edits the file, and the state file cannot know that.
+    config_notice_dismissed: bool = false,
     tab_placement: TabPlacement = .top,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
@@ -841,6 +849,13 @@ pub const Model = struct {
             if (!retained) state.* = .{};
         }
         for (refs[0..count]) |terminal_ref| _ = model.remoteUi(terminal_ref);
+    }
+
+    /// Whether the config band is up: there is something to say and nobody has
+    /// said "seen it" yet. Derived, with no second flag to drift — an empty
+    /// diagnostic list can never show a band, whatever the latch says.
+    pub fn configNoticeVisible(model: *const Model) bool {
+        return model.config.diagnostic_count != 0 and !model.config_notice_dismissed;
     }
 
     /// The LIVE terminal type size. `font_size_offset` is the live delta the

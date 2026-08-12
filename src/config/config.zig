@@ -24,6 +24,24 @@ pub const max_theme_name_bytes: usize = 64;
 pub const max_diagnostics: usize = 16;
 pub const max_config_bytes: usize = 64 * 1024;
 
+/// How much of the offending key or value a diagnostic carries.
+///
+/// The longest key this parser accepts is 25 bytes, measured with
+///
+///   grep -oE 'eq\(key, "[a-z-]+"\)' src/config/config.zig |
+///     grep -oE '"[a-z-]+"' | awk '{print length($0)-2, $0}' | sort -rn | head -1
+///   => 25 "inherit-working-directory"
+///
+/// so 64 quotes every key whole and still holds the values worth quoting back
+/// (a colour, a size, a cursor style, a short command). It is deliberately not
+/// `max_shell_bytes`: a `too_long` shell is 512 bytes of nobody's business, and
+/// this storage is paid `max_diagnostics` times inside a `Config` that is
+/// copied by value into the model. The cost was measured, not assumed, with a
+/// throwaway `zig run` over this module printing `@sizeOf(Config)`:
+/// 1232 -> 2128 bytes, against a `Model` whose inline workspace is already
+/// ~151 KB.
+pub const max_diagnostic_text_bytes: usize = 64;
+
 pub const palette_len: usize = 16;
 
 pub const CursorStyle = enum {
@@ -109,13 +127,46 @@ pub const Diagnostic = struct {
     /// letting someone believe a setting took effect. A knob that accepts a
     /// value and does nothing is worse than one that is missing, because the
     /// missing one sends you to the docs and the silent one sends you hunting.
-    pub const Kind = enum { unknown_key, bad_value, missing_separator, too_long, unsupported_key };
+    pub const Kind = enum {
+        unknown_key,
+        bad_value,
+        missing_separator,
+        too_long,
+        unsupported_key,
+
+        /// The phrase a one-line surface uses. Short because it has to share a
+        /// band with a line number and a dismiss control; the startup log
+        /// spells the same five cases out as whole sentences, where there is
+        /// room for them.
+        pub fn summary(kind: Kind) []const u8 {
+            return switch (kind) {
+                .unknown_key => "unknown setting",
+                .bad_value => "value not understood",
+                .missing_separator => "no '=' on this line",
+                .too_long => "value too long",
+                .unsupported_key => "understood, but does nothing in this build",
+            };
+        }
+    };
 
     line: u32 = 0,
     kind: Kind = .bad_value,
-    /// Borrowed from the source bytes; only valid while they live. Callers
-    /// that outlive the bytes should render diagnostics before dropping them.
-    text: []const u8 = "",
+    /// The offending key or value, OWNED.
+    ///
+    /// It used to be a slice borrowed from the source bytes, and nothing that
+    /// reads a diagnostic is alive while those bytes are: the composition root
+    /// reads the file into a buffer local to the read, parses, and returns the
+    /// `Config` BY VALUE — so every borrowed slice pointed into a dead stack
+    /// frame before the first log line was even formatted, and the model keeps
+    /// the same `Config` for the life of the process. A bounded copy is what
+    /// makes a diagnostic mean something later, which is the whole point of
+    /// collecting one.
+    detail: DiagnosticText = .{},
+
+    /// The offending key or value, or empty when the kind carries none.
+    pub fn text(diagnostic: *const Diagnostic) []const u8 {
+        return diagnostic.detail.slice();
+    }
 };
 
 /// A bounded string field that owns its bytes.
@@ -147,6 +198,20 @@ fn Text(comptime capacity: usize) type {
 pub const FontFamily = Text(max_font_family_bytes);
 pub const Shell = Text(max_shell_bytes);
 pub const ThemeName = Text(max_theme_name_bytes);
+pub const DiagnosticText = Text(max_diagnostic_text_bytes);
+
+/// Cut `text` to at most `limit` bytes WITHOUT splitting a UTF-8 sequence.
+///
+/// A diagnostic's text is quoted straight back into a log line and an
+/// accessibility label, and a label that ends mid-codepoint is a label with an
+/// invalid byte in it. Walking back off continuation bytes costs at most three
+/// steps and removes the whole class.
+fn truncateUtf8(text: []const u8, limit: usize) []const u8 {
+    if (text.len <= limit) return text;
+    var end = limit;
+    while (end > 0 and (text[end] & 0xc0) == 0x80) end -= 1;
+    return text[0..end];
+}
 
 /// Font size bounds. Below 4pt the grid degenerates; above 72pt a default
 /// window holds almost no cells. Both ends are clamps, not errors, so a
@@ -210,7 +275,12 @@ pub const Config = struct {
 
     fn note(config: *Config, line: u32, kind: Diagnostic.Kind, text: []const u8) void {
         if (config.diagnostic_count >= max_diagnostics) return;
-        config.diagnostics[config.diagnostic_count] = .{ .line = line, .kind = kind, .text = text };
+        var entry: Diagnostic = .{ .line = line, .kind = kind };
+        // Truncating rather than refusing: the text is context, and a
+        // diagnostic that dropped its context because the offending value was
+        // long is a diagnostic that failed at the one moment it was needed.
+        entry.detail.set(truncateUtf8(text, max_diagnostic_text_bytes)) catch {};
+        config.diagnostics[config.diagnostic_count] = entry;
         config.diagnostic_count += 1;
     }
 

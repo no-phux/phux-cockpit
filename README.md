@@ -155,9 +155,12 @@ both.
 The syntax is Ghostty's — one `key = value` per line, `#` starts a whole-line
 comment, and there are deliberately no trailing comments because `#` is also how
 every colour begins. An unknown key or a malformed value is a diagnostic, not a
-failure: one bad line costs that line, never the rest of the file. Every
-diagnostic is reported to the log at startup, so a setting that did not take
-effect says so instead of leaving you to wonder.
+failure: one bad line costs that line, never the rest of the file. A config that
+produced any diagnostic raises **one line of chrome above the terminal naming
+the line numbers**, dismissed by clicking it; the startup log carries the same
+diagnostics in full, with the offending key or value quoted. The band takes no
+keyboard and holds no chord — a setting that did nothing is not a reason to
+stand between you and a prompt.
 
 ```
 font-size = 14
@@ -180,7 +183,8 @@ carries a NUL is refused and the built-in shell stands.
 `font-family` and `selection-foreground` are parsed but **cannot** be applied in
 this build: the SDK selects faces from a fixed registered set rather than by
 family name, and a terminal grid carries one selection colour rather than a
-foreground override. Setting either logs a line saying it did nothing.
+foreground override. Setting either raises the notice above, and logs a line,
+saying so.
 
 ## Install
 

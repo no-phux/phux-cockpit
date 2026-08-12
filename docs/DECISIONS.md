@@ -70,6 +70,48 @@ The last-window case is unchanged: it closes **and** quits.
 
 ---
 
+## Config diagnostics get a dismissible band, never a modal
+
+**Decided 2026-08-12.** A config that produced diagnostics raises one line of
+chrome above the terminal, naming the LINE NUMBERS, dismissed by a press
+anywhere in it. The startup log keeps every diagnostic in full sentences.
+
+The log alone was the bug. From a bundled `.app` `std.log` lands in the unified
+log, so a mistyped key produced a terminal that quietly behaved differently and
+a user with no reason to open Console. But the opposite failure is worse and is
+the one a dialog would have caused: most diagnostics are **benign** —
+`unsupported_key` fires for `font-family` on a config that is otherwise
+perfect — and nothing about a setting that did not apply justifies standing
+between someone and a prompt. So the band takes no keyboard, holds no chord,
+and leaves Escape to the search field, the palette, and the shell.
+
+It NAMES LINE NUMBERS because that is the only part a user can act on; "your
+config has a problem" sends them back to the file to hunt. With exactly one
+problem there is room to name the problem too, and it does.
+
+It takes its room out of the **content rect**, exactly as the scrollback search
+band does, rather than floating like the palette. Painter, hit-test tree, and
+PTY sizing pump all derive from `workspaceChromeIn`, and the palette floats only
+because it is transient enough that two SIGWINCHes per summon would be the
+larger cost. This band appears once per launch at most, so the honest layout is
+worth its one resize — and taking room is also what guarantees no press can fall
+through it into a grid painted underneath.
+
+Dismissal is **for the launch, not forever**. Persisting "seen it" would need
+state on disk that a re-read config file silently invalidates: the file is
+parsed fresh every start, so the only honest memory of a notice is one that dies
+with the process.
+
+A second finding came out of building it, recorded here because it explains why
+`Diagnostic` owns its bytes: the text used to be a slice borrowed from the
+source, and `main.readConfig` reads the file into a buffer local to the read and
+returns the `Config` **by value** — so every quoted key in the startup log was
+read out of a dead stack frame, before the band existed to make it worse. It is
+a bounded copy now. See `config_tests.zig`'s "a diagnostic outlives the bytes it
+was parsed from".
+
+---
+
 ## Glyph rasterization enables macOS font smoothing
 
 **Decided 2026-08-10**, in the SDK fork rather than here.

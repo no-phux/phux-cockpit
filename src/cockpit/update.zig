@@ -831,6 +831,11 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             if (!workspace.palette.open) return;
             workspace.palette.backspace();
         },
+        // One-way, and for this launch only. The band is the app's single
+        // chance to say a setting did not apply; re-raising it on the next
+        // frame would make it nagware, and re-raising it never would need
+        // state on disk that a re-read config file can invalidate.
+        .config_notice_dismissed => model.config_notice_dismissed = true,
         .close_tab => |index| closeTab(model, fx, index),
         .hover_tab => |index| model.ws().hovered_tab = index,
         .unhover_tab => model.ws().hovered_tab = model_module.no_hovered_tab,

@@ -153,6 +153,10 @@ pub const split_pane_min_height = projection.split_pane_min_height;
 pub const webkit_parking_extent = projection.webkit_parking_extent;
 pub const search_bar_height = projection.search_bar_height;
 pub const searchRevealed = projection.searchRevealed;
+pub const config_notice_height = projection.config_notice_height;
+pub const config_notice_bytes = projection.config_notice_bytes;
+pub const configNoticeRevealed = projection.configNoticeRevealed;
+pub const configNoticeLine = projection.configNoticeLine;
 pub const chrome_command_envelope = projection.chrome_command_envelope;
 pub const cockpitTokens = projection.cockpitTokens;
 pub const terminalTokens = projection.terminalTokens;
@@ -452,28 +456,27 @@ fn restoreWorkspace(
 
 /// Say out loud what the config file did not do.
 ///
-/// The parser has always COLLECTED diagnostics and nothing has ever rendered
-/// them, so a typo'd key, a malformed colour, and a setting this build cannot
-/// honour were all equally silent — which is the whole reason a knob that
-/// parses and does nothing is a trap rather than a missing feature.
-///
-/// stderr is where a terminal emulator's own startup complaints belong; from a
-/// bundle they land in the unified log. A surface inside the app would be
-/// better and is worth doing, but silence is the bug.
+/// This is the RECORD, not the notification. It carries every diagnostic in
+/// full sentences, with the offending text quoted, which is what someone
+/// debugging a config in a terminal wants — and from a bundle it lands in the
+/// unified log, where nobody is looking. The notification is the dismissible
+/// band the app itself draws (`projection.configNoticeLine`), which is what
+/// closes the gap between "the setting did nothing" and "the user found out".
+/// Both read the same diagnostics; neither is a second source of truth.
 fn reportConfigDiagnostics(user_config: *const Config) void {
     for (user_config.diagnosticSlice()) |diagnostic| {
         switch (diagnostic.kind) {
             .unsupported_key => std.log.warn(
                 "config line {d}: '{s}' is understood but does nothing in this build",
-                .{ diagnostic.line, diagnostic.text },
+                .{ diagnostic.line, diagnostic.text() },
             ),
             .unknown_key => std.log.warn(
                 "config line {d}: unknown setting '{s}'",
-                .{ diagnostic.line, diagnostic.text },
+                .{ diagnostic.line, diagnostic.text() },
             ),
             .bad_value => std.log.warn(
                 "config line {d}: value '{s}' was not understood, so the default is in effect",
-                .{ diagnostic.line, diagnostic.text },
+                .{ diagnostic.line, diagnostic.text() },
             ),
             .missing_separator => std.log.warn(
                 "config line {d}: no '=' on this line, so it was skipped",

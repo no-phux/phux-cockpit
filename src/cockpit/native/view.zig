@@ -649,6 +649,69 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
     });
 }
 
+/// What the config file did that the user did not ask for, said in the app.
+///
+/// The parser has always collected diagnostics, and until this band the only
+/// place they went was the startup log — which from a bundled `.app` is the
+/// unified log, i.e. nowhere. Someone who typo'd a key got a terminal that
+/// quietly behaved differently and no way to find out short of Console.
+///
+/// Three properties, and each one is load-bearing:
+///
+///   1. it NAMES LINE NUMBERS. "Your config has a problem" is not actionable;
+///      "line 7" is an edit. A single problem also gets its own text, because
+///      one line has room for it.
+///   2. it is NOT modal, and holds no chord. A benign diagnostic — an
+///      `unsupported_key` for a setting this build cannot honour — must never
+///      stand between someone and a prompt. The keyboard is untouched: the
+///      shell has focus the whole time the band is up.
+///   3. it DISMISSES ON PRESS, anywhere in the band, with an explicit `x` for
+///      the people who look for one. Anywhere-presses also mean the band has a
+///      hit target over every point it covers, so no press can fall through to
+///      a grid that is painted underneath it.
+fn configNoticeBand(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignTokens) TerminalUi.Node {
+    var storage: [projection.config_notice_bytes]u8 = undefined;
+    // `ui.fmt` copies into the UI's own arena; this buffer dies with the frame.
+    const line = ui.fmt("{s}", .{projection.configNoticeLine(model, &storage)});
+    const control_extent = projection.config_notice_height - 12;
+    return ui.row(.{
+        .height = projection.config_notice_height,
+        .gap = 8,
+        .cross = .center,
+        .padding = 6,
+        .style = .{ .background = tokens.colors.surface_subtle },
+        .on_press = .config_notice_dismissed,
+        .semantics = .{ .label = ui.fmt("{s}. Press to dismiss.", .{line}) },
+    }, .{
+        // Unnamed for the same reason the search band's icon is: `hidden`
+        // suppresses RENDERING as well as the accessibility node, and the
+        // row's own label above already says everything a reader needs.
+        ui.icon(.{
+            .width = 14,
+            .height = 14,
+            .style = .{ .foreground = tokens.colors.warning },
+        }, "alert"),
+        // Ellipsis rather than a truncation of my own: the line is bounded by
+        // `config_notice_bytes` and the widget knows the width it actually got,
+        // which no constant here could.
+        ui.text(.{
+            .grow = 1,
+            .wrap = false,
+            .overflow = .ellipsis,
+            .style = .{ .foreground = tokens.colors.text },
+        }, line),
+        ui.button(.{
+            .width = control_extent,
+            .height = control_extent,
+            .size = .icon,
+            .variant = .ghost,
+            .icon = "x",
+            .on_press = .config_notice_dismissed,
+            .semantics = .{ .label = "Dismiss the configuration notice" },
+        }, ""),
+    });
+}
+
 /// The summoned tab switcher.
 ///
 /// It FLOATS. Every other piece of chrome in this app takes its room out of
@@ -906,10 +969,20 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     // The search band sits above the content in BOTH placements, and the
     // wrapper only exists while a search does: an unconditional column would
     // change the widget tree of every frame that has no search in it.
-    const body = if (projection.searchRevealedIn(model, ws))
+    const searched = if (projection.searchRevealedIn(model, ws))
         ui.column(.{ .grow = 1 }, .{ searchBar(ui, model, ws, tokens), content })
     else
         content;
+
+    // The config band above both, matching `workspaceChromeIn`'s stacking. It
+    // is drawn in EVERY open window on purpose: the config is the app's, so a
+    // notice that only reached the window that happened to be in front would
+    // be a notice the user can miss by looking at the other one. Dismissing it
+    // anywhere clears it everywhere, because the latch is on the model.
+    const body = if (projection.configNoticeRevealed(model))
+        ui.column(.{ .grow = 1 }, .{ configNoticeBand(ui, model, tokens), searched })
+    else
+        searched;
 
     const laid_out = if (revealed and model.tab_placement == .side)
         ui.row(.{ .grow = 1, .gap = side_rail_gap }, .{ side_rail, body })
