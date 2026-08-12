@@ -2,6 +2,7 @@ const std = @import("std");
 const native_sdk = @import("native_sdk");
 const app = @import("../main.zig");
 const grid = @import("../terminal/grid.zig");
+const local = @import("../providers/local/provider.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -54,6 +55,57 @@ pub fn activeSlots(model: *app.Model) []app.Pane {
         if (state == .active) end = index + 1;
     }
     return model.provider.slots[0..end];
+}
+
+/// Open terminals until the effects layer's pty table is full.
+///
+/// No single chord can do this any more, which is phux-cockpit-ipg in one
+/// sentence: `local.max_live_shells` (32, from the SDK's pty table) is larger
+/// than `topology.max_tabs` (16) and larger than `layout.max_panes` (16), so
+/// repeating cmd+T stops at 16 tabs and repeating cmd+D stops at 16 panes,
+/// both well short of the shell ceiling. That is the intended shape: the
+/// binding constraint is now an app-owned number a person can see, not an
+/// invisible SDK one. It does mean any test that wants the shell ceiling has
+/// to fill a tab, start another, and fill that one too.
+///
+/// Splits come first because a split's refusal at the pane ceiling is CLEAN —
+/// `splitFocusedPane` hands the minted terminal back rather than leaking it,
+/// and sets no latch — so it is safe to use as the probe for "this tab is
+/// full". The caller gets a model with no refusal latched.
+/// Skip a test whose CAPABILITY the pinned SDK does not have yet.
+///
+/// Only two tests need this and both are phux-cockpit-ipg's deliverable: the
+/// window ceiling needs `max_windows` shells and the tab ceiling needs
+/// `max_tabs` of them, and under the SDK's old 4-shell pty table neither was
+/// reachable at all. A skip rather than a hard failure because the branch
+/// carrying the SDK patch (`docs/sdk-patches/raise-pty-ceiling.patch`) cannot
+/// move the pin itself — it can only stop pretending the capability is there.
+///
+/// Both were watched FAILING against the unpatched pin before this existed,
+/// which is the only thing that makes a skip trustworthy:
+///
+///   registry ... : try testing.expect(app.max_tabs <= local.max_live_shells);
+///   sixth window : try testing.expect(local.max_live_shells >= app.max_windows);
+///   355 pass, 5 skip, 2 fail
+///
+/// The condition is comptime-known, so the day the pin moves these arm
+/// themselves with no edit. Nothing else in the suite needs it —
+/// `fillLiveShells` is ceiling-agnostic and its callers pass at either size.
+pub fn requireLiveShells(needed: usize) !void {
+    if (local.max_live_shells < needed) return error.SkipZigTest;
+}
+
+pub fn fillLiveShells(state: *TerminalApp) !void {
+    while (state.model.provider.liveShellCount() < local.max_live_shells) {
+        const before = state.model.provider.liveShellCount();
+        app.update(&state.model, .split_right, &state.effects);
+        if (state.model.provider.liveShellCount() == before) {
+            app.update(&state.model, .new_terminal, &state.effects);
+        }
+        // A round that adds nothing would spin forever. Fail on the first one
+        // instead of hanging the suite on a ceiling nobody expected.
+        if (state.model.provider.liveShellCount() == before) return error.ShellCeilingUnreachable;
+    }
 }
 
 pub fn remoteTerminalRef(id: u32) !app.TerminalRef {

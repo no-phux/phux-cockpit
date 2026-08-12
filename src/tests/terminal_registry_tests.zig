@@ -9,6 +9,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const app = @import("../main.zig");
+const local = @import("../providers/local/provider.zig");
 const support = @import("support.zig");
 
 const geometry = native_sdk.geometry;
@@ -140,14 +141,22 @@ test "terminal key release from an ended generation cannot reach its replacement
     try testing.expectEqualStrings("", app_state.effects.ptyWrittenBytes(app.ptyKey(1)));
 }
 
-// Rewritten for phux-cockpit-pg1. This test used to keep pressing cmd+T to
-// `max_tabs` and assert 16 live terminals, on the strength of the registry
-// having been raised from 4 slots to 32 in 20d82dd. The registry was the wrong
-// thing to count: the effects layer backs only `native_sdk.max_effect_ptys`
-// live ptys for the whole process, so terminals 5..16 came up SPAWN REJECTED
-// with permanently blank grids — which is the bug itself, asserted here as
-// though it were the feature. The identity claims it makes are real and are
-// kept; the ceiling they run to is now the one the app can actually reach.
+// Twice rewritten, and worth reading as a pair.
+//
+// It originally ran cmd+T to `max_tabs` and asserted 16 live terminals, on the
+// strength of the registry having been raised from 4 slots to 32 in 20d82dd.
+// phux-cockpit-pg1 found that was asserting the bug as the feature: the
+// effects layer backed only `native_sdk.max_effect_ptys` = 4 live ptys for the
+// whole process, so terminals 5..16 came up SPAWN REJECTED with permanently
+// blank grids, and pg1 lowered the ceiling here to 4 to stop claiming
+// otherwise.
+//
+// phux-cockpit-ipg raised the pty table to 32, so `max_tabs` is a REACHABLE
+// ceiling for the first time and this test runs to it again. The difference
+// from the original is the one that matters: 16 tabs now means 16 shells that
+// exist, which is exactly what the intervening `pendingPtyCount` assertion
+// checks. This test is red against any SDK whose pty table holds fewer than
+// `max_tabs` — the loop simply stops adding tabs.
 test "the registry mints unique terminals up to the shells it can back" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
@@ -166,12 +175,19 @@ test "the registry mints unique terminals up to the shells it can back" {
     } });
     try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
 
-    // The pty table is what the identity checks run to: it is both what the
-    // fake executor holds in flight and what the real one does.
-    while (state.model.ws().tab_count < native_sdk.max_effect_ptys) app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.ws().tab_count);
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.effects.pendingPtyCount());
+    // The tab list is what the identity checks run to, and every tab must be
+    // backed: `pendingPtyCount` is what the fake executor holds in flight, so
+    // a tab without a pty shows up here as a count that fell behind.
+    //
+    // A loop that stops adding tabs would spin forever, which is precisely
+    // what a pty table smaller than `max_tabs` produces. Watched failing here
+    // against the unpatched pin (16 tabs, 4 shells) before this became a skip;
+    // see `support.requireLiveShells`.
+    try support.requireLiveShells(app.max_tabs);
+    while (state.model.ws().tab_count < app.max_tabs) app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
+    try testing.expectEqual(app.max_tabs, state.effects.pendingPtyCount());
 
     var seen: [app.max_tabs]app.TerminalRef = undefined;
     for (0..state.model.ws().tab_count) |index| {
@@ -185,14 +201,14 @@ test "the registry mints unique terminals up to the shells it can back" {
 
     // Past the ceiling nothing is minted, no orphan terminal is left behind in
     // the registry, and — the part that matters — no pane exists that no shell
-    // will ever write to. The registry's own 32 slots and the tab list's 16 are
-    // both still far above this; neither is reachable until the pty table grows
-    // (phux-cockpit-ipg).
-    try testing.expect(native_sdk.max_effect_ptys < app.max_tabs);
+    // will ever write to. The refusal here is the TAB list's, not the pty
+    // table's: shells are still free, which is what makes this the ceiling a
+    // person can name.
     app.update(&state.model, .new_terminal, &state.effects);
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.ws().tab_count);
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.provider.activeCount());
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.effects.pendingPtyCount());
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
+    try testing.expectEqual(app.max_tabs, state.effects.pendingPtyCount());
+    try testing.expect(state.model.provider.liveShellCount() < local.max_live_shells);
 
     // Cmd+W over the Web surface owns no terminal, so it closes nothing.
     app.update(&state.model, .{ .select_surface = .web }, &state.effects);
@@ -203,7 +219,7 @@ test "the registry mints unique terminals up to the shells it can back" {
         .modifiers = .{ .primary = true },
     } });
     try testing.expect(state.model.selectedSurface().eql(.web));
-    try testing.expectEqual(native_sdk.max_effect_ptys, state.model.ws().tab_count);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
     try testing.expect(app.onCommand("terminal.new") != null);
     try testing.expect(app.onCommand("terminal.close") != null);
     try testing.expect(app.onCommand("pane.split-right") != null);
