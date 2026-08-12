@@ -295,10 +295,15 @@ Zig 0.16-compatible checkpoint.
 ## Build and test
 
 ```sh
+./scripts/dev-run.sh     # build this checkout and RUN it, beside your installed app
 zig build
-zig build run
 zig build test -Dplatform=null --summary all
 ```
+
+`./scripts/dev-run.sh` is the one to reach for when the question is "does my
+change look right in the actual app". `zig build run` starts a bare binary that
+shares the installed app's identity and state file; the script does not. See
+[Running a local build beside the installed app](#running-a-local-build-beside-the-installed-app).
 
 ### Reading the result of `zig build test`
 
@@ -397,34 +402,96 @@ tests; it does not exercise Metal presentation.
 
 ### Running a local build beside the installed app
 
-Both can coexist: Homebrew installs an `.app` bundle, `zig build` produces a
-bare binary in `zig-out/bin`. They are different files in different places, so
-nothing needs uninstalling to test a change.
+```sh
+./scripts/dev-run.sh
+```
 
-What they *would* have shared is your saved layout. A debug build writes
-`workspace-dev.state` and a packaged build writes `workspace.state`, keyed off
-the optimize mode so it is right without anyone remembering — plain `zig build`
-is Debug, and `scripts/package-macos.sh` is ReleaseSafe. Without that split, a
-dev build running a newer schema would replace the layout the installed app was
-about to restore; the version guard means the loser opens a fresh window rather
-than crashing, but a window arrangement lost to a test build still reads as the
-app having forgotten it.
+One command: package this checkout, launch it, and leave no way to mistake it
+for `/Applications/Phux Cockpit.app`. Ctrl-C quits it.
 
-Config is deliberately NOT split: font size and colors are yours, and you want
-them in both.
+This exists because of a specific, expensive failure. Three days of rendering
+bug reports were filed against the installed app — 0.7.1, built 2026-08-09 —
+while `main` was 0.8.0. Nothing merged in those three days had ever been in
+front of the person reporting the bugs. Both apps are called "Phux Cockpit",
+both put the same icon in the same Dock, and a plain `zig build` binary is the
+installed app's identical twin to macOS.
 
-To separate two builds of the same optimize mode, or to keep a scratch layout
-entirely apart, override the paths:
+The dev run differs in four ways, each closing a different hole:
+
+| | installed | `dev-run.sh` |
+|---|---|---|
+| bundle id | `dev.phux.cockpit` | `dev.phux.cockpit.dev` |
+| process name | `phux-cockpit` | `phux-cockpit-dev` |
+| Dock and menu | Phux Cockpit | Phux Cockpit (dev) |
+| config | `~/.config/phux-cockpit/config` | `.dev-run/config` |
+| workspace layout | `~/Library/Application Support/…/workspace.state` | `.dev-run/workspace.state` |
+| automation dropbox | the CWD you launched from | `.dev-run/.zig-cache/…` |
+
+The process name is the one that matters to tooling rather than to you.
+`pgrep -x phux-cockpit` and System Events' `process "phux-cockpit"` both target
+by NAME, so two instances sharing it means any automation script may drive the
+wrong app and never say so (phux-cockpit-2ml.10).
+
+Useful flags — `--debug` for a faster Debug build, `--automation` to build with
+`-Dautomation=true` and print how to drive it, `--config PATH` to use a specific
+config file, `--fresh` for a clean dev home, `--detach` to launch and exit.
+`./scripts/dev-run.sh --help` lists them all.
+
+**Your config is not shared with the dev run,** which reverses what this section
+used to say. The settings surface writes a theme choice back into whatever
+config file the app was given, so a dev build pointed at your real config is a
+dev build that can edit it — the same class of clash as the shared layout file,
+one step further from being noticed. `.dev-run/config` starts empty; copy what
+you want into it, or pass `--config ~/.config/phux-cockpit/config` if you would
+rather have your own settings and accept that a dev build can rewrite them.
+
+A packaged build and a Debug build still write different state file names
+(`workspace.state` vs `workspace-dev.state`, keyed off the optimize mode in
+`src/cockpit/session_state.zig`). That split predates this script and still
+protects a plain `zig build run`; `dev-run.sh` does not rely on it.
+
+To prove any of the above rather than believe it:
+
+```sh
+./scripts/dev-isolation-check.sh
+```
+
+It runs the installed app and a dev build at the same time and asserts each
+process name resolves to exactly the pid it launched, that LaunchServices
+registers two different bundle ids, that System Events can name each instance,
+and that a config read and a layout write land in the dev home and not in
+yours. Every assertion has a negative control — the identity comparison must
+first report a clash for the *unstaged* bundle, and the isolation arm is paired
+with a run that removes only `PHUX_COCKPIT_CONFIG`/`PHUX_COCKPIT_STATE` and
+must then reach the "real" config. It is serial-only: quit any running Cockpit
+first.
+
+Two paths are still shared, and the check does not claim otherwise:
+`~/Library/Application Support/dev.phux.cockpit/State/windows.zon` and
+`~/Library/Logs/dev.phux.cockpit/native-sdk.jsonl`. The SDK keys those off the
+bundle id compiled in from `app.zon`, which the plist rewrite cannot reach.
+Nothing reads `windows.zon` back — `restore_state` is `false` — so the cost
+today is a shared log file.
+
+Without the script, the seams are ordinary environment variables. Both name a
+FILE, and both win over every search path, for writes as well as reads:
 
 ```sh
 PHUX_COCKPIT_STATE=/tmp/cockpit-scratch.state \
-PHUX_COCKPIT_CONFIG=~/.config/phux-cockpit/scratch \
+PHUX_COCKPIT_CONFIG=/tmp/cockpit-scratch-config \
   ./zig-out/bin/phux-cockpit
 ```
 
+Leaving them unset is not a harmless default: the config lookup reads
+`$XDG_CONFIG_HOME` before `$HOME`, so a run "isolated" by overriding `HOME`
+still finds your real config file.
+
 Add `-Dautomation=true` to drive the running app: commands are written as
-`command-<n>.txt` files into `.zig-cache/native-sdk-automation/`, and
-screenshots and a full widget snapshot appear beside them.
+`command-<n>.txt` files into `.zig-cache/native-sdk-automation/` **relative to
+the app's working directory**, and screenshots and a full widget snapshot
+appear beside them. That path has no environment override, so two instances
+launched from the same directory share one dropbox — which is why `dev-run.sh`
+launches from the dev home.
 
 ## Package
 

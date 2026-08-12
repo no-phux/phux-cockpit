@@ -47,6 +47,21 @@ conclude "the text renders correctly" from a screenshot. Read
 [docs/RENDER_FIDELITY.md](docs/RENDER_FIDELITY.md) before writing any test that
 claims to check what the terminal looks like.
 
+## Running the App
+
+```sh
+./scripts/dev-run.sh
+```
+
+Builds this checkout and runs it as a real app that cannot be confused with
+`/Applications/Phux Cockpit.app`: its own bundle id, its own process name
+(`phux-cockpit-dev`, so `pgrep -x` and System Events target it and not the
+installed copy), and its own config, layout and automation dropbox under
+`.dev-run/`. Never hand someone a change to look at by telling them to open the
+installed app — three days of bug reports once went to a build a week older
+than `main` exactly that way. `./scripts/dev-isolation-check.sh` is the proof
+and README explains the mechanisms.
+
 ## Quality Bar
 
 Every change should reduce cognitive load, preserve input and lifecycle
