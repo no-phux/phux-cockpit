@@ -153,13 +153,16 @@ test "the app quits only when the LAST window's last tab closes" {
     app.update(&state.model, .new_window, &state.effects);
 
     // Empty the MAIN window first, while the second window is still open. It
-    // stands on its web surface; the app keeps running.
+    // CLOSES, exactly as a secondary would; the app keeps running.
     app.update(&state.model, .{ .focus_window = 0 }, &state.effects);
     app.update(&state.model, .close_terminal, &state.effects);
     try testing.expectEqual(@as(u32, 0), state.effects.window_action_state.quit_count);
     try testing.expectEqual(@as(usize, 0), state.model.primary.tab_count);
-    try testing.expect(state.model.primary.web_selected);
+    try testing.expect(!state.model.primary_open);
     try testing.expect(state.model.wsAt(1) != null);
+    // Input landed on the window that is still there rather than on the one
+    // that just went away.
+    try testing.expectEqual(@as(usize, 1), state.model.active_window);
 
     // Now the second window's last tab: nothing is left, so this is the quit.
     app.update(&state.model, .{ .focus_window = 1 }, &state.effects);
@@ -313,6 +316,51 @@ test "a background window's frames resize its own terminals, not the front windo
         .label = "somebody-elses-canvas",
         .size = geometry.SizeF.init(700, 500),
     }) == null);
+}
+
+test "every pane converges on ONE frame, not one pane per frame" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    // Four panes in one window, which is where the old behaviour cost four
+    // frames: onFrame returns at most one Msg and stopped at the first pane
+    // whose grid was wrong, so during a live drag - where the size moves every
+    // frame - only one pane ever tracked the window.
+    app.update(&state.model, .split_right, &state.effects);
+    app.update(&state.model, .split_down, &state.effects);
+    app.update(&state.model, .split_right, &state.effects);
+
+    const frame: native_sdk.platform.GpuFrame = .{
+        .label = app.canvas_label,
+        .window_id = 1,
+        .size = geometry.SizeF.init(1301, 807),
+        .scale_factor = 2,
+    };
+
+    // EXACTLY ONE viewport dispatch. The old behaviour needed four - one per
+    // pane - so a test that allowed "a few more frames" would have passed
+    // against the bug it is meant to catch.
+    const first = app.onFrame(&state.model, frame) orelse return error.TestExpectedFrameMessage;
+    try testing.expect(first == .viewport);
+    app.update(&state.model, first, &state.effects);
+
+    // Nothing left to resize. Outbound drains and surface bookkeeping are not
+    // resize work, so they are allowed; a second `.viewport` is the failure.
+    if (app.onFrame(&state.model, frame)) |next| {
+        try testing.expect(next != .viewport);
+    }
+
+    // And every pane genuinely agrees with the geometry, rather than the pump
+    // having simply run out of things to say.
+    const proposals = app.proposedViewportsIn(&state.model, &state.model.primary, frame.size);
+    try testing.expectEqual(@as(usize, 4), proposals.count);
+    for (proposals.slice()) |proposal| {
+        const terminal = state.model.provider.terminal(proposal.terminal) orelse return error.TestExpectedTerminal;
+        try testing.expectEqual(proposal.cols, terminal.cols);
+        try testing.expectEqual(proposal.rows, terminal.rows);
+    }
 }
 
 // -------------------------------------------------------------- fullscreen

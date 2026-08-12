@@ -101,7 +101,7 @@ test "the strip shows terminals only and still reaches the web surface" {
     // Kept, not deleted: the surface, its pane declaration and its scene
     // wiring are all still there, and two paths reach it.
     var panes: [2]app.TerminalApp.WebViewPane = undefined;
-    try testing.expectEqual(@as(usize, 1), app.webPanes(&state.model, &panes));
+    try testing.expectEqual(@as(usize, 1), app.webPanes(&state.model, support.mainChromeContext(), &panes));
     try testing.expectEqualStrings(app.webview_label, panes[0].label);
     try testing.expect(app.onCommand("surface.web") != null);
 
@@ -348,7 +348,7 @@ test "a dead UNFOCUSED pane offers Restart inside its own rect" {
 
 // -------------------------------------------------------------- Mac chords
 
-test "cmd+A arms a selection over the whole visible screen" {
+test "cmd+A arms a selection over the whole scrollback, not just the viewport" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
     defer harness.destroy(gpa);
@@ -363,12 +363,45 @@ test "cmd+A arms a selection over the whole visible screen" {
 
     try pressCanvasKey(harness, iface, "a", .{ .primary = true });
     try testing.expect(pane.session.selectionActive());
-    try testing.expect(pane.selecting);
+    // Keyboard-selection mode stays DISARMED: this selection is absolute
+    // pins with no viewport caret, so there is nothing for the scrollback
+    // chords to fall out of sync with.
+    try testing.expect(!pane.selecting);
 
     const text = (try pane.session.selectionText(testing.allocator)) orelse return error.TestExpectedSelection;
     defer testing.allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, "alpha") != null);
     try testing.expect(std.mem.indexOf(u8, text, "bravo") != null);
+}
+
+test "cmd+A reaches text that has scrolled out of the viewport" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    const pane = state.model.provider.terminal(app.initialTerminalRef(0)).?;
+    // Fed straight into the emulator so this exercises the scrollback rather
+    // than the effect queue, the same way the cmd+K test does.
+    var line: [32]u8 = undefined;
+    for (0..120) |index| {
+        pane.session.feed(std.fmt.bufPrint(&line, "history {d}\r\n", .{index}) catch unreachable);
+    }
+    pane.session.refreshScreenText();
+    // The oldest line is genuinely off-screen: the viewport no longer holds it.
+    try testing.expect(std.mem.indexOf(u8, pane.session.screenText(), "history 0\n") == null);
+
+    try pressCanvasKey(harness, iface, "a", .{ .primary = true });
+
+    const text = (try pane.session.selectionText(testing.allocator)) orelse return error.TestExpectedSelection;
+    defer testing.allocator.free(text);
+    // The whole history, both ends of it. The old viewport-clamped select-all
+    // could only ever return the tail, which is exactly how someone loses half
+    // the output they meant to copy.
+    try testing.expect(std.mem.indexOf(u8, text, "history 0") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "history 119") != null);
 }
 
 test "cmd+K clears the screen and the scrollback" {

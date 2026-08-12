@@ -4,6 +4,7 @@ const vt = @import("ghostty-vt");
 const provider_contract = @import("provider_contract");
 const support = @import("phux_support.zig");
 const local = @import("../providers/local/provider.zig");
+const grid = @import("../terminal/grid.zig");
 const topology = @import("topology.zig");
 const layout = @import("layout.zig");
 const model_module = @import("model.zig");
@@ -435,30 +436,56 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 workspace.window_id = size.window_id;
                 if (validScale(size.scale_factor)) workspace.surface_scale_factor = size.scale_factor;
             }
-            if (model.provider.terminal(size.terminal_ref)) |pane| {
-                // Commit the new size only once the emulator actually took
-                // it: on an allocation failure the model keeps its old
-                // dimensions and the frame pump retries next frame, so the
-                // emulator and the pty never disagree about the grid.
-                if (!pane.session.resize(size.cols, size.rows)) return;
-                pane.cols = size.cols;
-                pane.rows = size.rows;
-                pane.session.refreshScreenText();
-                fx.ptyResize(pane.pty_key, size.cols, size.rows);
-                drainEveryPane(model, fx);
-                return;
+            // Converge EVERY pane of this window, not just the one the frame
+            // pump named.
+            //
+            // `onFrame` returns at most one Msg and stops at the first pane
+            // whose grid is wrong, so with N panes convergence used to take N
+            // frames. During a live window drag the size moves every frame, so
+            // only one pane ever tracked the window and the other N-1 rendered
+            // at a stale grid for the whole gesture.
+            //
+            // The fix deliberately does NOT batch the panes into the Msg. Msg
+            // is passed BY VALUE through every dispatch and is already 320
+            // bytes; a 16-entry array of (ref, cols, rows) triples would have
+            // roughly doubled that on every message in the app to save a few
+            // frames of latency, which is a plausible regression against the
+            // very latency this is meant to fix (see the size pin in
+            // app_contract_tests). The commit path re-derives instead, through
+            // the SAME `proposedViewportsIn` the frame pump used, and only
+            // when a resize is actually in flight rather than every frame.
+            // The Msg stays AUTHORITATIVE for the terminal it names: it says
+            // what that pane's grid is, and re-deriving over the top would
+            // make its own cols/rows meaningless. The convergence below is
+            // purely additive — it only touches panes the Msg did not name.
+            commitPaneViewport(model, fx, size.terminal_ref, size.cols, size.rows);
+            const workspace = model.wsAt(size.window) orelse &model.primary;
+            const proposals = projection.proposedViewportsIn(model, workspace, size.size);
+            for (proposals.slice()) |proposal| {
+                if (proposal.terminal.eql(size.terminal_ref)) continue;
+                commitPaneViewport(model, fx, proposal.terminal, proposal.cols, proposal.rows);
             }
-            const remote = model.phux() orelse return;
-            remote.viewportResize(size.terminal_ref, .{
-                .cols = size.cols,
-                .rows = size.rows,
-            }) catch {};
+            drainEveryPane(model, fx);
         },
         .surface_resized => |surface| {
             const workspace = model.wsAt(surface.window) orelse return;
             workspace.surface_size = surface.size;
             workspace.window_id = surface.window_id;
             if (validScale(surface.scale_factor)) workspace.surface_scale_factor = surface.scale_factor;
+        },
+        .search_tick => {
+            // Every pane with an open search, not just the focused one: a
+            // background tab's search is still owed its results.
+            for (0..model_module.max_terminals) |index| {
+                if (model.provider.states[index] != .active) continue;
+                const pane = model.provider.slot(index);
+                _ = pane.session.searchPump(grid.Session.search_frame_slice_steps);
+            }
+            // Outbound is drained here for the same reason the viewport arm
+            // drains it: this message can be the only one the pump returns for
+            // many consecutive frames, and a search must not starve a pane's
+            // pending writes.
+            drainEveryPane(model, fx);
         },
         .flush_outbound => drainEveryPane(model, fx),
         .selection_autoscroll => handleSelectionAutoscroll(model, fx),
@@ -563,6 +590,13 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 return;
             }
             if (model.provider.terminal(model.paste_owner.terminal_ref)) |pane| {
+                if (model.paste_target == .search_needle) {
+                    // The field may have closed between the request and the
+                    // result; `searchPaste` returns false rather than writing
+                    // into a needle nobody is looking at.
+                    model.paste_failed = !pane.session.searchPaste(result.text);
+                    return;
+                }
                 if (!pane.acceptsInput()) {
                     model.paste_failed = true;
                     return;
@@ -734,7 +768,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         // the pty. Every pane in every tab follows on its next frame.
         .font_size_step => |delta| _ = model.stepFontSize(@floatFromInt(delta)),
         .font_size_reset => _ = model.resetFontSize(),
-        .select_all => selectAllVisible(model),
+        .select_all => selectAllScrollback(model),
         .clear_terminal => clearFocusedTerminal(model, fx),
         .search_open => {
             const pane = focusedLocalPane(model) orelse return;
@@ -913,23 +947,18 @@ fn focusedLocalPane(model: *Model) ?*Pane {
     return model.provider.terminal(terminal_ref);
 }
 
-/// cmd+A: cover the visible screen with a selection the next cmd+C can copy.
+/// cmd+A: cover the whole SCROLLBACK with a selection the next cmd+C can copy.
 ///
-/// Composed from the existing keyboard-selection primitives rather than a new
-/// emulator call: `beginSelection` anchors at the cursor, one clamped
-/// non-extending move drags the anchor to the top-left, and one clamped
-/// extending move drags the head to the bottom-right. It is therefore
-/// VIEWPORT-wide, not scrollback-wide — see the handoff note.
-fn selectAllVisible(model: *Model) void {
+/// This used to compose the keyboard-selection primitives, which are clamped
+/// to the grid, so it could only ever reach the visible screen — and quietly
+/// handed back a fraction of the output someone meant to copy. It now delegates
+/// to the session's absolute-pin primitive; see `selectAllHistory` for why it
+/// leaves keyboard-selection mode disarmed.
+fn selectAllScrollback(model: *Model) void {
     const terminal_ref = model.selectedTerminalRef() orelse return;
     const pane = model.provider.terminal(terminal_ref) orelse return;
-    const session = pane.session;
-    const span_x: i32 = @intCast(session.cols());
-    const span_y: i32 = @intCast(session.rows());
-    session.beginSelection(false);
-    session.moveSelection(-span_x, -span_y, false);
-    session.moveSelection(span_x, span_y, true);
-    pane.selecting = true;
+    if (!pane.session.selectAllHistory()) return;
+    pane.selecting = false;
 }
 
 /// cmd+K: clear the screen and the scrollback.
@@ -1009,10 +1038,34 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
 /// that flushes the workspace layout still runs.
 fn retireEmptyWindow(model: *Model, fx: *Fx, window_index: usize) void {
     if (window_index == 0) {
-        // The MAIN window has one more state than the others: its web surface
-        // is a real place to be, so an emptied main window that is not the
-        // last window stands there instead of closing.
-        model.primary.web_selected = true;
+        // An emptied MAIN window closes, exactly as a secondary would.
+        //
+        // macOS apps genuinely vary here and this used to stand on the web
+        // surface instead. Closing is the majority behaviour and the one that
+        // keeps a single rule for every window: the thing you emptied is the
+        // thing that goes away. Standing meant cmd+W on the last tab of the
+        // main window left a window on screen showing something the user never
+        // asked for, while the identical gesture in any other window closed it.
+        //
+        // Only when other windows remain. When this is the last window the
+        // tail below owns the outcome, which is to close it AND quit - the
+        // rule that was already correct and is deliberately untouched.
+        var others: usize = 0;
+        for (model.secondary) |slot| {
+            if (slot != null) others += 1;
+        }
+        if (others > 0) {
+            // `model.closeWindow` is what moves input off a window that just
+            // went away (`firstOpenWindow`); doing this by hand would leave
+            // `active_window` naming a closed window. The scene's window is
+            // not declarative like a secondary's, so it also needs the effect.
+            model.closeWindow(window_index);
+            fx.closeWindow(scene.main_window_label);
+        } else {
+            // LAST window: the tail below closes it and quits. Left exactly as
+            // it was — the web surface is the state the app is torn down from.
+            model.primary.web_selected = true;
+        }
     } else {
         // A secondary window is retired DECLARATIVELY: `view.windows` stops
         // naming it and the runtime reconciles it closed. Sending
@@ -1031,8 +1084,13 @@ fn retireEmptyWindow(model: *Model, fx: *Fx, window_index: usize) void {
     if (secondaries > 0) return;
     if (model.primary_open and model.primary.tab_count > 0) return;
 
-    model.primary_open = false;
-    fx.closeWindow(scene.main_window_label);
+    // Guarded because an emptied main window now closes itself above. Closing
+    // it a second time here would be two closes against one label, the second
+    // against a window that is already gone.
+    if (model.primary_open) {
+        model.primary_open = false;
+        fx.closeWindow(scene.main_window_label);
+    }
     fx.quitApp();
 }
 
@@ -1120,6 +1178,31 @@ fn copySelection(model: *Model, fx: *Fx, terminal_ref: TerminalRef) void {
     // convention until typing, a new selection, or restart clears it.
 }
 
+/// Commit one pane's grid, local or remote.
+///
+/// A local commit lands only once the EMULATOR actually took the resize: on an
+/// allocation failure the model keeps its old dimensions and the frame pump
+/// retries next frame, so the emulator and the pty never disagree about the
+/// grid. A commit that changes nothing does no work, which is what makes it
+/// safe to call for every pane on every resize dispatch.
+fn commitPaneViewport(model: *Model, fx: *Fx, terminal_ref: TerminalRef, cols: u16, rows: u16) void {
+    if (model.provider.terminal(terminal_ref)) |pane| {
+        if (pane.cols == cols and pane.rows == rows) return;
+        if (!pane.session.resize(cols, rows)) return;
+        pane.cols = cols;
+        pane.rows = rows;
+        pane.session.refreshScreenText();
+        fx.ptyResize(pane.pty_key, cols, rows);
+        return;
+    }
+    const remote = model.phux() orelse return;
+    const viewport: Viewport = .{ .cols = cols, .rows = rows };
+    if (remote.lastViewport(terminal_ref)) |last| {
+        if (last.eql(viewport)) return;
+    }
+    remote.viewportResize(terminal_ref, viewport) catch {};
+}
+
 /// One read in flight: the fixed paste key remains occupied until its result
 /// is delivered. A repeated Cmd+V is consumed but cannot issue a duplicate
 /// request that would only be rejected.
@@ -1127,7 +1210,21 @@ fn requestPaste(model: *Model, fx: *Fx, terminal_ref: TerminalRef) void {
     if (model.paste_inflight) return;
     model.paste_owner = model.terminalOwner(terminal_ref) orelse return;
     model.paste_failed = false;
+    model.paste_target = .terminal;
     if (model.provider.terminal(terminal_ref)) |pane| {
+        // An open search field is where a paste GOES, for the same reason
+        // committed text does. Deciding it here rather than at the chord
+        // means the menu's Edit > Paste agrees with cmd+V for free, and
+        // that the two can never drift apart.
+        if (pane.session.search.open) {
+            model.paste_target = .search_needle;
+            model.paste_inflight = true;
+            fx.readClipboard(.{
+                .key = paste_clipboard_key,
+                .on_result = Fx.clipboardMsg(.paste_clipboard),
+            });
+            return;
+        }
         if (!pane.acceptsInput()) {
             model.paste_failed = true;
             return;
@@ -1580,11 +1677,31 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
 
 /// Every key press that reaches an OPEN search field.
 ///
-/// Three of them do something and the rest are SWALLOWED, which is the point:
+/// A handful do something and the rest are SWALLOWED, which is the point:
 /// a key with no meaning here is not a key that should fall through to the
 /// child. Printable presses do not arrive here at all — they come through the
 /// text channel (see the `.text` arm) and are appended to the needle there.
 fn handleSearchKey(model: *Model, fx: *Fx, pane: *Pane, event: canvas.WidgetKeyboardEvent) void {
+    const primary = event.modifiers.hasCommandModifier();
+    // cmd+V fills the needle; cmd+C still copies the TERMINAL's selection.
+    //
+    // Both sit above the swallowing arms because the search band is modal
+    // over the terminal, not over the machine: a field that eats the two
+    // chords every Mac app answers reads as broken, and being unable to
+    // paste the very string you are looking for is the worst case of it.
+    // cmd+C keeps its terminal meaning because the needle is not selectable
+    // text — there is nothing else it could copy — and a selection made
+    // before cmd+F survives the field being opened.
+    if (primary and keyIs(event.key, "v")) {
+        latchAppShortcut(model, event.key);
+        requestPaste(model, fx, pane.id);
+        return;
+    }
+    if (primary and keyIs(event.key, "c") and (pane.selecting or pane.session.selectionActive())) {
+        latchAppShortcut(model, event.key);
+        copySelection(model, fx, pane.id);
+        return;
+    }
     if (keyIs(event.key, "escape")) {
         latchAppShortcut(model, event.key);
         updateModel(model, .search_close, fx);

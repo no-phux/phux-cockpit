@@ -25,6 +25,47 @@ const activePointerCapture = pointer_support.activePointerCapture;
 
 const max_effect_mouse_test_bytes: usize = 64 * 32 + 1;
 
+test "cmd+click opens the URL under the pointer, and only a URL" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const app_iface = host.app();
+    const model = &host.inner.model;
+    const pane = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "open https://example.com/docs now\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    const frame = terminalInteractionFrame(harness, "example.com") orelse return error.TestExpectedTerminalInteractionSurface;
+
+    // Column 10 of row 0 is inside "https://example.com/docs".
+    const on_link = terminalCellPoint(pane, frame, 10, 0);
+    try pointerInput(harness, app_iface, .pointer_down, on_link, 0, .{ .command = true }, 0);
+    try testing.expectEqual(@as(u32, 1), model.opened_url_count);
+    try testing.expectEqualStrings("https://example.com/docs", model.openedUrl());
+    // The press was CONSUMED: no capture to leave dangling, no half-started
+    // selection.
+    try testing.expectEqual(@as(usize, 0), activePointerCaptureCount(model));
+    try testing.expect(!pane.session.selectionActive());
+
+    // Column 1 is the word "open" - ordinary text falls through to the normal
+    // gesture rather than being swallowed by the link chord.
+    const off_link = terminalCellPoint(pane, frame, 1, 0);
+    try pointerInput(harness, app_iface, .pointer_down, off_link, 0, .{ .command = true }, 0);
+    try testing.expectEqual(@as(u32, 1), model.opened_url_count);
+    try pointerInput(harness, app_iface, .pointer_up, off_link, 0, .{ .command = true }, 0);
+
+    // A plain click on the link is a SELECTION, not a navigation.
+    try pointerInput(harness, app_iface, .pointer_down, on_link, 0, .{}, 0);
+    try testing.expectEqual(@as(u32, 1), model.opened_url_count);
+    try pointerInput(harness, app_iface, .pointer_up, on_link, 0, .{}, 0);
+}
+
 test "pointer drag selects Ghostty cells and Shift overrides TUI mouse reporting" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);

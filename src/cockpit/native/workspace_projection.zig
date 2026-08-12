@@ -480,6 +480,91 @@ pub fn resolvePanesIn(model: *const Model, workspace: *const Workspace, size: ge
     );
 }
 
+pub const PaneViewport = struct {
+    terminal: support.TerminalRef,
+    cols: u16,
+    rows: u16,
+};
+
+/// Every pane's proposed grid for a surface of `size`, in resolve order.
+///
+/// ONE derivation, shared by the two sides that used to disagree about scope:
+/// the frame pump reports the FIRST pane whose grid is wrong, and the commit
+/// path converges ALL of them in that same dispatch. Deriving the proposal
+/// twice — once to report, once to commit — is exactly the kind of split that
+/// `resolvePanes` exists to prevent.
+pub const ProposedViewports = struct {
+    items: [layout.max_panes]PaneViewport = undefined,
+    count: usize = 0,
+    /// A local pane whose painter has not yet written cell metrics, so nothing
+    /// after it in resolve order was measured either. The frame pump treats
+    /// this as "not ready" and proposes nothing rather than sizing a pane
+    /// against metrics that do not exist yet.
+    incomplete: bool = false,
+
+    pub fn slice(self: *const ProposedViewports) []const PaneViewport {
+        return self.items[0..self.count];
+    }
+};
+
+pub fn proposedViewportsIn(
+    model: *const Model,
+    workspace: *const Workspace,
+    size: geometry.SizeF,
+) ProposedViewports {
+    var result: ProposedViewports = .{};
+    var panes: [layout.max_panes]layout.Pane = undefined;
+    const count = resolvePanesIn(model, workspace, size, &panes);
+    // Cell metrics for a LOCAL pane come from `session.cell_*`, which the
+    // painter wrote from the live terminal tokens. Deriving them here instead
+    // would be wrong, not merely redundant: only the painter's tokens carry the
+    // runtime's text-measure provider, so a token derivation here falls back to
+    // the `label_size * 0.6` estimate and proposes a different column count
+    // than the one being painted.
+    const metrics = canvas.terminalCellMetrics(terminalTokens(model));
+    for (panes[0..count]) |pane| {
+        const inner = pane.rect;
+        if (inner.width <= 0 or inner.height <= 0) continue;
+        if (model.provider.terminalConst(pane.terminal)) |terminal| {
+            const session = terminal.session;
+            if (session.cell_width <= 0 or session.cell_height <= 0) {
+                result.incomplete = true;
+                return result;
+            }
+            const proposed = grid.Session.clampGrid(
+                @intFromFloat(@max(2, inner.width / session.cell_width)),
+                @intFromFloat(@max(2, inner.height / session.cell_height)),
+            );
+            result.items[result.count] = .{ .terminal = pane.terminal, .cols = proposed.x, .rows = proposed.y };
+            result.count += 1;
+            continue;
+        }
+        const remote = model.phuxConst() orelse continue;
+        if (remote.presentation(pane.terminal) == null) continue;
+        const proposed = grid.Session.clampGrid(
+            @intFromFloat(@max(2, inner.width / metrics.width)),
+            @intFromFloat(@max(2, inner.height / metrics.height)),
+        );
+        result.items[result.count] = .{ .terminal = pane.terminal, .cols = proposed.x, .rows = proposed.y };
+        result.count += 1;
+    }
+    return result;
+}
+
+/// Whether `proposal` disagrees with what that terminal is currently at.
+///
+/// Local panes compare against the model's committed cols/rows; remote ones
+/// against the last viewport the provider was told, because a remote terminal
+/// has no local grid to read.
+pub fn viewportDiffers(model: *const Model, proposal: PaneViewport) bool {
+    if (model.provider.terminalConst(proposal.terminal)) |terminal| {
+        return proposal.cols != terminal.cols or proposal.rows != terminal.rows;
+    }
+    const remote = model.phuxConst() orelse return false;
+    const last = remote.lastViewport(proposal.terminal) orelse return true;
+    return !last.eql(.{ .cols = proposal.cols, .rows = proposal.rows });
+}
+
 /// The pane under a view point, or null over the band, a divider, or a
 /// gutter. Same bounds and same clamps as `resolvePanes` by construction.
 pub fn paneAtPoint(model: *const Model, size: geometry.SizeF, x: f32, y: f32) ?layout.Pane {

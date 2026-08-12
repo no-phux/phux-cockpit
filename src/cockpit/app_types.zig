@@ -43,6 +43,14 @@ pub const Msg = union(enum) {
         window: u8 = 0,
         window_id: native_sdk.platform.WindowId = 1,
     },
+    /// One slice of incremental scrollback search, driven by the frame pump.
+    ///
+    /// Scrollback search cannot run on a background thread — `vt.search.Thread`
+    /// is `void` in a library-artifact libghostty-vt — so walking a deep
+    /// history on every keystroke stuttered the dispatch thread. The engine
+    /// makes bounded progress per slice instead, and this is the tick that
+    /// asks for the next one.
+    search_tick,
     clipboard: native_sdk.EffectClipboardResult,
     paste_clipboard: native_sdk.EffectClipboardResult,
     copy_selection,
@@ -86,7 +94,8 @@ pub const Msg = union(enum) {
     font_size_step: i8,
     font_size_reset,
     /// cmd+A over the focused terminal: arm a selection covering the whole
-    /// visible screen, so the very next cmd+C copies it.
+    /// SCROLLBACK — not merely the visible screen — so the very next cmd+C
+    /// copies all of it.
     select_all,
     /// cmd+K: clear the screen AND the scrollback, the way `clear` does.
     clear_terminal,

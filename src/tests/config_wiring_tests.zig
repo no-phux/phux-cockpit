@@ -5,6 +5,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const app = @import("../main.zig");
+const grid = @import("../terminal/grid.zig");
 const support = @import("support.zig");
 
 const canvas = native_sdk.canvas;
@@ -236,6 +237,71 @@ test "a new tab and a split start in the focused pane's directory" {
     state.model.config = app.parseConfig("inherit-working-directory = false");
     try state.dispatch(&harness.runtime, 1, .new_terminal);
     try testing.expectEqualSlices([]const u8, app.paneArgv(0), state.model.provider.slots[3].argv);
+}
+
+test "scrollback-limit reaches the emulator instead of being stored and ignored" {
+    // The regression this pins: `scrollback_bytes` parsed and stored, while
+    // the session was built from a comptime const that merely HAPPENED to
+    // equal the config default. Anyone setting the knob got the default and
+    // no indication of it.
+    const gpa = testing.allocator;
+    const small = try grid.Session.createWithScrollback(gpa, testing.io, 80, 24, 1024 * 1024);
+    defer small.destroy();
+    const large = try grid.Session.createWithScrollback(gpa, testing.io, 80, 24, 64 * 1024 * 1024);
+    defer large.destroy();
+
+    try testing.expect(small.term.screens.active.pages.maxSize() != large.term.screens.active.pages.maxSize());
+    try testing.expect(small.term.screens.active.pages.maxSize() < large.term.screens.active.pages.maxSize());
+}
+
+test "a configured shell reaches the argv of every pane, old and new" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    // The pane that already exists is re-pointed, because the config cannot be
+    // read until after the first pane is built.
+    try testing.expect(state.model.provider.setShellCommand("/opt/homebrew/bin/fish"));
+    const first = state.model.provider.slots[0].argv;
+    try testing.expectEqualStrings("exec /opt/homebrew/bin/fish", first[first.len - 1]);
+
+    // ...and so is every pane minted afterwards.
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    const second = state.model.provider.slots[1].argv;
+    try testing.expectEqualStrings("exec /opt/homebrew/bin/fish", second[second.len - 1]);
+}
+
+test "a rejected shell value leaves the built-in shell standing" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    // A NUL would be truncated at the C boundary, and an over-long value does
+    // not fit the argv budget. Both degrade to the default shell rather than
+    // to a pane that cannot open.
+    try testing.expect(!state.model.provider.setShellCommand(""));
+    try testing.expect(!state.model.provider.setShellCommand("/bin/sh\x00rm -rf /"));
+    try testing.expect(!state.model.provider.setShellCommand("x" ** 4096));
+    try testing.expectEqualSlices([]const u8, app.paneArgv(0), state.model.provider.slots[0].argv);
+}
+
+test "a command line with arguments survives as a command line" {
+    // `command = tmux attach` has to keep its argument. Single-quoting the
+    // whole value the way a working DIRECTORY is quoted would turn this into
+    // one nonexistent program named "tmux attach".
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    try testing.expect(state.model.provider.setShellCommand("tmux attach"));
+    const argv = state.model.provider.slots[0].argv;
+    try testing.expectEqualStrings("exec tmux attach", argv[argv.len - 1]);
 }
 
 test "window-padding moves the content rect and the header band" {

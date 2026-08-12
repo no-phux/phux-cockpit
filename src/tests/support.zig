@@ -34,6 +34,20 @@ pub fn createSessions(cols: u16, rows: u16) ![2]*grid.Session {
 /// The registry's live panes, as a slice. Valid only while no slot has been
 /// freed, which holds for fixtures that only ever ADD terminals — a closed
 /// terminal leaves a hole whose session is gone.
+/// A `ChromeContext` naming the MAIN window — what the runtime hands
+/// `web_panes` and `build_window` when it is painting the scene's own window.
+/// Secondary windows are distinguished by `is_main = false` and their own
+/// canvas label.
+pub fn mainChromeContext() app.TerminalApp.ChromeContext {
+    return .{
+        .canvas_label = app.canvas_label,
+        .window_id = 1,
+        .size = geometry.SizeF.init(980, 640),
+        .tokens = .{},
+        .is_main = true,
+    };
+}
+
 pub fn activeSlots(model: *app.Model) []app.Pane {
     var end: usize = 0;
     for (model.provider.states, 0..) |state, index| {

@@ -163,6 +163,8 @@ pub const workspaceChrome = projection.workspaceChrome;
 pub const workspaceChromeIn = projection.workspaceChromeIn;
 pub const resolvePanes = projection.resolvePanes;
 pub const resolvePanesIn = projection.resolvePanesIn;
+pub const proposedViewportsIn = projection.proposedViewportsIn;
+pub const PaneViewport = projection.PaneViewport;
 pub const paneFrames = projection.paneFrames;
 pub const paneAtPoint = projection.paneAtPoint;
 pub const paneFrameFor = projection.paneFrameFor;
@@ -434,6 +436,7 @@ fn restoreWorkspace(
     io: std.Io,
     path: []const u8,
     restored: *TopologySnapshot,
+    max_scrollback_bytes: usize,
 ) ?Model {
     var persisted: PersistedTopologySnapshot = undefined;
     if (!readPersistedState(io, path, &persisted)) return null;
@@ -442,9 +445,46 @@ fn restoreWorkspace(
     // valid state (the web surface was selected when the last tab closed) but
     // it is not a workspace to reopen, so it takes the fresh path.
     if (snapshot.tab_count == 0) return null;
-    const model = restoreModel(gpa, io, .{ .v4 = snapshot }) catch return null;
+    const model = model_module.restoreModelWithScrollback(gpa, io, .{ .v4 = snapshot }, max_scrollback_bytes) catch return null;
     restored.* = snapshot;
     return model;
+}
+
+/// Say out loud what the config file did not do.
+///
+/// The parser has always COLLECTED diagnostics and nothing has ever rendered
+/// them, so a typo'd key, a malformed colour, and a setting this build cannot
+/// honour were all equally silent — which is the whole reason a knob that
+/// parses and does nothing is a trap rather than a missing feature.
+///
+/// stderr is where a terminal emulator's own startup complaints belong; from a
+/// bundle they land in the unified log. A surface inside the app would be
+/// better and is worth doing, but silence is the bug.
+fn reportConfigDiagnostics(user_config: *const Config) void {
+    for (user_config.diagnosticSlice()) |diagnostic| {
+        switch (diagnostic.kind) {
+            .unsupported_key => std.log.warn(
+                "config line {d}: '{s}' is understood but does nothing in this build",
+                .{ diagnostic.line, diagnostic.text },
+            ),
+            .unknown_key => std.log.warn(
+                "config line {d}: unknown setting '{s}'",
+                .{ diagnostic.line, diagnostic.text },
+            ),
+            .bad_value => std.log.warn(
+                "config line {d}: value '{s}' was not understood, so the default is in effect",
+                .{ diagnostic.line, diagnostic.text },
+            ),
+            .missing_separator => std.log.warn(
+                "config line {d}: no '=' on this line, so it was skipped",
+                .{diagnostic.line},
+            ),
+            .too_long => std.log.warn(
+                "config line {d}: value is too long for this setting, so it was ignored",
+                .{diagnostic.line},
+            ),
+        }
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -461,21 +501,41 @@ pub fn main(init: std.process.Init) !void {
     // The restore runs BEFORE the default terminal is created, not after: a
     // model that boots with one shell and is then reshaped would show the
     // fresh window for a frame and rebuild itself in front of the user.
+    // The config is read BEFORE any session exists, because the scrollback
+    // ceiling is fixed at `vt.Terminal.init` and cannot be changed afterwards.
+    // Reading it later is exactly how `scrollback-limit` came to parse, store,
+    // and do nothing.
+    const user_config = loadUserConfig(init.io, init);
+    reportConfigDiagnostics(&user_config);
+    const max_scrollback_bytes: usize = @intCast(@min(
+        user_config.scrollback_bytes,
+        @as(u64, std.math.maxInt(usize)),
+    ));
+
     var restored_snapshot: TopologySnapshot = .{};
     var restored = false;
     var model = restore: {
         if (state_path) |path| {
-            if (restoreWorkspace(std.heap.page_allocator, init.io, path, &restored_snapshot)) |saved| {
+            if (restoreWorkspace(std.heap.page_allocator, init.io, path, &restored_snapshot, max_scrollback_bytes)) |saved| {
                 restored = true;
                 break :restore saved;
             }
         }
-        const session = try grid.Session.create(std.heap.page_allocator, init.io, 80, 24);
+        const session = try grid.Session.createWithScrollback(std.heap.page_allocator, init.io, 80, 24, max_scrollback_bytes);
         break :restore initialProductionModelWithIo(std.heap.page_allocator, init.io, session) catch |err| {
             session.destroy();
             return err;
         };
     };
+    // Terminals are minted lazily, so the provider carries the ceiling for
+    // every pane opened after this point.
+    model.provider.max_scrollback_bytes = max_scrollback_bytes;
+    if (user_config.shell.slice().len != 0 and !model.provider.setShellCommand(user_config.shell.slice())) {
+        std.log.warn(
+            "config: shell/command value was rejected (empty, too long, or contains a NUL), so the default shell is in effect",
+            .{},
+        );
+    }
     const remote_provider = createConfiguredPhuxProvider(init) catch |err| {
         deinitModel(&model);
         return err;
@@ -484,7 +544,7 @@ pub fn main(init: std.process.Init) !void {
     // Seed the shape hash with what is already on disk, so a launch that
     // changes nothing writes nothing.
     model.state.fingerprint = model.topologyFingerprint();
-    model.config = loadUserConfig(init.io, init);
+    model.config = user_config;
     model.tab_placement = switch (model.config.tab_placement) {
         .top => .top,
         .side => .side,
@@ -589,6 +649,7 @@ test "AppKit pointer buttons map to provider mouse buttons" {
 
 test {
     _ = @import("tests/app_contract_tests.zig");
+    _ = @import("tests/url_detection_tests.zig");
     _ = @import("tests/grid_state_tests.zig");
     _ = @import("tests/grid_rendering_tests.zig");
     _ = @import("tests/cell_attribute_tests.zig");

@@ -20,6 +20,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const vt = @import("ghostty-vt");
+const url_module = @import("url.zig");
 const palette_module = @import("palette.zig");
 
 const canvas = native_sdk.canvas;
@@ -96,6 +97,13 @@ pub const Search = struct {
     /// screen's state actually allows (see `discardSearchEngine`).
     screen_key: vt.ScreenSet.Key = .primary,
     screen_generation: usize = 0,
+    /// The engine has not finished walking the scrollback yet, so a caller
+    /// should keep pumping it. See `Session.searchPump`.
+    incomplete: bool = false,
+    /// Whether this needle has already been landed on a match. The first match
+    /// to appear takes the selection; later ones stream in without yanking the
+    /// viewport out from under someone who is already reading.
+    landed: bool = false,
     /// Where the viewport was when the field opened. Escape puts it back.
     restore_row: usize = 0,
     /// ...and whether that was the LIVE bottom, which is not the same
@@ -239,7 +247,25 @@ pub const Session = struct {
     /// session still costs one page.
     pub const max_scrollback: usize = 50_000_000;
 
+    /// `create` with the default ceiling. Tests and fixtures that do not care
+    /// about scrollback size use this; anything holding a user's config should
+    /// call `createWithScrollback` so `scrollback-limit` is not silently
+    /// ignored.
     pub fn create(gpa: std.mem.Allocator, io: std.Io, initial_cols: u16, initial_rows: u16) !*Session {
+        return createWithScrollback(gpa, io, initial_cols, initial_rows, max_scrollback);
+    }
+
+    /// `max_scrollback_bytes` is a per-SESSION parameter, not the comptime
+    /// constant it used to be. It was a `const` that happened to equal the
+    /// config default, which made `scrollback-limit` parse, store, and do
+    /// nothing at all.
+    pub fn createWithScrollback(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        initial_cols: u16,
+        initial_rows: u16,
+        max_scrollback_bytes: usize,
+    ) !*Session {
         const session = try gpa.create(Session);
         errdefer gpa.destroy(session);
         session.* = .{
@@ -247,7 +273,7 @@ pub const Session = struct {
             .term = try vt.Terminal.init(io, gpa, .{
                 .cols = @intCast(@min(initial_cols, max_cols)),
                 .rows = @intCast(@min(initial_rows, max_rows)),
-                .max_scrollback = max_scrollback,
+                .max_scrollback = max_scrollback_bytes,
             }),
             .stream = undefined,
             .render = .empty,
@@ -978,6 +1004,35 @@ pub const Session = struct {
         return true;
     }
 
+    /// Insert CLIPBOARD text into the needle.
+    ///
+    /// Separate from `searchInput` because typed text and pasted text fail
+    /// differently. A typed control byte is a key that had no business in a
+    /// phrase, so rejecting the press is right. A PASTE carrying one is
+    /// ordinary — copying a word out of a terminal picks up its trailing
+    /// newline almost every time — and rejecting the whole paste for it would
+    /// leave cmd+V looking as inert as it was before it was implemented.
+    ///
+    /// So this takes the first line and drops control bytes from it. A needle
+    /// cannot span rows anyway: the engine matches within a row, so the bytes
+    /// after a newline could never contribute to a match, and silently keeping
+    /// them would search for a phrase the field cannot display.
+    pub fn searchPaste(session: *Session, text: []const u8) bool {
+        if (!session.search.open) return false;
+        var end: usize = 0;
+        while (end < text.len and text[end] != '\n' and text[end] != '\r') end += 1;
+        var wrote = false;
+        for (text[0..end]) |byte| {
+            if (byte < 0x20 or byte == 0x7f) continue;
+            if (session.search.needle_len + 1 > session.search.needle_buf.len) break;
+            session.search.needle_buf[session.search.needle_len] = byte;
+            session.search.needle_len += 1;
+            wrote = true;
+        }
+        if (wrote) session.searchRefresh();
+        return wrote;
+    }
+
     /// Delete the last SCALAR of the needle. Cutting a single byte off a
     /// multi-byte character leaves an invalid needle that matches nothing and
     /// paints as replacement junk.
@@ -1036,17 +1091,88 @@ pub const Session = struct {
         session.search.screen_generation = screens.generation(screens.active_key);
         // `vt.search.Thread` is `void` in a libghostty-vt built as a LIBRARY
         // (`GhosttyZig.zig` pins `artifact = .lib`), so there is no background
-        // searcher to hand this to: the whole scrollback is walked here, on
-        // the dispatch thread, in exactly the tick/feed loop `searchAll` runs.
-        // See the handoff note about a deep scrollback.
-        session.search.engine.?.searchAll() catch {
-            session.discardSearchEngine();
-            return;
+        // searcher to hand this to. This used to call `searchAll`, which walks
+        // the WHOLE scrollback on the dispatch thread on every keystroke — fine
+        // for ordinary history, a visible stutter while typing against a full
+        // 50 MB one.
+        //
+        // So it does one bounded slice here and leaves the rest to
+        // `searchPump`, driven a slice per frame. The engine's own `tick` is
+        // built for exactly this: it makes incremental progress, asks for a
+        // `feed` when it needs more data, and reports `SearchComplete`.
+        //
+        // The first slice covers the ACTIVE screen before history, so the
+        // matches on the text someone is looking at appear on the same frame
+        // they typed into — the rest stream in behind.
+        session.search.incomplete = true;
+        session.search.landed = false;
+        _ = session.searchPump(search_first_slice_steps);
+    }
+
+    /// Steps of incremental search per slice.
+    ///
+    /// MEASURED, not guessed: against a 4000-row scrollback the whole search
+    /// takes 14 ticks, so one tick covers roughly 285 rows — about a PageList
+    /// page. Re-measure before changing either number; the granularity is the
+    /// engine's, not ours.
+    ///
+    /// The first slice runs INLINE on the keystroke and is deliberately small.
+    /// One tick covers the active screen, and the step after a `FeedRequired`
+    /// is spent on the feed itself, so four is the smallest budget that still
+    /// lets an ORDINARY history — the common case, a terminal nowhere near its
+    /// scrollback ceiling — finish inline and never wake the frame pump at
+    /// all. A deep history stays off the keystroke either way.
+    pub const search_first_slice_steps: usize = 4;
+    /// ...and the frame slices are sized so a 500k-row history finishes in
+    /// well under a second of frames (~9k rows a frame) without any single
+    /// frame paying for the whole walk.
+    pub const search_frame_slice_steps: usize = 32;
+
+    /// Make bounded progress on the incremental search. True means work
+    /// remains and the caller should pump again next frame.
+    ///
+    /// Every failure DISCARDS the engine rather than leaving a half-walked one
+    /// live: a partial result set that has stopped growing would read as "these
+    /// are all the matches", which is a worse answer than no search.
+    pub fn searchPump(session: *Session, budget: usize) bool {
+        if (!session.search.open or !session.search.incomplete) return false;
+        const engine = if (session.search.engine) |*value| value else {
+            session.search.incomplete = false;
+            return false;
         };
-        // Land on a match immediately. A needle that has already typed itself
-        // into a hit should show that hit, not wait for a separate Enter.
-        _ = session.search.engine.?.select(.next) catch {};
-        session.revealCurrentMatch();
+        var steps: usize = 0;
+        while (steps < budget) : (steps += 1) {
+            engine.tick() catch |err| switch (err) {
+                error.OutOfMemory => {
+                    session.discardSearchEngine();
+                    session.search.incomplete = false;
+                    return false;
+                },
+                error.FeedRequired => engine.feed() catch {
+                    session.discardSearchEngine();
+                    session.search.incomplete = false;
+                    return false;
+                },
+                error.SearchComplete => {
+                    session.search.incomplete = false;
+                    break;
+                },
+            };
+        }
+        // Land on the FIRST match to appear, once, rather than on every slice:
+        // re-selecting as later matches stream in would drag the viewport
+        // around while someone is already reading the hit they were given.
+        if (!session.search.landed and engine.matchesLen() > 0) {
+            _ = engine.select(.next) catch {};
+            session.search.landed = true;
+            session.revealCurrentMatch();
+        }
+        return session.search.incomplete;
+    }
+
+    /// Whether this session owes the frame pump more search work.
+    pub fn searchPending(session: *const Session) bool {
+        return session.search.open and session.search.incomplete;
     }
 
     /// Push the live matches into the render state's per-row highlight lists.
@@ -1099,6 +1225,10 @@ pub const Session = struct {
     /// itself is gone — an application leaving the alternate screen frees it
     /// — the pool went with it and only `deinitScreenInvalid` is safe.
     fn discardSearchEngine(session: *Session) void {
+        // Cleared even when there is no engine: an engine that never got built
+        // must not leave the session claiming it owes the frame pump work.
+        session.search.incomplete = false;
+        session.search.landed = false;
         const engine = if (session.search.engine) |*value| value else return;
         if (session.searchScreenAlive()) engine.deinit() else engine.deinitScreenInvalid();
         session.search.engine = null;
@@ -1175,6 +1305,31 @@ pub const Session = struct {
         session.pointer_selection.reset(&session.term);
         session.select_anchor = null;
         session.term.screens.active.clearSelection();
+    }
+
+    /// Select the ENTIRE scrollback, not merely the visible screen — what
+    /// Ghostty's `select_all` does, and what someone arriving from it expects
+    /// cmd+A to mean. The engine's own `Screen.selectAll` walks from
+    /// `.screen = .{}` (the top of history, not the top of the viewport) and
+    /// omits surrounding whitespace, so a mostly-empty screen does not hand
+    /// back a copy padded with blank rows.
+    ///
+    /// Deliberately does NOT arm keyboard-selection mode. That mode carries a
+    /// VIEWPORT anchor and head, and the reason scrollback chords pause while
+    /// it is armed is that scrolling would leave the painted caret naming
+    /// different text than a copy returns. This selection is expressed purely
+    /// in absolute pins with no caret at all, so scrolling under it stays
+    /// truthful and the chords can stay live.
+    ///
+    /// False means there was nothing to select — an empty screen — and the
+    /// previous selection is left alone rather than being silently dropped.
+    pub fn selectAllHistory(session: *Session) bool {
+        const screen = session.term.screens.active;
+        const selection = screen.selectAll() orelse return false;
+        session.pointer_selection.reset(&session.term);
+        screen.select(selection) catch return false;
+        session.select_anchor = null;
+        return true;
     }
 
     /// Primary-pointer selection using Ghostty's own cell/word/line gesture.
@@ -1392,6 +1547,39 @@ pub const Session = struct {
     /// `screenText` pays, once, and only when something actually reads.
     pub fn refreshScreenText(session: *Session) void {
         session.screen_text_dirty = true;
+    }
+
+    /// The URL under a pointer at view-relative `x`/`y`, or null.
+    ///
+    /// Returns a slice into the session's own cached screen text, so it stays
+    /// valid until the next screen change — which is exactly the lifetime a
+    /// hover or a click needs, and no longer.
+    ///
+    /// Heuristic by necessity: terminal output has no author to mark up its
+    /// links. It fails toward "not a link", because a missed URL costs a click
+    /// while a wrong one hands arbitrary program output to the OS to open.
+    pub fn urlAtPoint(session: *Session, x: f32, y: f32) ?[]const u8 {
+        if (session.cell_width <= 0 or session.cell_height <= 0) return null;
+        if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
+        if (x < 0 or y < 0) return null;
+        const coordinate = session.pointerViewportCoordinate(x, y) orelse return null;
+        const text = session.screenText();
+        const row = rowSlice(text, coordinate.y) orelse return null;
+        const offset = url_module.byteOffsetForColumn(row, coordinate.x) orelse return null;
+        const span = url_module.spanAt(row, offset) orelse return null;
+        return span.slice(row);
+    }
+
+    /// Row `index` of a newline-separated viewport dump, without its newline.
+    fn rowSlice(text: []const u8, index: usize) ?[]const u8 {
+        var start: usize = 0;
+        var row: usize = 0;
+        while (row < index) : (row += 1) {
+            const newline = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return null;
+            start = newline + 1;
+        }
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+        return text[start..end];
     }
 
     /// The cached viewport text, recomputed on demand when the screen

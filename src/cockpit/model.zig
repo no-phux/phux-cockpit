@@ -8,6 +8,7 @@ const topology = @import("topology.zig");
 const layout = @import("layout.zig");
 const config_module = @import("../config/config.zig");
 const session_state = @import("session_state.zig");
+const url_module = @import("../terminal/url.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -144,6 +145,9 @@ pub const TerminalPointerEvent = struct {
 };
 
 pub const PointerDragMode = enum { local_selection, mouse_report };
+
+/// Destination of an in-flight clipboard read. See `Model.paste_target`.
+pub const PasteTarget = enum { terminal, search_needle };
 
 pub const PointerCapture = struct {
     active: bool = false,
@@ -467,6 +471,20 @@ pub const Model = struct {
         .generation = .{},
     },
     paste_failed: bool = false,
+    /// Where the in-flight clipboard read is going to land. A paste issued
+    /// while the scrollback search field is up belongs to the NEEDLE, not to
+    /// the child process, and the two differ in more than destination: a
+    /// needle paste is legitimate against a pane that no longer accepts input,
+    /// because searching a dead session's scrollback is ordinary work.
+    paste_target: PasteTarget = .terminal,
+    /// The last URL handed to the OS to open, and how many have been handed
+    /// over. Kept on the model rather than being fire-and-forget so the
+    /// gesture is observable — a click that opens the WRONG link, or opens one
+    /// when it should not have, is the failure mode worth being able to assert
+    /// on, and an effect alone leaves nothing to assert against.
+    opened_url_buf: [url_module.max_url_bytes]u8 = undefined,
+    opened_url_len: usize = 0,
+    opened_url_count: u32 = 0,
     /// Where the layout snapshot goes and what is owed to it. Disabled by
     /// default so every test and every fixture stays free of disk traffic
     /// until a composition root hands it a real path.
@@ -479,6 +497,21 @@ pub const Model = struct {
     /// Window 0 is the fallback for an `active_window` whose slot has since
     /// closed: a message that arrives one dispatch after its window went away
     /// must land somewhere real rather than reach through a null.
+    /// The last URL handed to the OS, or empty when none has been.
+    pub fn openedUrl(model: *const Model) []const u8 {
+        return model.opened_url_buf[0..model.opened_url_len];
+    }
+
+    /// Record a URL as handed over. False when it does not fit, in which case
+    /// nothing is recorded and nothing should be opened either.
+    pub fn recordOpenedUrl(model: *Model, value: []const u8) bool {
+        if (value.len == 0 or value.len > model.opened_url_buf.len) return false;
+        @memcpy(model.opened_url_buf[0..value.len], value);
+        model.opened_url_len = value.len;
+        model.opened_url_count += 1;
+        return true;
+    }
+
     pub fn ws(model: *Model) *Workspace {
         return model.wsAt(model.active_window) orelse &model.primary;
     }
@@ -1121,10 +1154,23 @@ pub fn initialProductionModelWithIo(gpa: std.mem.Allocator, io: std.Io, session:
 }
 
 pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopologySnapshot) !Model {
+    return restoreModelWithScrollback(gpa, io, persisted, grid.Session.max_scrollback);
+}
+
+/// Restore with an explicit scrollback ceiling, so a restored window's panes
+/// honour `scrollback-limit` too. Every restored leaf gets a fresh session
+/// built HERE, which is why the limit has to arrive as a parameter rather than
+/// being set on the provider afterwards.
+pub fn restoreModelWithScrollback(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    persisted: PersistedTopologySnapshot,
+    max_scrollback_bytes: usize,
+) !Model {
     const snapshot = try topology.migrateTopologySnapshot(persisted);
     const provider = try gpa.create(LocalProvider);
     errdefer gpa.destroy(provider);
-    provider.* = .{ .gpa = gpa, .io = io };
+    provider.* = .{ .gpa = gpa, .io = io, .max_scrollback_bytes = max_scrollback_bytes };
 
     var model: Model = .{
         .provider = provider,
@@ -1153,7 +1199,7 @@ pub fn restoreModel(gpa: std.mem.Allocator, io: std.Io, persisted: PersistedTopo
             workspace.tabs[tab_index] = decodeTab(tab);
             for (tab.nodes) |node| {
                 if (node.kind != .leaf or !node.has_terminal) continue;
-                const session = try grid.Session.create(gpa, io, 80, 24);
+                const session = try grid.Session.createWithScrollback(gpa, io, 80, 24, provider.max_scrollback_bytes);
                 errdefer session.destroy();
                 var index: usize = 0;
                 while (index < max_terminals and provider.states[index] != .vacant) : (index += 1) {}

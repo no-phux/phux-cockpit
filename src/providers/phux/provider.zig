@@ -181,8 +181,8 @@ pub const PhuxProvider = struct {
     pub fn clearSelection(self: *PhuxProvider, owner_value: provider.ReplicaOwner) !void {
         return self.host.clearSelection(owner_value);
     }
-    pub fn search(self: *PhuxProvider, owner_value: provider.ReplicaOwner, query: []const u8, case_sensitive: bool) ![]const SearchResult {
-        return self.host.search(owner_value, query, case_sensitive);
+    pub fn search(self: *PhuxProvider, owner_value: provider.ReplicaOwner, query: []const u8) ![]const SearchResult {
+        return self.host.search(owner_value, query);
     }
     pub fn clearSearchResults(self: *PhuxProvider, expected_owner: ?provider.ReplicaOwner) void {
         self.host.clearSearchResults(expected_owner);

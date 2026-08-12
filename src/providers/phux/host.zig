@@ -404,13 +404,17 @@ pub const Host = struct {
         try host.capturePublishStage();
     }
 
-    pub fn search(host: *Host, owner_value: provider.ReplicaOwner, query: []const u8, case_sensitive: bool) ![]const SearchResult {
+    /// Case sensitivity is NOT a parameter. It comes from
+    /// `provider.search_case_sensitive`, the one place the app's search rule
+    /// lives, so this side cannot be asked to match by a rule the local side
+    /// is incapable of honouring.
+    pub fn search(host: *Host, owner_value: provider.ReplicaOwner, query: []const u8) ![]const SearchResult {
         const id = try host.currentCId(owner_value);
         try outboundSize(query.len);
         host.clearSearchResults(null);
         var borrowed: [*c]const c.PhuxSearchResult = null;
         var count: usize = 0;
-        try resultError(c.phux_client_search(host.client, &id, bytes(query), case_sensitive, &borrowed, &count));
+        try resultError(c.phux_client_search(host.client, &id, bytes(query), provider.search_case_sensitive, &borrowed, &count));
         if (count > max_search_results or (count != 0 and borrowed == null)) {
             _ = c.phux_client_search_results_release(host.client);
             return error.OutOfMemory;
