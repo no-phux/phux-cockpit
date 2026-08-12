@@ -68,13 +68,22 @@
         // REBASED onto upstream v0.8.4 (`c7e64b6`), and now carries four more
         // Cockpit fixes:
         //
-        // - macOS font smoothing is ENABLED for every glyph raster context.
-        //   It is off by default on a transparent backing, and all three of
-        //   the host's contexts use one, so every glyph the app has ever drawn
-        //   rendered thin. Measured at +35% fully-solid stem pixels at 13pt.
-        //   The CPU reference renderer never touches CoreText, so no reference
-        //   screenshot can catch a regression here — re-measure with
-        //   `scripts/measure-glyph-smoothing.m`.
+        // - macOS font smoothing is set explicitly for every glyph raster
+        //   context. THIS MOVES ZERO PIXELS, and the claim that used to stand
+        //   here — "off by default on a transparent backing ... +35% solid
+        //   stem pixels" — was measured wrong and is false. The two states
+        //   that actually shipped are identical to four decimal places:
+        //
+        //     e8bd84886 (calls ABSENT)  cell_grid mean_luma=45.7978 solid=4179
+        //     f3678832f (calls `true`)  cell_grid mean_luma=45.7978 solid=4179
+        //
+        //   The +35% came from comparing the pin against a LOCAL EDIT that set
+        //   the calls to `false` — a state no build was ever in. Absent
+        //   defaults to smoothing ENABLED on these contexts, so there was
+        //   nothing to turn on. Keep the calls: they pin the behaviour against
+        //   a future default change. Do not credit them with a fix.
+        //   Re-measure two REAL commits with `scripts/host-raster-compare.sh`,
+        //   never a hand-edited counterfactual. See phux-cockpit-aht.
         // - `web_panes` takes a `ChromeContext`, like `build_window`. Panes
         //   are reconciled PER WINDOW, so a signature that could not say which
         //   window it was being asked about made every OTHER window's rebuild
