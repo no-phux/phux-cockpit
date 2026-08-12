@@ -273,6 +273,94 @@ zig build run
 zig build test -Dplatform=null --summary all
 ```
 
+### Reading the result of `zig build test`
+
+Two things have to be true for a test run to mean anything: it has to have
+passed, and it has to have compiled the code you changed. `zig build test`
+now answers both, in that order.
+
+**Did it pass?** The exit code, and only the exit code.
+
+```sh
+zig build test > /tmp/t.log 2>&1; echo "exit=$?"
+```
+
+Do not judge from a log line. A green run used to end with
+
+```
+failed command: ./.zig-cache/o/<hash>/test --cache-dir=./.zig-cache ... --listen=-
+```
+
+which read as a failure and was not one. That line came from tests calling
+`std.debug.print` on the happy path: Zig 0.16's build runner prints a
+step-failure report — including `failed command:` — for any step whose captured
+stderr is non-empty, whether or not the step failed. Those prints are now behind
+`-Dmeasure=true` (see `src/tests/measured.zig`), so a passing run is quiet.
+
+**What did it compile?** The last thing the run prints is a verdict:
+
+```
+------------------------------------------------------------------
+zig build test: PASS
+  phux provider: COMPILED AND TESTED (transport, host, provider, pointer)
+    ffi include: /Users/you/workspace/phux/crates/phux-client-ffi/include
+    ffi lib:     /Users/you/workspace/phux/target/ffi-release
+    found via:   ../phux sibling checkout
+  app graph:     local terminal provider (-Dphux-enabled defaults to false)
+------------------------------------------------------------------
+```
+
+The verdict is a build step that depends on every test step, so it prints only
+when all of them succeeded. **No verdict means the run was not green.**
+
+The named modules are the ones rooted as test artifacts. `extension.zig` is
+compiled but not rooted: its tests have never run anywhere, and rooting them
+hangs the build. See phux-cockpit-iwf and the comment on
+`phux_test_module_names` in `build.zig`.
+
+`src/providers/phux/` needs the phux client FFI, so `zig build test` looks for
+`phux/client.h` and `libphux_client_ffi.a` in four places, in order:
+
+1. `-Dphux-client-ffi-include-dir` / `-Dphux-client-ffi-lib-dir`
+2. `$PHUX_CLIENT_FFI_INCLUDE_DIR` / `$PHUX_CLIENT_FFI_LIB_DIR`
+3. `./.phux/crates/phux-client-ffi/include` and `./.phux/target/ffi-release`
+4. `../phux/crates/phux-client-ffi/include` and `../phux/target/ffi-release`
+
+If it finds them, the provider is compiled and its tests run — regardless of
+`-Dphux-enabled`. If it does not, everything else still runs and passes, and the
+verdict says `PASS, INCOMPLETE` and names what was left out. Without that line, a
+signature change to `PhuxProvider.search` or `Host.search` passes a local run
+without ever being compiled.
+
+Being in the build graph is not the same as being compiled: Zig analyzes only
+what is referenced, and nothing in Cockpit calls `PhuxProvider.search`. Each
+rooted module therefore ends with
+
+```zig
+test "every declaration in this module is compiled, not merely reachable" {
+    @import("phux_ref").refAllDeclsRecursive(@This());
+}
+```
+
+which is what makes the verdict's "COMPILED" claim true.
+
+To build the FFI for a sibling checkout:
+
+```sh
+cargo build --locked --profile ffi-release -p phux-client-ffi \
+  --manifest-path ../phux/Cargo.toml
+```
+
+`-Dphux-enabled=true` is a separate question: it swaps the **app** graph from the
+local terminal provider to the phux provider. It requires the FFI and now fails
+loudly rather than building a local-terminal app under a phux flag:
+
+```sh
+zig build test -Dphux-enabled=true \
+  -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
+  -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release"
+```
+
 Tabs start at the top by default. Set `PHUX_COCKPIT_TABS=side` (or `sidebar`)
 to start with the side rail; the in-app placement control switches the current
 workspace without restarting or resizing through intermediate states.

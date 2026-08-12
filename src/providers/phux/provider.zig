@@ -333,3 +333,10 @@ test "provider stop freezes every published canvas without dropping refs" {
         try std.testing.expect(!presentation_value.grid.running);
     }
 }
+
+test "every declaration in this module is compiled, not merely reachable" {
+    // Zig analyzes only what is referenced, so a module can sit in the build
+    // graph with its signatures never checked. Nothing calls PhuxProvider.search.
+    // See ref.zig.
+    @import("phux_ref").refAllDeclsRecursive(@This());
+}

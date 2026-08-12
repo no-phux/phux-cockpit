@@ -4,6 +4,7 @@ const native_sdk = @import("native_sdk");
 const app = @import("../main.zig");
 const grid = @import("../terminal/grid.zig");
 const support = @import("support.zig");
+const measured = @import("measured.zig");
 
 const canvas = native_sdk.canvas;
 const testing = std.testing;
@@ -41,7 +42,7 @@ test "MEASURED: the Msg union stays small enough to pass by value" {
     // 320 bytes, measured before and after the batched-resize work — which is
     // the point: the convergence fix cost the union nothing, because the batch
     // lives in the commit path rather than in the message.
-    std.debug.print("\nMEASURED Msg: size={d} align={d}\n", .{ @sizeOf(app.Msg), @alignOf(app.Msg) });
+    measured.print("\nMEASURED Msg: size={d} align={d}\n", .{ @sizeOf(app.Msg), @alignOf(app.Msg) });
     try testing.expectEqual(@as(usize, 320), @sizeOf(app.Msg));
 }
 
