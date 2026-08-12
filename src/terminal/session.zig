@@ -412,12 +412,19 @@ pub const Session = struct {
         // bead named, and this deliberately does NOT go through
         // `RenderState.updateHighlightsFlattened`: that channel takes
         // `highlight.Flattened` values, and the pinned libghostty-vt cannot
-        // build one — `highlight.Flattened.init` returns a struct literal with
-        // an `end_x` field the type does not have, so the call fails to
-        // compile. The search path only reaches that channel because the
-        // SEARCH engine hands out already-built highlights. A hover span has
-        // no such source, and inventing one to satisfy a channel we then read
-        // back out in the same function would be ceremony, not safety.
+        // build one. MEASURED, by calling it from a throwaway test:
+        //
+        //   highlight.zig:151:14: error: no field named 'serial' in struct
+        //   'terminal.PageList.PageIterator.Chunk'
+        //
+        // `Flattened.init` stamps `.serial = chunk.node.serial` onto a chunk
+        // type that has no such field, and the same literal goes on to name an
+        // `end_x` field where the struct declares `bot_x`. The function is
+        // simply never instantiated upstream, so neither error has surfaced.
+        // The search path reaches that channel only because the SEARCH engine
+        // hands out highlights it built itself. A hover span has no such
+        // source, and inventing one to satisfy a channel we then read back out
+        // in the same function would be ceremony, not safety.
         const hover = session.hoverLink();
         // Split by SOURCE because the two are found differently. A text link
         // is a column range on one row — the run that was matched. An OSC 8
