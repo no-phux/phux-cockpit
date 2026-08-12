@@ -43,8 +43,9 @@ by `scripts/automate-smoke.sh`), where the AppKit host decodes the packet
 and rasterizes each command with CoreText into a `CGBitmapContext`
 (`platform/macos/appkit_host.m:5256` for the cached raster, `:5473` for the
 direct full-surface draw, `:4569` for the composite scratch). All three set
-`CGContextSetShouldSmoothFonts` — the fix for `phux-cockpit-aht`, whose comment
-at `appkit_host.m:4573-4581` says the same thing this document says.
+`CGContextSetShouldSmoothFonts`, added for `phux-cockpit-aht`. That call does
+NOT fix anything: see "The smoothing calls are a no-op" below, where the two
+shipping SDK commits are measured against each other and come out identical.
 
 So: two renderers, two glyph rasterizers, and the screenshot only ever shows
 the one that is not on screen.
@@ -66,6 +67,47 @@ taken twice per run one second apart and matched within each run, so the
 comparison is not measuring capture jitter. Same numbers on the same basis
 (`scripts/measure-png-ink.m`, whole image): `mean_luma=21.6076 solid=132410
 lit=177883` for both.
+
+That result stands. It proves the screenshot is blind to the rasterizer. It
+does NOT prove the smoothing change fixed anything, and the next section is
+why.
+
+### The smoothing calls are a no-op
+
+`CGContextSetShouldSmoothFonts(ctx, false)` really does thin the glyphs, and the
+harness really does see it. But no build was ever in that state. The state
+before the fix was the calls being ABSENT, and absent is not false — on this
+`CGBitmapContext` the default is smoothing ENABLED.
+
+Three measurements, one harness, one basis, `scripts/host-raster-check.sh`:
+
+| SDK | smoothing calls | mean_luma | solid | lit |
+|---|---|---|---|---|
+| `e8bd84886` (0.7.1 and 0.8.0 shipped this) | absent | 45.7978 | 4179 | 5103 |
+| `f3678832f` (the current pin) | set `true` | 45.7978 | 4179 | 5103 |
+| `f3678832f`, locally edited | set `false` | 37.1124 | 3081 | 4272 |
+
+Reproduce the first two rows with
+
+```
+./scripts/host-raster-compare.sh e8bd84886
+```
+
+The two shipping commits are identical to four decimal places on every
+statistic. The +35%/-26.3% that justified the fix was measured against the
+third row: a state that exists only in a local edit made to demonstrate the
+knob. **Cockpit's glyph weight has not changed since 0.7.1.** Any report that
+the text still looks the same after the fix is correct, and is not a second
+defect.
+
+The comment in `build.zig.zon` claiming macOS font smoothing "is off by default
+on a transparent backing" is false as measured here; the row above is the
+refutation.
+
+This is the general trap, and it is what `scripts/host-raster-compare.sh`
+exists to close: a control you constructed tells you the knob is wired up. It
+cannot tell you the knob was ever in the other position. Compare two commits
+that shipped.
 
 Meanwhile the same defect, measured through the host's own rasterizer, is
 large — see section 3.
