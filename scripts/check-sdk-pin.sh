@@ -11,28 +11,30 @@ ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ZON="${ROOT}/build.zig.zon"
 README="${ROOT}/README.md"
 
-# Read one dependency's archive URL out of the .zon. The .zon is not JSON and
-# has no offline parser here, so scope the search to the block that opens with
-# `.<name> = .{` and read the first `.url` inside it.
-dependency_url() {
-    local name="$1"
-    awk -v name="${name}" '
-        $0 ~ "\\." name " = \\.\\{" { inside = 1; next }
-        inside && /\.url = "/ {
-            match($0, /"[^"]+"/)
-            print substr($0, RSTART + 1, RLENGTH - 2)
-            exit
-        }
-        inside && /^[[:space:]]*\},[[:space:]]*$/ { inside = 0 }
-    ' "${ZON}"
-}
+# shellcheck source=scripts/lib/zon.sh
+source "${ROOT}/scripts/lib/zon.sh"
 
 status=0
 
 check_pin() {
-    local name="$1" url slug sha
-    url="$(dependency_url "${name}")"
-    if [[ -z "${url}" ]]; then
+    local name="$1" url read_status slug sha
+    # `set -e` would kill the script at this assignment on a non-zero read,
+    # before the refusal below could name what went wrong — a silent exit 3.
+    # Capture the status instead of inheriting it.
+    read_status=0
+    url="$(zon_dependency_url "${ZON}" "${name}")" || read_status=$?
+    # A .path override is a REFUSAL, not a miss. This check used to read the
+    # override's block as never-closing and answer with the NEXT dependency's
+    # url — ghostty's — which passes the sha-pinned-archive test below, so the
+    # drift gate printed "Pinned native_sdk is ghostty-org/ghostty@..." and
+    # exited 0. See scripts/lib/zon.sh and phux-cockpit-yo5.
+    if [[ "${read_status}" -eq 3 ]]; then
+        printf 'error: .%s is a local override (.path), so there is no pin to check.\n' "${name}" >&2
+        printf 'That is fine while developing, but CI must run against a published pin.\n' >&2
+        status=1
+        return
+    fi
+    if [[ "${read_status}" -ne 0 || -z "${url}" ]]; then
         printf 'error: build.zig.zon has no .%s dependency with a .url\n' "${name}" >&2
         status=1
         return

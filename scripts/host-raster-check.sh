@@ -33,6 +33,8 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/zon.sh
+source "${ROOT}/scripts/lib/zon.sh"
 PIN_CACHE="${PHUX_COCKPIT_SDK_CACHE:-${ROOT}/.zig-cache/pinned-sdk}"
 ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -54,8 +56,15 @@ if [[ -z "$SDK_SRC" ]]; then
         printf '       run ./scripts/build-automation-cli.sh first, or set PHUX_COCKPIT_SDK_SRC\n' >&2
         exit 1
     fi
-    url="$(awk '/\.native_sdk = \.\{/ { found = 1 } found && /\.url = / { print; exit }' "${ROOT}/build.zig.zon" \
-        | sed -E 's/.*"(.*)".*/\1/')"
+    # Block-scoped read: the old one-liner answered a local `.path` override
+    # with GHOSTTY's url, so this pin check compared against ghostty's sha.
+    # See scripts/lib/zon.sh and phux-cockpit-yo5.
+    read_status=0
+    url="$(zon_dependency_url "${ROOT}/build.zig.zon" native_sdk)" || read_status=$?
+    if [[ "${read_status}" -ne 0 ]]; then
+        printf 'error: .native_sdk has no published pin to check against (local override?).\n' >&2
+        exit 1
+    fi
     sha="$(printf '%s' "${url}" | sed -E 's#.*/archive/([0-9a-f]+)\.tar\.gz$#\1#')"
     have="$(git -C "$PIN_CACHE" rev-parse HEAD)"
     if [[ "$have" != "$sha" ]]; then

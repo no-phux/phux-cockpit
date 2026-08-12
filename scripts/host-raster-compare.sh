@@ -48,8 +48,19 @@ if [[ ! -d "${PIN_CACHE}/.git" ]]; then
     exit 1
 fi
 
-pinned_sha="$(awk '/\.native_sdk = \.\{/ { found = 1 } found && /\.url = / { print; exit }' "${ROOT}/build.zig.zon" \
-    | sed -E 's#.*/archive/([0-9a-f]+)\.tar\.gz.*#\1#')"
+# shellcheck source=scripts/lib/zon.sh
+source "${ROOT}/scripts/lib/zon.sh"
+# Block-scoped read: the old one-liner answered a local `.path` override with
+# GHOSTTY's url, which would have made this compare two ghostty commits while
+# reporting them as SDK pins. See phux-cockpit-yo5.
+read_status=0
+pinned_url="$(zon_dependency_url "${ROOT}/build.zig.zon" native_sdk)" || read_status=$?
+if [[ "${read_status}" -ne 0 ]]; then
+    printf 'error: .native_sdk has no published pin to compare against (local override?).\n' >&2
+    printf 'Pass both commits explicitly, or restore a published pin.\n' >&2
+    exit 1
+fi
+pinned_sha="$(printf '%s' "${pinned_url}" | sed -E 's#.*/archive/([0-9a-f]+)\.tar\.gz.*#\1#')"
 
 BEFORE="$1"
 AFTER="${2:-$pinned_sha}"
