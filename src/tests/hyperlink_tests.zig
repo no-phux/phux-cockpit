@@ -11,15 +11,22 @@
 
 const std = @import("std");
 const native_sdk = @import("native_sdk");
+const app = @import("../main.zig");
 const grid = @import("../terminal/grid.zig");
 const url = @import("../terminal/url.zig");
 const support = @import("support.zig");
+const pointer_support = @import("pointer_support.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 const testing = std.testing;
 
 const createSession = support.createSession;
+const destroyModelSessions = app.deinitModel;
+const startPointerHost = pointer_support.startPointerHost;
+const pointerInput = pointer_support.pointerInput;
+const terminalCellPoint = pointer_support.terminalCellPoint;
+const terminalInteractionFrame = support.terminalInteractionFrame;
 
 /// OSC 8, no id parameter: `open ++ href ++ st` starts a hyperlink and
 /// `close_link` ends it. Split into pieces rather than wrapped in a helper so
@@ -304,4 +311,131 @@ test "the underline follows its text when output scrolls under the pointer" {
     // row 0, so nothing is underlined anywhere.
     try expectUnderlinedRange(moved, 0, 0, 0, 14);
     try expectUnderlinedRange(moved, 1, 0, 0, 14);
+}
+
+// ------------------------------------------------------- through the app
+//
+// The three tests below drive the real pointer path. Everything above proves
+// the session answers correctly; these prove the app ASKS — the hover chord
+// and the click both run through `handleTerminalPointer`, and a session that
+// resolves links perfectly is worth nothing if nothing arms it.
+
+/// Repaint the main window's canvas from the model, the way the runtime does,
+/// and hand back the focused pane's lattice.
+fn paintHostGrid(host: *app.CockpitHost, builder: *canvas.Builder) !support.CellGridView {
+    try app.buildChromeWindow(&host.inner.model, builder, support.mainChromeContext());
+    return support.expectCellGrid(builder.displayList());
+}
+
+test "cmd+click follows an OSC 8 href, not the words it is wrapped around" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const app_iface = host.app();
+    const model = &host.inner.model;
+    const pane = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+
+    try host.inner.effects.feedPtyOutput(
+        pane.pty_key,
+        open_link ++ "https://example.com/docs" ++ st ++ "read the docs" ++ close_link ++ "\r\n",
+    );
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    const frame = terminalInteractionFrame(harness, "read the docs") orelse
+        return error.TestExpectedTerminalInteractionSurface;
+
+    // ABSENT: nothing has been opened yet, so the count below is not carrying
+    // over from the fixture.
+    try testing.expectEqual(@as(u32, 0), model.opened_url_count);
+
+    // "read the docs" is ordinary prose — the heuristic finds nothing here, so
+    // the only way this opens anything at all is the explicit channel.
+    const on_link = terminalCellPoint(pane, frame, 4, 0);
+    try pointerInput(harness, app_iface, .pointer_down, on_link, 0, .{ .command = true }, 0);
+    try testing.expectEqual(@as(u32, 1), model.opened_url_count);
+    try testing.expectEqualStrings("https://example.com/docs", model.openedUrl());
+}
+
+test "the link chord arms the hover underline, and a bare pointer does not" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const app_iface = host.app();
+    const model = &host.inner.model;
+    const pane = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "see https://example.com/docs now\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    const frame = terminalInteractionFrame(harness, "https://example.com/docs") orelse
+        return error.TestExpectedTerminalInteractionSurface;
+    const on_link = terminalCellPoint(pane, frame, 10, 0);
+
+    // ABSENT: the pointer is over the link, with no modifier held. Hovering a
+    // URL must not underline it on its own — the underline advertises a chord,
+    // and one that is not being held promises a click that would only select.
+    try pointerInput(harness, app_iface, .pointer_move, on_link, 0, .{}, 0);
+    var bare_commands: [native_sdk.runtime.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+    var bare_builder = canvas.Builder.init(&bare_commands);
+    const bare = try paintHostGrid(host, &bare_builder);
+    try expectUnderlinedRange(bare, 0, 0, 0, 32);
+
+    // ACT: same point, chord held.
+    try pointerInput(harness, app_iface, .pointer_move, on_link, 0, .{ .command = true }, 0);
+    var armed_commands: [native_sdk.runtime.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+    var armed_builder = canvas.Builder.init(&armed_commands);
+    const armed = try paintHostGrid(host, &armed_builder);
+    try expectUnderlinedRange(armed, 0, 4, 4 + "https://example.com/docs".len, 32);
+
+    // ...and letting the chord go takes it away again.
+    try pointerInput(harness, app_iface, .pointer_move, on_link, 0, .{}, 0);
+    var released_commands: [native_sdk.runtime.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+    var released_builder = canvas.Builder.init(&released_commands);
+    const released = try paintHostGrid(host, &released_builder);
+    try expectUnderlinedRange(released, 0, 0, 0, 32);
+}
+
+test "window blur takes the hover underline with it" {
+    // The chord is a HELD key, and a blur is exactly how it stops being held
+    // without this app ever seeing the release.
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const app_iface = host.app();
+    const model = &host.inner.model;
+    const pane = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+
+    try host.inner.effects.feedPtyOutput(pane.pty_key, "see https://example.com/docs now\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    const frame = terminalInteractionFrame(harness, "https://example.com/docs") orelse
+        return error.TestExpectedTerminalInteractionSurface;
+    const on_link = terminalCellPoint(pane, frame, 10, 0);
+    try pointerInput(harness, app_iface, .pointer_move, on_link, 0, .{ .command = true }, 0);
+
+    var armed_commands: [native_sdk.runtime.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+    var armed_builder = canvas.Builder.init(&armed_commands);
+    const armed = try paintHostGrid(host, &armed_builder);
+    try expectUnderlinedRange(armed, 0, 4, 4 + "https://example.com/docs".len, 32);
+
+    app.update(&host.inner.model, .{ .focus_changed = false }, &host.inner.effects);
+    var blurred_commands: [native_sdk.runtime.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+    var blurred_builder = canvas.Builder.init(&blurred_commands);
+    const blurred = try paintHostGrid(host, &blurred_builder);
+    try expectUnderlinedRange(blurred, 0, 0, 0, 32);
 }
