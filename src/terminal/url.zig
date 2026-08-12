@@ -7,7 +7,11 @@
 //! output to the OS as something to open.
 //!
 //! OSC 8 hyperlinks are a separate, EXPLICIT channel the engine already parses;
-//! where one exists it should win over anything found here.
+//! where one exists it should win over anything found here. An explicit target
+//! arrives as bytes a program CHOSE rather than bytes a human recognised, so it
+//! carries none of the shape guarantees the heuristic gets for free — see
+//! `isAllowedTarget`, which is where an OSC 8 href has to earn the same trust
+//! this module's own output has by construction.
 
 const std = @import("std");
 
@@ -22,6 +26,36 @@ const schemes = [_][]const u8{ "https://", "http://", "mailto:" };
 /// The longest run this will call a URL. Long enough for any real link,
 /// short enough that a screenful of base64 cannot become one.
 pub const max_url_bytes: usize = 2048;
+
+/// Whether an EXPLICITLY supplied target — an OSC 8 href — may be handed on
+/// as something to open.
+///
+/// The heuristic above cannot produce a bad scheme: it only ever returns bytes
+/// it matched a scheme in, from text a human can read on screen. An OSC 8 href
+/// has neither property. The program picks it, it never has to appear on the
+/// glass, and nothing about the DISPLAY text constrains it — so `file://`,
+/// `javascript:`, a NUL splice, or a megabyte of base64 all arrive here as
+/// ordinary parser output. Every one of them is refused WHOLE (nothing is
+/// trimmed, escaped, or coerced into a valid URL), because a target that has
+/// to be repaired is a target nobody vetted.
+///
+/// Deliberately the same shape as the SDK's `validation.validateOpenUrl`,
+/// which is the SECOND gate every opened URL still passes. Two gates, not one,
+/// and this is the one that runs while the app still knows the bytes came out
+/// of a terminal.
+pub fn isAllowedTarget(target: []const u8) bool {
+    if (target.len == 0 or target.len > max_url_bytes) return false;
+    // Control bytes, whitespace, and DEL: a NUL truncates the URL at the C
+    // boundary the platform crosses, and the rest never appear in a
+    // well-formed URL. Refusing the class means `https://ok\x00javascript:...`
+    // cannot survive as its harmless-looking prefix.
+    for (target) |byte| {
+        if (byte <= 0x20 or byte == 0x7f) return false;
+    }
+    const scheme = matchScheme(target) orelse return false;
+    // A bare scheme names no target.
+    return target.len > scheme.len;
+}
 
 pub const Span = struct {
     start: usize,
@@ -136,6 +170,23 @@ fn matchScheme(rest: []const u8) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(rest[0..scheme.len], scheme)) return scheme;
     }
     return null;
+}
+
+/// Display COLUMN of byte offset `offset` in `row` — the inverse of
+/// `byteOffsetForColumn`, and carrying exactly the same wide-scalar caveat.
+///
+/// This is what turns a found span back into the cells to underline, so the
+/// underline marks the same characters the click resolves. An offset past the
+/// row's end reports the column one past its last scalar, which is the honest
+/// answer for an exclusive end.
+pub fn columnForByteOffset(row: []const u8, offset: usize) usize {
+    var cursor: usize = 0;
+    var column: usize = 0;
+    while (cursor < row.len and cursor < offset) : (column += 1) {
+        const length = std.unicode.utf8ByteSequenceLength(row[cursor]) catch 1;
+        cursor += @min(length, row.len - cursor);
+    }
+    return column;
 }
 
 /// Byte offset of display COLUMN `column` in `row`.

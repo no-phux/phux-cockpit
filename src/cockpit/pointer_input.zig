@@ -220,6 +220,43 @@ fn validPointerGeometry(event: TerminalPointerEvent) bool {
         event.frame.width > 0 and event.frame.height > 0;
 }
 
+/// Arm the hover underline on the pane under the pointer, and disarm every
+/// other one.
+///
+/// The chord is the SAME one that opens a link (Cmd, without Shift), which is
+/// the whole point of the affordance: what underlines is what a click would
+/// follow, so the gesture is discoverable by holding the key rather than by
+/// already knowing it exists. Shift is excluded because it is the
+/// override-the-TUI selection modifier — a Shift-drag is selecting text, not
+/// aiming at a link.
+///
+/// Every OTHER pane is disarmed here because there is no pointer-exit event to
+/// hang that on: a pointer that leaves a terminal produces no further events
+/// for the terminal it left, so the pane holding an underline is cleared by
+/// whichever pane the pointer arrives at next. A pointer that leaves the panes
+/// entirely (chrome, another window) is covered by the press and blur paths.
+fn updateHoverLink(model: *Model, pane: *Pane, event: TerminalPointerEvent) void {
+    const armed = event.modifiers.super and !event.modifiers.shift;
+    const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
+    for (0..model.provider.states.len) |index| {
+        if (model.provider.states[index] != .active) continue;
+        const other = model.provider.slot(index);
+        if (other == pane) continue;
+        _ = other.session.setHoverPoint(null);
+    }
+    _ = pane.session.setHoverPoint(if (armed) .{ .x = local.x, .y = local.y } else null);
+}
+
+/// Disarm every pane's hover underline. For the paths where the pointer stops
+/// being over a link without another pane hearing about it: a press that
+/// consumed the hover, and window blur.
+pub fn clearHoverLinks(model: *Model) void {
+    for (0..model.provider.states.len) |index| {
+        if (model.provider.states[index] != .active) continue;
+        _ = model.provider.slot(index).session.setHoverPoint(null);
+    }
+}
+
 pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) void {
     switch (event.phase) {
         .down => {
@@ -253,9 +290,15 @@ pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent
             if (event.button == 0 and event.modifiers.super and !event.modifiers.shift) {
                 if (pane.session.urlAtPoint(local.x, local.y)) |link| {
                     if (model.recordOpenedUrl(link)) fx.openUrl(model.openedUrl());
+                    // The link is being followed, so the affordance that
+                    // advertised it has done its job. Leaving it armed would
+                    // underline a link under a pointer that is no longer
+                    // hovering it — the press is the end of the hover.
+                    clearHoverLinks(model);
                     return;
                 }
             }
+            clearHoverLinks(model);
 
             const slot = freePointerCaptureIndex(model) orelse return;
             // An ended child cannot own pointer input. Its last mode flags may
@@ -356,7 +399,12 @@ pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent
             }
             const pane = model.provider.terminal(localRef(event.terminal_id)) orelse return;
             if (pane.session_generation != event.generation or !terminalVisible(model, pane.id) or
-                !pane.acceptsInput() or !validPointerGeometry(event)) return;
+                !validPointerGeometry(event)) return;
+            // Before the `acceptsInput` gate: an ended session still shows the
+            // URLs its child printed, and Cmd+click still opens them, so the
+            // affordance that advertises the gesture has to survive the child.
+            updateHoverLink(model, pane, event);
+            if (!pane.acceptsInput()) return;
             syncMouseProtocol(pane);
             if (pane.session.term.flags.mouse_event == .none or event.modifiers.shift) return;
             const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
@@ -404,7 +452,9 @@ pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent
         .hover => {
             const pane = model.provider.terminal(localRef(event.terminal_id)) orelse return;
             if (pane.session_generation != event.generation or !terminalVisible(model, pane.id) or
-                !pane.acceptsInput() or !validPointerGeometry(event)) return;
+                !validPointerGeometry(event)) return;
+            updateHoverLink(model, pane, event);
+            if (!pane.acceptsInput()) return;
             syncMouseProtocol(pane);
             if (pane.session.term.flags.mouse_event != .any or event.modifiers.shift) return;
             const local = geometry.PointF.init(event.point.x - event.frame.x, event.point.y - event.frame.y);
