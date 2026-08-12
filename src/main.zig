@@ -162,6 +162,7 @@ pub const chrome_command_envelope = projection.chrome_command_envelope;
 pub const cockpitTokens = projection.cockpitTokens;
 pub const terminalTokens = projection.terminalTokens;
 pub const terminalTokensFrom = projection.terminalTokensFrom;
+pub const terminalCellMetricsFor = projection.terminalCellMetricsFor;
 pub const windowPadding = projection.windowPadding;
 pub const chromeRevealed = projection.chromeRevealed;
 pub const workspaceChrome = projection.workspaceChrome;
@@ -248,7 +249,7 @@ pub const onTimer = view_module.onTimer;
 pub const CockpitHost = host.CockpitHost;
 
 pub const selection_autoscroll_timer_id = app_types.selection_autoscroll_timer_id;
-const terminal_font_id = scene.terminal_font_id;
+pub const terminal_font_id = scene.terminal_font_id;
 const terminal_bold_font_id = scene.terminal_bold_font_id;
 const terminal_italic_font_id = scene.terminal_italic_font_id;
 const terminal_bold_italic_font_id = scene.terminal_bold_italic_font_id;

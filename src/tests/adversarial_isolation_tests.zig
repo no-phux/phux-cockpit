@@ -835,7 +835,7 @@ test "ADVERSARIAL: a wheel over native tab chrome reaches neither terminal" {
     const bottom1 = model.provider.slots[1].session.scrollbar().offset;
     try testing.expect(bottom0 > 0 and bottom1 > 0);
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(0)));
-    const cell_h = model.provider.slots[0].session.cell_height;
+    const cell_h = model.provider.slots[0].session.measuredCell().?.height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,
@@ -900,7 +900,7 @@ test "ADVERSARIAL: split wheel routing scrolls only the pane under the pointer" 
             .kind = .scroll,
             .x = resolved[1].rect.x + resolved[1].rect.width / 2,
             .y = resolved[1].rect.y + resolved[1].rect.height / 2,
-            .delta_y = right.session.cell_height,
+            .delta_y = right.session.measuredCell().?.height,
         } });
     }
     try testing.expectEqual(bottom0, left.session.scrollbar().offset);
@@ -941,7 +941,7 @@ test "REGRESSION: the selected Terminal 2 frame receives wheel input before the 
     // Aim squarely at the selected Terminal 2 surface.
     try testing.expect(model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
     const target = app.paneFrames(model, model.ws().surface_size)[0];
-    const cell_h = model.provider.slots[1].session.cell_height;
+    const cell_h = model.provider.slots[1].session.measuredCell().?.height;
     for (0..6) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
             .window_id = 1,

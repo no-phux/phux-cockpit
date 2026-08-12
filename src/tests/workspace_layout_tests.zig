@@ -145,8 +145,8 @@ test "the painter, the hit targets, and the PTY pump agree on one set of rects" 
     for (panes[0..count]) |pane| {
         const terminal = app_state.model.provider.terminal(pane.terminal) orelse return error.TestExpectedTerminal;
         const expected = grid.Session.clampGrid(
-            @intFromFloat(@max(2, pane.rect.width / terminal.session.cell_width)),
-            @intFromFloat(@max(2, pane.rect.height / terminal.session.cell_height)),
+            @intFromFloat(@max(2, pane.rect.width / terminal.session.measuredCell().?.width)),
+            @intFromFloat(@max(2, pane.rect.height / terminal.session.measuredCell().?.height)),
         );
         try testing.expectEqual(expected.x, terminal.cols);
         try testing.expectEqual(expected.y, terminal.rows);

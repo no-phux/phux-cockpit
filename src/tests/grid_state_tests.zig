@@ -433,13 +433,13 @@ test "wheel scrolling over the grid scrolls history" {
         // terminal there is no band at all, so the old y=30 would now land
         // in the grid itself.
         .y = 4,
-        .delta_y = app_state.model.provider.slots[0].session.cell_height * 4,
+        .delta_y = app_state.model.provider.slots[0].session.measuredCell().?.height * 4,
     } });
     try testing.expectEqual(bottom_offset, app_state.model.provider.slots[0].session.scrollbar().offset);
 
     // A trackpad swipe (several fractional deltas accumulating past one
     // cell) scrolls into history, like every terminal.
-    const cell_h = app_state.model.provider.slots[0].session.cell_height;
+    const cell_h = app_state.model.provider.slots[0].session.measuredCell().?.height;
     const frame = app.paneFrames(&app_state.model, app_state.model.ws().surface_size)[0];
     for (0..4) |_| {
         try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{

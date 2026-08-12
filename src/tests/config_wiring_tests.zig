@@ -48,6 +48,144 @@ test "font-size drives the terminal cell box and leaves the chrome alone" {
     try testing.expectEqual(small.font_size, canvas.terminalCellMetrics(app.cockpitTokens(&state.model)).font_size);
 }
 
+// Every test below uses `font-size = 26`, never the default 13, and that is
+// load-bearing rather than arbitrary. The bug they guard was a pair of
+// hardcoded metric defaults, `cell_width = 8` and `cell_height = 18`. The SDK
+// derives an unmeasured cell as `round(font_size * 0.6)` by
+// `round(font_size * 1.4)`, and at font-size 13 that is round(7.8) = 8 by
+// round(18.2) = 18 — the wrong values and the right ones are the same
+// numbers. A test written at the default font cannot fail no matter how
+// broken the metrics path is, which is precisely why this survived to ship.
+// At 26 the mono cell is 15.6 x 36 and the two states are far apart.
+const metric_test_font_size: f32 = 26;
+
+test "a pane proposes no viewport until its cell box has been measured" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(1301, 807);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    state.model.config = app.parseConfig("font-size = 26");
+    // A brand new pane, exactly as a split or a cmd+T mints one: it has a
+    // grid, and nothing has ever painted it.
+    app.update(&state.model, .split_right, &state.effects);
+
+    // BEFORE any paint the proposer must say "I do not know yet" about the new
+    // pane. This is the assertion the old code could not make: the guard it
+    // stood on read `cell_width <= 0`, and 8 is not <= 0, so the proposer
+    // sized every fresh pane against a cell it had invented and the shell took
+    // a SIGWINCH for a width it was about to be told to abandon.
+    //
+    // One proposal, not zero: the pane that startCockpit already painted keeps
+    // its own, which is the established contract (`ProposedViewports` stops at
+    // the first unmeasured pane and reports what it had). What must not happen
+    // is a proposal for the pane nobody has measured.
+    const before = app.proposedViewportsIn(&state.model, &state.model.primary, size);
+    try testing.expect(before.incomplete);
+    try testing.expectEqual(@as(usize, 1), before.count);
+
+    // AFTER a paint the proposal exists, and it is derived from the real
+    // 26-point cell rather than from 8 x 18.
+    try support.pumpPaint(harness, state.app(), app.canvas_label, size);
+    const after = app.proposedViewportsIn(&state.model, &state.model.primary, size);
+    try testing.expect(!after.incomplete);
+    try testing.expectEqual(@as(usize, 2), after.count);
+
+    var panes: [app.max_panes_per_tab]app.LayoutPane = undefined;
+    const count = app.resolvePanes(&state.model, size, &panes);
+    try testing.expectEqual(@as(usize, 2), count);
+    for (after.slice(), panes[0..count]) |proposal, pane| {
+        const terminal = state.model.provider.terminal(proposal.terminal) orelse
+            return error.TestExpectedTerminal;
+        const cell = terminal.session.measuredCell() orelse return error.TestExpectedMeasuredCell;
+        // The cell really is the 26-point mono box, not the stale default.
+        try testing.expectApproxEqAbs(
+            metric_test_font_size * canvas.mono_advance_em,
+            cell.width,
+            0.01,
+        );
+        try testing.expectEqual(@as(f32, 36), cell.height); // round(26 * 1.4)
+
+        const expected = grid.Session.clampGrid(
+            @intFromFloat(@max(2, pane.rect.width / cell.width)),
+            @intFromFloat(@max(2, pane.rect.height / cell.height)),
+        );
+        try testing.expectEqual(expected.x, proposal.cols);
+        try testing.expectEqual(expected.y, proposal.rows);
+
+        // And the number the OLD defaults would have produced is a genuinely
+        // different one, so the equality above is not passing by coincidence.
+        const stale = grid.Session.clampGrid(
+            @intFromFloat(@max(2, pane.rect.width / 8.0)),
+            @intFromFloat(@max(2, pane.rect.height / 18.0)),
+        );
+        try testing.expect(stale.x != proposal.cols);
+    }
+}
+
+test "a pane sized without a text-measure provider uses the mono cell, not a sans estimate" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    state.model.config = app.parseConfig("font-size = 26");
+    const tokens = app.terminalTokens(&state.model);
+    // The condition under test: these tokens were built outside the painter,
+    // so they carry no provider. Remote (phux) panes are sized from exactly
+    // this token set.
+    try testing.expect(tokens.text_measure == null);
+    try testing.expectEqual(canvas.min_registered_font_id, tokens.typography.mono_font_id);
+
+    const corrected = app.terminalCellMetricsFor(tokens);
+    try testing.expectApproxEqAbs(
+        metric_test_font_size * canvas.mono_advance_em,
+        corrected.width,
+        0.01,
+    );
+
+    // The negative control, and the measurement in the bead. Asking the SDK
+    // directly still returns the proportional estimate, because its estimator
+    // only knows `default_mono_font_id` is monospace and cockpit's face is
+    // registered at 64. Recorded so the size of the error stays visible:
+    //   26 * 0.877 em = 22.802 vs 26 * 0.6 em = 15.6, a ratio of 1.4617.
+    const uncorrected = canvas.terminalCellMetrics(tokens);
+    try testing.expect(uncorrected.width > corrected.width * 1.4);
+    try testing.expect(uncorrected.width < corrected.width * 1.5);
+}
+
+test "the registered terminal face is a 0.6 em monospace" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    // What licenses `terminalCellMetricsFor` to substitute the SDK's mono id
+    // when no provider is stamped: cockpit's own terminal face has the same
+    // 0.6 em advance that constant describes. Measured through the REAL
+    // provider, against the id the app actually registers.
+    //
+    // A font swap to a face with a different pitch must fail HERE, loudly,
+    // rather than silently re-opening the remote-pane sizing bug.
+    const provider = harness.runtime.textMeasureProvider() orelse
+        return error.TestExpectedTextMeasureProvider;
+    const measured = canvas.measureTextWidthForFont(
+        provider,
+        app.terminal_font_id,
+        "MMMMMMMMMMMMMMMM",
+        metric_test_font_size,
+    );
+    try testing.expectApproxEqAbs(
+        metric_test_font_size * canvas.mono_advance_em,
+        measured / 16,
+        0.01,
+    );
+}
+
 test "a bigger font reflows the pty to fewer columns" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);

@@ -111,6 +111,32 @@ pub const Search = struct {
     restore_bottom: bool = true,
 };
 
+/// A MEASURED terminal cell, in canvas points. Both fields are finite and
+/// strictly positive by construction: `Session.setMeasuredCell` is the only
+/// way to build one, and it refuses anything else.
+///
+/// This exists as a distinct type, reachable only through an optional, because
+/// the alternative cost real bugs. The fields used to be
+/// `cell_width: f32 = 8, cell_height: f32 = 18` directly on `Session`, and the
+/// PAINTER was their only writer — so every reader that ran before the first
+/// paint silently got "the estimate for font-size 13" while believing it had a
+/// measurement. `round(13 * 1.4) = 18` and `round(13 * 0.6) = 8` are exactly
+/// those defaults, which is why the defect was invisible at the default font
+/// and drew the prompt at three different widths at `font-size = 26`.
+///
+/// Three separate `if (cell_width <= 0 or cell_height <= 0)` guards had been
+/// written to catch precisely that, and not one of them could ever fire: 8 and
+/// 18 are both positive. Making the default `0` so the guards fire would have
+/// been worse — several sites DIVIDE by these fields, so a plausible-looking
+/// zero is a division by zero waiting for the one caller who forgets. The
+/// optional moves the check from something every future caller must remember
+/// into something the compiler will not let them skip, and the validating
+/// setter means "not null" already implies "safe to divide by".
+pub const CellBox = struct {
+    width: f32,
+    height: f32,
+};
+
 /// One live emulator session. Heap-owned by the app (the model holds a
 /// pointer): the emulator allocates internally and its state is derived
 /// entirely from journaled inputs — fed pty bytes, resizes, and
@@ -157,10 +183,10 @@ pub const Session = struct {
     /// and viewport movement while a drag is active; the model only owns
     /// which terminal/generation receives subsequent pointer phases.
     pointer_selection: vt.SelectionGesture = .init,
-    /// Cell metrics for the mono face at the terminal type size,
-    /// refreshed whenever tokens/scale reach the painter.
-    cell_width: f32 = 8,
-    cell_height: f32 = 18,
+    /// The mono face's cell box at the terminal type size, or NULL until the
+    /// painter has actually measured it. See `CellBox` for why this is an
+    /// optional rather than a pair of floats with plausible defaults.
+    measured_cell: ?CellBox = null,
     font_size: f32 = 13,
     /// Reused projection buffers for `snapshot` (see that function). The
     /// first-party painter takes a RESOLVED snapshot whose every slice
@@ -1332,17 +1358,48 @@ pub const Session = struct {
         return true;
     }
 
+    /// The cell box the painter last MEASURED for this session, or null if
+    /// nothing has painted it yet.
+    ///
+    /// Null is a real answer, not a missing one: before the first paint the
+    /// app genuinely does not know how wide a cell is, because the width is
+    /// the mono face's advance as resolved by the platform's text-measure
+    /// provider and only the painter is handed that provider. Callers must
+    /// decide what "not measured yet" means for them — the viewport proposer
+    /// declares itself incomplete and proposes nothing, the pointer paths
+    /// decline the gesture. None of them may substitute a guess.
+    pub fn measuredCell(session: *const Session) ?CellBox {
+        return session.measured_cell;
+    }
+
+    /// Record a measurement. The PAINTER is the only legitimate caller: it is
+    /// the only place holding tokens with the runtime's text-measure provider
+    /// stamped on, which is what makes `width` an advance rather than an
+    /// estimate.
+    ///
+    /// A non-finite or non-positive box is REFUSED rather than stored, which
+    /// is what lets every reader treat a non-null `measured_cell` as safe to
+    /// divide by. Refusing leaves the previous value in place: a single bad
+    /// frame should not strand a session that was already measured.
+    pub fn setMeasuredCell(session: *Session, width: f32, height: f32) void {
+        if (!std.math.isFinite(width) or !std.math.isFinite(height)) return;
+        if (width <= 0 or height <= 0) return;
+        session.measured_cell = .{ .width = width, .height = height };
+    }
+
     /// Primary-pointer selection using Ghostty's own cell/word/line gesture.
     /// Coordinates are relative to the exact retained terminal-widget frame;
     /// captured drags may extend beyond it and clamp to the nearest edge.
     pub fn pointerSelection(session: *Session, event: PointerSelectionEvent) bool {
         if (!std.math.isFinite(event.x) or !std.math.isFinite(event.y) or
             !std.math.isFinite(event.width) or !std.math.isFinite(event.height) or
-            event.width <= 0 or event.height <= 0 or
-            session.cell_width <= 0 or session.cell_height <= 0)
+            event.width <= 0 or event.height <= 0)
         {
             return false;
         }
+        // Nothing has measured this pane yet, so there is no mapping from a
+        // point to a cell. Declining is the only honest answer.
+        const cell = session.measuredCell() orelse return false;
 
         const screen = session.term.screens.active;
         switch (event.phase) {
@@ -1362,7 +1419,7 @@ pub const Session = struct {
                     .pin = pin,
                     .xpos = event.x,
                     .ypos = event.y,
-                    .max_distance = @max(1, session.cell_width),
+                    .max_distance = cell.width,
                     .repeat_interval = 0,
                     .word_boundary_codepoints = &pointer_word_boundaries,
                     .behaviors = &behaviors,
@@ -1393,6 +1450,7 @@ pub const Session = struct {
     }
 
     fn applyPointerDrag(session: *Session, event: PointerSelectionEvent) bool {
+        const cell = session.measuredCell() orelse return false;
         const pin = session.pointerPin(event) orelse return false;
         const selection = session.pointer_selection.drag(&session.term, .{
             .pin = pin,
@@ -1402,7 +1460,13 @@ pub const Session = struct {
             .word_boundary_codepoints = &pointer_word_boundaries,
             .geometry = .{
                 .columns = session.cols(),
-                .cell_width = @intFromFloat(@max(1, @round(session.cell_width))),
+                // Ghostty's geometry wants whole device columns, so this one
+                // rounds where the painter deliberately does not (see the
+                // SDK's `cellMetrics`). `@max(1, ...)` keeps the integer at
+                // least one cell wide for a sub-point cell at a tiny font;
+                // it is NOT a guard against zero, which `measuredCell` has
+                // already ruled out.
+                .cell_width = @intFromFloat(@max(1, @round(cell.width))),
                 .padding_left = 0,
                 .screen_height = @intFromFloat(@max(1, @round(event.height))),
             },
@@ -1421,11 +1485,11 @@ pub const Session = struct {
         if (!session.pointerAutoscrollActive() or
             !std.math.isFinite(event.x) or !std.math.isFinite(event.y) or
             !std.math.isFinite(event.width) or !std.math.isFinite(event.height) or
-            event.width <= 0 or event.height <= 0 or
-            session.cell_width <= 0 or session.cell_height <= 0)
+            event.width <= 0 or event.height <= 0)
         {
             return false;
         }
+        const cell = session.measuredCell() orelse return false;
         const coordinate = session.pointerViewportCoordinate(event.x, event.y) orelse return false;
         const selection = session.pointer_selection.autoscrollTick(&session.term, .{
             .viewport = coordinate,
@@ -1435,7 +1499,7 @@ pub const Session = struct {
             .word_boundary_codepoints = &pointer_word_boundaries,
             .geometry = .{
                 .columns = session.cols(),
-                .cell_width = @intFromFloat(@max(1, @round(session.cell_width))),
+                .cell_width = @intFromFloat(@max(1, @round(cell.width))),
                 .padding_left = 0,
                 .screen_height = @intFromFloat(@max(1, @round(event.height))),
             },
@@ -1450,14 +1514,24 @@ pub const Session = struct {
         return session.term.screens.active.pages.pin(.{ .viewport = coordinate });
     }
 
+    /// Point (in widget-relative canvas points) to viewport cell.
+    ///
+    /// THE divide by the cell box, and the reason `measured_cell` is an
+    /// optional: this is reached from pointer selection, autoscroll, and URL
+    /// hover, and each of those used to carry its own `cell_width <= 0` guard
+    /// to protect this division. Three copies of a check that could never fire
+    /// is three chances for a fourth caller to arrive without one. The check
+    /// now lives HERE, once, at the division it actually protects, and the
+    /// optional makes it unskippable.
     fn pointerViewportCoordinate(session: *const Session, x: f32, y: f32) ?vt.Coordinate {
+        const cell = session.measuredCell() orelse return null;
         const cols_count = session.cols();
         const rows_count = session.rows();
         if (cols_count == 0 or rows_count == 0) return null;
         const max_x: f32 = @floatFromInt(cols_count - 1);
         const max_y: f32 = @floatFromInt(rows_count - 1);
-        const cell_x = std.math.clamp(@floor(x / session.cell_width), 0, max_x);
-        const cell_y = std.math.clamp(@floor(y / session.cell_height), 0, max_y);
+        const cell_x = std.math.clamp(@floor(x / cell.width), 0, max_x);
+        const cell_y = std.math.clamp(@floor(y / cell.height), 0, max_y);
         return .{
             .x = @intFromFloat(cell_x),
             .y = @intFromFloat(cell_y),
@@ -1559,7 +1633,6 @@ pub const Session = struct {
     /// links. It fails toward "not a link", because a missed URL costs a click
     /// while a wrong one hands arbitrary program output to the OS to open.
     pub fn urlAtPoint(session: *Session, x: f32, y: f32) ?[]const u8 {
-        if (session.cell_width <= 0 or session.cell_height <= 0) return null;
         if (!std.math.isFinite(x) or !std.math.isFinite(y)) return null;
         if (x < 0 or y < 0) return null;
         const coordinate = session.pointerViewportCoordinate(x, y) orelse return null;

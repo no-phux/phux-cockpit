@@ -99,8 +99,10 @@ test "a column maps to the right byte even after multi-byte text" {
 test "the pointer resolves a URL printed by a real session" {
     const session = try support.createSession(80, 24);
     defer session.destroy();
-    session.cell_width = 10;
-    session.cell_height = 20;
+    // A 10x20 cell so the column arithmetic below is readable by hand.
+    // Through the setter, because that is the only way to record a
+    // measurement — see `grid.CellBox`.
+    session.setMeasuredCell(10, 20);
     session.feed("open https://example.com/docs now\r\n");
     session.refreshScreenText();
 

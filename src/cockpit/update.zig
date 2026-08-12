@@ -552,7 +552,13 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // own viewport.
             const state = model.remoteUi(terminal_ref) orelse return;
             if (state.selecting) return;
-            const cell_h = @max(1, canvas.terminalCellMetrics(terminalTokens(model)).height);
+            // `terminalCellMetricsFor`, not `canvas.terminalCellMetrics`:
+            // outside the painter these tokens carry no text-measure provider.
+            // Height happens to be the estimate either way (the SDK derives it
+            // as `round(font_size * 1.4)` and never measures it), but routing
+            // through the same helper as the proposer keeps one answer to
+            // "how tall is a row" rather than two that agree by luck.
+            const cell_h = @max(1, projection.terminalCellMetricsFor(terminalTokens(model)).height);
             state.wheel_accum += wheel.delta;
             const rows = @trunc(state.wheel_accum / cell_h);
             if (rows != 0) {
