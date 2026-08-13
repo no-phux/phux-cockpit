@@ -67,6 +67,16 @@ pub const PaintOptions = struct {
     /// the glass — the command envelope only prices box geometry and
     /// selection washes. Zero leaves it unbounded.
     cell_reserve: usize = 0,
+    /// The user's `minimum-contrast`. Applies to LOCAL sessions only: a
+    /// provider-projected grid arrives with its foregrounds already resolved
+    /// by whoever produced it, and second-guessing a colour this process never
+    /// chose is not a floor, it is a repaint. See `paintTerminalGrid`.
+    ///
+    /// Defaults to 1 (no floor) rather than to the config default, so the
+    /// value can only ever come from a caller that actually holds the user's
+    /// config. A default that turned the floor ON here would make every
+    /// synthetic PaintOptions in the codebase quietly apply it.
+    minimum_contrast: f32 = 1,
     /// Use `paneIdBase` for multiple grids in one retained view.
     id_base: u64 = grid_id_base,
 };
@@ -81,6 +91,13 @@ pub fn paint(session: *Session, builder: *canvas.Builder, options: PaintOptions)
     // else in the app those tokens are unavailable and the same call silently
     // degrades to an estimate — see `workspace_projection.terminalCellMetricsFor`.
     session.setMeasuredCell(metrics.width, metrics.height);
+    // Written every frame from the live config, alongside the font size, for
+    // the reason `theme.zig` spells out: a colour policy that is stamped onto
+    // the session once at spawn needs an explicit re-apply on every config
+    // change, and a re-apply is a thing to forget. Rewriting it here means
+    // `minimum-contrast` moves the moment `Model.config` does, with nothing to
+    // invalidate and no stale copy for an old value to hide in.
+    session.minimum_contrast = options.minimum_contrast;
 
     const snap = try session.snapshot(options.tokens, options.running, options.selecting);
     try paintTerminalGrid(snap, builder, options);

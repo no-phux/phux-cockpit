@@ -239,6 +239,72 @@ colour chosen wrongly upstream, a command that was never emitted, or a defect in
 compositing between commands. Reference screenshots remain the right instrument
 for those, and they are trustworthy for exactly that.
 
+### Its two headline statistics are blind to a whole defect class
+
+`solid` (luma > 127) and `lit` (luma > 32) are ABSOLUTE thresholds. They ask
+"how bright is this pixel", not "how far is this pixel from the ground it sits
+on". Dark ink on a dark ground is real ink that neither counts, so a row of
+unreadable text and a row of blank space score identically. Measured, at the
+pinned SDK, same row, same font, same scale:
+
+| foreground | solid | lit | distinct | peak_delta |
+|---|---|---|---|---|
+| `#f4f7fb` default text | 4179 | 5103 | 5521 | 235.79 |
+| `#1d1f21` ANSI black (SGR 30) | **0** | **0** | 4870 | **19.86** |
+
+The middle row is the whole of `phux-cockpit-wmi`: text that is fully present
+in the raster and 19.86 luminance steps out of 255 away from its background.
+`solid` and `lit` say "nothing here", which is also what they say about an
+empty row.
+
+`scripts/contrast-floor-check.sh` reports two more statistics for exactly this
+reason — `distinct` (pixels more than one 8-bit step from the row's own
+background) and `peak_delta` (the furthest any pixel gets from it). Use those
+whenever the question is legibility rather than weight.
+
+---
+
+## 3b. `scripts/contrast-floor-check.sh` — colour, not weight
+
+Same `#include` trick, different question. `host-raster-check.sh` holds the
+colour fixed at the app's foreground and asks how thickly the rasterizer inks a
+glyph. This holds the rasterizer fixed and asks how much of that ink survives a
+given foreground on a given background.
+
+Its colours are not declared anywhere in the harness. They come out of a
+MEASURED test (`src/tests/minimum_contrast_tests.zig`) that paints a REAL
+session through `grid.paint` and prints the resolved foreground it handed the
+painter, one line per SGR case per floor. The script greps those lines and
+feeds them straight to the rasterizer. So both columns of the table are
+produced by code that shipped, and flipping `minimum-contrast` moves the whole
+table on its own.
+
+That construction is deliberate and it is the rule `aht` was retracted for
+breaking: a fix validated against a hand-edited SDK state no build was ever in
+moved zero pixels against the commit that actually shipped. A colour typed into
+a harness is a counterfactual. A colour the build printed is evidence.
+
+Measured 2026-08-12 at the pinned SDK `f3678832f`, 13pt, scale 2, 48 columns,
+on `#090b0f`:
+
+| SGR | `minimum-contrast = 1` | | `minimum-contrast = 3` | |
+|---|---|---|---|---|
+| | fg | peak_delta | fg | peak_delta |
+| (none) | `#f4f7fb` | 235.79 | `#f4f7fb` | 235.79 |
+| `30` black | `#1d1f21` | 19.86 | `#ffffff` | 244.14 |
+| `90` bright black | `#666666` | 91.14 | `#666666` | 91.14 |
+| `2` faint | `#7f8185` | 118.00 | `#7f8185` | 118.00 |
+| `2;34` faint blue | `#455767` | 73.46 | `#ffffff` | 244.14 |
+
+Deriving command: `./scripts/contrast-floor-check.sh`
+
+It proves the rasterizer's response to the colour the projection chose. The
+other half of that wire — that the app's real chrome build asks for the floor
+at all — is covered by `zig build test`, which drives the runtime through
+`view.zig` and reads the retained scene. Neither half is sufficient alone, and
+this is exactly the split section 5 describes: nothing short of Screen
+Recording covers both in one instrument.
+
 ---
 
 ## 4. Rules that follow

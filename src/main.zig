@@ -782,6 +782,7 @@ test {
     _ = @import("tests/grid_state_tests.zig");
     _ = @import("tests/grid_rendering_tests.zig");
     _ = @import("tests/cell_attribute_tests.zig");
+    _ = @import("tests/minimum_contrast_tests.zig");
     _ = @import("tests/provider_identity_tests.zig");
     _ = @import("tests/terminal_keyboard_tests.zig");
     _ = @import("tests/clipboard_tests.zig");

@@ -241,6 +241,66 @@ pub const default_font_size: f32 = 13;
 pub const default_scrollback_bytes: u64 = 50 * 1024 * 1024;
 pub const max_scrollback_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
+/// `minimum-contrast` bounds. Ghostty's own range, and its own meaning: 1 is
+/// "no floor at all" (the disable value) and 21 is the most any sRGB display
+/// can produce, black on white. Out-of-range is CLAMPED rather than refused,
+/// the way `font-size` is — `minimum-contrast = 100` is an unambiguous "as
+/// much as you can give me".
+pub const min_minimum_contrast: f32 = 1;
+pub const max_minimum_contrast: f32 = 21;
+
+/// The default contrast floor, and the ONE place this build knowingly diverges
+/// from Ghostty (whose default is 1, i.e. off).
+///
+/// WHY DIVERGE. Ghostty ships 1 because a general-purpose terminal's first
+/// duty is to paint the colour the application asked for. Cockpit inherits
+/// that duty and still has a defect Ghostty does not: its ground is #090b0f,
+/// which is darker than any ground the ANSI-16 defaults were calibrated
+/// against, and the owner's standing report is "the text is see-through or
+/// black or something". A floor that ships disabled does not answer that
+/// report — it answers it only for the person who already knows the key name.
+///
+/// WHY 3 AND NOT SOMETHING ELSE. Measured, not chosen. Every ratio below is
+/// libghostty's own default palette entry against the app's own default
+/// ground, through `theme.contrastRatio`; reproduce with
+///
+///   python3 - <<'PY'
+///   def lin(c):
+///       c /= 255.0
+///       return c/12.92 if c <= 0.03928 else ((c+0.055)/1.055)**2.4
+///   def L(c): return 0.2126*lin(c[0]) + 0.7152*lin(c[1]) + 0.0722*lin(c[2])
+///   def ratio(a, b):
+///       la, lb = L(a), L(b)
+///       return (max(la,lb)+0.05)/(min(la,lb)+0.05)
+///   bg = (0x09,0x0b,0x0f)
+///   for name, c in [("SGR 30 black",(0x1d,0x1f,0x21)),
+///                   ("SGR 2 faint blue",(0x45,0x56,0x66)),
+///                   ("SGR 90 bright black",(0x66,0x66,0x66)),
+///                   ("SGR 2 faint default fg",(0x7e,0x81,0x85)),
+///                   ("SGR 31 red",(0xcc,0x66,0x66))]:
+///       print(name, round(ratio(c, bg), 2))
+///   PY
+///
+///   SGR 30 black            #1d1f21   1.19    illegible
+///   SGR 2 faint blue        #455666   2.60    illegible
+///   SGR 90 bright black     #666666   3.43    dim, but readable
+///   SGR 2 faint default fg  #7e8185   5.03    readable (clears WCAG AA)
+///   SGR 31 red              #cc6666   5.31    readable
+///
+/// The two illegible cases sit at or below 2.60 and the first legible one at
+/// 3.43, so any floor in (2.60, 3.43] lifts exactly what is unreadable and
+/// touches nothing else. 3 is the round number inside that window, and it is
+/// also WCAG SC 1.4.11's non-text-contrast minimum — the line below which a
+/// shape stops being distinguishable from its ground at all.
+///
+/// It is deliberately NOT `theme.wcag_aa_body_text` (4.5). This floor does not
+/// dim a colour towards readability, it REPLACES it with pure white or pure
+/// black (see `Palette.contrasted`), so every raised cell loses its hue. At
+/// 4.5 the grey a prompt uses for de-emphasis becomes the same pure white as
+/// the text it was de-emphasising, which destroys information rather than
+/// revealing it. At 3 the grey stays grey.
+pub const default_minimum_contrast: f32 = 3;
+
 pub const Config = struct {
     font_family: FontFamily = FontFamily.init(""),
     font_size: f32 = default_font_size,
@@ -279,6 +339,15 @@ pub const Config = struct {
 
     cursor_style: CursorStyle = .block,
     cursor_style_blink: bool = true,
+
+    /// The WCAG contrast ratio a cell's foreground must clear against the
+    /// background it is painted on. 1 disables the floor entirely, which is
+    /// Ghostty's default and this build's OFF switch rather than its default;
+    /// see `default_minimum_contrast` for why the default is 3 here.
+    ///
+    /// Always in `[min_minimum_contrast, max_minimum_contrast]`: the parser
+    /// clamps, so nothing downstream re-checks the range.
+    minimum_contrast: f32 = default_minimum_contrast,
 
     scrollback_bytes: u64 = default_scrollback_bytes,
 
@@ -509,6 +578,22 @@ fn applyPair(config: *Config, line: u32, key: []const u8, value: []const u8) voi
             config.note(line, .bad_value, value);
             return;
         };
+        return;
+    }
+    if (eq(key, "minimum-contrast")) {
+        const parsed = std.fmt.parseFloat(f32, value) catch {
+            config.note(line, .bad_value, value);
+            return;
+        };
+        // NaN is refused rather than clamped. `std.math.clamp` of a NaN is a
+        // NaN, and a NaN floor compares false against every ratio, so it would
+        // silently disable the floor while the config file says otherwise —
+        // the worst of the three outcomes.
+        if (std.math.isNan(parsed)) {
+            config.note(line, .bad_value, value);
+            return;
+        }
+        config.minimum_contrast = std.math.clamp(parsed, min_minimum_contrast, max_minimum_contrast);
         return;
     }
     if (eq(key, "cursor-style-blink")) return setBool(config, line, &config.cursor_style_blink, value);

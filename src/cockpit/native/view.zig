@@ -1712,6 +1712,7 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
                 .glyph_budget = glyph_budget,
                 .path_reserve = path_reserve,
                 .cell_reserve = cell_reserve,
+                .minimum_contrast = model.config.minimum_contrast,
                 .id_base = grid.paneIdBase(terminalPaintIndex(model, pane.terminal)),
             });
         } else {

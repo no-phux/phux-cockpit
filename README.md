@@ -170,11 +170,33 @@ cursor-style-blink = false
 background = #090b0f
 foreground = #f4f7fb
 palette = 1 = #f38ba8
+minimum-contrast = 3
 scrollback-limit = 50000000
 shell = /opt/homebrew/bin/fish
 inherit-working-directory = true
 tab-placement = top
 ```
+
+### Minimum contrast
+
+`minimum-contrast` is a WCAG contrast ratio, 1 to 21, that every cell's text
+must clear against the background it is painted on. A cell that falls short is
+repainted in pure white or pure black — whichever reads better on that
+background. **`minimum-contrast = 1` turns it off.**
+
+This is Ghostty's key, with Ghostty's range and Ghostty's algorithm, and one
+difference: Ghostty defaults it to 1 and Cockpit defaults it to **3**. On
+Cockpit's ground (`#090b0f`) the terminal's own ANSI black measures 1.19:1 and
+a faint blue 2.60:1 — both are faithful VT output and neither is text you can
+read. 3 lifts exactly those and leaves everything above them alone: ANSI bright
+black (3.43:1) stays the grey a prompt meant it to be, and so does plain faint
+(5.03:1). Raising it to the AA threshold of 4.5 would turn that grey the same
+pure white as the text it was de-emphasising, which is why the default is not
+4.5.
+
+Box-drawing, block, Legacy Computing and Powerline glyphs are exempt, matching
+Ghostty: those are shapes drawn in a foreground colour on purpose, and a
+Powerline separator raised to white is a white wedge through your prompt.
 
 ### Themes and the settings surface
 

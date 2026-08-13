@@ -188,6 +188,18 @@ pub const Session = struct {
     /// optional rather than a pair of floats with plausible defaults.
     measured_cell: ?CellBox = null,
     font_size: f32 = 13,
+    /// The WCAG contrast ratio a cell's foreground must clear against its
+    /// background before `snapshot` replaces it with pure white or pure black.
+    /// See `Palette.contrasted`.
+    ///
+    /// DEFAULT 1 — no floor — even though the user-facing default is 3. This
+    /// field is the RENDERING policy, and a session that nobody is painting
+    /// (a test, a headless feed, a fingerprint) has no rendering policy to
+    /// speak of. Defaulting it to the config value would silently colour-shift
+    /// every such caller, and the shift is invisible in exactly the places
+    /// that check colours least. `render.paint` writes the real value from the
+    /// live config on every frame; that is the ONE path to glass.
+    minimum_contrast: f32 = 1,
     /// Reused projection buffers for `snapshot` (see that function). The
     /// first-party painter takes a RESOLVED snapshot whose every slice
     /// must outlive the build referencing it, so these are owned per
@@ -441,7 +453,7 @@ pub const Session = struct {
         else
             null;
         const rs = &session.render;
-        const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette);
+        const palette = Palette.init(tokens, &rs.colors, &session.term.colors.palette, session.minimum_contrast);
 
         session.snap_text_len = 0;
         var row_count: usize = 0;
@@ -503,7 +515,7 @@ pub const Session = struct {
                     // style to speak of. A styled BLANK is a space
                     // (`cp == 0x20`) in every stream that produces one, so
                     // it lands here like any other character.
-                    projected.fg = palette.resolveFg(style, projected.bg);
+                    projected.fg = palette.resolveFg(style, projected.bg, cp);
                     projected.bold = style.flags.bold;
                     projected.italic = style.flags.italic;
                     projected.strikethrough = style.flags.strikethrough;
