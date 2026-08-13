@@ -127,3 +127,68 @@ phux-cockpit-pg1 happened.
 One thing DOES change for any consumer's tests: with the table larger than the
 app's tab and pane ceilings, no single repeated chord reaches the shell
 ceiling any more. Cockpit's suite grew `support.fillLiveShells` for that.
+
+---
+
+## composite-cell-grid.patch
+
+`cell_grid` added to the GPU composite pass's known-kind list in
+`src/platform/macos/appkit_host.m`. One list entry, plus the comment
+explaining why it belongs there.
+
+### What it unlocks
+
+`NATIVE_SDK_GPU_SHOT_DIR` — the SDK's only real-pixel-to-PNG path, and the only
+capture of Cockpit's actual presented frames that needs no Screen Recording
+permission. `docs/RENDER_FIDELITY.md` section 2 concluded it was "not available
+to Cockpit". That conclusion was correct about the shipped SDK and wrong about
+what it would take to change: the blocker is a single missing entry in a list,
+not a missing capability.
+
+### Why it is safe rather than a hack
+
+The known-kind list is not a statement about what the composite pass can DRAW.
+Both bitmap paths under it — `rasterCacheBuildEntryForCommand:` and
+`compositeScratchTextureForCommand:` — dispatch through
+`NativeSdkPacketDrawCommandBody`, which has drawn `cell_grid` since the kind
+existed, and `NativeSdkPacketCommandRasterCacheable` already answers YES for
+it. The kind was drawable all along; only the gate said otherwise.
+
+Leaving it out is not graceful degradation. A refusal returns 0, the engine
+reads that as "this host cannot present packets", and falls back to its own CPU
+reference renderer (`recordCanvasPacketFallback` ... `.missing_service` in
+`runtime/canvas_frame.zig`). For an app whose frames are ENTIRELY `cell_grid` —
+a terminal — every present is refused, so composite mode REPLACES the CoreText
+rasterizer instead of compositing it. That is the measured behaviour
+`RENDER_FIDELITY.md` recorded: `gpu_present_path=pixels`,
+`present_fallback=missing_service`, 147 fallback frames, zero shots.
+
+### Measured, with the patch applied
+
+Real bundle, `zig build package -Dautomation=true`, pin `f3678832f` plus this
+one hunk, driven by the run recorded in `phux-cockpit-wmi`:
+
+```
+gpu_present_path=packet   present_fallback=none   gpu_nonblank=true
+shots written: 3 (p1, p30, p60)
+```
+
+No fallback at all, and the dumps hold the real composited texture. Filed
+upstream-side as `phux-cockpit-2ml.7`.
+
+### How to use it
+
+```sh
+./scripts/build-automation-cli.sh
+cp -R .zig-cache/pinned-sdk .zig-cache/pinned-sdk-patched
+git -C .zig-cache/pinned-sdk-patched apply ../../docs/sdk-patches/composite-cell-grid.patch
+zig fetch --save=native_sdk .zig-cache/pinned-sdk-patched     # revert before committing
+zig build package -Dautomation=true
+NATIVE_SDK_GPU_COMPOSITE=1 NATIVE_SDK_GPU_SHOT_DIR=<dir> \
+  PHUX_COCKPIT_CONFIG=<config> ./zig-out/package/phux-cockpit.app/Contents/MacOS/phux-cockpit
+```
+
+The dump fires on composite present 1 and every 30th after, and the filename
+carries the count. `-p1.png` is the BOOT frame — an empty pane. Waiting for
+"a PNG exists" reads a blank window and calls it a measurement; wait for
+`-p30` or later.

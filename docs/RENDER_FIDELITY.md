@@ -165,8 +165,27 @@ path — which is the reference renderer. So turning composite mode on does not
 capture the real rasterizer; it *replaces* it. That is a real SDK bug, filed as
 `phux-cockpit-2ml.7`.
 
-**Conclusion.** No SDK affordance captures Cockpit's real frames without TCC
-today. A negative result, with the code that makes it negative named above.
+**Correction, 2026-08-12 (`phux-cockpit-wmi`).** The conclusion that followed
+from this — "no SDK affordance captures Cockpit's real frames without TCC" —
+was right about the shipped SDK and wrong about what it would cost to change.
+The blocker is the missing list ENTRY, not a missing capability: both bitmap
+paths under that gate already draw `cell_grid`, and
+`NativeSdkPacketCommandRasterCacheable` already answers YES for it. Adding the
+kind to the list is one line. With `docs/sdk-patches/composite-cell-grid.patch`
+applied to a sandbox copy of the pin, the real bundle reports
+`gpu_present_path=packet present_fallback=none` and writes real composited PNGs
+at presents 1, 30, 60, …
+
+That is how `wmi` was confirmed and fixed on glass: two runs of the same
+binary, same driving script, one config key apart, each asserting
+`publisher_pid` against the pid it launched. See the patch's entry in
+`docs/sdk-patches/README.md` for the recipe and its traps (`-p1.png` is the
+BOOT frame — empty).
+
+The gap this leaves is narrower than the old conclusion: the dump is a readback
+of the canvas TEXTURE, so it still cannot see window compositing or display
+colour conversion. Section 5 is about that remaining sliver, not about the
+whole frame.
 
 ---
 
@@ -301,9 +320,27 @@ Deriving command: `./scripts/contrast-floor-check.sh`
 It proves the rasterizer's response to the colour the projection chose. The
 other half of that wire — that the app's real chrome build asks for the floor
 at all — is covered by `zig build test`, which drives the runtime through
-`view.zig` and reads the retained scene. Neither half is sufficient alone, and
-this is exactly the split section 5 describes: nothing short of Screen
-Recording covers both in one instrument.
+`view.zig` and reads the retained scene.
+
+### And the whole chain, once, on the real app
+
+With `docs/sdk-patches/composite-cell-grid.patch` in a sandbox SDK, the same
+question was put to the real bundle. One binary, one driving script writing
+eight rows each of SGR 30, SGR 90, faint blue and plain text, two runs one
+config key apart, `publisher_pid` asserted against the launched pid both times,
+measured over fixed pixel bands of the `-p60` dump with
+`scripts/measure-png-ink.m`:
+
+| band | `minimum-contrast = 1` | `minimum-contrast = 3` |
+|---|---|---|
+| SGR 30 | mean_luma 14.57, solid 0, **lit 0** | mean_luma 67.57, solid 10944, lit 15360 |
+| SGR 90 | mean_luma 34.22, lit 15519 | mean_luma 33.95, lit 15424 |
+| faint blue | mean_luma 19.59, solid 0, lit 7344 | mean_luma 59.27, solid 10304, lit 13663 |
+
+`lit = 0` over 46400 pixels of a band that is full of glyphs is the defect
+stated as a number: the text is there and nothing on the screen distinguishes
+it from the ground. The SGR 90 row is the control — it moves by 0.8% while the
+other two transform, which is the floor discriminating rather than repainting.
 
 ---
 
