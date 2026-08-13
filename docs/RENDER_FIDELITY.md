@@ -15,10 +15,14 @@ to check what the terminal looks like.
 |---|---|---|---|
 | `native automate screenshot` | display list, layout, colour choices, which commands were emitted | everything the real macOS rasterizer does: CoreText outlines, hinting, font smoothing, CG blend arithmetic, device colour space | no |
 | `scripts/host-raster-check.sh` | the real host rasterizer's output for a fixed row | layout, what the app actually emitted, anything outside one command | no |
+| `scripts/drive-backing-scale.sh` | the real frame the live app uploads to the Metal texture, at any backing scale | the Metal upload itself, compositing by the window server, scanout | no, but it needs a diagnostic SDK build |
 | eyes on glass / screen capture | everything | nothing | **yes** |
 
-There is no instrument in the middle that captures the app's real frames
-without TCC. The evidence for that claim is below; it was checked, not assumed.
+No instrument in the middle captures the app's real frames **through a
+shipping build** without TCC; that claim is checked in section 2. Section 4
+adds the one that does it through a diagnostic build, and the reason it had
+to exist: everything in sections 1-3 was measured at one backing scale, and
+the backing scale moves the numbers.
 
 ---
 
@@ -219,7 +223,7 @@ pass is not evidence.
 ### Pinned baseline
 
 Measured on this machine at the pinned SDK `f3678832f`, JetBrains Mono NL
-Nerd Font Mono Regular, 13pt, backing scale 2, 48 columns:
+Nerd Font Mono Regular, 13pt, **backing scale 2**, 48 columns:
 
 | kind | mean_luma | solid (>127) | lit (>32) |
 |---|---|---|---|
@@ -227,6 +231,11 @@ Nerd Font Mono Regular, 13pt, backing scale 2, 48 columns:
 | `draw_text` | 36.5460 | 4068 | 5021 |
 
 Deriving command: `./scripts/host-raster-check.sh`
+
+Backing scale 2 is the harness default and must stay the default, because
+these numbers are only comparable within one scale — see section 4. `--scale`
+overrides it for a deliberate cross-scale reading; it is not a knob to turn
+while chasing a regression against the floor above.
 
 `--min-solid 4000` is the floor to assert in CI: roughly 4% under the measured
 value, and well clear of the 3081 a smoothing regression produces. Re-derive it,
@@ -241,7 +250,124 @@ for those, and they are trustworthy for exactly that.
 
 ---
 
-## 4. Rules that follow
+## 4. The backing scale is a measurement axis, and it had never been moved
+
+`phux-cockpit-aht`, round 6. Every number in sections 1-3 was taken on this
+machine, which drives one 1920x1080 panel at `backingScaleFactor` 1.00. The
+owner reporting "I can't see the text" is on a Retina display, at 2. So the
+2x path — a 2x drawable, a raster cache keyed on a 2x scale, CoreText asked
+for glyphs on a 2x grid, a 4x-larger upload — had never been executed once,
+and "could not reproduce" meant "could not reproduce on the wrong path".
+
+### The panel cannot be made Retina, and that was measured
+
+`CGDisplayCopyAllDisplayModes` on the only display, called **with**
+`kCGDisplayShowDuplicateLowResolutionModes` (the option whose entire purpose
+is to reveal HiDPI modes the Displays pane hides), returns 31 modes. Every one
+of them reports `CGDisplayModeGetPixelWidth == CGDisplayModeGetWidth`. There
+is no 2x mode on this hardware to switch into, so `CGDisplaySetDisplayMode`
+has nothing to aim at. Exposing one would need
+`defaults write /Library/Preferences/com.apple.windowserver
+DisplayResolutionEnabled -bool true` as root plus a logout, and even then only
+for modes the panel can actually drive.
+
+`native automate resize <w> <h> <scale>` does not help, and this was checked
+rather than repeated: with the pattern asserted absent first, `resize 900 600
+2` left `gpu_scale=1` (and `gpu_size` unchanged at `1100x640`). The scale
+argument does not reach the backing scale, because the backing scale is not an
+input — `appkit_host.m:4111` reads it off `self.window.backingScaleFactor`.
+
+### The seam that does work
+
+That read is the ONE place the host learns the device scale. Everything
+downstream takes the value that lands in that local: `contentsScale`,
+`drawableSize`, the `GPU_SURFACE_RESIZE` event the runtime stores as
+`gpu_scale_factor` and publishes as `gpu_scale`, and therefore the `scale`
+argument every packet present is drawn with. `docs/sdk-patches/scale-probe.patch`
+overrides it from `NATIVE_SDK_FORCE_BACKING_SCALE` and dumps the exact
+premultiplied bytes handed to the texture upload;
+`scripts/drive-backing-scale.sh` applies it to a scratch worktree of the
+pinned SDK, builds, drives the live app, and measures.
+
+What that reproduces: every line of code a Retina window runs, at the same
+pixel dimensions, with the same CoreText rasterization. What it does not:
+the window server's 2x scanout, since the 2x layer is downsampled on its way
+to a 1x panel. The numbers below are read upstream of scanout, so that gap
+does not touch them — but a defect living only in scanout is still out of
+reach here.
+
+### The finding: the same text inks LESS as the scale rises
+
+Two independent instruments, one direction, on `5bccbd2`.
+
+Live app, the bytes uploaded to the Metal texture, one fixed 380x60 **point**
+rectangle of terminal text (`./scripts/drive-backing-scale.sh 1.5 2 3`):
+
+| forced | `gpu_scale` | raster px | mean_luma | solid_frac | lit_frac |
+|---|---|---|---|---|---|
+| none (control) | 1 | 1100x640 | 52.8903 | 18.70% | 26.11% |
+| 1.5 | 1.5 | 1650x960 | 52.6717 | 17.78% | 24.09% |
+| 2 | 2 | 2200x1280 | 49.2482 | 16.46% | 20.67% |
+| 3 | 3 | 3300x1920 | 46.1627 | 14.89% | 18.00% |
+
+Headless, the host rasterizer alone, the fixed sample row
+(`./scripts/host-raster-check.sh --scale N`):
+
+| scale | mean_luma | solid_frac | lit_frac |
+|---|---|---|---|
+| 1 | 49.4425 | 0.1816 | 0.2289 |
+| 2 | 45.7978 | 0.1512 | 0.1846 |
+| 3 | 42.9154 | 0.1351 | 0.1631 |
+
+1x → 2x is −6.9% mean luminance and −12.0% solid fraction in the live app,
+−7.4% and −16.7% headless. Both monotone, both agreeing on sign and rough
+size, from completely different code paths.
+
+Read it correctly. Over a fixed area of the same glyphs, mean luminance is
+conserved by an *ideal* area-coverage rasterizer, and edge pixels become a
+smaller share of a glyph as resolution rises, so the naive prediction is that
+`solid_frac` goes **up**. It goes down. The same text emits measurably less
+light per unit area on a 2x window than on a 1x one. That is the signature of
+a rasterizer with no stem darkening: whatever fattening the smoothing pass
+applies is roughly a fixed sub-pixel amount, so it is worth proportionally
+less as the pixels get smaller. It is exactly why Ghostty ships `font-thicken`
+and `minimum-contrast`, and it is what this bead's original DESCRIPTION said
+before four rounds went looking elsewhere.
+
+### And the headline non-finding
+
+**See-through or black terminal text does not reproduce at 2x.** The dumped
+2x frames are crisp, bright, correctly positioned text on the terminal ground,
+with `gpu_present_path=packet`, `gpu_status=ready`, `dispatch_errors=0` and
+`gpu_nonblank=true`. The 2x defect that would explain "I can't see it" is not
+there. What is there is ~7% less light, which makes an already-thin render
+thinner, not invisible.
+
+### The apparatus is not blind, and here is the proof
+
+A measurement that has only ever returned "fine" is worth nothing until it has
+been seen to return "broken". Forcing scale 8 on the same 1100x640 window asks
+for 8800x5120 device pixels, past the `pixelWidth > 8192` refusal at
+`appkit_host.m:5599`. The run fails, and fails in the right place:
+
+```
+$ ./scripts/drive-backing-scale.sh 8
+none   1          1100x640    1100x640    52.8903    4264     18.70%      26.11%
+error: automate assert failed after 30000ms
+  missing: gpu_present_path=packet
+exit=1
+```
+
+The snapshot of that instance reads `gpu_scale=8 ... gpu_present_path=pixels`:
+every packet present is refused and the runtime falls back to the CPU
+reference renderer. So the harness does distinguish a working 2x path from a
+broken one — and separately, that cliff sits at a 4096-**point** window at 2x,
+which no shipping Mac display can produce. It is a bound worth knowing, not a
+bug the owner can hit.
+
+---
+
+## 5. Rules that follow
 
 - **Never** conclude "the text renders correctly" from a reference screenshot.
   It cannot support that claim about anything CoreText does.
@@ -253,11 +379,11 @@ for those, and they are trustworthy for exactly that.
   different hinting, different stem darkening — and reading a defect out of it is
   how `aht` was misdiagnosed twice.
 - `phux-cockpit-aht`'s fix is still unconfirmed ON GLASS. Nothing here changes
-  that: it needs a human to grant Screen Recording once. See section 5.
+  that: it needs a human to grant Screen Recording once. See section 6.
 
 ---
 
-## 5. What a human would have to do once
+## 6. What a human would have to do once
 
 To close the last gap — confirming the app's actual presented frames, including
 compositing and display colour conversion — someone has to grant Screen

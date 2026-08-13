@@ -1,0 +1,84 @@
+diff --git a/src/platform/macos/appkit_host.m b/src/platform/macos/appkit_host.m
+index 00d4252..8b6cffa 100644
+--- a/src/platform/macos/appkit_host.m
++++ b/src/platform/macos/appkit_host.m
+@@ -4111,6 +4111,20 @@ static void NativeSdkPremultiplyStraightRgba8(const uint8_t *source, uint8_t *de
+     CGFloat scale = self.window.backingScaleFactor;
+     if (scale <= 0) scale = NSScreen.mainScreen.backingScaleFactor;
+     if (scale <= 0) scale = 1;
++    /* DIAGNOSTIC BUILD ONLY (phux-cockpit-aht). This is the single point
++     * where the host learns the device scale: contentsScale, drawableSize,
++     * the GPU_SURFACE_RESIZE event the runtime stores as gpu_scale_factor,
++     * and therefore the `scale` every packet present is drawn at all come
++     * from this local. Overriding it here runs the whole 2x code path on a
++     * 1x panel. What it does NOT reproduce is the display server's own 2x
++     * scanout - the layer is simply downsampled on the way to glass. */
++    {
++        const char *forced = getenv("NATIVE_SDK_FORCE_BACKING_SCALE");
++        if (forced && forced[0]) {
++            double value = atof(forced);
++            if (value > 0) scale = (CGFloat)value;
++        }
++    }
+     NSSize size = self.bounds.size;
+     CGSize drawableSize = CGSizeMake(MAX(1.0, ceil(size.width * scale)), MAX(1.0, ceil(size.height * scale)));
+     BOOL changed = fabs(self.lastDrawableSize.width - drawableSize.width) > 0.5 ||
+@@ -5580,6 +5594,49 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
+     }
+ }
+ 
++/* DIAGNOSTIC BUILD ONLY (phux-cockpit-aht): write the exact premultiplied
++ * RGBA8 bytes that are about to be handed to the Metal texture upload. Not
++ * a reference render, not a screenshot, not the frozen gpu_sample - the
++ * frame itself, on its way to glass. */
++static void NativeSdkDumpPacketPixels(const uint8_t *bytes,
++                                      NSUInteger width,
++                                      NSUInteger height,
++                                      NSString *label,
++                                      CGFloat scale) {
++    const char *dir = getenv("NATIVE_SDK_PACKET_DUMP_DIR");
++    if (!dir || !dir[0] || !bytes || width == 0 || height == 0) return;
++    static long long counter = 0;
++    const char *limitEnv = getenv("NATIVE_SDK_PACKET_DUMP_LIMIT");
++    const long long limit = (limitEnv && limitEnv[0]) ? atoll(limitEnv) : 16;
++    const long long index = counter++;
++    if (index >= limit) return;
++
++    const size_t byteLength = (size_t)width * (size_t)height * 4;
++    CFDataRef data = CFDataCreate(NULL, bytes, (CFIndex)byteLength);
++    if (!data) return;
++    CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
++    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
++    CGImageRef image = CGImageCreate(width, height, 8, 32, width * 4, space,
++                                     kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
++                                     provider, NULL, NO, kCGRenderingIntentDefault);
++    if (image) {
++        NSString *path = [NSString stringWithFormat:@"%s/packet-%@-scale%.0f-%03lld-%lux%lu.png",
++                          dir, label.length ? label : @"view", (double)scale, index,
++                          (unsigned long)width, (unsigned long)height];
++        CGImageDestinationRef destination = CGImageDestinationCreateWithURL(
++            (__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
++        if (destination) {
++            CGImageDestinationAddImage(destination, image, NULL);
++            CGImageDestinationFinalize(destination);
++            CFRelease(destination);
++        }
++        CGImageRelease(image);
++    }
++    CGColorSpaceRelease(space);
++    CGDataProviderRelease(provider);
++    CFRelease(data);
++}
++
+ - (NSInteger)presentGpuPacketObject:(NSDictionary *)packet surfaceWidth:(CGFloat)surfaceWidth height:(CGFloat)surfaceHeight scale:(CGFloat)scale clearR:(uint8_t)clearR clearG:(uint8_t)clearG clearB:(uint8_t)clearB clearA:(uint8_t)clearA commandCount:(NSUInteger)commandCount {
+     if (!packet) return 0;
+     CGFloat normalizedScale = scale > 0 ? scale : 1;
+@@ -5771,6 +5828,8 @@ static BOOL NativeSdkCompositeBlurWriteRegion(NSDictionary *command, CGFloat sca
+         return 0;
+     }
+     self.canvasPacketPixelsValid = YES;
++    NativeSdkDumpPacketPixels((const uint8_t *)pixels.bytes, pixelWidth, pixelHeight,
++                              self.surfaceLabel, normalizedScale);
+ 
+     if (directRetainedDirtyUpdate && NativeSdkGpuVerifyIncrementalEnabled()) {
+         /* The drawn list is always the FULL retained command list (a

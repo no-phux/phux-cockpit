@@ -1,9 +1,18 @@
 # SDK patches
 
 Changes Cockpit needs in the pinned Native SDK, kept here as patch files until
-someone decides where they land. Nothing in this directory is applied
-automatically: the pin in `build.zig.zon` is a tarball sha, and a patch that
+someone decides where they land. Nothing in this directory is applied to a
+build you ship: the pin in `build.zig.zon` is a tarball sha, and a patch that
 the build silently applied would make the sha a lie.
+
+Two kinds live here, and the difference matters:
+
+- **Candidate patches** (`raise-pty-ceiling.patch`) — proposals for the fork.
+  Applied by hand, as below.
+- **Diagnostic probes** (`scale-probe.patch`) — instruments that must NEVER
+  ship. `scripts/drive-backing-scale.sh` applies this one automatically, but
+  only ever to a scratch worktree under `.zig-cache/`, and it restores
+  `build.zig.zon` on exit including on failure.
 
 To try one, clone the pinned sha into a sandbox and point the build at it:
 
@@ -127,3 +136,34 @@ phux-cockpit-pg1 happened.
 One thing DOES change for any consumer's tests: with the table larger than the
 app's tab and pane ceilings, no single repeated chord reaches the shell
 ceiling any more. Cockpit's suite grew `support.fillLiveShells` for that.
+
+---
+
+## scale-probe.patch
+
+**Diagnostic only. Never ship this.** Two additions to `appkit_host.m`, both
+inert unless their environment variable is set:
+
+- `NATIVE_SDK_FORCE_BACKING_SCALE=<n>` overrides the device scale in
+  `updateDrawableSize`. That local is the single point where the host learns
+  the backing scale, so overriding it runs the entire Retina path — 2x
+  drawable, 2x raster cache, CoreText on a 2x grid, 4x upload — on a 1x panel.
+- `NATIVE_SDK_PACKET_DUMP_DIR=<dir>` writes the exact premultiplied RGBA8
+  bytes handed to the Metal texture upload as PNGs (`NATIVE_SDK_PACKET_DUMP_LIMIT`
+  caps the count, default 16). Not a reference render, not a screenshot, not
+  the one-pixel `gpu_sample` — the frame itself.
+
+### Why it is not a candidate
+
+The scale override exists to answer one question that had no other instrument:
+this machine has no Retina display and none of its 31 display modes is HiDPI,
+so the 2x path could not otherwise be executed at all. An SDK that shipped a
+way to lie about the backing scale would be a footgun, not a feature.
+
+The packet dump is closer to shippable — it is the only TCC-free capture of
+Cockpit's real frames that exists (see `docs/RENDER_FIDELITY.md` section 2 for
+why every other route fails) — but it writes uncompressed frames from the
+present path, which is not something to leave reachable in a released host.
+
+Driver: `scripts/drive-backing-scale.sh`. Findings:
+`docs/RENDER_FIDELITY.md` section 4.

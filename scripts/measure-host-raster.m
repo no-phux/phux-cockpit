@@ -64,14 +64,20 @@
 @end
 
 // The row under test. Fixed on purpose: the numbers this prints are pinned in
-// docs/GPU_INK_BASELINE.md, so the content may not drift.
+// docs/RENDER_FIDELITY.md, so the content may not drift.
 static NSString *const kSampleText = @"the quick brown fox jumps over the lazy dog $ ls";
 
 static const CGFloat kFontSize = 13.0;
 static const CGFloat kCellWidth = 8.0;
 static const CGFloat kCellHeight = 18.0;
 static const CGFloat kBaseline = 14.0;
-static const CGFloat kScale = 2.0;
+
+// The device scale the row rasterizes at. 2.0 is the DEFAULT and must stay
+// the default: docs/RENDER_FIDELITY.md pins its numbers, and the CI floor
+// compares against them. `--scale S` overrides it, which is what makes this
+// harness able to answer "does the same row ink differently on a Retina
+// window than on a 1x one" without a Retina panel to point it at.
+static CGFloat gScale = 2.0;
 
 // #f4f7fb on #090b0f, the app's terminal foreground on its terminal ground.
 static NSArray *ForegroundColor(void) { return @[ @(0.957), @(0.969), @(0.984), @(1.0) ]; }
@@ -183,7 +189,7 @@ static void WritePng(CGImageRef image, NSString *path) {
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc < 2) {
-            fprintf(stderr, "usage: measure-host-raster <font.ttf> [--png-prefix PREFIX] [--min-solid N]\n");
+            fprintf(stderr, "usage: measure-host-raster <font.ttf> [--png-prefix PREFIX] [--min-solid N] [--scale S]\n");
             return 2;
         }
         NSString *fontPath = [NSString stringWithUTF8String:argv[1]];
@@ -192,6 +198,14 @@ int main(int argc, const char **argv) {
         for (int index = 2; index + 1 < argc; index += 2) {
             if (strcmp(argv[index], "--png-prefix") == 0) pngPrefix = [NSString stringWithUTF8String:argv[index + 1]];
             else if (strcmp(argv[index], "--min-solid") == 0) minSolid = atoll(argv[index + 1]);
+            else if (strcmp(argv[index], "--scale") == 0) {
+                const double parsed = atof(argv[index + 1]);
+                if (parsed <= 0) {
+                    fprintf(stderr, "--scale wants a positive number, got %s\n", argv[index + 1]);
+                    return 2;
+                }
+                gScale = (CGFloat)parsed;
+            }
         }
 
         // Register the app's own face under font id 1, through the host's own
@@ -222,8 +236,8 @@ int main(int argc, const char **argv) {
         if (!view.canvasColorSpace) view.canvasColorSpace = CGColorSpaceCreateDeviceRGB();
 
         const NSUInteger cols = kSampleText.length;
-        const NSUInteger pixelWidth = (NSUInteger)(cols * kCellWidth * kScale);
-        const NSUInteger pixelHeight = (NSUInteger)(kCellHeight * kScale);
+        const NSUInteger pixelWidth = (NSUInteger)(cols * kCellWidth * gScale);
+        const NSUInteger pixelHeight = (NSUInteger)(kCellHeight * gScale);
 
         struct {
             const char *name;
@@ -236,14 +250,14 @@ int main(int argc, const char **argv) {
 
         printf("sdk=%s\n", NATIVE_SDK_APPKIT_HOST);
         printf("font=%s size=%.1f scale=%.1f cols=%lu\n",
-               argv[1], (double)kFontSize, (double)kScale, (unsigned long)cols);
+               argv[1], (double)kFontSize, (double)gScale, (unsigned long)cols);
 
         long long cellGridSolid = -1;
         for (size_t index = 0; index < sizeof(cases) / sizeof(cases[0]); index++) {
             NativeSdkPacketCommandRaster *entry =
                 [view rasterCacheBuildEntryForCommand:cases[index].command
                                                  kind:cases[index].kind
-                                                scale:kScale
+                                                scale:gScale
                                            pixelWidth:pixelWidth
                                           pixelHeight:pixelHeight];
             if (!entry || !entry.image) {
@@ -255,8 +269,16 @@ int main(int argc, const char **argv) {
                 fprintf(stderr, "unexpected raster layout for %s\n", cases[index].name);
                 return 1;
             }
-            printf("kind=%-9s width=%zu height=%zu mean_luma=%.4f solid=%llu lit=%llu\n",
-                   cases[index].name, ink.width, ink.height, ink.mean, ink.solid, ink.lit);
+            // solid and lit are raw pixel counts, so they quadruple with the
+            // scale and cannot be read across two scales. The _frac columns
+            // are the same counts over the raster's own pixel area, which
+            // can: they answer "is the same row inking more or less densely
+            // on a 2x window than on a 1x one".
+            const double area = (double)(ink.width * ink.height);
+            printf("kind=%-9s width=%zu height=%zu mean_luma=%.4f solid=%llu lit=%llu solid_frac=%.4f lit_frac=%.4f\n",
+                   cases[index].name, ink.width, ink.height, ink.mean, ink.solid, ink.lit,
+                   area > 0 ? (double)ink.solid / area : 0.0,
+                   area > 0 ? (double)ink.lit / area : 0.0);
             if (strcmp(cases[index].name, "cell_grid") == 0) cellGridSolid = (long long)ink.solid;
             if (pngPrefix) {
                 WritePng(entry.image, [NSString stringWithFormat:@"%@-%s.png", pngPrefix, cases[index].name]);
