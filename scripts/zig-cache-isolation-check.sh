@@ -87,22 +87,36 @@ esac
 # Absent, act, present. The package cache must come back as a SYMLINK: a copy
 # would mean re-downloading the pinned SDK per worktree, which is the tradeoff
 # this design deliberately refuses.
-rm -f "$iso_path/p"
-if [ -e "$iso_path/p" ]; then
-    bad "could not clear $iso_path/p for the negative control"
-else
-    ok "negative control: $iso_path/p absent before the run"
-fi
-if [ "$(cd "$ROOT" && run_bounded 300 "$ZB" --fetch)" = 0 ]; then
-    ok "zig build --fetch through the wrapper"
-else
-    bad "zig build --fetch through the wrapper: $(tail -3 "$WORK/bounded.log")"
-fi
-if [ -L "$iso_path/p" ]; then
-    ok "package cache shared by symlink -> $(readlink "$iso_path/p")"
-else
-    bad "$iso_path/p is not a symlink; the package cache was copied, not shared"
-fi
+#
+# The guard around the `rm` is not paranoia. Run with the fix disabled, this
+# section resolved `$iso_path` to the MACHINE-WIDE cache and pointed `rm` at
+# its 793 MB package directory; only `rm` refusing to unlink a directory
+# without -r stood between this check and deleting every worktree's packages.
+# A destructive step that can be aimed outside the build root by an
+# environment variable is a bug even when it happens to miss.
+case "$iso_path" in
+    "$ROOT"/*)
+        [ -L "$iso_path/p" ] && rm -f "$iso_path/p"
+        if [ -e "$iso_path/p" ]; then
+            bad "could not clear $iso_path/p for the negative control"
+        else
+            ok "negative control: $iso_path/p absent before the run"
+        fi
+        if [ "$(cd "$ROOT" && run_bounded 300 "$ZB" --fetch)" = 0 ]; then
+            ok "zig build --fetch through the wrapper"
+        else
+            bad "zig build --fetch through the wrapper: $(tail -3 "$WORK/bounded.log")"
+        fi
+        if [ -L "$iso_path/p" ]; then
+            ok "package cache shared by symlink -> $(readlink "$iso_path/p")"
+        else
+            bad "$iso_path/p is not a symlink; the package cache was copied, not shared"
+        fi
+        ;;
+    *)
+        bad "cache $iso_path is outside $ROOT; skipping the package-cache checks rather than writing there"
+        ;;
+esac
 
 # ------------------------------------------------------ 3. wrong-tree refusal
 mkdir -p "$WORK/other"
