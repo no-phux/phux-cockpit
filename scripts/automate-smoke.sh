@@ -34,9 +34,16 @@
 #   new tab            role=tab name="Terminal N
 #   rendered pane      role=textbox name="Terminal        (SELECTED tab only)
 #   scrollback search  role=group name="Scrollback search
+#
+# SERIAL ONLY (phux-cockpit-2ml.10). The automation dropbox is per-user, not
+# per-process, so a second live bundle steals the channel and this script would
+# assert cleanly against someone else's binary. scripts/lib/app-instance.sh
+# refuses that instead, and keeps refusing it mid-run - the instance swap that
+# bead was filed for happened in the MIDDLE of a sequence that started clean.
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "${ROOT}/scripts/lib/app-instance.sh"
 WORK="${TMPDIR:-/tmp}/phux-cockpit-smoke.$$"
 PROFILE=0
 KEEP=0
@@ -49,11 +56,16 @@ for arg in "$@"; do
     esac
 done
 
+app_instance_require_free
+
 mkdir -p "$WORK"
 APP_PID=""
 cleanup() {
+    # Waits for the app to actually exit, not just for the signal to be sent:
+    # these runs are serial, and returning early makes the NEXT one refuse a
+    # machine that is about to be idle. See app_instance_stop.
     if [[ -n "$APP_PID" && "$KEEP" == "0" ]]; then
-        kill "$APP_PID" 2>/dev/null || true
+        app_instance_stop "$APP_PID"
     fi
     [[ "$KEEP" == "1" ]] || rm -rf "$WORK"
 }
@@ -90,6 +102,7 @@ PHUX_COCKPIT_STATE="${WORK}/workspace.state" \
 APP_PID=$!
 
 "$NATIVE" automate wait >/dev/null
+app_instance_bind "$NATIVE" "$APP_PID"
 
 # Assert a pattern is absent, run the action, then assert it is present. The
 # absent half is the negative control: it proves this assertion can tell the
@@ -97,6 +110,11 @@ APP_PID=$!
 # than meaning the pattern was always there.
 expect_change() {
     local what="$1" pattern="$2"; shift 2
+    # Re-verify the binding at every step, not just at startup. A sole-instance
+    # check that runs once cannot see a sibling that appears afterwards, and
+    # that is precisely how phux-cockpit-2ml.10 presented: a sequence that
+    # began against our pid and finished against someone else's.
+    app_instance_assert || return 1
     if ! "$NATIVE" automate assert --absent "$pattern" >/dev/null 2>&1; then
         printf 'NEGATIVE CONTROL FAILED: %s already matches before the action.\n' "$pattern" >&2
         printf 'This assertion cannot prove %s did anything. Fix the assertion.\n' "$what" >&2
@@ -143,7 +161,7 @@ if [[ "$PROFILE" == "1" ]]; then
     "$NATIVE" automate widget-key phux-cockpit-canvas cmd+d >/dev/null
     "$NATIVE" automate widget-key phux-cockpit-canvas cmd+shift+d >/dev/null
     "$NATIVE" automate widget-key phux-cockpit-canvas cmd+d >/dev/null
-    panes="$("$NATIVE" automate snapshot | grep -c 'role=textbox name="Terminal' || true)"
+    panes="$(app_instance_snapshot | grep -c 'role=textbox name="Terminal' || true)"
     printf '  panes in the selected tab: %s\n' "$panes"
     if [[ "$panes" -lt 4 ]]; then
         printf 'REFUSING TO PROFILE: wanted 4 panes, got %s. Numbers from the\n' "$panes" >&2
@@ -164,7 +182,7 @@ if [[ "$PROFILE" == "1" ]]; then
     min_samples=200
     deadline=$((SECONDS + 60))
     while :; do
-        drawn="$("$NATIVE" automate snapshot | grep -o 'host_draw_n=[0-9]*' | head -1 | cut -d= -f2)"
+        drawn="$(app_instance_snapshot | grep -o 'host_draw_n=[0-9]*' | head -1 | cut -d= -f2)"
         drawn="${drawn:-0}"
         [[ "$drawn" -ge "$min_samples" ]] && break
         if [[ "$SECONDS" -ge "$deadline" ]]; then
@@ -178,7 +196,7 @@ if [[ "$PROFILE" == "1" ]]; then
     printf '  host_draw samples: %s\n' "$drawn"
 
     printf '\n--- frame profile (4 panes, continuous repaint) ---\n'
-    "$NATIVE" automate snapshot | grep -o 'frame_profile.*' | tr ' ' '\n' | grep -E '_p50_us=|_p90_us=|_n=' || true
+    app_instance_snapshot | grep -o 'frame_profile.*' | tr ' ' '\n' | grep -E '_p50_us=|_p90_us=|_n=' || true
     printf '\nNOTE: check the _n= counts before believing any percentile. A stage\n'
     printf 'with a handful of samples describes a near-idle app, not load.\n'
 fi

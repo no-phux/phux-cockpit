@@ -31,12 +31,14 @@
 # build graph. This script prints it before driving anything.
 #
 # SERIAL ONLY (phux-cockpit-2ml.10). The automation dropbox is per-user, not
-# per-process: a second bundle steals the channel. This script refuses to
-# start if one is already running, and asserts `publisher_pid` is the pid it
-# launched before believing a single assertion.
+# per-process: a second bundle steals the channel. scripts/lib/app-instance.sh
+# refuses to start if one is already running, binds every later read to the pid
+# this script launched, and refuses an empty widget tree rather than reporting
+# a dead instance as a vanished UI.
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "${ROOT}/scripts/lib/app-instance.sh"
 WORK="${TMPDIR:-/tmp}/phux-cockpit-ceiling.$$"
 WANT=8
 KEEP=0
@@ -51,20 +53,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# `pgrep -f` would match this script's OWN command line and report a hit every
-# time. `-x` matches the executable name, which cannot self-match.
-if pgrep -x phux-cockpit >/dev/null 2>&1; then
-    printf 'REFUSING TO RUN: a phux-cockpit is already running.\n' >&2
-    printf 'Automation is serial-only; a second bundle steals the dropbox.\n' >&2
-    exit 1
-fi
+app_instance_require_free
 
 mkdir -p "$WORK"
 APP_PID=""
 cleanup() {
     if [[ -n "$APP_PID" && "$KEEP" == "0" ]]; then
-        kill "$APP_PID" 2>/dev/null || true
-        wait "$APP_PID" 2>/dev/null || true
+        app_instance_stop "$APP_PID"
     fi
     [[ "$KEEP" == "1" ]] || rm -rf "$WORK"
 }
@@ -109,19 +104,15 @@ APP_PID=$!
 
 # The instance under test must be the instance we launched. A sibling agent's
 # bundle answering these assertions would produce a perfectly clean transcript
-# about someone else's binary.
-publisher="$("$NATIVE" automate snapshot | grep -o 'publisher_pid=[0-9]*' | head -1 | cut -d= -f2)"
-if [[ "$publisher" != "$APP_PID" ]]; then
-    printf 'REFUSING TO ASSERT: the dropbox publisher is %s, not the pid we launched (%s).\n' \
-        "${publisher:-<none>}" "$APP_PID" >&2
-    exit 1
-fi
-printf 'publisher_pid: %s (ours)\n' "$APP_PID"
+# about someone else's binary. app_instance_bind also refuses an empty widget
+# tree, which the old publisher_pid check here could not tell from a healthy
+# app that simply had no UI.
+app_instance_bind "$NATIVE" "$APP_PID"
 
 # The compiled-in ceiling, read back out of the running binary.
 report_ceiling() {
     local limit
-    limit="$("$NATIVE" automate snapshot \
+    limit="$(app_instance_snapshot \
         | grep -o 'Shell limit reached: [0-9]* running terminals' \
         | head -1 | cut -d' ' -f4 || true)"
     printf 'compiled-in shell ceiling (read out of the running binary): %s\n' \
@@ -206,8 +197,8 @@ fi
 # So the count is reported against what is PUBLISHED, and the per-tab proof
 # is the `expect_change` chain above: each tab was asserted absent, opened,
 # and asserted present, one at a time.
-published="$("$NATIVE" automate snapshot | grep -c 'role=tab ' || true)"
-running="$("$NATIVE" automate snapshot | grep -c 'role=tab .*native terminal, RUNNING' || true)"
+published="$(app_instance_snapshot | grep -c 'role=tab ' || true)"
+running="$(app_instance_snapshot | grep -c 'role=tab .*native terminal, RUNNING' || true)"
 printf '\ntabs opened and individually proven present: %s\n' "$WANT"
 printf 'tabs the strip publishes: %s (it scrolls; the rest are off-strip)\n' "$published"
 printf 'of those, RUNNING: %s   SPAWN REJECTED: 0\n' "$running"
