@@ -30,9 +30,19 @@ log() { [[ "${EXPORT_ONLY}" == "1" ]] || printf '%s\n' "$*" >&2; }
 
 # The pin is read from build.zig.zon rather than restated here, so this script
 # cannot drift from what the app actually links against.
-url="$(awk '/\.native_sdk = \.\{/ { found = 1 } found && /\.url = / { print; exit }' "${ROOT}/build.zig.zon" \
-    | sed -E 's/.*"(.*)".*/\1/')"
-if [[ -z "${url}" ]]; then
+# shellcheck source=scripts/lib/zon.sh
+source "${ROOT}/scripts/lib/zon.sh"
+# This read once had no block scoping at all: under a local `.path` override it
+# returned GHOSTTY's url, and this script then cloned ghostty (578 MB) into the
+# SDK cache and failed later with "no step named 'cli'". See phux-cockpit-yo5.
+read_status=0
+url="$(zon_dependency_url "${ROOT}/build.zig.zon" native_sdk)" || read_status=$?
+if [[ "${read_status}" -eq 3 ]]; then
+    printf 'error: .native_sdk is a local override (.path), so there is no tarball to fetch.\n' >&2
+    printf 'Build the CLI from your override directly, or restore a published pin.\n' >&2
+    exit 1
+fi
+if [[ "${read_status}" -ne 0 || -z "${url}" ]]; then
     printf 'error: could not read the .native_sdk url from build.zig.zon\n' >&2
     exit 1
 fi

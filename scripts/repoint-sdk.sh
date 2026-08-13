@@ -13,6 +13,8 @@ set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ZON="${ROOT}/build.zig.zon"
+# shellcheck source=scripts/lib/zon.sh
+source "${ROOT}/scripts/lib/zon.sh"
 
 # The fork tracks upstream by rebasing onto each release, and names the result
 # after the upstream version it sits on: cockpit/v0.8.3, cockpit/v0.8.4, ...
@@ -58,14 +60,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-pinned_url="$(awk '
-    /\.native_sdk = \.\{/ { inside = 1; next }
-    inside && /\.url = "/ {
-        match($0, /"[^"]+"/)
-        print substr($0, RSTART + 1, RLENGTH - 2)
-        exit
-    }
-' "${ZON}")"
+# This read used to have NO block-close rule at all, so `inside` latched on the
+# first `.native_sdk = .{` and never cleared: under a local `.path` override it
+# answered with GHOSTTY's url. `slug` below is derived from this url and feeds
+# `zig fetch --save=native_sdk` at the end — so the script would have pinned
+# ghostty AS the SDK, in build.zig.zon, and reported success. This is the most
+# dangerous of the five copies of that defect. See scripts/lib/zon.sh and
+# phux-cockpit-yo5.
+#
+# `|| read_status=$?` rather than a bare assignment: `set -e` would otherwise
+# kill the script here before the refusal below could say why.
+read_status=0
+pinned_url="$(zon_dependency_url "${ZON}" native_sdk)" || read_status=$?
+if [[ "${read_status}" -eq 3 ]]; then
+    printf 'error: .native_sdk is a local override (.path); there is no pin to repoint.\n' >&2
+    printf 'Restore a published pin first, or edit build.zig.zon by hand.\n' >&2
+    exit 1
+fi
 
 if [[ ! "${pinned_url}" =~ ^https://github\.com/([^/]+/[^/]+)/archive/([0-9a-f]{40})\.tar\.gz$ ]]; then
     printf 'error: build.zig.zon native_sdk url is not a sha-pinned github archive: %s\n' \
