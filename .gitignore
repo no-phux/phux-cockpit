@@ -3,6 +3,11 @@ zig-out/
 zig-pkg/
 *.png
 
+# The dev run's own home: config, workspace layout and automation dropbox for
+# ./scripts/dev-run.sh. Deliberately NOT under zig-out, so a clean build cannot
+# throw away the profile you have been tuning.
+.dev-run/
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
