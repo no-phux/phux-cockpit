@@ -111,8 +111,8 @@
         //   the second of two gates in front of terminal output, the first
         //   being Cockpit's own URL detection.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/5db8681e63b036b43640ad562661bda0e21358d3.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQhu86AHT4k_4QpsROWiVdVsqxLZR1CSL8JG02nu4",
+            .url = "https://github.com/phall1/native/archive/cff219789c456715266d64a9785b1588dd0cb77b.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQpgrnQKU1_tCNpZFrA9mDL-lZhvgh0NVe-iqhJJ9",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream
