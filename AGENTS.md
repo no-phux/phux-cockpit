@@ -38,6 +38,21 @@ product structure, identity, navigation, or orchestration boundaries.
 - Do not fake detach, restoration, durability, or visibility when an underlying
   runtime seam is missing. Establish the seam and test its invariants first.
 
+## Chrome
+
+Every band, control, icon and gutter in the chrome traces to the Geist theme
+pack's own token ladder or to the 4pt grid — a band is one default-register
+control tall (40) and hosts small-register controls (32) with 4pt shoulders.
+Read [docs/DESIGN_SYSTEM.md](docs/DESIGN_SYSTEM.md) before adding a number to
+`view.zig` or `workspace_projection.zig`;
+`src/tests/chrome_register_tests.zig` is what will stop you if you skip it, and
+it runs the toolkit's layout audit over the real widget tree in every state the
+chrome has, at every window size this app declares.
+
+The terminal GRID is not on that grid and cannot be: no integer number of rows
+ever lands on a 4pt multiple. Snap the container, float the rows inside it, and
+never derive a chrome spacing value from cell metrics.
+
 ## Rendering Evidence
 
 `native automate screenshot` renders through the SDK's CPU reference renderer,
