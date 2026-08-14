@@ -228,6 +228,15 @@ pub const Legibility = theme_module.Legibility;
 pub const legibility = projection.legibility;
 pub const legibilityOf = projection.legibilityOf;
 pub const Settings = model_module.Settings;
+pub const TabDrag = model_module.TabDrag;
+pub const pinch_points_per_step = model_module.pinch_points_per_step;
+pub const quotePaths = @import("cockpit/shell_words.zig").quotePaths;
+pub const theme_auto_dark = theme_module.auto_dark;
+pub const theme_auto_light = theme_module.auto_light;
+pub const terminalTitleInto = projection.terminalTitleInto;
+pub const statusItem = view_module.statusItem;
+pub const cockpit_status_item = scene.cockpit_status_item;
+pub const onDrop = update_module.onDrop;
 pub const ConfigFile = model_module.ConfigFile;
 pub const settings_width = view_module.settings_width;
 pub const settings_panel_label = view_module.settings_panel_label;
@@ -269,11 +278,19 @@ pub fn appOptions() TerminalApp.Options {
         .key_release_events = true,
         .on_text = update_module.onText,
         .on_wheel = update_module.onWheel,
+        .on_pinch = update_module.onPinch,
+        .on_drop = update_module.onDrop,
+        .on_appearance = update_module.onAppearance,
         .on_timer = view_module.onTimer,
         .on_chrome = update_module.onChrome,
         .on_lifecycle = update_module.onLifecycle,
         .on_frame = view_module.onFrame,
         .web_panes = webPanes,
+        // The menu-bar extra: an install-time shell in the scene, and a live
+        // derivation beside `web_panes` and `windows_fn` — same shape, same
+        // cadence, model as the only source of truth.
+        .status_item = scene.cockpit_status_item,
+        .status_item_fn = view_module.statusItem,
         .on_command = onCommand,
         // The declared secondary windows, and their trees. Presence in
         // `windows_fn`'s answer IS visibility, so `Model.closeWindow` closes
@@ -759,4 +776,5 @@ test {
     _ = @import("tests/tab_strip_tests.zig");
     _ = @import("tests/scrollback_search_tests.zig");
     _ = @import("tests/multi_window_tests.zig");
+    _ = @import("tests/sdk_surface_tests.zig");
 }

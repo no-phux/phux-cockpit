@@ -15,6 +15,7 @@ const pointer_input = @import("pointer_input.zig");
 const projection = @import("native/workspace_projection.zig");
 const scene = @import("native/scene.zig");
 const theme_module = @import("../config/theme.zig");
+const shell_words = @import("shell_words.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -314,12 +315,17 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                     pane.output_batches += 1;
                     pane.output_bytes += event.bytes.len;
                     const pointer_protocol_before = pane.mouse_protocol_fingerprint;
+                    // Read BEFORE the feed: the notification below fires on
+                    // the latch's rising edge, and after `feedOutput` there is
+                    // no way left to tell a fresh bell from a standing one.
+                    const bell_before = pane.bellRung();
                     feedOutput(pane, fx, event.bytes);
                     syncMouseProtocol(pane);
                     if (pointer_protocol_before != 0 and pointer_protocol_before != pane.mouse_protocol_fingerprint) {
                         endMismatchedMouseCaptures(model, fx, pane);
                     }
                     pane.session.refreshScreenText();
+                    notifyBackgroundBell(model, fx, pane, bell_before);
                     if (pane.selecting and !pane.session.rebaseSelection()) {
                         pane.selecting = false;
                     }
@@ -532,6 +538,29 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                 for (&model.held_terminal_keys) |*held| held.* = .{};
             }
         },
+        // The system crossed sunset (or somebody flipped the switch). Only a
+        // config that asked to follow moves; `adoptSystemTheme` is the whole
+        // gate, so this arm can stay unconditional.
+        //
+        // Nothing is written to disk: the file says `auto`, and following is
+        // what `auto` means. Writing the resolved name back would turn a
+        // subscription into a choice the user never made.
+        .appearance_changed => |appearance| {
+            _ = model.config.adoptSystemTheme(switch (appearance.color_scheme) {
+                .dark => .dark,
+                .light => .light,
+            });
+        },
+        // Pinch to size the type, the way every Mac terminal does. The gearbox
+        // lives in `Model.pinchStep`; the step itself is exactly the cmd+= /
+        // cmd+- path, so the reflow, the clamp at both ends of the range and
+        // the PTY resize pump are all already right.
+        .pinch => |gesture| {
+            const steps = model.pinchStep(gesture.phase, gesture.scale);
+            if (steps == 0) return;
+            _ = model.stepFontSize(@floatFromInt(steps));
+        },
+        .files_dropped => |drop| dropPathsIntoTerminal(model, fx, drop),
         .pointer => |pointer| handleTerminalPointer(model, fx, pointer),
         .wheel_fallback => |wheel| {
             if (model.selectedTerminalRef() == null) return;
@@ -778,6 +807,23 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         // from the green button flips back out of it here — no parity state
         // for this app to mirror and get wrong.
         .toggle_fullscreen => fx.toggleFullscreenWindow(scene.windowLabelFor(model.active_window)),
+        // cmd+M. Addressed to the focused window's declared label, exactly like
+        // fullscreen above — and, exactly like fullscreen, it exists because
+        // declaring custom menus replaces the toolkit's stock bar, Minimize
+        // included. Without it, the chord every Mac app answers is a chord
+        // this one swallows.
+        .minimize_window => fx.minimizeWindow(scene.windowLabelFor(model.active_window)),
+        // A pick from the menu bar happens while this app is behind whatever
+        // the user was actually looking at, so the selection is only half the
+        // gesture: `showWindow` unhides, un-minimizes, orders front and
+        // activates, which is what makes "go to that terminal" true.
+        .tray_select => |index| {
+            updateModel(model, .{ .select_position = index }, fx);
+            fx.showWindow(scene.windowLabelFor(model.active_window));
+        },
+        // The derivation behind the menu is consulted after every dispatch, so
+        // being dispatched IS the refresh. Nothing else to do.
+        .tray_opened => {},
         .close_terminal => {
             const id = model.selectedTerminalRef() orelse return;
             // Close owns LOCAL lifetime only. A Phux terminal exists because
@@ -930,6 +976,37 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             persistThemeChoice(model);
         },
         .close_tab => |index| closeTab(model, fx, index),
+        // "Close Others", from the tab's own menu. Walked from the END so a
+        // tab dropping out from under the walk cannot skip its neighbour, and
+        // the kept tab is named by IDENTITY rather than by index for the same
+        // reason: every close renumbers everything after it.
+        .close_other_tabs => |index| {
+            const workspace = model.wsConst();
+            const keep = workspace.tabTerminal(index) orelse return;
+            var doomed: [max_tabs]TerminalRef = undefined;
+            var count: usize = 0;
+            var tab = workspace.tab_count;
+            while (tab > 0) {
+                tab -= 1;
+                const id = workspace.tabTerminal(tab) orelse continue;
+                if (support.refEql(id, keep)) continue;
+                doomed[count] = id;
+                count += 1;
+            }
+            for (doomed[0..count]) |id| {
+                const at = model.ws().tabOfTerminal(id) orelse continue;
+                closeTab(model, fx, @intCast(at));
+            }
+        },
+        // Move THIS tab, not the selected one: a right-click acts on what is
+        // under the pointer. `moveTerminal` takes the terminal rather than the
+        // index for the usual reason — the index is a position and the
+        // terminal is an identity.
+        .move_tab => |request| {
+            const id = model.wsConst().tabTerminal(request.index) orelse return;
+            _ = model.moveTerminal(id, request.delta);
+        },
+        .tab_drag => |drag| applyTabDrag(model, drag),
         .hover_tab => |index| model.ws().hovered_tab = index,
         .unhover_tab => model.ws().hovered_tab = model_module.no_hovered_tab,
         .split_right => splitFocusedPane(model, fx, .horizontal),
@@ -1012,6 +1089,153 @@ fn splitFocusedPane(model: *Model, fx: *Fx, orientation: layout.Orientation) voi
     model.terminal_limit_refused = false;
     endHiddenCaptures(model, fx);
     spawnConfiguredPane(model, pane, fx);
+}
+
+/// The bell that rang while nobody was looking, said out loud.
+///
+/// A bell is the one thing a shell sends ON PURPOSE to get a person's
+/// attention — a build finished, a prompt is waiting, an agent wants an
+/// answer — and until this the app's whole response was a dot in the tab
+/// strip. A dot is a fine answer for a window you are looking at. It is no
+/// answer at all for a window behind your browser, which is exactly when a
+/// bell is worth ringing.
+///
+/// So the notification is deliberately NOT the general case: it fires only
+/// while the app is in the background, which is the state
+/// `acknowledgeVisibleAttention` already treats as "keep this one". A banner
+/// for a bell from the pane the user is typing in would be noise, and noise is
+/// how notifications get turned off wholesale.
+///
+/// The EDGE is the caller's `rang_before`, read before the output was fed.
+/// Latching on the bell flag alone would re-post on every subsequent chunk of
+/// output for as long as the latch stood — one bell, a hundred banners.
+///
+/// Fire-and-forget: the platform owns whether a banner is drawn (Notification
+/// Centre settings, focus modes, permission), so no result Msg could be
+/// honest. `Model.recordNotification` is the observable half.
+fn notifyBackgroundBell(model: *Model, fx: *Fx, pane: *const Pane, rang_before: bool) void {
+    if (model.focused) return;
+    if (rang_before or !pane.bellRung()) return;
+    var title_storage: [projection.max_terminal_title_bytes]u8 = undefined;
+    const title = projection.terminalTitleInto(model, pane.id, &title_storage);
+    if (!model.recordNotification(title)) return;
+    fx.showNotification(.{
+        .title = title,
+        .subtitle = scene.app_name,
+        .body = "Terminal bell",
+    });
+}
+
+/// A drop from Finder, delivered into the shell under the pointer.
+///
+/// A drop IS a paste — of paths the user chose with the mouse instead of with
+/// the keyboard — so it goes through the same bracketed-paste encoder cmd+V
+/// uses. That is not a shortcut: bracketed paste is what tells a shell, an
+/// editor, or a TUI agent that the bytes arriving are DATA rather than typing,
+/// and a drop that bypassed it would let a dropped filename with a newline in
+/// it run as a command.
+///
+/// The pointer decides the pane, not the focus: dropping onto the split you
+/// are looking at should reach that split, and dragging from Finder never gave
+/// this app a chance to be focused first. The drop's own window is adopted for
+/// the same reason — the paths landed on a window, so that window is the one
+/// the user is addressing.
+///
+/// Refusals are whole and silent: an unquotable path list (see
+/// `shell_words.quotePaths`) and a pane that does not accept input both end
+/// here with nothing sent, because there is no half of a path list worth
+/// pasting.
+fn dropPathsIntoTerminal(model: *Model, fx: *Fx, drop: native_sdk.platform.FileDropEvent) void {
+    if (scene.windowIndexForCanvas(drop.view_label)) |window_index| {
+        if (model.windowOpen(window_index) and model.active_window != window_index) {
+            model.active_window = window_index;
+            endHiddenCaptures(model, fx);
+        }
+    }
+    // A drop with no point is a drop the host could not place — the focused
+    // pane is the honest answer, and it is the one a keyboard paste would
+    // have used.
+    const terminal_ref = blk: {
+        if (drop.point) |point| {
+            if (terminalRefAtPoint(model, point.x, point.y)) |hit| break :blk hit;
+        }
+        break :blk model.selectedTerminalRef() orelse return;
+    };
+    const pane = model.provider.terminal(terminal_ref) orelse return;
+    if (!pane.acceptsInput()) return;
+    var quoted: [shell_words.max_quoted_bytes]u8 = undefined;
+    const text = shell_words.quotePaths(drop.paths, &quoted) orelse return;
+    // Focus follows the drop. The paths went into THIS pane, and leaving the
+    // keyboard pointed somewhere else would put the next keystroke in a
+    // different terminal from the words that just appeared.
+    if (model.wsConst().selectedTreeConst()) |current| {
+        if (current.find(terminal_ref)) |node| updateModel(model, .{ .focus_pane = node }, fx);
+    }
+    pasteClipboardText(model, pane, fx, text);
+}
+
+/// One event of a live tab drag.
+///
+/// The gesture's own bookkeeping is `Model.TabDrag`; this is the arithmetic
+/// that turns a pointer position into swaps. The step is measured against the
+/// STRIP's own tab extent — the same derivation the strip lays out with — so a
+/// windowed strip whose tabs are narrower than full width steps at the width
+/// the user can actually see.
+fn applyTabDrag(model: *Model, drag: @FieldType(Msg, "tab_drag")) void {
+    const workspace = model.wsConst();
+    // Side placement is a vertical rail, and this gesture is horizontal. A
+    // drag there is refused whole rather than reinterpreted: guessing that a
+    // sideways pointer means a vertical reorder is how a UI gets a reputation
+    // for moving things by itself.
+    if (model.tab_placement != .top) return;
+    const window = projection.visibleTabWindowIn(workspace, workspace.surface_size.width - projection.windowPadding(model) * 2);
+    switch (drag.phase) {
+        // `change`
+        0 => {
+            if (drag.sourceId >= workspace.tab_count) return;
+            var state = model.tab_drag orelse model_module.TabDrag{
+                .origin = @intCast(drag.sourceId),
+                .current = @intCast(drag.sourceId),
+                .anchor_x = drag.x,
+            };
+            defer model.tab_drag = state;
+            if (window.extent <= 0) return;
+            const steps_f = std.math.trunc((drag.x - state.anchor_x) / window.extent);
+            if (steps_f == 0) return;
+            const steps = std.math.lossyCast(i32, steps_f);
+            const moved = moveTabBy(model, state.current, steps) orelse return;
+            state.anchor_x += @as(f32, @floatFromInt(@as(i32, moved.applied))) * window.extent;
+            state.current = moved.landed;
+        },
+        // `end`: the tabs are already where they look.
+        1 => model.tab_drag = null,
+        // `cancel`: Escape, or the gesture losing its pointer. Put it back.
+        2 => {
+            const state = model.tab_drag orelse return;
+            model.tab_drag = null;
+            const delta = @as(i32, state.origin) - @as(i32, state.current);
+            _ = moveTabBy(model, state.current, delta);
+        },
+        else => {},
+    }
+}
+
+/// Walk the tab at `index` `delta` places, one swap at a time, stopping at the
+/// ends of the strip. Answers where it landed and how far it actually got —
+/// which is what re-anchors the drag, so a tab pinned against the last slot
+/// does not bank up steps the pointer would have to unwind.
+fn moveTabBy(model: *Model, index: u8, delta: i32) ?struct { landed: u8, applied: i32 } {
+    if (delta == 0) return .{ .landed = index, .applied = 0 };
+    const id = model.wsConst().tabTerminal(index) orelse return null;
+    const step: i8 = if (delta > 0) 1 else -1;
+    var remaining = @abs(delta);
+    var applied: i32 = 0;
+    while (remaining > 0) : (remaining -= 1) {
+        if (!model.moveTerminal(id, step)) break;
+        applied += step;
+    }
+    const landed = model.wsConst().tabOfTerminal(id) orelse return null;
+    return .{ .landed = @intCast(landed), .applied = applied };
 }
 
 /// Close a WHOLE tab — every pane in it — which is what the strip's `x`
@@ -1409,6 +1633,26 @@ pub fn onWheel(wheel: native_sdk.platform.WheelEvent) ?Msg {
 
 pub fn onChrome(chrome: native_sdk.platform.WindowChrome) ?Msg {
     return .{ .chrome_changed = chrome };
+}
+
+/// Pinch magnification. `.begin` and `.end` carry no scale of their own but
+/// are still forwarded: `.begin` is what resets the accumulator, so two
+/// gestures never add up into one step.
+pub fn onPinch(pinch: native_sdk.platform.PinchEvent) ?Msg {
+    return .{ .pinch = pinch };
+}
+
+/// A file drop. An empty drop is not a message: the host reports the gesture,
+/// and a gesture that carried no paths has nothing for a shell.
+pub fn onDrop(drop: native_sdk.platform.FileDropEvent) ?Msg {
+    if (drop.paths.len == 0) return null;
+    return .{ .files_dropped = drop };
+}
+
+/// The system appearance. Forwarded unconditionally — `theme = auto` is the
+/// gate, and it lives in the config where the user set it.
+pub fn onAppearance(appearance: native_sdk.platform.Appearance) ?Msg {
+    return .{ .appearance_changed = appearance };
 }
 
 pub fn onLifecycle(event: native_sdk.LifecycleEvent) ?Msg {

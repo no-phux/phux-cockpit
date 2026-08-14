@@ -1,5 +1,6 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
+const provider_contract = @import("provider_contract");
 const grid = @import("../../terminal/grid.zig");
 const support = @import("../phux_support.zig");
 const local = @import("../../providers/local/provider.zig");
@@ -346,6 +347,59 @@ fn paneNeedsAttention(model: *const Model, pane: *const Pane) bool {
     return pane.bellRung() or
         pane.phase == .ended or pane.phase == .failed or
         pane.hasUnacknowledgedLoss() or pane.copy_failed or paste_failed;
+}
+
+/// The most a terminal's name can take. Long enough for a shell title anybody
+/// writes on purpose, short enough that a runaway OSC 0 cannot push a menu row
+/// off a screen.
+pub const max_terminal_title_bytes: usize = 96;
+
+/// The name for a terminal, in the order a terminal user reads it:
+///
+///   1. the SHELL's own title (OSC 0/2). A prompt with title integration is
+///      already saying what this is — "vim src/main.zig", "npm run dev" — and
+///      nothing this app invents beats that.
+///   2. the last component of the working directory (OSC 7), which is what
+///      Ghostty and Terminal.app fall back to and what most shells report even
+///      without title integration.
+///   3. `Terminal N`, the mint-order number, which is always true and never
+///      useful.
+///
+/// A Phux terminal borrows the title its coordinator published; the local
+/// chain does not apply because there is no local session to ask.
+///
+/// The caller's buffer is only ever used for case 3, so the common answers are
+/// borrowed from the pane and cost nothing. It lives HERE rather than in the
+/// view because the view is no longer the only caller: a menu-bar row and a
+/// notification banner are the same name, and a second implementation of this
+/// chain is a second set of titles to keep in agreement.
+pub fn terminalTitleInto(model: *const Model, id: TerminalRef, out: []u8) []const u8 {
+    if (provider_contract.localId(id)) |local_id| {
+        if (model.provider.terminalConst(id)) |pane| {
+            const shell_title = pane.title();
+            if (shell_title.len > 0) return clampTitle(shell_title);
+            const cwd = pane.pwd();
+            if (cwd.len > 0) {
+                // `basename("/")` is empty and `basename("")` is empty; both
+                // fall through to the number rather than painting a blank tab.
+                const leaf = std.fs.path.basename(cwd);
+                if (leaf.len > 0) return clampTitle(leaf);
+            }
+        }
+        const number = @intFromEnum(local_id) - @intFromEnum(support.LocalTerminalId.terminal_1) + 1;
+        return std.fmt.bufPrint(out, "Terminal {d}", .{number}) catch "Terminal";
+    }
+    const presentation = model.remotePresentation(id) orelse return "Phux";
+    return if (presentation.title.len == 0) "Phux" else clampTitle(presentation.title);
+}
+
+/// Cut an over-long title at a UTF-8 boundary rather than mid-codepoint: a
+/// half-written codepoint is a tofu box on every surface that draws it.
+fn clampTitle(title: []const u8) []const u8 {
+    if (title.len <= max_terminal_title_bytes) return title;
+    var end = max_terminal_title_bytes;
+    while (end > 0 and title[end] & 0xc0 == 0x80) end -= 1;
+    return title[0..end];
 }
 
 pub fn terminalNeedsAttention(model: *const Model, id: TerminalRef) bool {

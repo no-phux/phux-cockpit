@@ -249,6 +249,16 @@ pub const Config = struct {
     /// `bad_value` diagnostic and is NOT stored, so nothing downstream has to
     /// re-check whether the name means anything.
     theme: ThemeName = ThemeName.init(""),
+    /// `theme = auto`: the theme FOLLOWS the system light/dark setting instead
+    /// of naming one.
+    ///
+    /// It is a second field rather than a magic value inside `theme` because
+    /// everything downstream reads `theme` expecting a name it can resolve —
+    /// storing "auto" there would put a string that means nothing to
+    /// `theme.byName` in front of every colour lookup in the app. Here, the
+    /// pair reads honestly: `theme` is always the theme in effect right now,
+    /// and this says who chose it.
+    follow_system_theme: bool = false,
 
     /// Null means "the palette the terminal engine ships", which is a real
     /// terminal palette. Only an explicit `palette = N=#rrggbb` overrides it.
@@ -339,10 +349,30 @@ pub const Config = struct {
     /// Adopt a theme by name, dropping an unknown one rather than storing it.
     /// False means nothing changed, which is what the settings surface needs
     /// to know before it decides whether to write the file.
+    ///
+    /// Naming a theme ENDS the subscription: picking one in the settings
+    /// surface while `theme = auto` was in effect is a choice, and the next
+    /// sunset must not overrule it. Writing the config file is the settings
+    /// surface's own step — it writes the NAME, so the file stops saying
+    /// `auto` at exactly the moment the app stops following.
     pub fn setTheme(config: *Config, name: []const u8) bool {
         if (name.len != 0 and theme_module.byName(name) == null) return false;
+        const following = config.follow_system_theme;
+        config.follow_system_theme = false;
+        if (eq(config.theme.slice(), name)) return following;
+        config.theme.set(name) catch return following;
+        return true;
+    }
+
+    /// Follow the system into `scheme`. A no-op unless `theme = auto` asked
+    /// for it, so an appearance event can be delivered unconditionally.
+    pub fn adoptSystemTheme(config: *Config, scheme: theme_module.ColorScheme) bool {
+        if (!config.follow_system_theme) return false;
+        const name = theme_module.forScheme(scheme);
         if (eq(config.theme.slice(), name)) return false;
         config.theme.set(name) catch return false;
+        // `setTheme` is deliberately not reused: it ends the subscription, and
+        // this IS the subscription.
         return true;
     }
 
@@ -434,6 +464,17 @@ fn applyPair(config: *Config, line: u32, key: []const u8, value: []const u8) voi
         return;
     }
     if (eq(key, "theme")) {
+        // `auto` is not a theme, it is a SUBSCRIPTION: the app adopts the
+        // light or dark member of the pair as the system reports it, and
+        // re-adopts on every flip. The name written here is the one that is in
+        // effect until the first appearance event lands — which the host emits
+        // before the run loop arms, so in practice it is only ever the value
+        // in the very first painted frame.
+        if (theme_module.isAutoName(value)) {
+            config.follow_system_theme = true;
+            config.theme.set(theme_module.auto_dark) catch config.note(line, .too_long, value);
+            return;
+        }
         // A name this build does not ship is a `bad_value` and is NOT stored.
         // Storing it would leave `Config.theme` holding a string that resolves
         // to nothing, so every reader downstream would have to re-check

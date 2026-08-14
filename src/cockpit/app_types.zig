@@ -185,6 +185,59 @@ pub const Msg = union(enum) {
     /// per-window chrome event use.
     window_chrome_changed: struct { window: u8, top: f32 },
     focus_changed: bool,
+    /// The system flipped light/dark. `theme = auto` is the only thing that
+    /// reads it: a config that NAMES a theme is a choice, and a choice does
+    /// not move when the OS does.
+    ///
+    /// The host emits this before the run loop arms, so a following config is
+    /// already on the right side of the flip in the first painted frame —
+    /// there is no dark-then-light blink to design around.
+    appearance_changed: native_sdk.platform.Appearance,
+    /// A trackpad pinch over a canvas surface.
+    ///
+    /// The platform's `scale` is a MULTIPLICATIVE per-event delta, and a
+    /// terminal's type size is a discrete number of points, so this arm
+    /// accumulates the gesture and steps whole points across a threshold —
+    /// see `Model.pinchStep`.
+    pinch: native_sdk.platform.PinchEvent,
+    /// Finder (or any app that drags files) dropped paths on a surface.
+    ///
+    /// The paths are BORROWED for the dispatch, exactly like `key`'s bytes:
+    /// the arm quotes them into the pane's outbound buffer and keeps nothing.
+    files_dropped: native_sdk.platform.FileDropEvent,
+    /// cmd+M, and Window > Minimize.
+    minimize_window,
+    /// A row of the menu-bar extra: go to that terminal.
+    ///
+    /// Distinct from `select_position`, which the strip and the chords use,
+    /// because a pick made from the menu bar is a pick made while this app is
+    /// NOT in front — selecting a tab in a window the user cannot see would be
+    /// a gesture with no visible effect. This one raises the window too.
+    tray_select: u8,
+    /// The menu-bar menu was opened. It carries no state of its own: the
+    /// derivation behind the menu is re-read after every dispatch, so being a
+    /// message at all is the whole job.
+    tray_opened,
+    /// The tab context menu's verbs. Addressed by tab INDEX rather than by
+    /// "the selected tab": a right-click acts on the tab under the pointer,
+    /// which is very often not the one that is selected.
+    close_other_tabs: u8,
+    move_tab: struct { index: u8, delta: i8 },
+    /// A live tab drag. The field NAMES are the toolkit's closed drag record
+    /// (six fields, exactly these spellings) — `Tree.msgForDragTemplate`
+    /// injects `phase`, `x`, `y` and the view extent into whatever the view
+    /// authored, and leaves `sourceId` alone, which is why the tab index
+    /// rides in it.
+    ///
+    /// `phase` is the wire's own numbering: 0 change, 1 end, 2 cancel.
+    tab_drag: struct {
+        sourceId: u32 = 0,
+        phase: u8 = 0,
+        x: f32 = 0,
+        y: f32 = 0,
+        viewWidth: f32 = 0,
+        viewHeight: f32 = 0,
+    },
     /// The layout-snapshot debounce expired: write the workspace shape now.
     /// Arriving as a Msg rather than as a direct write inside every topology
     /// arm is the whole debounce — the timer is re-armed on each change and

@@ -176,36 +176,17 @@ fn terminalNumber(id: LocalTerminalId) u64 {
     return @intFromEnum(id) - first_terminal_raw + 1;
 }
 
-/// The tab label for a terminal, in the order a terminal user reads it:
+/// The tab label for a terminal. The chain itself lives in
+/// `workspace_projection.terminalTitleInto`, because the tab strip is no
+/// longer its only reader — the menu-bar extra and the background-bell banner
+/// name the same terminals, and two implementations of one chain are two sets
+/// of names to keep in agreement.
 ///
-///   1. the SHELL's own title (OSC 0/2). A prompt with title integration is
-///      already saying what the tab is — "vim src/main.zig", "npm run dev" —
-///      and nothing this app invents beats that.
-///   2. the last component of the working directory (OSC 7), which is what
-///      Ghostty and Terminal.app fall back to and what most shells report
-///      even without title integration.
-///   3. `Terminal N`, the mint-order number, which is always true and never
-///      useful.
-///
-/// A Phux terminal borrows the title its coordinator published; the local
-/// chain does not apply because there is no local session to ask.
+/// The build arena is the buffer: only the `Terminal N` fallback needs one,
+/// and it lives exactly as long as this view build.
 fn terminalTitle(ui: *TerminalUi, model: *const Model, id: TerminalRef) []const u8 {
-    if (provider_contract.localId(id)) |local| {
-        if (model.provider.terminalConst(id)) |pane| {
-            const shell_title = pane.title();
-            if (shell_title.len > 0) return shell_title;
-            const cwd = pane.pwd();
-            if (cwd.len > 0) {
-                // `basename("/")` is empty and `basename("")` is empty; both
-                // fall through to the number rather than painting a blank tab.
-                const leaf = std.fs.path.basename(cwd);
-                if (leaf.len > 0) return leaf;
-            }
-        }
-        return ui.fmt("Terminal {d}", .{terminalNumber(local)});
-    }
-    const presentation = model.remotePresentation(id) orelse return "Phux";
-    return if (presentation.title.len == 0) "Phux" else presentation.title;
+    const scratch = ui.arena.alloc(u8, projection.max_terminal_title_bytes) catch return "Terminal";
+    return projection.terminalTitleInto(model, id, scratch);
 }
 
 /// The retained-command id namespace a terminal paints into. Local terminals
@@ -396,6 +377,43 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
     else
         ui.el(.stack, .{ .width = tab_control_extent, .semantics = .{ .hidden = true } }, .{});
 
+    // The tab's own menu. Every verb here has a chord already; what the menu
+    // adds is that they act on THIS tab rather than on the selected one, which
+    // is the whole reason a right-click on a tab exists. `Close Others` has no
+    // chord at all and is the one people reach for after an afternoon.
+    //
+    // Disabled rather than absent at the ends of the strip: a menu whose items
+    // move depending on where the tab sits is a menu nobody can learn.
+    const last_tab = ws.tab_count -| 1;
+    const tab_menu = [_]TerminalUi.ContextMenuItem{
+        .{ .label = "New Terminal", .msg = .new_terminal },
+        .{ .separator = true },
+        .{
+            .label = "Move Left",
+            .msg = .{ .move_tab = .{ .index = @intCast(tab_index), .delta = -1 } },
+            .enabled = tab_index > 0,
+        },
+        .{
+            .label = "Move Right",
+            .msg = .{ .move_tab = .{ .index = @intCast(tab_index), .delta = 1 } },
+            .enabled = tab_index < last_tab,
+        },
+        .{ .separator = true },
+        .{
+            .label = "Close",
+            .msg = .{ .close_tab = @intCast(tab_index) },
+            // A Phux terminal's lifetime belongs to its coordinator, exactly
+            // as it does for cmd+W: an item that looks live and does nothing
+            // is worse than one that says it cannot.
+            .enabled = provider_contract.isLocal(id),
+        },
+        .{
+            .label = "Close Others",
+            .msg = .{ .close_other_tabs = @intCast(tab_index) },
+            .enabled = ws.tab_count > 1,
+        },
+    };
+
     // ONE selection signal, not two. The list item's own rounded selected
     // fill plus the brighter label already say which tab is current; an
     // accent rule under a rounded pill reads as a second, competing marker
@@ -424,8 +442,16 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
         .height = tab_height,
         .selected = selected,
         .on_press = .{ .select_position = @intCast(tab_index) },
+        // Drag to reorder. The toolkit's drag record is closed at six fields
+        // and the runtime injects five of them, so `sourceId` is the only
+        // channel this app has for saying WHICH tab was picked up — which is
+        // exactly what it carries. The gesture crosses the runtime's own drag
+        // slop before a single event arrives, so an ordinary click still
+        // selects and only a real drag reorders.
+        .on_drag = .{ .tab_drag = .{ .sourceId = @intCast(tab_index) } },
         .on_hover_enter = .{ .hover_tab = @intCast(tab_index) },
         .on_hover_leave = .unhover_tab,
+        .context_menu = &tab_menu,
         .style = .{ .background = if (selected) tokens.colors.surface_subtle else tokens.colors.surface },
         .semantics = .{ .role = .tab, .label = semantics },
     }, .{body});
@@ -451,8 +477,35 @@ fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspac
     }, title);
 }
 
+/// A control plus the name it does not otherwise show.
+///
+/// An icon-only button has an accessibility label and nothing a sighted mouse
+/// user can read, which leaves `+`, `x` and two chevrons to be learned by
+/// pressing them. The toolkit's tooltip is the answer and costs this app no
+/// state at all: the RUNTIME owns hover intent — delay, keyboard-focus reveal,
+/// Escape, the warm window that makes the second tooltip in a row instant —
+/// and the model never hears about hover.
+///
+/// Deliberately not on every tab. Anchored surfaces are budgeted at 16 per
+/// view (`max_canvas_widget_anchored_per_view`, a loud
+/// `error.WidgetAnchoredSurfaceLimitReached`), and a strip of 16 tabs would
+/// spend the entire budget before the chrome around it got one. The controls
+/// tipped here are FIXED chrome — four of them, whatever the tab count.
+fn tipped(ui: *TerminalUi, trigger: TerminalUi.Node, text: []const u8) TerminalUi.Node {
+    return ui.el(.stack, .{}, .{
+        trigger,
+        ui.el(.tooltip, .{
+            .anchor = .below,
+            .text = text,
+            // The tip repeats the control's own accessible name, so a reader
+            // that announced the button would announce it twice.
+            .semantics = .{ .decorative = true },
+        }, .{}),
+    });
+}
+
 fn newTabButton(ui: *TerminalUi) TerminalUi.Node {
-    return ui.button(.{
+    return tipped(ui, ui.button(.{
         .width = tab_height,
         .height = tab_control_extent + 6,
         .size = .icon,
@@ -460,7 +513,10 @@ fn newTabButton(ui: *TerminalUi) TerminalUi.Node {
         .icon = "plus",
         .on_press = .new_terminal,
         .semantics = .{ .label = "New terminal, shortcut CMD+T" },
-    }, "");
+        // Spelled out rather than ⌘: the bundled face is a terminal font, and
+        // the toolkit's own coverage guard names ⌘ as one of the codepoints
+        // that renders as a tofu box on the reference and mobile paths.
+    }, ""), "New Terminal (Cmd+T)");
 }
 
 /// The spoken identity of a terminal SURFACE.
@@ -690,7 +746,7 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
         // "next" while the screen moves UP is a button that has to be
         // learned. The menu keeps the platform's Find Next/Find Previous
         // vocabulary over the same two messages.
-        ui.button(.{
+        tipped(ui, ui.button(.{
             .width = control_extent,
             .height = control_extent,
             .size = .icon,
@@ -698,8 +754,8 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
             .icon = "chevron-up",
             .on_press = .{ .search_step = 1 },
             .semantics = .{ .label = "Older match" },
-        }, ""),
-        ui.button(.{
+        }, ""), "Older match (Cmd+G)"),
+        tipped(ui, ui.button(.{
             .width = control_extent,
             .height = control_extent,
             .size = .icon,
@@ -707,8 +763,8 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
             .icon = "chevron-down",
             .on_press = .{ .search_step = -1 },
             .semantics = .{ .label = "Newer match" },
-        }, ""),
-        ui.button(.{
+        }, ""), "Newer match (Cmd+Shift+G)"),
+        tipped(ui, ui.button(.{
             .width = control_extent,
             .height = control_extent,
             .size = .icon,
@@ -716,7 +772,7 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
             .icon = "x",
             .on_press = .search_close,
             .semantics = .{ .label = "Close search" },
-        }, ""),
+        }, ""), "Close search (Esc)"),
     });
 }
 
@@ -1753,9 +1809,115 @@ pub fn windows(model: *const Model, scratch: *TerminalApp.WindowsScratch) []cons
     return scratch.windows[0..count];
 }
 
+/// The command name the menu-bar row for tab `index` dispatches. A comptime
+/// table rather than a formatted string, because `on_command` is handed a
+/// borrowed name and answers with a Msg — there is nowhere in that signature
+/// for an allocation to live.
+const tray_select_prefix = "tray.select.";
+
+const tray_select_commands = blk: {
+    var names: [max_tabs][]const u8 = undefined;
+    for (&names, 0..) |*name, index| name.* = std.fmt.comptimePrint("tray.select.{d}", .{index});
+    break :blk names;
+};
+
+/// The menu-bar extra, derived from the model on every rebuild.
+///
+/// What it answers, from a machine whose front window belongs to something
+/// else entirely: how many terminals are open, whether any of them wants
+/// something, which one, and — through the rows — a way straight to it.
+///
+/// The ACTIVE window's tabs, not every window's: the rows dispatch
+/// `select_position`, which is a position inside one workspace, and a flat
+/// list mixing four windows' tabs would have two rows called "Terminal 2" that
+/// went to different places. The count in the title is the same scope, so the
+/// two agree.
+pub fn statusItem(model: *const Model, scratch: *TerminalApp.StatusItemScratch) TerminalApp.StatusItemState {
+    const ws = model.wsConst();
+    var count: usize = 0;
+    var attention: usize = 0;
+    var arena_used: usize = 0;
+    // Two rows are reserved for the trailer below, so a workspace at the tab
+    // ceiling cannot push New Terminal out of its own menu.
+    const row_ceiling = @min(max_tabs, scratch.items.len -| 2);
+    for (0..ws.tab_count) |index| {
+        if (count >= row_ceiling) break;
+        const id = ws.tabTerminal(index) orelse continue;
+        const needs = projection.terminalNeedsAttention(model, id);
+        if (needs) attention += 1;
+        // Titles come from the pane and are borrowed, except the `Terminal N`
+        // fallback — which needs a buffer that outlives this call, and the
+        // scratch is exactly that (it lives on the app struct, valid until the
+        // next apply).
+        const room = scratch.arena_buffer[arena_used..];
+        const label = projection.terminalTitleInto(model, id, room);
+        if (label.ptr == room.ptr) arena_used += label.len;
+        scratch.items[count] = .{
+            // Item ids are the platform's own handle for a row and must be
+            // non-zero; the tab position plus one is stable for as long as the
+            // menu is open, which is the only lifetime that matters.
+            .id = @intCast(index + 1),
+            .label = label,
+            .command = tray_select_commands[index],
+            // The marker is a WORD, not a dot: a status menu is read, not
+            // scanned, and "needs attention" says what a coloured dot only
+            // hints at.
+            .detail = if (needs) "needs attention" else "",
+            // `.agent` is the toolkit's role for a row that BOTH acts and
+            // reports — a `.command` row carrying a detail is refused whole
+            // (`validateTrayMenuItems`), and a `.info` row cannot carry a
+            // command. A terminal is exactly the thing that has to be both.
+            .role = .agent,
+            .enabled = true,
+        };
+        count += 1;
+    }
+    scratch.items[count] = .{ .separator = true, .id = @intCast(count + 1) };
+    count += 1;
+    scratch.items[count] = .{
+        .id = @intCast(count + 1),
+        .label = "New Terminal",
+        .command = "terminal.new",
+        .key = "t",
+        .modifiers = .{ .primary = true },
+    };
+    count += 1;
+
+    const title = std.fmt.bufPrint(
+        &scratch.title_buffer,
+        "{s} {d}",
+        .{ scene_module.status_item_prefix, ws.tab_count },
+    ) catch scene_module.status_item_prefix;
+    return .{
+        .title = title,
+        .presentation = .{
+            .title = title,
+            // The whole point of the extra is the glance, so attention is the
+            // one thing it says without being opened. Tone rather than an
+            // extra glyph: the menu bar is a shared strip, and an app that
+            // grows a character when it wants something shoves everything to
+            // its left.
+            .tone = if (attention > 0) .warning else .normal,
+        },
+        .items = scratch.items[0..count],
+    };
+}
+
 pub fn onCommand(name: []const u8) ?Msg {
+    // The menu-bar rows, which carry the tab position in the command name —
+    // the tray channel has no payload of its own.
+    if (std.mem.startsWith(u8, name, tray_select_prefix)) {
+        const index = std.fmt.parseInt(u8, name[tray_select_prefix.len..], 10) catch return null;
+        if (index >= max_tabs) return null;
+        return .{ .tray_select = index };
+    }
+    // Every menu open re-reads the derivation for free (the runtime consults
+    // `status_item_fn` after each dispatch), so the command needs no arm of
+    // its own beyond being a message at all.
+    if (std.mem.eql(u8, name, "tray.opened")) return .tray_opened;
     if (std.mem.eql(u8, name, "window.new")) return .new_window;
     if (std.mem.eql(u8, name, "window.fullscreen")) return .toggle_fullscreen;
+    if (std.mem.eql(u8, name, "window.minimize")) return .minimize_window;
     if (std.mem.eql(u8, name, "surface.1")) return .{ .select_position = 0 };
     if (std.mem.eql(u8, name, "surface.2")) return .{ .select_position = 1 };
     if (std.mem.eql(u8, name, "surface.3")) return .{ .select_position = 2 };
