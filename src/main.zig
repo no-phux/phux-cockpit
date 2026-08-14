@@ -144,6 +144,20 @@ pub const RemoteUiState = model_module.RemoteUiState;
 pub const retainSelectionAfterCopy = update_module.retainSelectionAfterCopy;
 pub const remoteFocusTarget = update_module.remoteFocusTarget;
 
+/// The chrome register. See docs/DESIGN_SYSTEM.md, and
+/// `src/tests/chrome_register_tests.zig` for what holds it in place.
+pub const chrome_band_height = projection.chrome_band_height;
+pub const chrome_band_inset = projection.chrome_band_inset;
+pub const chrome_control_extent = projection.chrome_control_extent;
+pub const chrome_icon_extent = projection.chrome_icon_extent;
+pub const chrome_gap = projection.chrome_gap;
+pub const chrome_hit_target = projection.chrome_hit_target;
+pub const grid_inset = projection.grid_inset;
+pub const tab_height = projection.tab_height;
+pub const tab_control_extent = projection.tab_control_extent;
+pub const tab_marker_extent = projection.tab_marker_extent;
+pub const tab_indicator_thickness = projection.tab_indicator_thickness;
+
 pub const header_height = projection.header_height;
 pub const side_rail_width = projection.side_rail_width;
 pub const side_rail_gap = projection.side_rail_gap;
@@ -185,7 +199,18 @@ pub const terminalNeedsAttention = projection.terminalNeedsAttention;
 pub const tabsRideTitlebarIn = projection.tabsRideTitlebarIn;
 pub const paletteRowsIn = projection.paletteRowsIn;
 pub const paletteSelectedTabIn = projection.paletteSelectedTabIn;
+pub const paletteWindowFor = projection.paletteWindowFor;
+pub const PaletteWindow = projection.PaletteWindow;
+pub const palette_max_visible_rows = projection.palette_max_visible_rows;
 pub const palette_width = view_module.palette_width;
+pub const palette_row_height = view_module.palette_row_height;
+pub const palette_padding = view_module.palette_padding;
+pub const palette_top_inset = view_module.palette_top_inset;
+pub const settings_row_height = view_module.settings_row_height;
+pub const settings_padding = view_module.settings_padding;
+pub const settings_margin = view_module.settings_margin;
+pub const field_caret_width = view_module.field_caret_width;
+pub const field_caret_height = view_module.field_caret_height;
 pub const titlebar_tab_leading_reserve = projection.titlebar_tab_leading_reserve;
 pub const titlebar_tab_band_min = projection.titlebar_tab_band_min;
 
@@ -195,6 +220,8 @@ pub const webview_anchor = scene.webview_anchor;
 pub const app_name = scene.app_name;
 pub const bundle_id = scene.bundle_id;
 pub const main_window_label = scene.main_window_label;
+pub const window_width = scene.window_width;
+pub const window_height = scene.window_height;
 pub const window_min_width = scene.window_min_width;
 pub const window_min_height = scene.window_min_height;
 pub const web_origins = scene.web_origins;
@@ -777,4 +804,5 @@ test {
     _ = @import("tests/scrollback_search_tests.zig");
     _ = @import("tests/multi_window_tests.zig");
     _ = @import("tests/sdk_surface_tests.zig");
+    _ = @import("tests/chrome_register_tests.zig");
 }

@@ -69,18 +69,46 @@ const attention_marker_icon = "circle-dot";
 pub const window_ground_command_id: u64 = 0x0c01;
 pub const header_ground_command_id: u64 = 0x0c02;
 pub const header_rule_command_id: u64 = 0x0c03;
+/// The drawn caret, in the two fields this app routes keys to itself.
+///
+/// The one place in the chrome that takes its size from the TERMINAL rather
+/// than from the chrome register, and deliberately: it is imitating the cursor
+/// two rows below it, so a caret on the 4pt grid would be a caret that does not
+/// match the thing it is pretending to be. At the default 13pt the bundled
+/// 0.6em face gives a 7.8 x 17.16 cell, and 8 x 16 is the whole-point box
+/// nearest it. This is a MARK, not a spacing value; docs/DESIGN_SYSTEM.md's
+/// rule against deriving chrome spacing from cell metrics still holds
+/// everywhere else.
+///
+/// One pair, not two. The search band drew 7x16 and the switcher drew 7x15,
+/// and neither site recorded why they differed.
+pub const field_caret_width: f32 = 8;
+pub const field_caret_height: f32 = 16;
+
 /// The summoned switcher's geometry. Wide enough for a real shell title
 /// beside its chord, short enough that it reads as a panel over the terminal
 /// rather than as a second window.
+///
+/// Its rows are `chrome_control_extent` — the same small-register control the
+/// search band hosts — and its padding is `chrome_gap`. A floating panel and a
+/// docked band are the same system; what separates them is the scrim behind
+/// this one, not a second set of metrics.
 pub const palette_width: f32 = 460;
-pub const palette_row_height: f32 = 30;
+pub const palette_row_height: f32 = projection.chrome_control_extent;
 /// The panel's own padding, and the row width inside it.
-pub const palette_padding: f32 = 6;
+pub const palette_padding: f32 = projection.chrome_gap;
 pub const palette_row_width: f32 = palette_width - palette_padding * 2;
 /// How far down the content the panel sits. Not centred: a switcher pinned to
 /// the vertical middle covers the prompt, which is the one row the user was
 /// looking at when they summoned it.
-pub const palette_top_inset: f32 = 72;
+///
+/// 40, not 72. The inset is applied on every side (`ElementOptions.padding` is
+/// symmetric), so it is subtracted from the panel's available height twice: at
+/// 72 a full eight-row switcher needed 336pt inside the 276 that a
+/// minimum-height window left it, and the tail of the list was painted past the
+/// bottom edge. 40 leaves 340 for the same 336, which the layout audit is what
+/// proves rather than this arithmetic.
+pub const palette_top_inset: f32 = 40;
 /// The scrim behind it — black, for the same reason `dim_scrim` is: it has to
 /// darken whatever the terminal's own background happens to be.
 ///
@@ -94,12 +122,22 @@ const palette_scrim: canvas.Color = canvas.Color.rgba(0, 0, 0, 0.5);
 /// carries a name, a one-line summary, and its measured contrast, and none of
 /// the three is worth eliding.
 pub const settings_width: f32 = 560;
-pub const settings_row_height: f32 = 34;
-pub const settings_padding: f32 = 10;
+pub const settings_row_height: f32 = projection.chrome_control_extent;
+pub const settings_padding: f32 = projection.chrome_gap;
 pub const settings_row_width: f32 = settings_width - settings_padding * 2;
-/// How far down the content the panel sits — the same reasoning as
-/// `palette_top_inset`, one row lower because this panel is taller.
-pub const settings_top_inset: f32 = 56;
+/// The panel's margin from the window edge, and it is a MARGIN now rather than
+/// a top inset: the panel is centred.
+///
+/// The old arrangement pinned it 56pt from the top, which is the palette's
+/// reasoning — do not cover the prompt — applied to a surface that reasoning
+/// does not describe. The switcher is a lightweight overlay you read the
+/// terminal around; the settings panel is modal, takes the keyboard, and lays a
+/// 62% scrim over everything behind it. There is no prompt left to preserve, so
+/// the panel goes where a modal goes.
+///
+/// It also has to: at 56 on every side the panel needed 385pt inside the 308 a
+/// minimum-height window left it. Centred at a 16pt margin it gets 388.
+pub const settings_margin: f32 = 16;
 
 /// THE SETTINGS SURFACE'S OWN COLOURS, AND WHY THEY ARE LITERALS.
 ///
@@ -286,7 +324,7 @@ fn paneStatus(ui: *TerminalUi, model: *const Model, terminal_ref: TerminalRef) T
     if (providerKind(terminal_ref) == .phux) return emptyStatusNode(ui);
     const pane = model.provider.terminalConst(terminal_ref) orelse return emptyStatusNode(ui);
     if (!paneLifecycleFailed(pane)) return emptyStatusNode(ui);
-    return ui.row(.{ .gap = 6, .cross = .center }, .{
+    return ui.row(.{ .gap = projection.chrome_gap, .cross = .center }, .{
         ui.el(.badge, .{
             .variant = .destructive,
             .text = paneLifecycleText(ui, pane),
@@ -330,6 +368,16 @@ fn tabSemantics(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_
 /// The attention marker: a DOT in a fixed slot, never a `!` welded onto the
 /// terminal's name. The slot is reserved whether or not the dot is drawn, so
 /// a bell does not shove the label sideways.
+///
+/// `tab_marker_extent` is `chrome_icon_extent` — the app's ONE inline-icon
+/// size — rather than the 8pt it used to be. At 8pt `circle-dot` has a ring and
+/// a dot to draw inside eight points and renders as a smudge; the register's
+/// own answer for an icon beside 13pt text is 15 and the cap-height recipe says
+/// 15.1, so 16 is the artboard both round to. No extra room is held for the
+/// fact that it is a CIRCLE — circles do want 111-113% of an equivalent square
+/// to read the same size, but this is a vector icon on the toolkit's own icon
+/// grid, which has already applied that correction; adding it again here would
+/// double it.
 fn tabAttentionMarker(ui: *TerminalUi, model: *const Model, id: TerminalRef, tokens: canvas.DesignTokens) TerminalUi.Node {
     if (!terminalNeedsAttention(model, id)) {
         return ui.el(.stack, .{ .width = tab_marker_extent, .semantics = .{ .hidden = true } }, .{});
@@ -414,19 +462,47 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
         },
     };
 
-    // ONE selection signal, not two. The list item's own rounded selected
-    // fill plus the brighter label already say which tab is current; an
-    // accent rule under a rounded pill reads as a second, competing marker
-    // (and is clipped by the pill's own radius anyway).
-    const body = ui.row(.{ .height = tab_height, .gap = 6, .cross = .center, .padding = 8 }, .{
-        tabAttentionMarker(ui, model, id, tokens),
-        ui.text(.{
-            .grow = 1,
-            .wrap = false,
-            .overflow = .ellipsis,
-            .style = .{ .foreground = if (selected) tokens.colors.text else tokens.colors.text_muted },
-        }, title),
-        close_node,
+    // TWO selection signals, and the second one is not redundancy — it is the
+    // only one that carries.
+    //
+    // The lighter fill alone was the whole signal here, on the argument that a
+    // second marker would compete with it. Measured, that fill is
+    // `surface_subtle` over `surface`: 1.07 to 1. WCAG 2.1 SC 1.4.11 asks 3:1
+    // of anything that indicates STATE, and this is not a palette that was
+    // picked badly — it is the ceiling. Material's dark-theme elevation model
+    // runs 5% white at 1dp to 16% at 24dp, and the whole of that range spans
+    // 1.00:1 to 1.60:1. Reaching 3:1 against this ground needs a mid grey, at
+    // which point the selected tab has stopped being a tab and become a button.
+    //
+    // So elevation says NEAR and the accent says HERE, which is the same verb
+    // the focused pane's edge already uses. `accent` on `surface` measures
+    // 14.10:1. The bar is the Geist pack's own `tabs_indicator_thickness`, and
+    // it is inset by a full gap on each side so it clears the pill's 6pt corner
+    // radius instead of being clipped by it — which is the real reason the
+    // earlier underline did not survive.
+    const body = ui.column(.{ .width = extent, .height = tab_height }, .{
+        ui.row(.{ .grow = 1, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
+            tabAttentionMarker(ui, model, id, tokens),
+            ui.text(.{
+                .grow = 1,
+                .wrap = false,
+                .overflow = .ellipsis,
+                .style = .{ .foreground = if (selected) tokens.colors.text else tokens.colors.text_muted },
+            }, title),
+            close_node,
+        }),
+        // The unselected bar is painted in the tab's OWN ground rather than
+        // omitted: a slot that appears only when selected would move the label
+        // by two points every time the selection changed. It is deliberately
+        // unnamed rather than `semantics.hidden`, because that flag suppresses
+        // RENDERING as well as the accessibility node.
+        ui.row(.{ .width = extent, .height = projection.tab_indicator_thickness, .main = .center }, .{
+            ui.el(.stack, .{
+                .width = @max(0, extent - projection.chrome_gap * 2),
+                .height = projection.tab_indicator_thickness,
+                .style = .{ .background = if (selected) tokens.colors.accent else tokens.colors.surface },
+            }, .{}),
+        }),
     });
 
     // `.list_item`, not `.stack`. A plain container is invisible to the
@@ -504,10 +580,13 @@ fn tipped(ui: *TerminalUi, trigger: TerminalUi.Node, text: []const u8) TerminalU
     });
 }
 
+/// The `+`. One SMALL-register control (`chrome_control_extent`), square,
+/// which is what puts it on the same rung as every other standalone control in
+/// the chrome. It was 34x24 — a third height in a row that already had two.
 fn newTabButton(ui: *TerminalUi) TerminalUi.Node {
     return tipped(ui, ui.button(.{
-        .width = tab_height,
-        .height = tab_control_extent + 6,
+        .width = projection.chrome_control_extent,
+        .height = projection.chrome_control_extent,
         .size = .icon,
         .variant = .ghost,
         .icon = "plus",
@@ -600,7 +679,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, n
         .height = rect.height,
     }, .{
         surface,
-        ui.column(.{ .grow = 1, .main = .center, .cross = .center, .gap = 8 }, .{
+        ui.column(.{ .grow = 1, .main = .center, .cross = .center, .gap = projection.chrome_gap }, .{
             ui.el(.badge, .{
                 .variant = .destructive,
                 .text = paneLifecycleText(ui, local_pane),
@@ -692,12 +771,17 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
     else
         ui.fmt("{d} of {d}", .{ session.searchMatchOrdinal(), total });
 
-    const control_extent = projection.search_bar_height - 12;
+    // The band's controls are the register's SMALL rung, not a height derived
+    // from the band by subtraction. `search_bar_height - 12` produced 22, which
+    // is on no ladder the toolkit knows: a row reads as one height exactly when
+    // every control in it declares the same size, and 22 was the reason this
+    // band read as a strip of odds and ends.
+    const control_extent = projection.chrome_control_extent;
     return ui.row(.{
         .height = projection.search_bar_height,
-        .gap = 8,
+        .gap = projection.chrome_gap,
         .cross = .center,
-        .padding = 6,
+        .padding = projection.chrome_band_inset,
         .style = .{ .background = tokens.colors.surface_subtle },
         .semantics = .{
             .label = ui.fmt("Scrollback search, {s}, {s}", .{
@@ -713,8 +797,8 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
         // unnamed instead — the band's own label above already says
         // everything a reader needs.
         ui.icon(.{
-            .width = 14,
-            .height = 14,
+            .width = projection.chrome_icon_extent,
+            .height = projection.chrome_icon_extent,
             .style = .{ .foreground = tokens.colors.text_muted },
         }, "search"),
         ui.row(.{ .grow = 1, .gap = 1, .cross = .center }, .{
@@ -730,8 +814,8 @@ fn searchBar(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens:
             // cursor two rows below: a 2pt bar was invisible against the
             // band at 1x, and an invisible focus cue is not one.
             ui.el(.stack, .{
-                .width = 7,
-                .height = 16,
+                .width = field_caret_width,
+                .height = field_caret_height,
                 .style = .{ .background = tokens.colors.accent },
             }, .{}),
             ui.spacer(1),
@@ -800,12 +884,15 @@ fn configNoticeBand(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignT
     var storage: [projection.config_notice_bytes]u8 = undefined;
     // `ui.fmt` copies into the UI's own arena; this buffer dies with the frame.
     const line = ui.fmt("{s}", .{projection.configNoticeLine(model, &storage)});
-    const control_extent = projection.config_notice_height - 12;
+    // The register, not a subtraction from the band — same reasoning as the
+    // search band above, and the two bands now agree by construction rather
+    // than by two sites happening to pick the same arithmetic.
+    const control_extent = projection.chrome_control_extent;
     return ui.row(.{
         .height = projection.config_notice_height,
-        .gap = 8,
+        .gap = projection.chrome_gap,
         .cross = .center,
-        .padding = 6,
+        .padding = projection.chrome_band_inset,
         .style = .{ .background = tokens.colors.surface_subtle },
         .on_press = .config_notice_dismissed,
         .semantics = .{ .label = ui.fmt("{s}. Press to dismiss.", .{line}) },
@@ -814,8 +901,8 @@ fn configNoticeBand(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignT
         // suppresses RENDERING as well as the accessibility node, and the
         // row's own label above already says everything a reader needs.
         ui.icon(.{
-            .width = 14,
-            .height = 14,
+            .width = projection.chrome_icon_extent,
+            .height = projection.chrome_icon_extent,
             .style = .{ .foreground = tokens.colors.warning },
         }, "alert"),
         // Ellipsis rather than a truncation of my own: the line is bounded by
@@ -854,14 +941,21 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
     const count = projection.paletteRowsIn(model, ws, &rows);
     const needle = ws.palette.needle();
     const cursor = if (count == 0) 0 else @min(ws.palette.cursor, count - 1);
+    // Which of the matches this panel is tall enough to DRAW. The match set
+    // above is untouched, so Enter still commits the row under the cursor
+    // whether or not the panel had room for it — the drawing window and the
+    // commit target reading from two different derivations is exactly the class
+    // of bug `resolvePanes` exists to prevent, so this one derives from the same
+    // count and cursor the loop below uses.
+    const window = projection.paletteWindowFor(count, cursor);
 
-    var row_nodes: [max_tabs]TerminalUi.Node = undefined;
-    for (rows[0..count], 0..) |tab_index, offset| {
+    var row_nodes: [projection.palette_max_visible_rows]TerminalUi.Node = undefined;
+    for (rows[window.first..][0..window.count], 0..) |tab_index, offset| {
         const id = ws.tabTerminal(tab_index) orelse {
             row_nodes[offset] = ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
             continue;
         };
-        const highlighted = offset == cursor;
+        const highlighted = window.first + offset == cursor;
         const title = terminalTitle(ui, model, id);
         row_nodes[offset] = ui.el(.list_item, .{
             // Explicit, and both levels of it. A `grow` inside a container
@@ -883,35 +977,49 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
                 }),
             },
         }, .{
-            ui.row(.{ .width = palette_row_width, .height = palette_row_height, .gap = 8, .cross = .center, .padding = 8 }, .{
-                tabAttentionMarker(ui, model, id, tokens),
-                ui.text(.{
-                    .grow = 1,
-                    .wrap = false,
-                    .overflow = .ellipsis,
-                    .style = .{ .foreground = if (highlighted) tokens.colors.text else tokens.colors.text_muted },
-                }, title),
-                // The chord that also reaches this tab, for the first five.
-                // Past five there is no chord, and the row says nothing rather
-                // than naming one that does not exist.
-                ui.text(.{
-                    .wrap = false,
-                    .style = .{ .foreground = tokens.colors.text_muted },
-                }, if (tab_index < 5) ui.fmt("CMD+{d}", .{tab_index + 1}) else ""),
+            ui.row(.{ .width = palette_row_width, .height = palette_row_height, .cross = .center }, .{
+                // The cursor's accent rail, and it is here for the same
+                // measured reason the selected tab grew one: `surface_pressed`
+                // over `surface` is 1.26:1, and SC 1.4.11 asks 3:1 of anything
+                // that indicates state. A vertical rail rather than the tab's
+                // horizontal bar because this is a vertical list — the accent
+                // marks the edge the rows are read from. Unselected rows paint
+                // it in the row's own ground so the label never shifts.
+                ui.el(.stack, .{
+                    .width = projection.tab_indicator_thickness,
+                    .height = palette_row_height,
+                    .style = .{ .background = if (highlighted) tokens.colors.accent else tokens.colors.surface },
+                }, .{}),
+                ui.row(.{ .grow = 1, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
+                    tabAttentionMarker(ui, model, id, tokens),
+                    ui.text(.{
+                        .grow = 1,
+                        .wrap = false,
+                        .overflow = .ellipsis,
+                        .style = .{ .foreground = if (highlighted) tokens.colors.text else tokens.colors.text_muted },
+                    }, title),
+                    // The chord that also reaches this tab, for the first five.
+                    // Past five there is no chord, and the row says nothing rather
+                    // than naming one that does not exist.
+                    ui.text(.{
+                        .wrap = false,
+                        .style = .{ .foreground = tokens.colors.text_muted },
+                    }, if (tab_index < 5) ui.fmt("CMD+{d}", .{tab_index + 1}) else ""),
+                }),
             }),
         });
     }
 
     const body = if (count == 0)
-        ui.el(.stack, .{ .height = palette_row_height, .padding = 8 }, .{
+        ui.el(.stack, .{ .height = palette_row_height, .padding = projection.chrome_gap }, .{
             ui.text(.{ .style = .{ .foreground = tokens.colors.warning } }, "No terminal matches"),
         })
     else
-        ui.list(.{ .gap = 2, .semantics = .{ .label = "Matching terminals" } }, row_nodes[0..count]);
+        ui.list(.{ .gap = projection.chrome_band_inset, .semantics = .{ .label = "Matching terminals" } }, row_nodes[0..window.count]);
 
     return ui.column(.{
         .width = palette_width,
-        .gap = 4,
+        .gap = projection.chrome_band_inset,
         .padding = palette_padding,
         .style = .{ .background = tokens.colors.surface },
         .semantics = .{
@@ -925,10 +1033,10 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
         // The needle, drawn rather than hosted — same reasoning as the
         // scrollback search field two hundred lines up: the app routes the
         // keys, so the app draws the caret.
-        ui.row(.{ .width = palette_row_width, .height = palette_row_height, .gap = 6, .cross = .center, .padding = 8 }, .{
+        ui.row(.{ .width = palette_row_width, .height = palette_row_height, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
             ui.icon(.{
-                .width = 13,
-                .height = 13,
+                .width = projection.chrome_icon_extent,
+                .height = projection.chrome_icon_extent,
                 .style = .{ .foreground = tokens.colors.text_muted },
             }, "search"),
             ui.text(.{
@@ -937,8 +1045,8 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
                 .style = .{ .foreground = if (needle.len == 0) tokens.colors.text_muted else tokens.colors.text },
             }, if (needle.len == 0) "Go to terminal…" else needle),
             ui.el(.stack, .{
-                .width = 7,
-                .height = 15,
+                .width = field_caret_width,
+                .height = field_caret_height,
                 .style = .{ .background = tokens.colors.accent },
             }, .{}),
             ui.spacer(1),
@@ -984,10 +1092,11 @@ fn legibilityReadout(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     };
     return ui.row(.{
         .width = settings_row_width,
-        .height = settings_row_height + 8,
-        .gap = 10,
+        // One BAND tall, which is what this row is: a readout, not a list row.
+        .height = projection.chrome_band_height,
+        .gap = projection.chrome_gap,
         .cross = .center,
-        .padding = 6,
+        .padding = projection.chrome_band_inset,
         .style = .{ .background = settings_ground_raised },
         .semantics = .{ .label = ui.fmt(
             "Legibility: foreground {s} on background {s}, contrast ratio {d:.2} to 1, {s}",
@@ -999,8 +1108,8 @@ fn legibilityReadout(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         // place on screen where "what does my text look like" is answerable by
         // looking rather than by squinting at a whole screen of it.
         ui.el(.stack, .{
-            .width = 46,
-            .height = settings_row_height - 4,
+            .width = 48,
+            .height = 24,
             .style = .{ .background = reading.background },
         }, .{
             ui.row(.{ .grow = 1, .main = .center, .cross = .center }, .{
@@ -1067,11 +1176,11 @@ fn settingsThemeRow(ui: *TerminalUi, index: usize, highlighted: bool, active: bo
             }),
         },
     }, .{
-        ui.row(.{ .width = settings_row_width, .height = settings_row_height, .gap = 8, .cross = .center, .padding = 7 }, .{
+        ui.row(.{ .width = settings_row_width, .height = settings_row_height, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
             // The theme's own pair, as a swatch. Two colours are faster to
             // compare than two hex strings.
             ui.el(.stack, .{
-                .width = 22,
+                .width = 24,
                 .height = 16,
                 .style = .{ .background = canvas.Color.rgb8(entry.background.r, entry.background.g, entry.background.b) },
             }, .{
@@ -1134,12 +1243,12 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
 
     return ui.column(.{
         .width = settings_width,
-        .gap = 6,
+        .gap = projection.chrome_gap,
         .padding = settings_padding,
         .style = .{ .background = settings_ground },
         .semantics = .{ .label = settings_panel_label },
     }, .{
-        ui.row(.{ .width = settings_row_width, .gap = 8, .cross = .center }, .{
+        ui.row(.{ .width = settings_row_width, .gap = projection.chrome_gap, .cross = .center }, .{
             ui.text(.{ .wrap = false, .style = .{ .foreground = settings_ink } }, "Settings"),
             ui.spacer(1),
             ui.text(.{
@@ -1150,7 +1259,11 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
         settingsRule(ui),
         legibilityReadout(ui, model),
         settingsRule(ui),
-        ui.list(.{ .gap = 1, .semantics = .{ .label = "Themes" } }, row_slice),
+        // Gap ZERO, not one. The theme rows are a table read down a column,
+        // and the highlight is what separates them; a one-point gutter is
+        // neither a gap nor a rule, and it is the only spacing value in this
+        // panel that was on no scale at all.
+        ui.list(.{ .gap = 0, .semantics = .{ .label = "Themes" } }, row_slice),
         settingsRule(ui),
         // Where the choice lands. Said out loud because "it did not persist"
         // and "it persisted somewhere you are not looking" are the two failure
@@ -1165,7 +1278,7 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
             "no config file location could be resolved, so this run only"),
         // A pointer path to both verbs. The panel is keyboard-first, but a
         // surface reachable only by keys is one a pointer user cannot finish.
-        ui.row(.{ .width = settings_row_width, .gap = 8, .cross = .center }, .{
+        ui.row(.{ .width = settings_row_width, .gap = projection.chrome_gap, .cross = .center }, .{
             ui.spacer(1),
             settingsAction(ui, "Cancel", .settings_close, false),
             settingsAction(ui, "Save", .settings_commit, true),
@@ -1179,8 +1292,11 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
 /// on this panel is allowed to do.
 fn settingsAction(ui: *TerminalUi, label: []const u8, msg: Msg, emphasis: bool) TerminalUi.Node {
     return ui.el(.stack, .{
-        .width = 84,
-        .height = 26,
+        .width = 88,
+        // The small register, like every other standalone control in the
+        // chrome. 26 was on no ladder, and a footer verb below the pointer
+        // floor is the last place to save four points.
+        .height = projection.chrome_control_extent,
         .on_press = msg,
         .style = .{ .background = if (emphasis) settings_ground_raised else settings_ground },
         .semantics = .{ .role = .button, .label = label },
@@ -1302,7 +1418,9 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     const tab_strip = ui.row(.{
         .grow = 1,
         .height = tab_height,
-        .gap = 2,
+        // `spacing.xs`. Two points was a gutter you cannot see and cannot land
+        // on a device pixel column at 1x; four reads as a seam between tabs.
+        .gap = projection.chrome_band_inset,
         .cross = .center,
         .semantics = .{ .label = "Terminal tabs" },
     }, .{
@@ -1317,7 +1435,7 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     const rides_titlebar = projection.tabsRideTitlebarIn(model, ws);
     const show_top_strip = revealed and model.tab_placement == .top;
 
-    const top_header = if (show_top_strip and !rides_titlebar) ui.row(.{ .height = header_height, .gap = 12, .cross = .center, .window_drag = true }, .{
+    const top_header = if (show_top_strip and !rides_titlebar) ui.row(.{ .height = header_height, .gap = projection.chrome_gap, .cross = .center, .window_drag = true }, .{
         tab_strip,
         status,
     })
@@ -1346,8 +1464,8 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
         .semantics = .{ .label = webview_anchor },
     }, .{}) else ui.el(.stack, .{ .grow = 1 }, .{});
 
-    const side_rail_content = ui.column(.{ .width = side_rail_width, .gap = 8 }, .{
-        ui.list(.{ .width = side_rail_width, .gap = 3, .semantics = .{ .label = "Terminal tabs" } }, rail_slice),
+    const side_rail_content = ui.column(.{ .width = side_rail_width, .gap = projection.chrome_gap }, .{
+        ui.list(.{ .width = side_rail_width, .gap = projection.chrome_band_inset, .semantics = .{ .label = "Terminal tabs" } }, rail_slice),
         newTabButton(ui),
         ui.spacer(1),
         status,
@@ -1402,7 +1520,7 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
                 .on_press = .settings_close,
                 .semantics = .{ .label = "Dismiss settings without saving" },
             }, .{}),
-            ui.row(.{ .grow = 1, .main = .center, .cross = .start, .padding = settings_top_inset }, .{
+            ui.row(.{ .grow = 1, .main = .center, .cross = .center, .padding = settings_margin }, .{
                 settingsPanel(ui, model, ws),
             }),
         })
@@ -1438,7 +1556,7 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     const titlebar_band = @max(0, chrome.titlebar_height - inset);
     const titlebar = if (show_top_strip and rides_titlebar) ui.row(.{
         .height = titlebar_band,
-        .gap = 12,
+        .gap = projection.chrome_gap,
         .cross = .center,
         .window_drag = true,
         .semantics = .{ .label = "Phux Cockpit window" },

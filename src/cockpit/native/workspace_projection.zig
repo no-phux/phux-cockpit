@@ -29,7 +29,43 @@ pub const grid_inset: f32 = 8;
 pub fn windowPadding(model: *const Model) f32 {
     return @max(0, model.config.window_padding);
 }
-/// The tab band's height. It must be at least the register's own trigger
+
+/// THE CHROME REGISTER: five numbers, and every band in the app is built out
+/// of them.
+///
+/// The toolkit is explicit that a row reads as ONE height exactly when every
+/// control in it carries the same size rung, and that a hand-sized pressable
+/// panel never lands on the scale at all. This app had four bands at four
+/// different paddings hosting controls at four different extents, which is the
+/// long way of saying nobody could tell you what a band was.
+///
+/// A band is one DEFAULT-register control tall and hosts SMALL-register
+/// controls with `spacing.xs` shoulders: 40 = 32 + 4 + 4. That is the whole
+/// system, and it is the Geist pack's own ladder rather than a scale invented
+/// here — `metrics.control_height` is 40, `control_height_sm` is 32, and
+/// `spacing.xs` is 4. See docs/DESIGN_SYSTEM.md for the derivations and the
+/// sources.
+pub const chrome_band_height: f32 = 40;
+pub const chrome_band_inset: f32 = 4;
+pub const chrome_control_extent: f32 = 32;
+/// Every inline icon in the chrome, from three derivations that agree: the
+/// SDK's own `label_size + icon_text_step` (13 + 2 = 15), the cap-height recipe
+/// (1.65 x cap = 1.163 x size = 15.1), and Carbon's shipped 16px-against-14px
+/// pairing. 15.1 rounds to the artboard every icon system ships, and 16 centres
+/// on whole device pixels at 1x and 2x where 15 does not.
+pub const chrome_icon_extent: f32 = 16;
+pub const chrome_gap: f32 = 8;
+
+/// The floor for anything the pointer has to hit. WCAG 2.2 SC 2.5.8 asks 24x24
+/// for AA; Apple's macOS guidance is a 28pt default over a 20pt minimum, which
+/// is the POINTER figure — the 44pt number on Apple's Buttons page is written
+/// for fingertips and chasing it would cost this app the density that makes a
+/// terminal a terminal. 24 clears the AA floor exactly, sits between Apple's
+/// two numbers, and leaves the toolkit's own 18pt audit floor a real margin
+/// instead of passing it by zero, which is what an 18pt control did.
+pub const chrome_hit_target: f32 = 24;
+
+/// The tab band's fallback height. It must be at least the register's own trigger
 /// height, or the strip overflows the band and paints its hairline and
 /// underline indicator down into the terminal's first row. The Geist pack
 /// computes 50 at the default control size (`metrics.tabs_trigger_height`),
@@ -39,13 +75,32 @@ pub const header_height: f32 = 50;
 /// derivation below is the thing tests pin, and it needs the same numbers the
 /// strip lays out with.
 pub const tab_extent: f32 = 168;
-/// Tabs SHRINK before the strip windows, the way every real tab bar does. 92pt
-/// still holds a readable ~10-character title plus the marker and the close
-/// affordance; below that a tab is a swatch, not a label.
-pub const tab_min_extent: f32 = 92;
-pub const tab_height: f32 = 34;
-pub const tab_control_extent: f32 = 18;
-pub const tab_marker_extent: f32 = 8;
+/// Tabs SHRINK before the strip windows, the way every real tab bar does, and
+/// this is where they stop.
+///
+/// DERIVED, not chosen. A tab's furniture is fixed whatever its width — two
+/// `chrome_gap` shoulders (16), the attention slot (16), two gaps between the
+/// three children (16), and the close affordance (24) — which is 72pt before a
+/// single glyph of title. 120 leaves 48pt of label: six to seven characters of
+/// the pack's 13pt sans, and more room than any other single thing in the tab.
+///
+/// It was 92, against furniture that was then 54, so the old floor left 38pt —
+/// five characters — while its comment claimed ten. Raising the close
+/// affordance to a real pointer target had to move this with it or the strip
+/// would have windowed down to tabs that were all furniture. The cost is
+/// visible tab count at a given width, and it is the right trade: the switcher
+/// (cmd+shift+P) reaches every tab in constant time, so the strip's job is to
+/// be READABLE, not to be complete.
+pub const tab_min_extent: f32 = 120;
+/// One default-register control (`metrics.control_height`). It rides a titlebar
+/// band measured at 62pt on this machine, so `titlebar_tab_band_min` clears it
+/// with 14pt to spare.
+pub const tab_height: f32 = chrome_band_height;
+pub const tab_control_extent: f32 = chrome_hit_target;
+pub const tab_marker_extent: f32 = chrome_icon_extent;
+/// The selected tab's accent bar — the Geist pack's own
+/// `metrics.tabs_indicator_thickness`, which is the vocabulary its underline
+/// tab register already speaks.
 pub const tab_indicator_thickness: f32 = 2;
 /// Room held back at the right of the band for the `+` button and the focused
 /// pane's status, so a full strip never pushes either off the edge.
@@ -132,9 +187,16 @@ pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindo
 }
 
 pub const side_rail_width: f32 = 184;
-pub const side_rail_gap: f32 = 8;
-pub const side_tab_height: f32 = 34;
-pub const split_divider_width: f32 = 9;
+pub const side_rail_gap: f32 = chrome_gap;
+/// The rail's rows are the same control as the strip's tabs, at the same
+/// height, because they ARE the same control — a rail that sized its rows
+/// differently would make toggling placement look like a different app.
+pub const side_tab_height: f32 = tab_height;
+/// The grab band between two panes. 8, not 9: an odd extent cannot centre on a
+/// whole point between two halves, so the divider's own hairline landed on a
+/// half-pixel column at 1x and the two panes were never symmetric about it.
+/// 8 is `spacing.sm`, and it is still a wide enough band to grab.
+pub const split_divider_width: f32 = chrome_gap;
 pub const split_pane_min_width: f32 = 240;
 pub const split_pane_min_height: f32 = 80;
 pub const webkit_parking_extent = scene.webkit_parking_extent;
@@ -450,14 +512,19 @@ pub fn workspaceTerminalRef(model: *const Model, workspace: *const Workspace) ?T
     return if (model.containsTerminal(id)) id else null;
 }
 
-/// The scrollback-search band's height.
+/// The scrollback-search band's height: one band (`chrome_band_height`), like
+/// every other band in the app.
+///
+/// It was 34, which held a 22pt control that was on no register at all. 40 is
+/// the register, and the 6pt it costs the terminal is a third of one row at the
+/// default cell.
 ///
 /// The band takes its room from the CONTENT rect rather than floating over
 /// the grid. Painter, widget tree, and PTY sizing pump all derive from
 /// `workspaceChrome`, so an overlay would leave the three disagreeing about
 /// how tall the terminal is — which is the same class of bug that once left a
 /// zone of painted text with no hit target behind it.
-pub const search_bar_height: f32 = 34;
+pub const search_bar_height: f32 = chrome_band_height;
 
 /// Whether the focused terminal has its search field open. Derived, with no
 /// stored copy to drift: search state lives on the session, so a tab switch
@@ -581,6 +648,46 @@ pub fn paletteRowsIn(model: *const Model, workspace: *const Workspace, out: []us
         }
     }
     return written;
+}
+
+/// The most rows the switcher DRAWS at once.
+///
+/// A cap is not a limit on what the switcher can REACH — `paletteRowsIn` above
+/// is still the whole match set, and the cursor still walks all of it — it is a
+/// limit on what the panel is tall enough to be. Without one the panel grew a
+/// row per match and at the tab ceiling stood 624pt tall inside a window whose
+/// declared minimum height is 420, so the bottom of the list was simply painted
+/// off the window.
+///
+/// EIGHT, and Hick's law is not the reason. That law's own statement of scope
+/// excludes a filtered list: scanning an unordered list is linear, and a
+/// palette you type into is a recall task whose cost is roughly constant in the
+/// match count — which is the argument FOR a switcher, not for a short one.
+/// What bounds it is the fixation: eight rows is inside Miller's 7±2 and it is
+/// what fits above the minimum window with the panel's own inset.
+pub const palette_max_visible_rows: usize = 8;
+
+/// The contiguous run of MATCHES the switcher draws, always containing the
+/// cursor. Deliberately the same shape and the same anchoring rule as
+/// `visibleTabWindow`: anchor at the top until the cursor walks past the last
+/// drawn row, then keep the cursor as the last one, because recentring on every
+/// step makes the rows under the pointer jump.
+pub const PaletteWindow = struct {
+    first: usize = 0,
+    count: usize = 0,
+
+    pub fn contains(window: PaletteWindow, offset: usize) bool {
+        return offset >= window.first and offset < window.first + window.count;
+    }
+};
+
+pub fn paletteWindowFor(match_count: usize, cursor: usize) PaletteWindow {
+    if (match_count == 0) return .{};
+    const shown = @min(palette_max_visible_rows, match_count);
+    if (shown == match_count) return .{ .first = 0, .count = shown };
+    const clamped = @min(cursor, match_count - 1);
+    const first = if (clamped < shown) 0 else clamped - shown + 1;
+    return .{ .first = first, .count = shown };
 }
 
 fn paletteTabMatches(model: *const Model, workspace: *const Workspace, index: usize, needle: []const u8) bool {
