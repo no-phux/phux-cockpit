@@ -280,7 +280,7 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 - Internet access on the first source build to fetch pinned dependencies
 
 native-sdk is pinned to
-[`phall1/native@f3678832`](https://github.com/phall1/native/commit/f3678832fd282b81241993d0c08105cd5170f39f),
+[`phall1/native@5db8681e`](https://github.com/phall1/native/commit/5db8681e63b036b43640ad562661bda0e21358d3),
 the head of that fork's `cockpit/v0.8.4` branch: upstream v0.8.4 plus Cockpit's
 terminal interaction, viewport, and font seams, the packed `cell_grid` canvas
 command with its AppKit decoder and wire format v6, macOS glyph smoothing, the
