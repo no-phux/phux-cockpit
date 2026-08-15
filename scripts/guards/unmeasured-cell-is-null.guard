@@ -17,6 +17,7 @@
 # longer applied and `guard-check` said so. That is the mechanism working.
 #
 test: a pane proposes no viewport until its cell box has been measured
+red: 2026-08-15 at 94dc680
 diff --git a/src/terminal/session.zig b/src/terminal/session.zig
 index 1e70a6f..f4d2ebd 100644
 --- a/src/terminal/session.zig
