@@ -186,7 +186,12 @@ printf 'source root: confirmed %s\n\n' "$ROOT"
 # ------------------------------------------------------------- the red runs
 
 failed=0
-declare -A proved=()
+# A plain array, not `declare -A`: associative arrays are bash 4 and macOS
+# ships 3.2. This script is developer-run rather than CI-run, so it never blew
+# up the way guard-check.sh did — but the same trap is the same trap, and a
+# guard tool that only works under a Homebrew bash is a guard tool somebody
+# will one day run under /bin/bash.
+proved=()
 
 for name in "${names[@]}"; do
     guard="$GUARD_DIR/$name.guard"
@@ -240,7 +245,7 @@ for name in "${names[@]}"; do
     grep -F "$needle" "$log" | head -1 | sed 's/^/  /'
     grep -E '^\+- run test .*fail' "$log" | head -1 | sed 's/^/  /' || true
     grep -A 8 -F "$needle" "$log" | grep -F "$ROOT/src" | head -1 | sed 's/^/  /' || true
-    proved["$name"]=1
+    proved+=("$name")
     printf '\n'
 done
 
@@ -265,7 +270,7 @@ fi
 # a run that aborted midway leaves no claim behind.
 
 today="$(date +%Y-%m-%d)"
-for name in "${!proved[@]}"; do
+for name in ${proved[@]+"${proved[@]}"}; do
     guard="$GUARD_DIR/$name.guard"
     line="red: $today at ${start_head:0:7}"
     tmp="$(mktemp)"

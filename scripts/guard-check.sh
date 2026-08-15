@@ -71,11 +71,17 @@ shopt -s nullglob
 guard_files=("$GUARD_DIR"/*.guard)
 shopt -u nullglob
 
-declare -A known_guard=()
+# A space-delimited set rather than `declare -A`. Associative arrays are bash
+# 4, and macOS ships bash 3.2 as /bin/bash — which is what a GitHub macOS
+# runner resolves `bash scripts/guard-check.sh` to, so this script died on
+# `declare: -A: invalid option` in CI while passing on every developer machine
+# with a Homebrew bash on PATH. A build step that only runs on the machine that
+# wrote it is not a gate.
+known_guards=" "
 
 for guard in "${guard_files[@]}"; do
     name="$(basename "$guard" .guard)"
-    known_guard["$name"]=1
+    known_guards="${known_guards}${name} "
 
     test_name="$(sed -n 's/^test: //p' "$guard" | head -1)"
     if [[ -z "$test_name" ]]; then
@@ -130,7 +136,7 @@ while IFS= read -r marker_line; do
         complain "malformed GUARD marker (expected '// GUARD: <name>'): $marker_line"
         continue
     fi
-    if [[ -z "${known_guard[$name]:-}" ]]; then
+    if [[ "$known_guards" != *" $name "* ]]; then
         complain "$name: marked in ${marker_line%%:*} but scripts/guards/$name.guard does not exist."
     fi
 done < <(grep -rn '// GUARD: ' "$ROOT/src" || true)
