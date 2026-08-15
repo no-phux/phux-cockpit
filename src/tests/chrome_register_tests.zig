@@ -353,3 +353,301 @@ test "the chrome survives the layout audit in every state it has" {
     state.model.tab_placement = .side;
     try sweep(state, "the side rail");
 }
+
+// ------------------------------------------- the band's trailing arithmetic
+
+/// The solved widget tree for one size and density, as the audit above builds
+/// it. Returned as a slice the caller frees, because the findings we want here
+/// are geometric relationships between named nodes rather than audit findings.
+/// Everything the chrome band can occupy, and nothing the terminal below it
+/// can. The titlebar band measures 62pt inside an 8pt inset on this machine and
+/// the fallback header band is 50; 80 clears both and is well above the first
+/// terminal row.
+const band_floor: f32 = 80;
+
+const SolvedTree = struct {
+    nodes: []canvas.WidgetLayoutNode,
+    solved: canvas.WidgetLayoutTree,
+
+    fn free(self: SolvedTree) void {
+        testing.allocator.free(self.nodes);
+    }
+
+    /// The frame of the first node IN THE CHROME BAND whose accessibility
+    /// label starts with `prefix`.
+    ///
+    /// Prefix rather than equality because the statuses name themselves with a
+    /// whole diagnostic sentence — and band-scoped because a pane's SURFACE
+    /// carries that same sentence (`terminalSurfaceLabel`), so an unscoped
+    /// search for the failed pane's badge finds the 1584pt terminal instead and
+    /// measures the window.
+    fn find(self: SolvedTree, prefix: []const u8) ?geometry.RectF {
+        for (self.solved.nodes) |node| {
+            if (node.frame.y + node.frame.height > band_floor) continue;
+            if (std.mem.startsWith(u8, node.widget.semantics.label, prefix)) return node.frame;
+        }
+        return null;
+    }
+
+    /// Everything the band carries to the RIGHT of the tab strip row, as one
+    /// box. That is the status slot by construction rather than by name, which
+    /// matters because the pane status is two widgets (a badge and a Restart
+    /// button) and the badge's label is the pane's own diagnostic sentence.
+    fn statusSlot(self: SolvedTree) ?geometry.RectF {
+        const strip = self.find("Terminal tabs") orelse return null;
+        const right_of = strip.x + strip.width;
+        var min_x: f32 = std.math.floatMax(f32);
+        var max_x: f32 = 0;
+        for (self.solved.nodes) |node| {
+            if (node.frame.y + node.frame.height > band_floor) continue;
+            if (node.frame.width <= 0) continue;
+            if (node.frame.x < right_of) continue;
+            min_x = @min(min_x, node.frame.x);
+            max_x = @max(max_x, node.frame.x + node.frame.width);
+        }
+        if (min_x > max_x) return null;
+        return geometry.RectF.init(min_x, 0, max_x - min_x, 0);
+    }
+
+    fn expect(self: SolvedTree, prefix: []const u8) !geometry.RectF {
+        return self.find(prefix) orelse {
+            std.debug.print("\nno widget labelled \"{s}...\" in the chrome band\n", .{prefix});
+            return error.WidgetMissing;
+        };
+    }
+};
+
+fn solveAt(
+    state: *support.TerminalApp,
+    arena_bytes: []u8,
+    size: geometry.SizeF,
+    density: canvas.Density,
+) !SolvedTree {
+    var fixed = std.heap.FixedBufferAllocator.init(arena_bytes);
+    var ui = support.TerminalApp.Ui.init(fixed.allocator());
+
+    state.model.ws().surface_size = size;
+    var tokens = app.cockpitTokens(&state.model);
+    tokens.density = density;
+
+    const node = app.viewWindow(&ui, &state.model, 0);
+    const tree = try ui.finalizeWithTokens(node, tokens);
+    const nodes = try testing.allocator.alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
+    const bounds = geometry.RectF.init(0, 0, size.width, size.height);
+    return .{
+        .nodes = nodes,
+        .solved = try canvas.layoutWidgetTreeWithTokens(tree.root, bounds, tokens, nodes),
+    };
+}
+
+// What this pins, in one sentence: the `+` button is a child of the tab strip
+// row, so it has to be INSIDE that row, and the status is the row's sibling,
+// so the two can never share a column.
+//
+// It shipped doing neither. `tab_strip_trailing_reserve` (220) was subtracted
+// from the band width, but the 78pt traffic-light reserve and the two 8pt gaps
+// around the row were not — so the strip laid out believing it had 94pt more
+// room than it had, and the `+` walked out of its own row and under the badge.
+// Driven live at the app's declared minimum width, five keystrokes from a
+// fresh launch (fill to the shell ceiling, then one more cmd+T):
+//
+//   ### width=900  tabs_drawn=4
+//     strip row:    94.0 ..   784.0     (role=group name="Terminal tabs")
+//     + button :   774.0 ..   806.0     (role=button name="New terminal…")
+//     status   :   792.0 ..   892.0     (role=text name="Shell limit reached…")
+//
+// 22pt outside the row and 14pt under the badge, over the whole narrow range
+// (900, 800: +22/+14; 700, 660, 600: +18/+10), and it only came clear at 1100.
+// The 32pt button centres a 16pt glyph, so about 6pt of the `+` itself was
+// covered.
+test "the new-tab button stays inside the tab strip and clear of the status" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(1100, 640) });
+    defer harness.destroy(gpa);
+    const state = try support.startCockpit(harness);
+    defer support.stopCockpit(state);
+
+    // The state five keystrokes reach from a fresh launch. Bounded by the CHORD
+    // count and not by the tab count: cmd+T stops producing tabs at the shell
+    // ceiling, and a loop that waits for a tab it will never get spins forever.
+    try testing.expect(!state.model.terminal_limit_refused);
+    for (0..app.max_tabs) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    // Assert-absent, act, assert-present: without this the geometry below would
+    // be checked in a state that has no status node at all, and it would pass
+    // for the wrong reason forever.
+    try testing.expect(state.model.terminal_limit_refused);
+
+    // THE STRIP HAS TO BE RIDING THE TITLEBAR, which is where the traffic-light
+    // reserve is spent and where the overflow lives. 66 is this machine's
+    // measured `chrome_top` (see "the titlebar band this app is given can host
+    // the strip it puts there"), and a default `Workspace` leaves it at zero --
+    // which is the fullscreen fallback band, and the reason the audit sweep
+    // above has never once laid out the arrangement that ships.
+    state.model.ws().chrome_top = 66;
+    try testing.expect(app.tabsRideTitlebarIn(&state.model, state.model.wsConst()));
+
+    const arena_bytes = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(arena_bytes);
+
+    for (sweep_sizes) |size| {
+        for ([_]canvas.Density{ .compact, .regular, .spacious }) |density| {
+            const tree = try solveAt(state, arena_bytes, size, density);
+            defer tree.free();
+
+            const strip = try tree.expect("Terminal tabs");
+            const plus = try tree.expect("New terminal, shortcut");
+            const status = try tree.expect("Shell limit reached");
+
+            const past_row = (plus.x + plus.width) - (strip.x + strip.width);
+            const over_status = (plus.x + plus.width) - status.x;
+            if (past_row > 0.5 or over_status > 0.5) {
+                std.debug.print(
+                    "\nat {d:.0}x{d:.0}, {s} density:\n" ++
+                        "  strip row: {d:.1} ..{d:.1}\n" ++
+                        "  + button : {d:.1} ..{d:.1}\n" ++
+                        "  status   : {d:.1} ..{d:.1}\n" ++
+                        "  + past the row's right edge by {d:.1}pt, over the status by {d:.1}pt\n",
+                    .{
+                        size.width,          size.height,
+                        @tagName(density),   strip.x,
+                        strip.x + strip.width, plus.x,
+                        plus.x + plus.width, status.x,
+                        status.x + status.width, past_row,
+                        over_status,
+                    },
+                );
+                return error.TabStripTrailingOverlap;
+            }
+        }
+    }
+}
+
+// The reserve is a MEASUREMENT, and this is the measuring.
+//
+// `tabStripStatusReserveIn` holds back a fixed slot for a status whose width
+// nothing in the projection can compute — the badge's text is laid out by the
+// same estimator the audit predicts paint with, and only the solved tree knows
+// what it came to. Holding back a number nobody re-derives is how the 220 that
+// caused the overlap survived: this fails with the number if a status ever
+// outgrows its slot, rather than letting the `+` slide back under it.
+test "the trailing status fits the room the strip holds back" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(1600, 900) });
+    defer harness.destroy(gpa);
+    const state = try support.startCockpit(harness);
+    defer support.stopCockpit(state);
+
+    const arena_bytes = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(arena_bytes);
+    // Wide enough that nothing in the band is being clamped by the window, so
+    // what is measured is the status's own intrinsic width.
+    const size = geometry.SizeF.init(1600, 900);
+
+    const Case = struct { label: []const u8, prefix: []const u8 };
+    const notices = [_]Case{
+        .{ .label = "shell limit", .prefix = "Shell limit reached" },
+        .{ .label = "window limit", .prefix = "Window limit reached" },
+        .{ .label = "theme save failure", .prefix = "Theme could not be saved" },
+    };
+
+    for (notices, 0..) |case, index| {
+        state.model.terminal_limit_refused = index == 0;
+        state.model.window_limit_refused = index == 1;
+        state.model.config_write_refused = index == 2;
+        defer {
+            state.model.terminal_limit_refused = false;
+            state.model.window_limit_refused = false;
+            state.model.config_write_refused = false;
+        }
+        for ([_]canvas.Density{ .compact, .regular, .spacious }) |density| {
+            const tree = try solveAt(state, arena_bytes, size, density);
+            defer tree.free();
+            _ = try tree.expect(case.prefix);
+            const slot = tree.statusSlot() orelse return error.WidgetMissing;
+            try expectStatusFits(case.label, density, slot.width, app.tab_strip_notice_reserve);
+            try testing.expectEqual(
+                app.tab_strip_notice_reserve,
+                app.tabStripStatusReserveIn(&state.model, state.model.wsConst()),
+            );
+        }
+    }
+
+    // The pane status is the wide one: a lifecycle badge AND a Restart button.
+    const slots = support.activeSlots(&state.model);
+    inline for (.{ "rejected", "spawn_failed", "exited" }) |reason| {
+        slots[0].phase = .failed;
+        slots[0].exit_reason = @field(native_sdk.EffectExitReason, reason);
+        for ([_]canvas.Density{ .compact, .regular, .spacious }) |density| {
+            const tree = try solveAt(state, arena_bytes, size, density);
+            defer tree.free();
+            // Named to be sure the state under test is the one being measured,
+            // then measured as a whole slot: the pane status is a badge AND a
+            // Restart button, and both have to fit.
+            _ = try tree.expect("Restart Terminal 1");
+            const slot = tree.statusSlot() orelse return error.WidgetMissing;
+            try expectStatusFits(
+                "failed/" ++ reason,
+                density,
+                slot.width,
+                app.tab_strip_pane_status_reserve,
+            );
+            try testing.expectEqual(
+                app.tab_strip_pane_status_reserve,
+                app.tabStripStatusReserveIn(&state.model, state.model.wsConst()),
+            );
+        }
+    }
+}
+
+fn expectStatusFits(label: []const u8, density: canvas.Density, measured: f32, reserve: f32) !void {
+    if (measured <= reserve) return;
+    std.debug.print(
+        "\nthe \"{s}\" status is {d:.1}pt at {s} density, and the strip only holds back {d:.1}\n",
+        .{ label, measured, @tagName(density), reserve },
+    );
+    return error.StatusWiderThanItsReserve;
+}
+
+// The same constant, wrong in the other direction.
+//
+// With no status at all the old 220 held that room back for a node that lays
+// out 0x0, and it cost whole tabs. Measured in a fullscreen-shaped band (1920
+// wide, no titlebar to ride, so no leading reserve and no status):
+//
+//   usable = 1904 - 220 = 1684 -> floor(1684/120) = 14 tabs
+//   but 15 tabs need 15*120 + 14*4 + 4 + 32 = 1892, and the band is 1904
+//
+// so one visible tab was traded for 132pt of dead gutter. What this pins is
+// not the number 15 — it is that the run is MAXIMAL: one more tab, at the
+// narrowest a tab is allowed to be, would not have fit.
+test "the tab run takes every tab the band actually has room for" {
+    var model: app.Model = .{ .provider = undefined };
+    model.ws().tab_count = app.max_tabs;
+
+    // Fullscreen: `chrome_top` is zero, so the strip falls back to its own band
+    // and there are no traffic lights to clear.
+    const band = 1920 - app.grid_inset * 2;
+    const window = app.visibleTabWindow(&model, band);
+    try testing.expect(window.count > 0);
+    try testing.expect(window.extent >= app.tab_min_extent);
+
+    // What the run's children actually cost: one gap per tab (n-1 between them
+    // and one before the button) plus the button itself.
+    const gap = app.chrome_band_inset;
+    const drawn = @as(f32, @floatFromInt(window.count));
+    const spent = drawn * window.extent + drawn * gap + app.chrome_control_extent;
+    try testing.expect(spent <= band + 0.5);
+
+    // ...and one more, at the floor, would not have.
+    if (window.count < model.ws().tab_count) {
+        const one_more = (drawn + 1) * (app.tab_min_extent + gap) + app.chrome_control_extent;
+        if (one_more <= band) {
+            std.debug.print(
+                "\nthe strip drew {d} tabs in a {d:.0}pt band, but {d} at the {d:.0}pt floor " ++
+                    "would have cost {d:.0} and fit\n",
+                .{ window.count, band, window.count + 1, app.tab_min_extent, one_more },
+            );
+            return error.TabRunLeavesRoomUnused;
+        }
+    }
+}

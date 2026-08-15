@@ -56,13 +56,18 @@ fn hasSemanticsPrefix(harness: anytype, prefix: []const u8) bool {
 test "the visible tab window shrinks tabs before it hides any" {
     var model: app.Model = .{ .provider = undefined };
     model.ws().tab_count = 4;
-    // Four tabs at full width need 672pt plus the trailing reserve. 860 is
-    // narrower than that and wider than four tabs at the floor, so the strip is
-    // forced to shrink — which is the behaviour this test is about, and it
-    // stops being exercised the moment the width is generous enough to fit
-    // them. (It WAS 900, and a wider minimum tab made that width roomy enough
-    // that the assertion below could no longer fail.)
-    const four = app.visibleTabWindow(&model, 860);
+    // The band this asks about carries no status and no traffic lights, so the
+    // whole of it is the tab run. Four tabs cost `4*(extent + 4) + 32`: 720 at
+    // full width, 528 at the floor. 640 is between them, which is the only
+    // place the shrink this test is about happens at all.
+    //
+    // It WAS 860, against a derivation that subtracted a flat 220 from the band
+    // whether or not there was anything to hold room for. Four tabs genuinely
+    // FIT in 860 — the strip was shrinking them to clear a reserve it did not
+    // need, which is the same wrong constant that put the `+` button under the
+    // status badge at the narrow end. (And before that it was 900, when a
+    // wider minimum tab made the assertion below unable to fail.)
+    const four = app.visibleTabWindow(&model, 640);
     try testing.expectEqual(@as(usize, 0), four.first);
     try testing.expectEqual(@as(usize, 4), four.count);
     try testing.expect(four.extent >= app.tab_min_extent);
