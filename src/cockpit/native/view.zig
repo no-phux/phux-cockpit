@@ -229,6 +229,24 @@ fn terminalTitle(ui: *TerminalUi, model: *const Model, id: TerminalRef) []const 
     return projection.terminalTitleInto(model, id, scratch);
 }
 
+/// The tab label as it will be PAINTED, which at the strip's shrink floor is
+/// not the same string as the name.
+///
+/// `projection.elideTitleMiddleInto` explains why the middle goes rather than
+/// the tail. What belongs here is why the app does it at all instead of leaving
+/// it to the renderer's own `.overflow = .ellipsis`: the elided string is what
+/// the accessibility tree and `native automate snapshot` report, so doing it
+/// here is what makes an unreadable strip visible to automation. It was not,
+/// and that is why a strip painting `Termi…` seven times shipped — the snapshot
+/// said `Terminal 10`, `Terminal 11`, and only the composited pixels disagreed.
+///
+/// The full title still reaches the SEMANTICS label and the close button's, so
+/// nothing an assistive reader is told gets shorter.
+fn paintedTabLabel(ui: *TerminalUi, tokens: canvas.DesignTokens, title: []const u8, label_width: f32) []const u8 {
+    const scratch = ui.arena.alloc(u8, projection.max_painted_title_bytes) catch return title;
+    return projection.elideTitleMiddleInto(tokens, title, label_width, scratch);
+}
+
 /// The retained-command id namespace a terminal paints into. Local terminals
 /// take their registry slot, which is bounded and collision-free by
 /// construction; remote terminals derive a disjoint namespace from their
@@ -499,12 +517,17 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
     const body = ui.column(.{ .width = extent, .height = tab_height }, .{
         ui.row(.{ .grow = 1, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
             tabAttentionMarker(ui, model, id, tokens),
+            // `.ellipsis` stays, and is now a BACKSTOP rather than the policy:
+            // the string handed over already fits the box (`paintedTabLabel`),
+            // so the renderer's own tail elision is what catches the case where
+            // its measurement and ours disagree by a hair. Losing a hair off
+            // the tail is a blemish; losing the whole tail was the bug.
             ui.text(.{
                 .grow = 1,
                 .wrap = false,
                 .overflow = .ellipsis,
                 .style = .{ .foreground = if (selected) tokens.colors.text else tokens.colors.text_muted },
-            }, title),
+            }, paintedTabLabel(ui, tokens, title, projection.tabLabelWidth(extent))),
             close_node,
         }),
         // The unselected bar is painted in the tab's OWN ground rather than

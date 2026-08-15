@@ -239,6 +239,111 @@ test "stepping backward to a tab already on screen does not scroll the strip" {
         try testing.expectEqual(want_first, window.first);
         try testing.expect(window.contains(step + 1));
     }
+// ------------------------------------------------------- the label the tab
+//                                                          actually paints
+
+/// The PAINTED label of every top-strip tab, with the box it was painted into.
+///
+/// Deliberately the text leaf rather than `semantics.label`: the accessibility
+/// label carries the whole name and always did, which is exactly why a strip
+/// painting one word seven times was invisible to every test in this file. The
+/// leaf's `text` is the string the renderer inks.
+fn tabPaintedLabels(harness: anytype, texts: [][]const u8, widths: []f32) usize {
+    const nodes = harness.runtime.views[0].widgetLayoutTree().nodes;
+    var count: usize = 0;
+    for (nodes) |node| {
+        if (node.widget.kind != .text) continue;
+        if (node.widget.text.len == 0) continue;
+        if (!insideTab(nodes, node.parent_index)) continue;
+        if (count == texts.len) break;
+        texts[count] = node.widget.text;
+        widths[count] = node.frame.width;
+        count += 1;
+    }
+    return count;
+}
+
+fn insideTab(nodes: anytype, start: ?usize) bool {
+    var current = start;
+    while (current) |index| {
+        if (nodes[index].widget.semantics.role == .tab) return true;
+        current = nodes[index].parent_index;
+    }
+    return false;
+}
+
+fn allDistinct(values: []const []const u8) bool {
+    for (values, 0..) |value, index| {
+        for (values[0..index]) |earlier| {
+            if (std.mem.eql(u8, value, earlier)) return false;
+        }
+    }
+    return true;
+}
+
+// GUARD: tab-label-keeps-its-tail
+test "a shrunken tab keeps the END of its name, which is the half that identifies" {
+    // The geometry is not invented here: it is what the running app reports.
+    // Sixteen tabs in an 1100pt window, real bundle, publisher_pid checked
+    // against the pid dev-run.sh launched, gpu_present_path=packet with no
+    // fallback -- the strip shows seven tabs 123.428574 apart and every label
+    // text node lands at 51.428574 wide:
+    //
+    //   role=text name="Terminal 10" bounds=(126,29.25 51.428574x17.5)
+    //   role=text name="Terminal 16" bounds=(890.5715,29.25 51.428574x17.5)
+    var model: app.Model = .{ .provider = undefined };
+    model.ws().tab_count = app.max_tabs;
+    const window = app.visibleTabWindow(&model, 1100 - app.grid_inset * 2);
+    try testing.expectEqual(@as(usize, 7), window.count);
+    try testing.expectApproxEqAbs(@as(f32, 123.428574), window.extent, 0.001);
+    const label_width = app.tabLabelWidth(window.extent);
+    try testing.expectApproxEqAbs(@as(f32, 51.428574), label_width, 0.001);
+
+    const tokens = app.cockpitTokens(&model);
+    // ASSERT ABSENT FIRST. Every one of these names is far too wide for the
+    // box, and they differ ONLY in their last two characters -- so a strip
+    // that elides the tail cannot tell them apart, and a test written against
+    // a box that happened to fit them would prove nothing at all.
+    const names = [_][]const u8{
+        "Terminal 10", "Terminal 11", "Terminal 12", "Terminal 13",
+        "Terminal 14", "Terminal 15", "Terminal 16",
+    };
+    for (names) |name| try testing.expect(app.chromeTextWidth(tokens, name) > label_width);
+
+    var storage: [names.len][app.max_painted_title_bytes]u8 = undefined;
+    var painted: [names.len][]const u8 = undefined;
+    for (names, 0..) |name, index| {
+        painted[index] = app.elideTitleMiddleInto(tokens, name, label_width, &storage[index]);
+        // It fits the box it will be painted into, so the renderer's own
+        // trailing elision has nothing left to take.
+        try testing.expect(app.chromeTextWidth(tokens, painted[index]) <= label_width);
+        // It is shorter than the name (the box demanded it) and it still ends
+        // in the two characters that make it that tab and no other.
+        try testing.expect(painted[index].len < name.len);
+        try testing.expect(std.mem.endsWith(u8, painted[index], name[name.len - 2 ..]));
+    }
+    // And the whole point: seven visible tabs, seven different words.
+    try testing.expect(allDistinct(&painted));
+}
+
+test "a title that fits is painted whole, and an impossible box says nothing" {
+    var model: app.Model = .{ .provider = undefined };
+    const tokens = app.cockpitTokens(&model);
+    var out: [app.max_painted_title_bytes]u8 = undefined;
+
+    // No elision when none is needed -- a marker in a tab that had room is a
+    // lie about the name.
+    try testing.expectEqualStrings("zsh", app.elideTitleMiddleInto(tokens, "zsh", 200, &out));
+    // A box narrower than the marker itself paints nothing rather than
+    // overrunning into the close affordance.
+    try testing.expectEqualStrings("", app.elideTitleMiddleInto(tokens, "Terminal 16", 2, &out));
+    try testing.expectEqualStrings("", app.elideTitleMiddleInto(tokens, "", 200, &out));
+    // Multi-byte names elide on codepoint boundaries, never mid-sequence: a
+    // half-written codepoint is a tofu box on every surface that draws it.
+    const wide = "\u{4f60}\u{597d}\u{4e16}\u{754c}\u{4f60}\u{597d}\u{4e16}\u{754c}\u{4f60}\u{597d}";
+    const elided = app.elideTitleMiddleInto(tokens, wide, 40, &out);
+    try testing.expect(std.unicode.utf8ValidateSlice(elided));
+    try testing.expect(elided.len < wide.len);
 }
 
 // -------------------------------------------------------------- the strip
@@ -334,6 +439,78 @@ test "the strip shows terminals only and still reaches the web surface" {
 
     try pressCanvasKey(harness, state.app(), "b", .{ .primary = true, .shift = true });
     try testing.expect(state.model.ws().web_selected);
+}
+
+test "the strip hands the renderer a label that already fits, so the snapshot cannot lie" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startTwoPaneCockpit(gpa, harness);
+    defer gpa.destroy(state);
+    defer app.deinitModel(&state.model);
+    defer state.deinit();
+
+    // Two REAL shell titles through the real channel (OSC 0), sharing a long
+    // prefix and differing only at the end -- which is the shape of every set
+    // of names a terminal multiplexer actually holds: sibling directories,
+    // sibling branches, the same command in two trees. Reachable on the
+    // shipped binary at two tabs; it does not need the raised pty ceiling that
+    // sixteen "Terminal N" tabs need.
+    try state.effects.feedPtyOutput(app.ptyKey(0), "\x1b]0;~/workspace/phux-cockpit/src/tests\x07");
+    try state.effects.feedPtyOutput(app.ptyKey(1), "\x1b]0;~/workspace/phux-cockpit/src/cockpit\x07");
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+    // At the app's own MINIMUM window, so this is a geometry a person can
+    // actually put the app in rather than one invented for the test.
+    try support.pumpPaint(harness, state.app(), app.canvas_label, geometry.SizeF.init(app.window_min_width, app.window_min_height));
+
+    const tokens = app.cockpitTokens(&state.model);
+    const band = app.window_min_width - app.grid_inset * 2;
+    const window = app.visibleTabWindowIn(state.model.wsConst(), band);
+    const label_width = app.tabLabelWidth(window.extent);
+
+    // ASSERT ABSENT. Both names are wider than the box, and their shared
+    // prefix is wider than the box on its own -- so trailing elision paints
+    // one word twice, and this test can fail.
+    var titles: [2][app.max_terminal_title_bytes]u8 = undefined;
+    var names: [2][]const u8 = undefined;
+    for (0..2) |index| {
+        const id = state.model.ws().tabTerminal(index).?;
+        names[index] = app.terminalTitleInto(&state.model, id, &titles[index]);
+        try testing.expect(std.mem.startsWith(u8, names[index], "~/workspace/phux-cockpit/src/"));
+        try testing.expect(app.chromeTextWidth(tokens, names[index]) > label_width);
+    }
+    try testing.expect(app.chromeTextWidth(tokens, "~/workspace/phux-cockpit/src/") > label_width);
+
+    var texts: [app.max_tabs][]const u8 = undefined;
+    var widths: [app.max_tabs]f32 = undefined;
+    const count = tabPaintedLabels(harness, &texts, &widths);
+    try testing.expectEqual(@as(usize, 2), count);
+    for (texts[0..count], widths[0..count], names) |text, width, name| {
+        // The string the app handed over fits the frame the layout gave it.
+        // This is the assertion the old strip could never have passed: it
+        // handed over the whole name and let the renderer cut it, which is
+        // why the accessibility snapshot and the glass disagreed.
+        try testing.expect(width > 0);
+        try testing.expect(app.chromeTextWidth(tokens, text) <= width + 0.001);
+        // Shorter than the name -- the box demanded it -- and still ending in
+        // the name's own last bytes. Stated as "the last four bytes of the
+        // name survived" rather than as a literal, because HOW MUCH tail fits
+        // is a property of the face and the box; THAT the tail is what
+        // survives is the fix. Measured, this paints "~/work…/tests" and
+        // "~/wor…ockpit" at a 96pt label box.
+        try testing.expect(text.len < name.len);
+        try testing.expectEqualStrings(name[name.len - 4 ..], text[text.len - 4 ..]);
+    }
+    try testing.expect(allDistinct(texts[0..count]));
+
+    // And the app can now SAY so, which is the other half of the fix: nothing
+    // in this app could answer "is the strip still naming anything" without
+    // driving the real bundle under a GPU capture.
+    const identity = app.tabLabelIdentityIn(&state.model, state.model.wsConst(), tokens, band);
+    try testing.expectEqual(@as(usize, 2), identity.shown);
+    try testing.expectEqual(@as(usize, 2), identity.nameable);
+    try testing.expectEqual(@as(usize, 2), identity.distinct);
+    try testing.expect(!identity.ambiguous());
 }
 
 test "a tab carries a close affordance and the strip ends in a new-tab button" {
