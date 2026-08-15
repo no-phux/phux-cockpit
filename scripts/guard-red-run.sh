@@ -163,6 +163,11 @@ printf '=== baseline: the tree as committed must be GREEN ===\n'
 printf 'HEAD %s (%s)\n' "$(git -C "$ROOT" rev-parse --short HEAD)" "$start_branch"
 baseline_log="$LOG_DIR/baseline.log"
 set +e
+# The guards being proved right now are exempted from guard-check's "has it
+# been demonstrated red" and "does its break still apply" complaints, for the
+# duration of this run only. Those two are precisely what this run answers, and
+# the gate that asks them lives inside the baseline it would otherwise refuse.
+export GUARD_CHECK_REDERIVING="${names[*]}"
 (cd "$ROOT" && zig build test) > "$baseline_log" 2>&1
 baseline_exit=$?
 set -e

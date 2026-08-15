@@ -37,6 +37,28 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 GUARD_DIR="$ROOT/scripts/guards"
 
+# The guard currently being re-derived, if any, named by guard-red-run.sh.
+#
+# Checks 2 and 3 are exactly what a re-derivation is on its way to satisfying,
+# and this script runs inside the `zig build test` that re-derivation uses as
+# its baseline — so without this the mechanism deadlocks the moment a guard
+# goes stale: guard-check refuses the tree because the guard is unproved, and
+# guard-red-run refuses to prove it because the baseline is not green. It was
+# reachable the first time a fix's CONTEXT moved, which is the ordinary life of
+# any line of code.
+#
+# Deliberately narrow: only the guard being re-derived, only the two checks it
+# is in the middle of answering. Its marker and its test must still exist, and
+# every OTHER guard is held to the full standard.
+GUARD_CHECK_REDERIVING="${GUARD_CHECK_REDERIVING:-}"
+rederiving() {
+    local name="$1" candidate
+    for candidate in $GUARD_CHECK_REDERIVING; do
+        [[ "$candidate" == "$name" ]] && return 0
+    done
+    return 1
+}
+
 status=0
 complain() {
     printf 'guard-check: %s\n' "$1" >&2
@@ -81,6 +103,10 @@ for guard in "${guard_files[@]}"; do
     marker="$(sed -n "$((line - 1))p" "$src_file")"
     if [[ "$marker" != *"// GUARD: $name"* ]]; then
         complain "$name: expected '// GUARD: $name' directly above test \"$test_name\" in $src_file:$line."
+    fi
+
+    if rederiving "$name"; then
+        continue
     fi
 
     if ! grep -q '^red: ' "$guard"; then
