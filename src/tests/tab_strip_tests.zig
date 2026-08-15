@@ -441,6 +441,7 @@ test "the strip shows terminals only and still reaches the web surface" {
     try testing.expect(state.model.ws().web_selected);
 }
 
+// GUARD: tab-label-fits-its-box
 test "the strip hands the renderer a label that already fits, so the snapshot cannot lie" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
