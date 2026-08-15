@@ -152,11 +152,40 @@ dev_app_stage() {
     # is that staging does not make it WORSE -- and the day the SDK starts
     # sealing resources, source becomes valid, staged does not, and this fires
     # with the fix named.
-    local source_verify=0 dest_verify=0
-    /usr/bin/codesign --verify --deep --strict "$source_app" 2>/dev/null || source_verify=$?
+    # RE-SIGN. This is not hygiene, it is the difference between an app you can
+    # type into and one you cannot.
+    #
+    # `zig build package` emits an adhoc LINKER-signed binary. Renaming that
+    # binary and rewriting the Info.plist around it breaks the signature that
+    # was computed over both, and macOS then declines to make the process a
+    # proper foreground app: the window appears and paints, `focused=true` shows
+    # on the window, the shell runs -- and NOT ONE KEYSTROKE arrives. Cockpit's
+    # own `handleKey` opens with `if (!model.focused) return;`, which drops every
+    # key with no counter, no log and no error, so the app looks healthy while
+    # being completely deaf.
+    #
+    # Measured 2026-08-14: identical build, plain bundle takes input (typed `ec`
+    # reached the shell and autosuggested from history); staged bundle took
+    # nothing -- five keystrokes, five chords, dispatch_errors=0, no error event.
+    # Re-signing is what closed the gap. See phux-cockpit-2ml.10 for why the
+    # silence made this expensive to find.
+    /usr/bin/codesign --force --deep --timestamp=none --sign - "$dest_app" 2>/dev/null \
+        || dev_app_die "could not adhoc re-sign ${dest_app}; without a valid signature macOS will not give it key focus and it will accept no keyboard input" \
+        || return 1
+
+    # Now that staging re-signs, the invariant is ABSOLUTE rather than
+    # differential: the staged bundle must verify cleanly, full stop. That is
+    # the property keyboard input actually depends on.
+    #
+    # It is deliberately NOT compared against the source any more. The source is
+    # `zig build package` output, which does not seal its resources and verifies
+    # 1; the staged bundle verifies 0. A differential check reads that
+    # improvement as a change and fails -- which it did, on the first run after
+    # the re-sign landed.
+    local dest_verify=0
     /usr/bin/codesign --verify --deep --strict "$dest_app" 2>/dev/null || dest_verify=$?
-    if [[ "$dest_verify" != "$source_verify" ]]; then
-        dev_app_die "staging changed codesign --verify from ${source_verify} to ${dest_verify}: the packaged bundle now seals its Info.plist, so dev_app_stage must re-sign after rewriting it" || return 1
+    if [[ "$dest_verify" != 0 ]]; then
+        dev_app_die "staged bundle ${dest_app} fails codesign --verify (${dest_verify}); macOS will not give it key focus and it will accept no keyboard input" || return 1
     fi
 
     printf '%s\n' "${dest_app}/Contents/MacOS/${dest_executable}"
