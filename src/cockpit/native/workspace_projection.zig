@@ -767,6 +767,38 @@ pub fn chromeTextWidth(tokens: canvas.DesignTokens, text: []const u8) f32 {
 /// The most a painted title can cost: the title, plus the elision marker.
 pub const max_painted_title_bytes: usize = max_terminal_title_bytes + canvas.text_ellipsis.len;
 
+/// The slack held back from a label box before anything is fitted into it.
+///
+/// A GREEDY FIT ALWAYS STOPS AT THE EDGE OF THE BOX, which is exactly where a
+/// measurement disagreement decides the last character. "The estimator and
+/// CoreText agree to the character" (see `chromeTextWidth`) and "they agree at
+/// the boundary" are two different claims, and the second one is false —
+/// measured on real composited pixels, at the 51.428574pt box, with the
+/// elision fitted right up to it:
+///
+///   painted        estimator   CoreText, on glass
+///   "Ter...l 11"      47.642   kept
+///   "Ter...l 12"      50.932   REFUSED, cut to "Ter...l..."
+///   "Ter...l 13"      50.848   kept
+///   "Ter...l 14"      51.156   REFUSED
+///   "Ter...l 15"      51.030   kept
+///   "Ter...l 16"      51.002   REFUSED
+///
+/// Under one percent of disagreement, not even monotone in the estimator's own
+/// number (15 survived at 51.030 while 16 died at 51.002), and it lands on the
+/// one character that identifies the tab. Three of seven tabs came back reading
+/// "Ter...l..." — better than seven identical words, and still not a name.
+///
+/// The reserve is ONE ELLIPSIS ADVANCE, which is derived rather than tuned: it
+/// is exactly what the renderer's backstop needs to reclaim in order to append
+/// its own marker, so holding it back means the backstop can never gain
+/// anything by firing. At the strip's floor that is 8.078pt of 51.4 — about one
+/// character of title — against a measured error under 0.5pt. Confirmed on the
+/// glass afterwards: seven tabs, seven different words.
+pub fn labelFitBudget(tokens: canvas.DesignTokens, max_width: f32) f32 {
+    return max_width - chromeTextWidth(tokens, canvas.text_ellipsis);
+}
+
 /// Fit `title` into `max_width` by eliding its MIDDLE, growing the TAIL first.
 ///
 /// THE BUG THIS CLOSES. The SDK elides the tail, which is the right default for
@@ -800,10 +832,16 @@ pub fn elideTitleMiddleInto(
     out: []u8,
 ) []const u8 {
     if (title.len == 0 or max_width <= 0) return "";
-    if (chromeTextWidth(tokens, title) <= max_width) return title;
+    // Everything below fits against the BUDGET, not the box: see
+    // `labelFitBudget` for the measurement that says why, and note that the
+    // whole-title check has to use it too. A title inside the box but inside
+    // the disagreement is a title the renderer will cut the tail off, and a
+    // needless elision is a far better outcome than that.
+    const budget = labelFitBudget(tokens, max_width);
+    if (chromeTextWidth(tokens, title) <= budget) return title;
     // A box too narrow for the marker itself has nothing left to say. Paint
     // nothing rather than an ellipsis that overruns into the close affordance.
-    if (chromeTextWidth(tokens, canvas.text_ellipsis) > max_width) return "";
+    if (chromeTextWidth(tokens, canvas.text_ellipsis) > budget) return "";
 
     var head_end: usize = 0;
     var tail_start: usize = title.len;
@@ -819,7 +857,7 @@ pub fn elideTitleMiddleInto(
             const next_tail = prevCodepointStart(title, tail_start);
             if (next_tail > head_end) {
                 if (composeElidedTitle(out, title, head_end, next_tail)) |candidate| {
-                    if (chromeTextWidth(tokens, candidate) <= max_width) {
+                    if (chromeTextWidth(tokens, candidate) <= budget) {
                         tail_start = next_tail;
                         advanced = true;
                     }
@@ -830,7 +868,7 @@ pub fn elideTitleMiddleInto(
             const next_head = nextCodepointEnd(title, head_end);
             if (next_head < tail_start) {
                 if (composeElidedTitle(out, title, next_head, tail_start)) |candidate| {
-                    if (chromeTextWidth(tokens, candidate) <= max_width) {
+                    if (chromeTextWidth(tokens, candidate) <= budget) {
                         head_end = next_head;
                         advanced = true;
                     }

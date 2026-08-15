@@ -324,6 +324,22 @@ test "a shrunken tab keeps the END of its name, which is the half that identifie
     }
     // And the whole point: seven visible tabs, seven different words.
     try testing.expect(allDistinct(&painted));
+
+    // FULLSCREEN is the harder box, and the one the bug report counted
+    // fourteen identical words in. 1920 gives the strip 1684pt of usable band,
+    // so it shows fourteen tabs at 120.2857 and the label falls to 48.2857 --
+    // narrower than the floor's own 51.4, because the strip shrinks to the
+    // floor and then windows, and fourteen tabs is what 1684 divides into.
+    const wide = app.visibleTabWindow(&model, 1920 - app.grid_inset * 2);
+    try testing.expectEqual(@as(usize, 14), wide.count);
+    const wide_label = app.tabLabelWidth(wide.extent);
+    try testing.expectApproxEqAbs(@as(f32, 48.2857), wide_label, 0.001);
+    var wide_painted: [names.len][]const u8 = undefined;
+    for (names, 0..) |name, index| {
+        wide_painted[index] = app.elideTitleMiddleInto(tokens, name, wide_label, &storage[index]);
+        try testing.expect(std.mem.endsWith(u8, wide_painted[index], name[name.len - 2 ..]));
+    }
+    try testing.expect(allDistinct(&wide_painted));
 }
 
 test "a title that fits is painted whole, and an impossible box says nothing" {
