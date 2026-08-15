@@ -92,9 +92,22 @@ README.md, "Reading the result of `zig build test`", has the FFI search order.
 
 ### Running it
 
-<!-- PLACEHOLDER: scripts/dev-run.sh was in flight on 2026-08-12 and is the
-     answer to "how do I run this". Replace this block with its invocation
-     once it lands, rather than guessing its flags here. -->
+```sh
+./scripts/dev-run.sh            # ReleaseSafe, foreground; ctrl-c ends it
+./scripts/dev-run.sh --debug --detach
+./scripts/dev-run.sh --automation   # -Dautomation=true, prints how to drive it
+./scripts/dev-run.sh --phux         # the phux provider graph
+```
+
+It builds THIS checkout and runs it as a real app that cannot be mistaken for
+`/Applications/Phux Cockpit.app`: its own bundle id (`dev.phux.cockpit.dev`),
+its own process name (`phux-cockpit-dev`, so `pgrep -x` and System Events
+target it rather than the installed copy), and its own config, workspace layout
+and automation dropbox under `.dev-run/`. `.dev-run/app.log` is where the
+runtime's own diagnostics land — read it after any chrome change, because
+`zero_canvas_layout` and `zero_canvas_ui` are how a spacing or coverage mistake
+announces itself. `./scripts/dev-isolation-check.sh` drives both apps at once
+and proves the separation.
 
 Whatever you run, check what binary a bug report is actually about. On
 2026-08-12 `/Applications` held 0.7.1 built three days earlier while `main` was
