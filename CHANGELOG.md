@@ -3,6 +3,30 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/phall1/phux-cockpit/compare/v0.8.0...v0.9.0) (2026-08-15)
+
+
+### Features
+
+* **cockpit:** catch up to native-sdk v0.9.0, and use what it added ([84db570](https://github.com/phall1/phux-cockpit/commit/84db5702c11129102bf44cec8a8dcac2833b77ee))
+* **cockpit:** raise the pty ceiling from 4 concurrent shells to 32 ([#33](https://github.com/phall1/phux-cockpit/issues/33)) ([9debd99](https://github.com/phall1/phux-cockpit/commit/9debd99b75daaf7f75b45a3522e6a0c1926abf0d))
+* **dev:** one command to build and run this checkout, unmistakable for the installed app ([#37](https://github.com/phall1/phux-cockpit/issues/37)) ([609c4fc](https://github.com/phall1/phux-cockpit/commit/609c4fc9c14e9e521eaaf2f818fefe44ef0a4b3c))
+* **sdk:** update to upstream v0.9.0 ([#39](https://github.com/phall1/phux-cockpit/issues/39)) ([3eaddc2](https://github.com/phall1/phux-cockpit/commit/3eaddc21d826d60b03e39075172b02c31b39b9d9))
+
+
+### Bug Fixes
+
+* **chrome:** one register for every band, and an accent that says which ([d8d4541](https://github.com/phall1/phux-cockpit/commit/d8d4541736d6b66db6719388f8626b9bba2d7c5c))
+* close the open bead backlog (15 of 18) ([#28](https://github.com/phall1/phux-cockpit/issues/28)) ([175aa1e](https://github.com/phall1/phux-cockpit/commit/175aa1e4d22e58d7b1b14f13ee1bb285e971452f))
+* **metrics:** make the unmeasured cell representable, and stop sizing remote panes with a sans font ([#34](https://github.com/phall1/phux-cockpit/issues/34)) ([5bccbd2](https://github.com/phall1/phux-cockpit/commit/5bccbd264f25fbe8abea8f83339666dcf731321a))
+* **render:** pin the SDK that actually paints terminal output ([#38](https://github.com/phall1/phux-cockpit/issues/38)) ([5b3d3fb](https://github.com/phall1/phux-cockpit/commit/5b3d3fb573cdafcffe5a713b8ff3a5977fad85da))
+* **scripts:** the pin gate certified ghostty as the SDK, green ([#35](https://github.com/phall1/phux-cockpit/issues/35)) ([39cba80](https://github.com/phall1/phux-cockpit/commit/39cba806aad6ccb84c7f9adc1533631e7024cd47))
+
+
+### Documentation
+
+* **design:** write down the chrome register, with numbers and sources ([c890771](https://github.com/phall1/phux-cockpit/commit/c890771dc798b647126cf8f08fe5741652b586cb))
+
 ## [0.8.0](https://github.com/phall1/phux-cockpit/compare/v0.7.1...v0.8.0) (2026-08-09)
 
 
