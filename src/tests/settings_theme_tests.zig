@@ -341,6 +341,79 @@ test "return keeps the previewed theme and writes it to the config file" {
     try testing.expectEqual(@as(f32, 15), reloaded.font_size);
 }
 
+// GUARD: settings-save-refusal-is-reported
+test "a config file that refuses the write is reported, not swallowed" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tempConfigPath(&path_buf, "readonly");
+    defer std.Io.Dir.cwd().deleteFile(testing.io, path) catch {};
+
+    const original = "# hands off\ntheme = nord\n";
+    try writeReadOnlyFile(path, original);
+
+    state.model.config_file.setPath(path);
+    state.model.config = app.parseConfig(original);
+
+    // ABSENT FIRST, on both halves of the contract. Without this the two
+    // assertions after the commit would also pass on a build that latched the
+    // complaint at startup and never cleared it, which says nothing at all
+    // about whether the save was noticed.
+    try testing.expect(!state.model.config_write_refused);
+    try testing.expect(state.model.configFileWritable(testing.io) == false);
+
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+    try pressCanvasKey(harness, iface, "arrowdown", .{});
+    const chosen = state.model.config.theme;
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    // BEFORE the user commits, the panel's own line stops promising a write it
+    // cannot make. This is the half that matters most: the other half only
+    // fires after the choice has already been lost for the next launch.
+    try testing.expect(panelSaysReadOnly(harness));
+
+    try pressCanvasKey(harness, iface, "enter", .{});
+
+    // The theme is still applied live — refusing the colour because a file is
+    // read-only would be the worse answer, and that has not changed.
+    try testing.expect(!state.model.ws().settings.open);
+    try testing.expectEqualStrings(chosen.slice(), state.model.config.theme.slice());
+
+    // ...but the failure is now STATE, not a swallowed error return.
+    try testing.expect(state.model.config_write_refused);
+    // ...the chrome reveals itself to carry it, exactly as it does for a
+    // refused cmd+N, so the message is visible in the at-rest chrome this app
+    // normally hides at one tab.
+    try testing.expect(app.chromeRevealed(&state.model));
+    // ...and it is really on screen, naming the file it could not write.
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    try testing.expect(treeMentions(harness, "could not be saved"));
+    try testing.expect(treeMentions(harness, path));
+
+    // And the file really is untouched, which is the whole reason any of this
+    // has to be said out loud.
+    var read_buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings(original, try readWholeFile(path, &read_buf));
+
+    // The latch CLEARS on a save that lands, so it cannot become permanent
+    // furniture after one bad afternoon.
+    try setFileMode(path, 0o644);
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    try testing.expect(!panelSaysReadOnly(harness));
+    try pressCanvasKey(harness, iface, "arrowdown", .{});
+    try pressCanvasKey(harness, iface, "enter", .{});
+    try testing.expect(!state.model.config_write_refused);
+    try testing.expect(!std.mem.eql(u8, original, try readWholeFile(path, &read_buf)));
+}
+
 // -------------------------------------------------- the panel stays readable
 
 test "the settings surface stays readable when the theme is broken" {
@@ -547,6 +620,48 @@ fn contains(outer: geometry.RectF, inner: geometry.RectF) bool {
 /// earlier run is overwritten rather than believed.
 fn tempConfigPath(storage: []u8, tag: []const u8) ![]const u8 {
     return std.fmt.bufPrint(storage, "/tmp/phux-cockpit-test-{s}.config", .{tag});
+}
+
+/// Write a file and then take the owner's write bit off it, which is the state
+/// a config under version control or under a restrictive umask arrives in.
+///
+/// The mode is set through the OPEN FILE rather than through the path, because
+/// `Io.File.setPermissions` is the only chmod this std exposes; writing first
+/// and clamping second also means the fixture never depends on what an earlier
+/// run left behind.
+fn writeReadOnlyFile(path: []const u8, data: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = data });
+    try setFileMode(path, 0o444);
+}
+
+fn setFileMode(path: []const u8, mode: std.posix.mode_t) !void {
+    var file = try std.Io.Dir.cwd().openFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    try file.setPermissions(testing.io, @enumFromInt(mode));
+}
+
+/// Whether the settings panel's destination line admits the file will not take
+/// the write. Matched on the rendered TEXT rather than on a model flag: the
+/// promise the panel makes is the thing under test.
+fn panelSaysReadOnly(harness: anytype) bool {
+    const panel = panelFrame(harness) orelse return false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.text.len == 0) continue;
+        if (!contains(panel, node.frame)) continue;
+        if (std.mem.indexOf(u8, node.widget.text, "read-only") != null) return true;
+    }
+    return false;
+}
+
+/// Whether ANY widget in the window — text or accessibility label — says this.
+/// The refusal band is a badge whose short text and whose spoken label carry
+/// different amounts of the story, and either one reaching the user counts.
+fn treeMentions(harness: anytype, needle: []const u8) bool {
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.indexOf(u8, node.widget.text, needle) != null) return true;
+        if (std.mem.indexOf(u8, node.widget.semantics.label, needle) != null) return true;
+    }
+    return false;
 }
 
 fn readWholeFile(path: []const u8, storage: []u8) ![]const u8 {

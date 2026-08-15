@@ -234,10 +234,23 @@ fn writeTopologySnapshot(model: *Model, fx: *Fx) void {
 ///
 /// A one-line wrapper so the arm above reads as one verb, and so the 128 KB of
 /// buffers `writeConfigTheme` needs stays in a LEAF frame rather than in the
-/// already-deep `updateModel` one. Synchronous rather than an effect, and
-/// silent on failure — see `Model.writeConfigTheme` for both reasons.
+/// already-deep `updateModel` one. Synchronous rather than an effect — see
+/// `Model.writeConfigTheme` for that reason, and for why it is no longer
+/// silent when the write does not land.
+///
+/// The latch is the point. `.refused` here is a save the user just made that
+/// the file did not take: the theme is applied live regardless, so without a
+/// band nothing on screen distinguishes it from the save that worked, and the
+/// difference only shows up as a mystery revert at the next launch. `.written`
+/// clears it so one read-only afternoon does not leave a permanent complaint,
+/// and `.no_destination` leaves it alone because that state is already said in
+/// full by the panel's own line.
 fn persistThemeChoice(model: *Model) void {
-    model.writeConfigTheme(model.provider.io);
+    switch (model.writeConfigTheme(model.provider.io)) {
+        .written => model.config_write_refused = false,
+        .refused => model.config_write_refused = true,
+        .no_destination => {},
+    }
 }
 
 /// Re-arm the debounce. Starting a timer key that is already active REPLACES
@@ -937,6 +950,11 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // Open ON the theme in effect, so the first arrow key is a step
             // away from where the user is rather than a jump to row zero.
             workspace.settings.cursor = theme_module.indexOf(model.config.theme.slice()) orelse 0;
+            // Ask the file, ONCE, whether it will take the write this panel is
+            // about to promise. Here rather than per frame because a `view` is
+            // pure and must not touch a disk, and because the answer only has
+            // to be true at the moment the user reads the line.
+            workspace.settings.config_writable = model.configFileWritable(model.provider.io);
         },
         .settings_close => {
             const workspace = model.ws();
