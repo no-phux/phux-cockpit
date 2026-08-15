@@ -208,11 +208,13 @@ pub const pane_focus_command_id_base: u64 = 0x0c30;
 /// The focus edge's thickness, in points.
 pub const pane_focus_edge_thickness: f32 = 1;
 
-/// Phux has one visual register regardless of the system appearance: deep
-/// graphite surfaces, porcelain text, and lime reserved for focus/action.
-fn terminalNumber(id: LocalTerminalId) u64 {
-    return @intFromEnum(id) - first_terminal_raw + 1;
-}
+// A `terminalNumber(LocalTerminalId)` used to sit here, turning a registry
+// slot into a display number, with no callers left and a doc comment about the
+// colour register that had drifted onto it. It is deleted rather than left
+// dormant: a second answer to "what number is this terminal" is exactly what
+// produced a tab named "Terminal 5" wearing the CMD+4 chord, and the next
+// reader in a hurry would have found it first. `projection.terminalAddress` is
+// the only answer now.
 
 /// The tab label for a terminal. The chain itself lives in
 /// `workspace_projection.terminalTitleInto`, because the tab strip is no
@@ -343,7 +345,21 @@ fn paneStatus(ui: *TerminalUi, model: *const Model, terminal_ref: TerminalRef) T
 /// strip: a screen reader still gets the whole diagnostic sentence the eye no
 /// longer sees.
 fn tabSemantics(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_index: usize, id: TerminalRef, title: []const u8, selected: bool) []const u8 {
-    const shortcut = ui.fmt("CMD+{d}", .{tab_index + 1});
+    // The digit spoken here and the digit that opens `title` are the SAME
+    // CALL, not two derivations that happen to agree. They did not agree: this
+    // line read `tab_index + 1` while the name came from the registry slot, so
+    // one close-then-open was enough to make a tab say "Terminal 5 … shortcut
+    // CMD+4" out loud. `terminalAddress` is now the only place either number
+    // is decided.
+    //
+    // A terminal the model cannot locate is announced with no digit at all
+    // rather than with `tab_index + 1`: a strip drawing an id that lives in no
+    // tab is a broken invariant, and answering it with a plausible-looking
+    // number is how the original contradiction stayed invisible for so long.
+    const shortcut = if (projection.terminalAddress(model, id)) |at|
+        ui.fmt("CMD+{d}", .{at.tab})
+    else
+        "unavailable";
     const panes_in_tab = if (ws.treeConst(tab_index)) |current| current.paneCount() else 1;
     const kind_label = if (provider_contract.isLocal(id)) "native terminal" else "phux terminal";
     return if (model.provider.terminalConst(id)) |terminal|

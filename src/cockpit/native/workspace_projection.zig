@@ -472,6 +472,59 @@ fn paneNeedsAttention(model: *const Model, pane: *const Pane) bool {
 /// off a screen.
 pub const max_terminal_title_bytes: usize = 96;
 
+/// Where a terminal LIVES, in the only coordinates anyone can act on: which
+/// tab holds it, and which pane inside that tab. Both 1-based, because both
+/// are read aloud and written on screen rather than used to index anything.
+///
+/// `tab` is exactly the digit `cmd+N` carries.
+pub const TerminalAddress = struct {
+    tab: usize,
+    pane: usize,
+    /// How many panes the tab holds. One means `pane` says nothing `tab` has
+    /// not already said, and the name drops it.
+    pane_count: usize,
+};
+
+/// The address a terminal answers to, or null when it sits in no tab at all.
+///
+/// This is deliberately NOT the registry slot, which is what the `Terminal N`
+/// fallback used to number by. The slot is MINT ORDER and only ever moves
+/// forward — `LocalProvider.next_terminal_raw` is incremented on every create
+/// and never rewound, because an identity that repeated would let a late event
+/// for a retired terminal resolve to a live one. That is right for identity
+/// and wrong for a name: one cmd+W followed by one cmd+T left the fourth tab
+/// holding slot 5 while cmd+4 went on selecting it, and the tab announced BOTH
+/// numbers in a single sentence —
+///
+///   "Terminal 5, native terminal, 1 pane(s); …; shortcut CMD+4"
+///
+/// Two integers in the same row, in the same font, one of them wrong; every
+/// further close/open widened the gap. Position cannot drift from the chord
+/// because it IS the chord.
+///
+/// The pane half is what keeps position from LOSING something the slot had.
+/// Two panes split inside one tab share a tab digit, so numbering by tab alone
+/// would name both of them "Terminal 3" and offer two identical "Restart
+/// Terminal 3" buttons — trading a wrong number for an ambiguous one. The pane
+/// digit is the tab's own leaf order (`Tree.terminals`), which is the order the
+/// splits laid them out in and the order `cycle_pane` walks.
+pub fn terminalAddress(model: *const Model, id: TerminalRef) ?TerminalAddress {
+    const where = model.locateTerminal(id) orelse return null;
+    const workspace = model.wsAtConst(where.window) orelse return null;
+    const tree = workspace.treeConst(where.tab) orelse return null;
+    var refs: [layout.max_panes]TerminalRef = undefined;
+    const count = tree.terminals(&refs);
+    for (refs[0..count], 0..) |ref, index| {
+        if (!ref.eql(id)) continue;
+        return .{ .tab = where.tab + 1, .pane = index + 1, .pane_count = count };
+    }
+    // `locateTerminal` found this terminal by walking the same trees, so
+    // failing to find it here means the two walks disagree. Null rather than a
+    // tab-only address: a plausible answer assembled from half a lookup is how
+    // the contradiction above stayed invisible for as long as it did.
+    return null;
+}
+
 /// The name for a terminal, in the order a terminal user reads it:
 ///
 ///   1. the SHELL's own title (OSC 0/2). A prompt with title integration is
@@ -480,8 +533,8 @@ pub const max_terminal_title_bytes: usize = 96;
 ///   2. the last component of the working directory (OSC 7), which is what
 ///      Ghostty and Terminal.app fall back to and what most shells report even
 ///      without title integration.
-///   3. `Terminal N`, the mint-order number, which is always true and never
-///      useful.
+///   3. `Terminal N`, or `Terminal N.M` for one pane of a split — the terminal's
+///      ADDRESS. See `terminalAddress` for why this is not the registry slot.
 ///
 /// A Phux terminal borrows the title its coordinator published; the local
 /// chain does not apply because there is no local session to ask.
@@ -492,7 +545,7 @@ pub const max_terminal_title_bytes: usize = 96;
 /// notification banner are the same name, and a second implementation of this
 /// chain is a second set of titles to keep in agreement.
 pub fn terminalTitleInto(model: *const Model, id: TerminalRef, out: []u8) []const u8 {
-    if (provider_contract.localId(id)) |local_id| {
+    if (provider_contract.isLocal(id)) {
         if (model.provider.terminalConst(id)) |pane| {
             const shell_title = pane.title();
             if (shell_title.len > 0) return clampTitle(shell_title);
@@ -504,8 +557,13 @@ pub fn terminalTitleInto(model: *const Model, id: TerminalRef, out: []u8) []cons
                 if (leaf.len > 0) return clampTitle(leaf);
             }
         }
-        const number = @intFromEnum(local_id) - @intFromEnum(support.LocalTerminalId.terminal_1) + 1;
-        return std.fmt.bufPrint(out, "Terminal {d}", .{number}) catch "Terminal";
+        // The tree walk this costs runs only on THIS branch — a terminal with
+        // a shell title or a pwd, which is nearly every terminal a second
+        // after it starts, has already returned — so the strip pays it for
+        // unnamed panes and nothing else.
+        const at = terminalAddress(model, id) orelse return "Terminal";
+        if (at.pane_count <= 1) return std.fmt.bufPrint(out, "Terminal {d}", .{at.tab}) catch "Terminal";
+        return std.fmt.bufPrint(out, "Terminal {d}.{d}", .{ at.tab, at.pane }) catch "Terminal";
     }
     const presentation = model.remotePresentation(id) orelse return "Phux";
     return if (presentation.title.len == 0) "Phux" else clampTitle(presentation.title);

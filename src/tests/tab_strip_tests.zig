@@ -336,6 +336,89 @@ test "a tab prefers the shell title, then the pwd leaf, then its number" {
     try testing.expect(std.mem.startsWith(u8, labels[0], "zig build test,"));
 }
 
+/// The integer in a tab label's `Terminal N, ...` name, or null when the tab is
+/// not wearing the numeric fallback at all. Null is a FAILURE for the caller
+/// below, never a skip: a test that quietly stops looking when the name format
+/// moves is a test that cannot fail for the reason it was written.
+fn fallbackNameNumber(label: []const u8) ?usize {
+    const prefix = "Terminal ";
+    if (!std.mem.startsWith(u8, label, prefix)) return null;
+    const rest = label[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, ',') orelse return null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
+}
+
+/// The integer the same label announces as the tab's chord.
+fn spokenShortcutNumber(label: []const u8) ?usize {
+    const marker = "shortcut CMD+";
+    const at = std.mem.indexOf(u8, label, marker) orelse return null;
+    const rest = label[at + marker.len ..];
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
+}
+
+/// Every tab says ONE number: the digit in its name is the digit in its
+/// shortcut, and both are its position in the strip.
+fn expectTabNumbersAgree(harness: anytype, expected_tabs: usize) !void {
+    var labels: [app.max_tabs][]const u8 = undefined;
+    const count = tabLabels(harness, &labels);
+    try testing.expectEqual(expected_tabs, count);
+    for (labels[0..count], 0..) |label, index| {
+        const named = fallbackNameNumber(label) orelse {
+            std.debug.print("tab {d} carries no `Terminal N` name: {s}\n", .{ index, label });
+            return error.TestExpectedNumberedTab;
+        };
+        const spoken = spokenShortcutNumber(label) orelse {
+            std.debug.print("tab {d} announces no shortcut digit: {s}\n", .{ index, label });
+            return error.TestExpectedSpokenShortcut;
+        };
+        if (named != spoken or named != index + 1) {
+            std.debug.print(
+                "tab {d} is named {d} and answers to CMD+{d}: {s}\n",
+                .{ index, named, spoken, label },
+            );
+            return error.TestTabNumberDisagreesWithShortcut;
+        }
+    }
+}
+
+test "a tab's number and its shortcut stay one number across a close-then-open" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    // The NEGATIVE CONTROL for the assertion itself. Four freshly minted tabs
+    // hold registry slots 1-4, so slot order and position order coincide and
+    // every tab agrees with itself. If this half ever fails, the check below
+    // is measuring something other than the drift it was written for.
+    try expectTabNumbersAgree(harness, 4);
+
+    // One cmd+W and one cmd+T is the whole reproduction. The registry never
+    // reuses a freed identity -- `next_terminal_raw` only moves forward -- so
+    // the replacement tab used to be minted as slot 5 and named "Terminal 5"
+    // while cmd+4 went on selecting it. Both counts are asserted so a refused
+    // close or a refused create (see phux-cockpit-sbn) cannot leave this test
+    // comparing an untouched strip against itself and passing.
+    try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
+    try state.dispatch(&harness.runtime, 1, .close_terminal);
+    try testing.expectEqual(@as(usize, 3), state.model.ws().tab_count);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    try expectTabNumbersAgree(harness, 4);
+}
+
 // ---------------------------------------------------------------- the bell
 
 test "a bell on a hidden tab raises the marker and looking at it clears it" {
