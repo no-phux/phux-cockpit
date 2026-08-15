@@ -609,7 +609,9 @@ workflow against the existing draft tag.
 ## Limitations
 
 - Native Phux terminal identity and lifetime remain coordinator-owned; Cockpit
-  projects published terminals but does not fake remote close or restoration.
+  projects published terminals but does not fake remote close. Tabs containing
+  remote terminals are not persisted or restored, so their placement is not
+  durable across launches.
 - Layout persistence restores the SHAPE of a workspace, never its processes.
   Tabs, pane trees, divider fractions, selection, focus, and working
   directories come back; scrollback and running programs do not.
@@ -619,17 +621,13 @@ workflow against the existing draft tag.
   emitting OSC 7 and OSC 0/2. A shell without integration falls back to `$HOME`
   and to numbered tabs — correct, but less useful, and not something Cockpit
   can fix from its side.
-- Scrollback search matches case-insensitively for local terminals, because the
-  pinned engine's search API exposes no case option. The remote phux provider
-  takes a case-sensitivity flag, so the two do not agree.
 - `bold` and `italic` are carried into every cell and every renderer but cannot
   change a glyph until companion mono faces are registered; the bundled face is
   the explicit no-ligature JetBrains Mono NL, so ligatures are structurally
   unavailable regardless of renderer support.
-- Single window. There is no new-window, fullscreen, or multi-window restore.
-- Detachable terminal windows are intentionally not faked. Cockpit does not yet
-  project a stable terminal identity into native-sdk's model-declared secondary
-  window trees with the same chrome and lifecycle guarantees as the main window.
+- Windows own independent workspaces. Tabs and panes cannot yet be moved or
+  detached between windows, even though every window has the same terminal,
+  chrome, lifecycle, fullscreen, and restoration behavior.
 - Web allowlists top-level navigation; it is not a content firewall for
   subframes or page resources. native-sdk v0.9.0 does not expose page title,
   committed-navigation, load-state, or native back/forward events to Zig, so
