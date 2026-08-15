@@ -192,3 +192,92 @@ The dump fires on composite present 1 and every 30th after, and the filename
 carries the count. `-p1.png` is the BOOT frame — an empty pane. Waiting for
 "a PNG exists" reads a blank window and calls it a measurement; wait for
 `-p30` or later.
+Two hunks in `src/platform/macos/appkit_host.m`, both about the GPU composite
+pass (`NATIVE_SDK_GPU_COMPOSITE=1`):
+
+1. `cell_grid` joins the composite pass's known-kind list.
+2. The composite screenshot dump's every-30th-present cadence becomes
+   `NATIVE_SDK_GPU_SHOT_EVERY` (default 30, unchanged when unset).
+
+### The problem
+
+`NATIVE_SDK_GPU_SHOT_DIR=<dir>` is the SDK's only path from real GPU pixels to
+a PNG: `dumpCompositeShotWithPixelWidth:` reads the composited canvas texture
+back with `getBytes` and writes it. It needs no Screen Recording permission, no
+focus and no visible window, which is exactly what CI needs and exactly what
+nothing else on macOS offers — every other real-pixel path (`CGWindowListCreateImage`,
+`CGDisplayCreateImage`, ScreenCaptureKit, `screencapture(1)`) is TCC-gated.
+docs/RENDER_FIDELITY.md section 2 is the survey.
+
+It was unreachable for Cockpit. The dump fires only from the composite pass,
+and that pass refuses any command whose `kind` is outside its known-kind list.
+`cell_grid` was not in the list, and a Cockpit terminal frame is nothing but
+`cell_grid` commands. A refusal returns 0, which the engine reads as "this host
+cannot present packets" and answers with its own CPU reference renderer.
+
+So composite mode did not capture the real rasterizer. It REPLACED it. Measured
+on the real bundle, same pane, `publisher_pid` checked against the pid we
+launched both times:
+
+```
+composite unset   gpu_present_path=packet  present_fallback=none
+composite=1       gpu_present_path=pixels  present_fallback=missing_service   shots written: 0
+```
+
+An app running under composite mode looked exactly like its own reference
+screenshots, which is the one failure a reference screenshot can never report.
+
+### Why the fix is one line of behaviour
+
+The known-kind list is not a statement about what the composite pass can draw.
+It is a statement about which kinds have been checked to reach a bitmap through
+one of the two CG paths the pass uses, and `cell_grid` already reaches both:
+
+| Claim | Evidence, pinned tree `f3678832` |
+|---|---|
+| The raster-cache path draws `cell_grid` | `rasterCacheBuildEntryForCommand:` calls `NativeSdkPacketDrawCommandBody`, whose `cell_grid` branch calls `NativeSdkPacketDrawCellGrid` |
+| The scratch path draws `cell_grid` | `compositeScratchTextureForCommand:` calls `NativeSdkPacketDrawCommand`, which is a wrapper over the same body |
+| The cache already accepts it | `NativeSdkPacketCommandRasterCacheable` returns YES for `cell_grid`, with a comment explaining why a row's raster is a pure function of its command |
+| Nothing else refuses it | With only the gate changed, `gpu_present_path` goes `pixels -> packet`, `present_fallback` goes `missing_service -> none`, and PNGs appear. No second refusal surfaced |
+
+The last row is the one that matters: if either CG path could not draw a cell
+grid, the pass would still refuse and the fallback would still be `pixels`.
+
+### Why the second hunk
+
+A composite present happens only when the packet content changes, so "every
+30th present" is a cadence for an animating view and unreachable for a settled
+one. Measured with `NATIVE_SDK_GPU_DRAW_TRACE=1` on a backgrounded Cockpit
+whose pane rewrites one row from its pty as fast as the pty will carry it:
+
+```
+3 composite presents in 30 seconds
+  action=clear ... drawn=27 fill=25   <- the full pass, 25 cell_grid rasters
+  action=patch ... drawn=4  hit=2
+  action=patch ... drawn=33 fill=31
+```
+
+Present 30 does not arrive. Present 1 does, and it is the empty first frame
+before any pty output has been drawn — so the fixed cadence writes exactly one
+PNG per run and it is blank. That is the difference between a capture
+affordance and a capture affordance for animating views only.
+
+With `NATIVE_SDK_GPU_SHOT_EVERY=1` the newest file in the directory is the
+newest settled frame, which is what a capture harness wants. Unset, the
+behaviour is byte-for-byte what it was.
+
+### What it unlocks, and the proof that it is worth unlocking
+
+`scripts/capture-gpu-ink.sh` is the harness. Against the pinned SDK it refuses
+(exit 1) and names this patch; against a build carrying this patch it captures.
+
+The capture sees a rasterizer defect that the reference screenshot cannot. The
+demonstration and every number behind it are in docs/RENDER_FIDELITY.md
+section 6.
+
+### Scope
+
+This does not make composite mode the default or recommend it for shipping.
+`NATIVE_SDK_GPU_COMPOSITE` stays a prototype flag, off unless set; the patch
+only stops the prototype from silently disabling the renderer it exists to
+composite.

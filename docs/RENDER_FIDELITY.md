@@ -15,10 +15,13 @@ to check what the terminal looks like.
 |---|---|---|---|
 | `native automate screenshot` | display list, layout, colour choices, which commands were emitted | everything the real macOS rasterizer does: CoreText outlines, hinting, font smoothing, CG blend arithmetic, device colour space | no |
 | `scripts/host-raster-check.sh` | the real host rasterizer's output for a fixed row | layout, what the app actually emitted, anything outside one command | no |
+| `scripts/capture-gpu-ink.sh` | the app's real composited frame: the host rasterizer AND the layout that fed it | anything the composite pass does differently from the shipping present path — it is a prototype flag, not the default; needs a patched SDK | no |
 | eyes on glass / screen capture | everything | nothing | **yes** |
 
-There is no instrument in the middle that captures the app's real frames
-without TCC. The evidence for that claim is below; it was checked, not assumed.
+The middle row was empty when this document was first written, and section 2
+is the survey that emptied it. Section 6 is how it got filled: one SDK-side
+patch, kept at docs/sdk-patches/composite-cell-grid.patch, plus the
+measurements proving the capture sees a defect the screenshot does not.
 
 ---
 
@@ -163,7 +166,7 @@ NATIVE_SDK_GPU_COMPOSITE=1       gpu_present_path=pixels  present_fallback=missi
 Every packet present is refused and the runtime falls back to the CPU **pixels**
 path — which is the reference renderer. So turning composite mode on does not
 capture the real rasterizer; it *replaces* it. That is a real SDK bug, filed as
-`phux-cockpit-2ml.7`.
+`phux-cockpit-2ml.7` and then as `phux-cockpit-g1z`.
 
 **Correction, 2026-08-12 (`phux-cockpit-wmi`).** The conclusion that followed
 from this — "no SDK affordance captures Cockpit's real frames without TCC" —
@@ -186,6 +189,23 @@ The gap this leaves is narrower than the old conclusion: the dump is a readback
 of the canvas TEXTURE, so it still cannot see window compositing or display
 colour conversion. Section 5 is about that remaining sliver, not about the
 whole frame.
+Reproduced against the pinned SDK, `publisher_pid` in the snapshot checked
+against the pid we launched on both runs:
+
+```
+composite unset   gpu_present_path=packet  present_fallback=none            shots written: 0
+composite=1       gpu_present_path=pixels  present_fallback=missing_service shots written: 0
+```
+
+**Conclusion, as it stood.** No SDK affordance captures Cockpit's real frames
+without TCC. A negative result, with the code that makes it negative named
+above.
+
+**Conclusion now.** That paragraph was a statement about the pinned SDK, not
+about macOS, and the gate it named is one condition long. Section 6 lifts it
+with `docs/sdk-patches/composite-cell-grid.patch`. The survey above still
+stands for everything else: with an unpatched SDK there is still no capture,
+and the four TCC-gated paths are still TCC-gated.
 
 ---
 
@@ -444,3 +464,143 @@ Once granted, a `screencapture -l<windowid> -o -x` of the Cockpit window, fed
 through `scripts/measure-png-ink.m` over a fixed crop, would be automatable on a
 developer machine — but not in CI, and not on a fresh machine without a human
 click. That is the honest boundary. Everything above it is automated now.
+
+---
+
+## 6. The real-frame capture, and what it can see that a screenshot cannot
+
+`phux-cockpit-g1z`. Section 2 ruled out every capture path on macOS and closed
+on the one that was not ruled out by macOS at all — `NATIVE_SDK_GPU_SHOT_DIR`
+was blocked by a single condition in the SDK. This section is that condition
+removed, and the measurement that says the result is worth having.
+
+The SDK change is `docs/sdk-patches/composite-cell-grid.patch`; that README
+carries the argument for it. The harness is `scripts/capture-gpu-ink.sh`. Note
+what neither of them is: composite mode remains a prototype flag that is off
+unless set, so this captures the app's frame through a pass the app does not
+normally present through. Everything below holds for the CoreText rasterization
+inside that frame, which is the same code either way.
+
+### The harness refuses in the state that would lie
+
+Against a bundle built on the pinned SDK:
+
+```
+$ ./scripts/capture-gpu-ink.sh --bundle <unpatched>
+gpu_present_path=pixels present_fallback=missing_service
+
+REFUSING TO CAPTURE: the host is not rasterizing this frame.
+gpu_present_path=pixels means every packet present was refused and the
+engine fell back to its own CPU reference renderer. Whatever the
+composite pass would dump is that renderer, not CoreText.
+Fix: docs/sdk-patches/composite-cell-grid.patch (see that README).
+exit=1
+```
+
+Against a bundle built on a sandbox copy of the pin with the patch applied:
+
+```
+$ ./scripts/capture-gpu-ink.sh --bundle <patched>
+gpu_present_path=packet present_fallback=none
+shots=3
+exit=0
+```
+
+Red then green, watched in that order. The refusal is not decoration: a capture
+taken in the `pixels` state is a picture of the reference renderer filed under
+the GPU path's name, which is the exact confusion this whole document exists to
+prevent.
+
+### The demonstration
+
+Three bundles, all from the same Cockpit tree, differing only in the SDK source
+they were built against:
+
+| bundle | SDK | binary sha256 |
+|---|---|---|
+| unpatched | the pin, `f3678832` | `b2bcbc1f6b7341c6…` |
+| patched | pin + `composite-cell-grid.patch` | `42f01b541ff0cff1…` |
+| bold-defect | patched, plus an INJECTED defect | `841053c4b31ba71c…` |
+
+The injected defect is one branch of `NativeSdkCellFaceFor` in
+`appkit_host.m`: the `wantBold` case returns the REGULAR face and synthesizes
+nothing, so every `\x1b[1m` cell inks at regular weight on the host while the
+engine's reference renderer still resolves the registered bold companion.
+
+**Why this defect and not the font-smoothing one.** The smoothing calls are the
+textbook example in section 1, and they are the wrong instrument test: measured
+between the two states that actually shipped they move ZERO pixels
+(`scripts/host-raster-compare.sh`, and the table in section 1). The only
+smoothing state that moves pixels is `false`, which no build was ever in — so
+demonstrating with it would mean measuring against a counterfactual authored
+for the demonstration, which is precisely the mistake this repo published a
+retraction for. The bold-face branch has neither problem: it changes what
+CoreText is asked to draw, so it cannot be a no-op, and it is the failure the
+SDK's own comment beside that code says must not be allowed to happen — "a bold
+run that renders bold on the reference path and regular on this one is worse
+than no bold at all."
+
+This is an INSTRUMENT SENSITIVITY test. It asks whether the capture moves when
+the rasterizer moves. It is not a claim that any shipped build had this defect,
+and no fix is being validated against it.
+
+Captured pane: twelve fixed rows of `BOLD bold …  regular regular …` and one
+ticking line at the bottom, cropped off every measurement. Numbers are over
+`rect=0,60,470,240`, 112,800 pixels, via `scripts/diff-png-region.m` and
+`scripts/measure-png-ink.m` on the same basis.
+
+```
+                                                    diff_pixels  max_delta   exit
+GPU capture,  same build, two independent launches            0          0      0
+GPU capture,  patched      vs bold-defect                 12492        105      1
+reference,    patched      vs bold-defect                     0          0      0
+reference,    same build, two independent launches            0          0      0
+```
+
+Ink over the same crop:
+
+| | mean_luma | solid (>127) | lit (>32) |
+|---|---|---|---|
+| GPU capture, patched | 49.1915 | 18828 | 25704 |
+| GPU capture, bold-defect | 44.7964 | 16884 | 23508 |
+| reference, patched | 37.8525 | 13848 | 20688 |
+| reference, bold-defect | 37.8525 | 13848 | 20688 |
+
+Read the rows down, never across: the GPU column and the reference column are
+different rasterizers and the gap between them is legitimate.
+
+**What the four diff rows establish, in the order they have to be established.**
+Row 1 is the negative control for the instrument: two launches of the same
+build produce byte-identical captures, so the capture has no jitter to
+mistake for a finding. Row 4 is the same control for the reference screenshot.
+Row 3 is the blindness: two different binaries, one byte-identical screenshot,
+identical to four decimal places on every statistic. Row 2 is the finding:
+12,492 pixels — 11.07% of the crop — with a peak channel delta of 105.
+
+Row 2 without rows 1, 3 and 4 would be worth nothing. An assertion that has
+only ever been seen to fire is not evidence, and `diff-png-region` was watched
+returning both 0 and 1 here.
+
+### Reproduce it
+
+```sh
+./scripts/build-automation-cli.sh                  # clones .zig-cache/pinned-sdk at the pin
+cp -R .zig-cache/pinned-sdk .zig-cache/pinned-sdk-patched
+rm -rf .zig-cache/pinned-sdk-patched/zig-out .zig-cache/pinned-sdk-patched/.zig-cache
+(cd .zig-cache/pinned-sdk-patched && git apply ../../docs/sdk-patches/composite-cell-grid.patch)
+# temporarily, in build.zig.zon:
+#   .native_sdk = .{ .path = ".zig-cache/pinned-sdk-patched" },
+zig build package -Dautomation=true
+./scripts/capture-gpu-ink.sh
+```
+
+Revert `build.zig.zon` before committing anything: the pin is a tarball sha and
+a locally patched build must not be able to masquerade as it.
+
+### What this still cannot see
+
+It is the composite pass's frame, not the shipping present path's frame, and it
+is a texture readback rather than a photograph of the display — so display
+colour conversion and anything the window server does after the drawable is
+presented are still outside it. Section 5 remains the honest boundary for
+those.
