@@ -12,10 +12,13 @@
 # wrong values AND the right ones. The test goes red under this break only
 # because it is written at font-size 26. A test at the default font could not.
 #
+# Re-derived on integration: the fix never moved, but the CONTEXT around it
+# did (the contrast floor landed two lines below it), so the recorded break no
+# longer applied and `guard-check` said so. That is the mechanism working.
+#
 test: a pane proposes no viewport until its cell box has been measured
-red: 2026-08-12 at ff16fa2
 diff --git a/src/terminal/session.zig b/src/terminal/session.zig
-index bfb06b2..b4c0001 100644
+index 1e70a6f..f4d2ebd 100644
 --- a/src/terminal/session.zig
 +++ b/src/terminal/session.zig
 @@ -186,7 +186,7 @@ pub const Session = struct {
@@ -25,5 +28,5 @@ index bfb06b2..b4c0001 100644
 -    measured_cell: ?CellBox = null,
 +    measured_cell: ?CellBox = .{ .width = 8, .height = 18 },
      font_size: f32 = 13,
-     /// Reused projection buffers for `snapshot` (see that function). The
-     /// first-party painter takes a RESOLVED snapshot whose every slice
+     /// The WCAG contrast ratio a cell's foreground must clear against its
+     /// background before `snapshot` replaces it with pure white or pure black.
