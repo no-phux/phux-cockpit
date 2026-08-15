@@ -3,6 +3,33 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0](https://github.com/phall1/phux-cockpit/compare/v0.9.0...v0.10.0) (2026-08-15)
+
+
+### Features
+
+* **terminal:** give the terminal a minimum-contrast floor ([b9b4885](https://github.com/phall1/phux-cockpit/commit/b9b488576eb8d431ed4a8fdb55015fc503f8d326))
+* **terminal:** surface OSC 8 hyperlinks and underline a link on hover ([bb3b67d](https://github.com/phall1/phux-cockpit/commit/bb3b67d253c308a404dcb8c202ce23b4a7245a21))
+
+
+### Bug Fixes
+
+* **automation:** bind a live-app run to one pid, and refuse the rest loudly ([bbe3717](https://github.com/phall1/phux-cockpit/commit/bbe371786870c4c1e482b8806af3e205ac893ccc))
+* **build:** give each worktree its own Zig global cache ([0dde91c](https://github.com/phall1/phux-cockpit/commit/0dde91cd351138e8543d1ec50e6d888c78a96b21))
+* **build:** keep the isolation check from writing outside its build root ([55b54df](https://github.com/phall1/phux-cockpit/commit/55b54dfcc67c909ca0bf0314bce0ff7feb52746e))
+* **guards:** break the deadlock a stale guard puts the mechanism in ([1ec72e8](https://github.com/phall1/phux-cockpit/commit/1ec72e80ce5ec091d2c110d0d1f3e33af5f1f3d1))
+* **guards:** the guard scripts required bash 4, and CI runs bash 3.2 ([baa6b74](https://github.com/phall1/phux-cockpit/commit/baa6b7471c6d136a3f4000a3bd57f071e85635ea))
+* **phux:** make writeExact's deadline reachable, and root extension.zig ([ae0ffa7](https://github.com/phall1/phux-cockpit/commit/ae0ffa7e746db3ec980642d45b1b77deeb01e914))
+* **state:** write the layout before creating its directory ([68987a3](https://github.com/phall1/phux-cockpit/commit/68987a32ed2f2fc55b9ff0741d51dc7c1e246678))
+
+
+### Documentation
+
+* **claude:** replace the dev-run placeholder with the command that landed ([caea926](https://github.com/phall1/phux-cockpit/commit/caea9264117f2a80e8b864a799eced5397efd7c9))
+* fill CLAUDE.md from what the repo now knows ([45faf08](https://github.com/phall1/phux-cockpit/commit/45faf08f4261abbf7fe4d1b94a6527fdca95b1d6))
+* **render:** confirm the contrast floor on real composited pixels ([bff6209](https://github.com/phall1/phux-cockpit/commit/bff62097d2b4342d871f37734858cabb9ca13d11))
+* **terminal:** name the error the compiler actually reports for Flattened.init ([c45ee9e](https://github.com/phall1/phux-cockpit/commit/c45ee9e34a3b7ee878a6713bb5a1cd8442d304a0))
+
 ## [0.9.0](https://github.com/phall1/phux-cockpit/compare/v0.8.0...v0.9.0) (2026-08-15)
 
 
