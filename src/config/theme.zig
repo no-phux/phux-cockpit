@@ -122,6 +122,50 @@ pub const builtins = [_]Theme{
     },
 };
 
+/// The value of `theme` that means "follow the system", and the pair it
+/// follows into.
+///
+/// The pair is `phux-dark` / `phux-light` and nothing else: they are the same
+/// register inverted, so a machine crossing sunset changes brightness rather
+/// than identity. A `theme = auto` that landed on nord in the dark and
+/// solarized in the light would be two terminals wearing one config line.
+pub const auto_name = "auto";
+pub const auto_dark = "phux-dark";
+pub const auto_light = "phux-light";
+
+/// The platform's own light/dark answer, restated here so `config.zig` — which
+/// cannot see the SDK — can take one without importing it.
+pub const ColorScheme = enum { light, dark };
+
+pub fn isAutoName(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, auto_name);
+}
+
+/// The theme name a system appearance selects. Total by construction: there is
+/// no third scheme, and a missing member of the pair would be a compile error
+/// through `builtins` below rather than a runtime fallback.
+pub fn forScheme(scheme: ColorScheme) []const u8 {
+    return switch (scheme) {
+        .dark => auto_dark,
+        .light => auto_light,
+    };
+}
+
+comptime {
+    // The pair has to name real themes. Both are built in above, and a rename
+    // that broke this would otherwise surface as a `theme = auto` that
+    // silently stopped changing anything.
+    if (byNameComptime(auto_dark) == null) @compileError("theme.auto_dark names no built-in theme");
+    if (byNameComptime(auto_light) == null) @compileError("theme.auto_light names no built-in theme");
+}
+
+fn byNameComptime(comptime name: []const u8) ?*const Theme {
+    for (&builtins) |*theme| {
+        if (std.mem.eql(u8, theme.name, name)) return theme;
+    }
+    return null;
+}
+
 /// The theme a name selects, or null for a name this build does not ship.
 /// Case-insensitive, matching every other value the config parser accepts.
 pub fn byName(name: []const u8) ?*const Theme {

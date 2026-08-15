@@ -229,3 +229,53 @@ The change is in the SDK, so it lives at `docs/sdk-patches/` until the pin
 moves. `local.max_live_shells` derives from `native_sdk.max_effect_ptys` with
 no literal in between, which is the part that must not be undone: a hardcoded
 duplicate is exactly how pg1 happened.
+
+---
+
+## State is said with the accent, not with elevation: SETTLED
+
+**Decided 2026-08-14.** `phux-cockpit-2q8`.
+
+The selected tab, and the switcher's cursor row, each carry an accent marker on
+top of their lighter fill. That is deliberately TWO signals, reversing a comment
+that had argued for one, and the reason is a measurement rather than a taste.
+
+The fill difference was the whole signal. Measured against the app's own tokens:
+
+```
+surface_subtle  on surface  = 1.07 : 1     the selected tab
+surface_pressed on surface  = 1.26 : 1     the switcher's cursor row
+border          on surface  = 1.61 : 1
+```
+
+WCAG 2.1 SC 1.4.11 asks **3:1** of *"visual information necessary to indicate
+state"*. Text is excluded from that criterion, so the brighter label was never
+the thing under test; the fill was, and it is not close.
+
+**It cannot be fixed by choosing a better grey.** Material's dark-theme
+elevation model expresses depth as a white overlay whose alpha rises with
+elevation — 5% at 1dp through 16% at 24dp — and the whole of that range spans
+**1.00:1 to 1.60:1**. Reaching 3:1 against this ground needs a relative
+luminance around 0.121, a mid grey, at which point the selected tab has stopped
+being a tab and become a button. Depth in a dark UI is a sub-3:1 signal by
+construction, which is also why 1.4.11 exempts elevation as decoration.
+
+So the rule, and it is general: **elevation says near or far; the accent says
+here.** One accent verb, already spoken by the focused pane's edge, now spoken
+by the tab strip and the switcher too. `accent` on `surface` measures 14.10:1.
+
+Shadow was never an alternative. A shadow works by darkening what is behind it,
+and on a `#090b0f` ground there is nothing left to take away — which is *why*
+the overlay-lightening model exists. On a GPU canvas a hairline also wins on the
+merits: one quad against a multi-tap separable blur and an offscreen target, and
+a blurred edge cannot land on the device-pixel grid at @2x while a snapped
+hairline can.
+
+The earlier removal of the underline was not wrong about its own evidence: an
+accent rule under a rounded pill *is* clipped by the pill's radius. The bar is
+inset a full gap on each side now, which clears a 6pt corner entirely.
+
+`src/tests/chrome_register_tests.zig` asserts both halves — that the two fills
+are under 1.5:1, so nobody "fixes" this by lightening a surface, and that the
+accent clears 3:1 on every ground it lands on. Full derivation and sources in
+[docs/DESIGN_SYSTEM.md](DESIGN_SYSTEM.md).

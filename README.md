@@ -179,7 +179,14 @@ tab-placement = top
 ### Themes and the settings surface
 
 `theme = <name>` names one of the built-in sets — `phux-dark`, `phux-light`,
-`high-contrast`, `nord`, `gruvbox-dark`, `solarized-dark`. A theme sets
+`high-contrast`, `nord`, `gruvbox-dark`, `solarized-dark`. `theme = auto`
+**follows the system** instead of naming one: `phux-dark` while macOS is in
+dark mode, `phux-light` while it is in light, re-adopted the moment you flip
+the switch. The pair is deliberately those two and not a mix of themes — they
+are the same register inverted, so crossing sunset changes brightness rather
+than identity. Picking a theme in the settings surface ENDS the subscription:
+the panel writes the name it chose, so the file stops saying `auto` at exactly
+the moment the app stops following. A theme sets
 `background`, `foreground` and `selection-background`; an explicit key for any
 of those **outranks** it, wherever the two lines happen to sit in the file. It
 deliberately leaves the ANSI-16 palette alone, so a terminal red stays a
@@ -255,6 +262,8 @@ attribute and reports that fact in its caveat.
 | `cmd+arrow-up` / `cmd+arrow-down` | Scroll one history line (`shift` scrolls a page) |
 | `cmd+home` / `cmd+end` | Jump to the top or bottom of history |
 | `cmd+R` | Restart the focused terminal after its process exits |
+| `cmd+M` | Minimize the focused window |
+| Pinch | Size the terminal type, the way `cmd+=` and `cmd+-` do |
 
 Clicking a tab switches surfaces without stopping hidden execution. Clicking a
 split pane moves input ownership to it. The divider supports pointer dragging,
@@ -270,8 +279,34 @@ have to give up mouse input for them to be clickable. It is deliberately a
 heuristic that fails toward "not a link": only `http`, `https` and `mailto` are
 recognised, so a printed `file:` or `javascript:` path is never something the
 OS can be asked to open. A `cmd+click` on ordinary text is an ordinary click. A copied range remains highlighted until typing or
-another selection clears it. Terminal tab reorder remains available through the
-menu command and keyboard shortcut; direct tab dragging is not claimed.
+another selection clears it.
+
+**Tabs drag.** Pick one up and carry it along the strip: the reorder happens as
+the pointer moves, so the tab under the cursor is the tab that will be there
+when you let go — there is no landing animation to disagree with. Escape puts it
+back where you picked it up. A click still selects; only a gesture past the
+runtime's own drag slop reorders. The menu command and `cmd+shift+arrow` are
+unchanged.
+
+**Right-clicking a tab** opens its own menu — New Terminal, Move Left, Move
+Right, Close, Close Others. Every verb acts on the tab under the pointer rather
+than on the selected one, which is the whole reason the menu exists; the ends of
+the strip disable Move rather than hiding it, so the menu never changes shape.
+
+**Dropping files** from Finder onto a pane types their paths into that pane's
+shell — quoted, space-separated, and delivered through the same bracketed-paste
+encoder `cmd+V` uses, so a filename containing a newline arrives as data rather
+than as a command. The pointer decides the pane, and focus follows the drop.
+
+**A bell that rings while Cockpit is in the background posts a notification**
+naming the terminal. In the foreground it stays a dot in the tab strip: a banner
+for the pane you are typing in is how notifications get turned off wholesale.
+
+**The menu-bar extra** (`PX`) carries the open terminal count, turns its title
+warning-toned when one of them wants something, and lists every terminal in the
+active window with a row that goes straight to it — raising the window on the
+way, since a menu-bar pick happens while Cockpit is behind whatever you were
+actually looking at.
 
 ## Requirements
 
@@ -281,7 +316,7 @@ menu command and keyboard shortcut; direct tab dragging is not claimed.
 
 native-sdk is pinned to
 [`phall1/native@cff21978`](https://github.com/phall1/native/commit/cff219789c456715266d64a9785b1588dd0cb77b),
-the head of that fork's `cockpit/v0.8.4` branch: upstream v0.8.4 plus Cockpit's
+the head of that fork's `cockpit/v0.9.0` branch: upstream v0.9.0 plus Cockpit's
 terminal interaction, viewport, and font seams, the packed `cell_grid` canvas
 command with its AppKit decoder and wire format v6, macOS glyph smoothing, the
 per-window `ChromeContext` on `build_window` and `web_panes`, and `fx.openUrl`.
@@ -574,7 +609,7 @@ workflow against the existing draft tag.
   project a stable terminal identity into native-sdk's model-declared secondary
   window trees with the same chrome and lifecycle guarantees as the main window.
 - Web allowlists top-level navigation; it is not a content firewall for
-  subframes or page resources. native-sdk v0.8.1 does not expose page title,
+  subframes or page resources. native-sdk v0.9.0 does not expose page title,
   committed-navigation, load-state, or native back/forward events to Zig, so
   Cockpit does not pretend to own general browser history.
 - Headless tests prove terminal and UI behavior but cannot prove live Metal

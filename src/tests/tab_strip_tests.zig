@@ -43,13 +43,17 @@ fn hasSemanticsPrefix(harness: anytype, prefix: []const u8) bool {
 test "the visible tab window shrinks tabs before it hides any" {
     var model: app.Model = .{ .provider = undefined };
     model.ws().tab_count = 4;
-    // A 900pt window: four tabs at full width would not fit, so they shrink
-    // rather than the fourth disappearing.
-    const four = app.visibleTabWindow(&model, 900);
+    // Four tabs at full width need 672pt plus the trailing reserve. 860 is
+    // narrower than that and wider than four tabs at the floor, so the strip is
+    // forced to shrink — which is the behaviour this test is about, and it
+    // stops being exercised the moment the width is generous enough to fit
+    // them. (It WAS 900, and a wider minimum tab made that width roomy enough
+    // that the assertion below could no longer fail.)
+    const four = app.visibleTabWindow(&model, 860);
     try testing.expectEqual(@as(usize, 0), four.first);
     try testing.expectEqual(@as(usize, 4), four.count);
     try testing.expect(four.extent >= app.tab_min_extent);
-    try testing.expect(four.extent <= app.tab_extent);
+    try testing.expect(four.extent < app.tab_extent);
 
     // Two tabs in a wide window get the full width, not a stretched one.
     model.ws().tab_count = 2;

@@ -51,6 +51,11 @@ pub const cockpit_shortcuts = [_]native_sdk.Shortcut{
     // AppKit beeping at a key the app answers, and it addresses the FOCUSED
     // window rather than the main one.
     .{ .id = "window.fullscreen", .key = "f", .modifiers = .{ .primary = true, .control = true } },
+    // cmd+M, for the same reason as fullscreen and with the same cause:
+    // supplying ANY custom menu replaces the toolkit's stock bar, and the
+    // stock bar is where Minimize lived. Without this the chord every Mac app
+    // answers is one this app swallows.
+    .{ .id = "window.minimize", .key = "m", .modifiers = .{ .primary = true } },
     // Splitting is unconditional now: one terminal on a fresh window is a
     // perfectly good thing to split, so the chord registers globally.
     .{ .id = "pane.split-right", .key = "d", .modifiers = .{ .primary = true } },
@@ -148,6 +153,11 @@ const view_menu_items = [_]native_sdk.MenuItem{
 };
 
 const window_menu_items = [_]native_sdk.MenuItem{
+    // Minimize is FIRST, where macOS puts it in every Window menu — this menu
+    // replaces the stock one, so the convention has to be restated rather than
+    // inherited.
+    .{ .label = "Minimize", .command = "window.minimize", .key = "m", .modifiers = .{ .primary = true } },
+    .{ .separator = true },
     .{ .label = "Go to Terminal…", .command = "tabs.palette", .key = "p", .modifiers = .{ .primary = true, .shift = true } },
     .{ .separator = true },
     .{ .label = "Previous Tab", .command = "tab.previous", .key = "[", .modifiers = .{ .primary = true, .shift = true } },
@@ -166,6 +176,31 @@ pub const cockpit_menus = [_]native_sdk.Menu{
     .{ .title = "View", .items = &view_menu_items },
     .{ .title = "Window", .items = &window_menu_items },
 };
+
+/// The menu-bar extra's INSTALL-time shell: the parts macOS reads once, when
+/// the `NSStatusItem` is created. Everything that moves — the title, the tone,
+/// the list of terminals — is derived from the model on every rebuild by
+/// `view.statusItem`, the way `web_panes` derives a webview's URL.
+///
+/// It exists because a terminal is the app you are LEAST likely to have in
+/// front of you: a long build, an agent working through a task, a server
+/// waiting to fail all happen behind whatever you switched to. The strip's
+/// attention dot is drawn on a window nobody is looking at. This is the same
+/// state, on the one surface that is always visible.
+///
+/// `open_command` fires on every menu open. It exists so the derivation is
+/// re-read at the moment the menu is presented rather than at the last
+/// rebuild, which for a background app can be a while ago.
+pub const cockpit_status_item: TerminalApp.StatusItemOptions = .{
+    .title = status_item_prefix,
+    .tooltip = app_name,
+    .open_command = "tray.opened",
+};
+
+/// The two letters in the menu bar. Not the full name: a menu-bar extra pays
+/// for its width in a strip everything else on the machine is also competing
+/// for, and "Phux Cockpit 3" would be the widest thing up there.
+pub const status_item_prefix = "PX";
 
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Phux Cockpit canvas", .accessibility_label = "Phux Cockpit", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },

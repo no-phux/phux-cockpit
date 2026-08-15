@@ -144,6 +144,20 @@ pub const RemoteUiState = model_module.RemoteUiState;
 pub const retainSelectionAfterCopy = update_module.retainSelectionAfterCopy;
 pub const remoteFocusTarget = update_module.remoteFocusTarget;
 
+/// The chrome register. See docs/DESIGN_SYSTEM.md, and
+/// `src/tests/chrome_register_tests.zig` for what holds it in place.
+pub const chrome_band_height = projection.chrome_band_height;
+pub const chrome_band_inset = projection.chrome_band_inset;
+pub const chrome_control_extent = projection.chrome_control_extent;
+pub const chrome_icon_extent = projection.chrome_icon_extent;
+pub const chrome_gap = projection.chrome_gap;
+pub const chrome_hit_target = projection.chrome_hit_target;
+pub const grid_inset = projection.grid_inset;
+pub const tab_height = projection.tab_height;
+pub const tab_control_extent = projection.tab_control_extent;
+pub const tab_marker_extent = projection.tab_marker_extent;
+pub const tab_indicator_thickness = projection.tab_indicator_thickness;
+
 pub const header_height = projection.header_height;
 pub const side_rail_width = projection.side_rail_width;
 pub const side_rail_gap = projection.side_rail_gap;
@@ -185,7 +199,18 @@ pub const terminalNeedsAttention = projection.terminalNeedsAttention;
 pub const tabsRideTitlebarIn = projection.tabsRideTitlebarIn;
 pub const paletteRowsIn = projection.paletteRowsIn;
 pub const paletteSelectedTabIn = projection.paletteSelectedTabIn;
+pub const paletteWindowFor = projection.paletteWindowFor;
+pub const PaletteWindow = projection.PaletteWindow;
+pub const palette_max_visible_rows = projection.palette_max_visible_rows;
 pub const palette_width = view_module.palette_width;
+pub const palette_row_height = view_module.palette_row_height;
+pub const palette_padding = view_module.palette_padding;
+pub const palette_top_inset = view_module.palette_top_inset;
+pub const settings_row_height = view_module.settings_row_height;
+pub const settings_padding = view_module.settings_padding;
+pub const settings_margin = view_module.settings_margin;
+pub const field_caret_width = view_module.field_caret_width;
+pub const field_caret_height = view_module.field_caret_height;
 pub const titlebar_tab_leading_reserve = projection.titlebar_tab_leading_reserve;
 pub const titlebar_tab_band_min = projection.titlebar_tab_band_min;
 
@@ -195,6 +220,8 @@ pub const webview_anchor = scene.webview_anchor;
 pub const app_name = scene.app_name;
 pub const bundle_id = scene.bundle_id;
 pub const main_window_label = scene.main_window_label;
+pub const window_width = scene.window_width;
+pub const window_height = scene.window_height;
 pub const window_min_width = scene.window_min_width;
 pub const window_min_height = scene.window_min_height;
 pub const web_origins = scene.web_origins;
@@ -228,6 +255,15 @@ pub const Legibility = theme_module.Legibility;
 pub const legibility = projection.legibility;
 pub const legibilityOf = projection.legibilityOf;
 pub const Settings = model_module.Settings;
+pub const TabDrag = model_module.TabDrag;
+pub const pinch_points_per_step = model_module.pinch_points_per_step;
+pub const quotePaths = @import("cockpit/shell_words.zig").quotePaths;
+pub const theme_auto_dark = theme_module.auto_dark;
+pub const theme_auto_light = theme_module.auto_light;
+pub const terminalTitleInto = projection.terminalTitleInto;
+pub const statusItem = view_module.statusItem;
+pub const cockpit_status_item = scene.cockpit_status_item;
+pub const onDrop = update_module.onDrop;
 pub const ConfigFile = model_module.ConfigFile;
 pub const settings_width = view_module.settings_width;
 pub const settings_panel_label = view_module.settings_panel_label;
@@ -269,11 +305,19 @@ pub fn appOptions() TerminalApp.Options {
         .key_release_events = true,
         .on_text = update_module.onText,
         .on_wheel = update_module.onWheel,
+        .on_pinch = update_module.onPinch,
+        .on_drop = update_module.onDrop,
+        .on_appearance = update_module.onAppearance,
         .on_timer = view_module.onTimer,
         .on_chrome = update_module.onChrome,
         .on_lifecycle = update_module.onLifecycle,
         .on_frame = view_module.onFrame,
         .web_panes = webPanes,
+        // The menu-bar extra: an install-time shell in the scene, and a live
+        // derivation beside `web_panes` and `windows_fn` — same shape, same
+        // cadence, model as the only source of truth.
+        .status_item = scene.cockpit_status_item,
+        .status_item_fn = view_module.statusItem,
         .on_command = onCommand,
         // The declared secondary windows, and their trees. Presence in
         // `windows_fn`'s answer IS visibility, so `Model.closeWindow` closes
@@ -759,4 +803,6 @@ test {
     _ = @import("tests/tab_strip_tests.zig");
     _ = @import("tests/scrollback_search_tests.zig");
     _ = @import("tests/multi_window_tests.zig");
+    _ = @import("tests/sdk_surface_tests.zig");
+    _ = @import("tests/chrome_register_tests.zig");
 }

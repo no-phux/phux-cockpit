@@ -33,6 +33,40 @@ pub const max_remote_terminals = support.max_remote_terminals;
 
 pub const max_held_terminal_keys: usize = 16;
 
+/// How much magnification buys one point of type size.
+///
+/// 12% is roughly a deliberate half-inch of finger travel on a trackpad: small
+/// enough that a pinch feels connected to the size, large enough that resting
+/// two fingers on the glass and breathing does not resize anybody's terminal.
+/// Every step reflows every pane, so the cost of being twitchy here is a
+/// SIGWINCH storm rather than a wobbly animation.
+pub const pinch_points_per_step: f32 = 0.12;
+
+/// Title ceiling for a posted desktop notification. The title is a terminal's
+/// name, which the tab strip already bounds well below this.
+pub const max_notification_title_bytes: usize = 128;
+
+/// One tab being dragged along the strip.
+///
+/// The reorder is applied AS THE POINTER MOVES rather than at the drop: the
+/// tab under the cursor is the tab that will be there when the button comes
+/// up, so there is nothing to guess and no landing animation to disagree with.
+/// That is also why `end` has no work — it only forgets the gesture.
+///
+/// `anchor_x` is the pointer position at which `current` was last committed,
+/// not where the drag began. Re-anchoring on every commit is what makes a long
+/// drag a run of single steps instead of an accelerating slide: the distance
+/// to the NEXT swap is always one tab, whatever happened before it.
+///
+/// `origin` is kept for exactly one caller — a cancelled drag (Escape, or the
+/// window losing the pointer), which has to put the tab back where the user
+/// picked it up.
+pub const TabDrag = struct {
+    origin: u8,
+    current: u8,
+    anchor_x: f32,
+};
+
 /// Path ceiling for the layout state file, matching the SDK's own
 /// `max_effect_file_path_bytes` — a path the write effect would refuse is a
 /// path there is no point storing.
@@ -574,6 +608,28 @@ pub const Model = struct {
     /// in the settings surface can be written back to it. Disabled by default,
     /// same as `state`.
     config_file: ConfigFile = .{},
+    /// The live pinch gesture's accumulated magnification, as a running
+    /// product of the platform's `(1 + scale)` deltas minus one.
+    ///
+    /// A trackpad reports magnification in continuous fractions and this
+    /// terminal's type size is a whole number of points, so the two need a
+    /// gearbox: the accumulator holds what the fingers have done since the
+    /// last step, and `pinchStep` spends it a point at a time. Nothing
+    /// downstream reads it — it exists so that a slow pinch is not a stream of
+    /// no-ops and a fast one is not a jump.
+    pinch_scale: f32 = 0,
+    /// How many desktop notifications this session has posted, and for what.
+    ///
+    /// A bell is fire-and-forget at the platform (the OS owns whether a banner
+    /// is drawn, so no result Msg could be honest), which leaves nothing to
+    /// assert on — exactly the shape `opened_url_*` already solved. The count
+    /// and the last title are the observable evidence that the edge fired
+    /// once, and only once, per bell.
+    notified_title_buf: [max_notification_title_bytes]u8 = undefined,
+    notified_title_len: usize = 0,
+    notification_count: u32 = 0,
+    /// The live tab drag, or null when no tab is being dragged.
+    tab_drag: ?TabDrag = null,
 
     // -------------------------------------------------------- windows
 
@@ -595,6 +651,50 @@ pub const Model = struct {
         model.opened_url_len = value.len;
         model.opened_url_count += 1;
         return true;
+    }
+
+    /// The title of the last notification posted, or empty when none has been.
+    pub fn notifiedTitle(model: *const Model) []const u8 {
+        return model.notified_title_buf[0..model.notified_title_len];
+    }
+
+    /// Record a notification as posted. A title too long to record is a
+    /// notification NOT posted: the record is the only evidence the gesture
+    /// happened, and a banner with no trace of it would be exactly the
+    /// unassertable thing this counter exists to prevent.
+    pub fn recordNotification(model: *Model, title: []const u8) bool {
+        if (title.len == 0 or title.len > model.notified_title_buf.len) return false;
+        @memcpy(model.notified_title_buf[0..title.len], title);
+        model.notified_title_len = title.len;
+        model.notification_count += 1;
+        return true;
+    }
+
+    /// Fold one pinch delta into the gesture, and answer the whole points of
+    /// type size it has earned.
+    ///
+    /// The platform's `scale` is multiplicative per event (`zoom *= 1 +
+    /// scale`), so the accumulator is a product rather than a sum. One point
+    /// per `pinch_points_per_step` of magnification is the gearing: it takes a
+    /// deliberate pinch to move a step, and a long one keeps stepping without
+    /// ever needing gesture-start bookkeeping. The spent portion is taken out
+    /// of the accumulator rather than cleared, so the remainder carries into
+    /// the next event and a slow pinch loses nothing.
+    ///
+    /// `.begin` and `.end` carry no magnification of their own; the reset on
+    /// `.begin` is what keeps two separate gestures from adding up.
+    pub fn pinchStep(model: *Model, phase: native_sdk.platform.PinchPhase, scale: f32) i8 {
+        if (phase == .begin) {
+            model.pinch_scale = 0;
+            return 0;
+        }
+        if (phase != .change) return 0;
+        if (!std.math.isFinite(scale)) return 0;
+        model.pinch_scale = (1 + model.pinch_scale) * (1 + scale) - 1;
+        const steps = std.math.trunc(model.pinch_scale / pinch_points_per_step);
+        if (steps == 0) return 0;
+        model.pinch_scale -= steps * pinch_points_per_step;
+        return std.math.lossyCast(i8, steps);
     }
 
     pub fn ws(model: *Model) *Workspace {
