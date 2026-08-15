@@ -877,6 +877,21 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // Idempotent, and deliberately: cmd+shift+P on an open palette
             // must not wipe a needle half typed.
             if (workspace.palette.open) return;
+            // The settings surface is the OTHER modal, and the MENU BAR can
+            // reach this arm while it is up — the keyboard cannot, because the
+            // settings gate in `handleKey` swallows every chord. Without
+            // this, Window > "Go to Terminal…" set `palette.open` underneath a
+            // settings panel that the view renders INSTEAD of the palette, so
+            // nothing appeared; the switcher then ambushed the user on the
+            // Escape they pressed to get back to their shell.
+            //
+            // This mirrors `settings_open`, which already dismisses the
+            // palette: the surface the user just asked for wins and the other
+            // one goes away VISIBLY, rather than stacking up invisibly behind
+            // it. Routed through `settings_close` rather than a bare reset
+            // because leaving the panel without committing has to put the
+            // previewed theme back, exactly as Escape does.
+            if (workspace.settings.open) updateModel(model, .settings_close, fx);
             workspace.palette.reset();
             workspace.palette.open = true;
         },
@@ -1703,10 +1718,10 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
     // terminal is unreadable, so the one thing it must never do is send the
     // keys meant for it into a shell the user cannot currently see.
     //
-    // It sits ABOVE the palette gate because `settings_open` dismisses the
-    // palette, so the two can never both be open — and if a bug ever made them
-    // both open, the one that just took the keyboard should be the one holding
-    // it.
+    // It sits ABOVE the palette gate because the two can never both be open:
+    // `settings_open` dismisses the palette and `palette_open` dismisses
+    // settings. If a bug ever made them both open, the one that just took the
+    // keyboard should be the one holding it.
     if (model.ws().settings.open) {
         if (keyIs(event.key, "escape")) {
             updateModel(model, .settings_close, fx);

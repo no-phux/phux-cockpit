@@ -1599,9 +1599,11 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     const workspace = if (ws.settings.open)
         // The settings surface rides above everything, on the same terms as
         // the palette below, and takes precedence over it in the tree because
-        // `settings_open` dismisses the palette — the two can never both be
-        // open, and if a bug ever made them so, the one that just took the
-        // keyboard is the one that should be on top.
+        // the two can never both be open: `settings_open` dismisses the
+        // palette and `palette_open` dismisses settings. This `else if` is a
+        // belt-and-braces ordering, not the thing that enforces the
+        // invariant — when it WAS the only thing enforcing it, the surface it
+        // hid was still open in the model and surfaced on the next Escape.
         ui.el(.stack, .{ .grow = 1 }, .{
             laid_out,
             ui.el(.stack, .{
