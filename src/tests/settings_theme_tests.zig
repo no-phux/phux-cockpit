@@ -556,3 +556,325 @@ fn readWholeFile(path: []const u8, storage: []u8) ![]const u8 {
     return storage[0..read];
 }
 
+// ------------------------------------------- the override the panel cannot fix
+//
+// `phux-cockpit-aht`, fourth round. The settings surface was built to end "I
+// cannot see the text", and against the exact config that complaint describes it
+// could be driven all the way to a green checkmark without changing one pixel:
+// it diagnosed 1.07:1 BELOW AA, offered `high-contrast` at 21.0:1, moved that
+// row to "in effect" when it was chosen, left the readout at 1.07:1, and then
+// wrote `theme = high-contrast` into a file whose `foreground` line beats it on
+// every future launch. Nothing on the panel — not the readout, not the row, not
+// the footer — said the word `foreground`.
+//
+// These five tests are that session, in order: the config layer knows which key
+// and which line, the panel says so, the row stops lying, X actually fixes the
+// file, and the rewriter that does it leaves everything else alone.
+
+test "the config layer knows which explicit key outranks the theme, and where" {
+    var storage: [app.ColorKey.count]app.ThemeOverride = undefined;
+
+    // ABSENT. A theme with no explicit key overrides nothing, and this is the
+    // half that keeps every assertion below from passing on a build that simply
+    // reports an override for everything.
+    const clean = app.parseConfig("theme = high-contrast\nfont-size = 15");
+    try testing.expectEqual(@as(usize, 0), clean.themeOverrides(&storage).len);
+    try testing.expect(!clean.hasThemeOverride());
+
+    // ...and PRESENT, on the config from the bead: two keys, two lines.
+    const broken = app.parseConfig("foreground = #141414\nbackground = #090b0f\ntheme = high-contrast");
+    try testing.expect(broken.hasThemeOverride());
+    const found = broken.themeOverrides(&storage);
+    try testing.expectEqual(@as(usize, 2), found.len);
+    // Reported in FILE order, because it is read as an instruction to go and
+    // edit a file.
+    try testing.expectEqual(app.ColorKey.foreground, found[0].key);
+    try testing.expectEqual(@as(u32, 1), found[0].line);
+    try testing.expectEqual(app.ColorKey.background, found[1].key);
+    try testing.expectEqual(@as(u32, 2), found[1].line);
+
+    // The line is the line that is IN CHARGE. The parser is last-wins, so a
+    // duplicate key must report where the winning value was written, not where
+    // the key was first mentioned — sending someone to line 1 to delete a value
+    // that line 4 is overriding anyway would be a wrong answer with a line
+    // number on it, which is worse than no answer.
+    const duplicated = app.parseConfig("foreground = #141414\n# note\ntheme = nord\nforeground = #222222");
+    const last = duplicated.themeOverrides(&storage);
+    try testing.expectEqual(@as(usize, 1), last.len);
+    try testing.expectEqual(@as(u32, 4), last[0].line);
+
+    // A MALFORMED value overrides nothing: it set no colour, so deleting its
+    // line would change no colour either.
+    const malformed = app.parseConfig("theme = nord\nforeground = not-a-colour");
+    try testing.expect(!malformed.hasThemeOverride());
+
+    // `cursor-color` and `selection-foreground` are deliberately NOT overrides.
+    // No theme competes for the cursor, and selection-foreground already
+    // carries an `unsupported_key` diagnostic of its own.
+    const cursor_only = app.parseConfig("theme = nord\ncursor-color = #ff0000\nselection-foreground = #00ff00");
+    try testing.expect(!cursor_only.hasThemeOverride());
+
+    // And clearing is exactly the inverse: the explicit keys go, the theme is
+    // what resolves, and a second clear reports that it changed nothing.
+    const nord = app.themeByName("nord") orelse return error.TestExpectedTheme;
+    var clearing = app.parseConfig("foreground = #141414\nbackground = #090b0f\ntheme = nord");
+    try testing.expect(clearing.clearThemeOverrides());
+    try testing.expect(!clearing.hasThemeOverride());
+    try testing.expectEqual(nord.foreground.r, (clearing.resolvedForeground() orelse return error.TestExpectedColor).r);
+    try testing.expectEqual(nord.background.b, (clearing.resolvedBackground() orelse return error.TestExpectedColor).b);
+    try testing.expect(!clearing.clearThemeOverrides());
+}
+
+test "the settings panel names the key and the line that outrank the theme" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    // The config is set BEFORE the panel is opened, both times. The widget tree
+    // is rebuilt from an EVENT, not from a bare `frame_requested`, so a config
+    // swapped underneath an already-open panel would be asserted against the
+    // tree the previous frame built — which is a test measuring its own
+    // staleness. Escape-and-reopen is the honest way to change the state under
+    // this surface.
+    state.model.config = app.parseConfig("theme = high-contrast");
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    // ABSENT. On a config with no explicit colour key the panel says nothing
+    // about overrides — so the assertions below are reporting the config and
+    // not a band this panel always paints.
+    try testing.expect(!panelMentions(harness, "outranks the theme"));
+    try testing.expect(!panelMentions(harness, "foreground on line"));
+
+    // THE config from the bead, and the readout that was already right about it.
+    try pressCanvasKey(harness, iface, "escape", .{});
+    state.model.config = app.parseConfig("foreground = #141414\nbackground = #090b0f\ntheme = high-contrast");
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    try testing.expect(!app.legibility(&state.model).readable());
+
+    // THE CONTRACT: the panel names the KEY and the LINE, and says what they
+    // do. A band that said only "a colour is overridden" would be the same dead
+    // end the readout already was.
+    try testing.expect(panelMentions(harness, "foreground on line 1"));
+    try testing.expect(panelMentions(harness, "background on line 2"));
+    try testing.expect(panelMentions(harness, "outranks the theme"));
+    // ...and it says what to do about it, which is the half that makes it a
+    // remedy rather than a better-worded dead end.
+    try testing.expect(panelMentions(harness, "Press X to clear"));
+}
+
+test "a theme whose colours are overridden does not claim to be in effect" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    // ABSENT: with nothing overriding it, the chosen theme IS in effect and the
+    // row says so. Without this half, "the row does not say in effect" below
+    // would also pass on a build that never says it at all. Set before the open
+    // for the reason the test above records: the tree is built from an event.
+    state.model.config = app.parseConfig("theme = high-contrast");
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    const healthy = themeRowLabel(harness, "high-contrast") orelse return error.TestExpectedThemeRow;
+    try testing.expect(std.mem.indexOf(u8, healthy, "in effect") != null);
+    try testing.expect(app.themeFullyInEffect(&state.model));
+
+    // THE DEFECT. Same theme, same 21.00-to-1 claim on the same row — and an
+    // explicit `foreground` deciding what the screen actually shows.
+    try pressCanvasKey(harness, iface, "escape", .{});
+    state.model.config = app.parseConfig("foreground = #141414\nbackground = #090b0f\ntheme = high-contrast");
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    try testing.expect(!app.themeFullyInEffect(&state.model));
+
+    const overridden = themeRowLabel(harness, "high-contrast") orelse return error.TestExpectedThemeRow;
+    // The row must NOT claim the screen is wearing this theme...
+    testing.expect(std.mem.indexOf(u8, overridden, "in effect") == null) catch |err| {
+        std.debug.print("theme row still claims to be in effect: '{s}'\n", .{overridden});
+        return err;
+    };
+    // ...and must say what took its colours, in the row itself, because a
+    // person who just picked a theme and saw nothing happen is looking here.
+    try testing.expect(std.mem.indexOf(u8, overridden, "selected") != null);
+    try testing.expect(std.mem.indexOf(u8, overridden, "foreground on line 1") != null);
+}
+
+test "X clears the override, the readout moves, and the config file loses the key" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tempConfigPath(&path_buf, "override-clear");
+    defer std.Io.Dir.cwd().deleteFile(testing.io, path) catch {};
+
+    // The bead's config, with a comment, an unknown key and a real setting
+    // around it — the bytes the rewriter has to leave alone.
+    const source =
+        \\# my terminal
+        \\foreground = #141414
+        \\background = #090b0f
+        \\font-size = 15
+        \\some-future-key = 3
+        \\theme = high-contrast
+        \\
+    ;
+    try std.Io.Dir.cwd().writeFile(testing.io, .{ .sub_path = path, .data = source });
+    state.model.config_file.setPath(path);
+    state.model.config = app.parseConfig(source);
+
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    // ABSENT: the terminal is unreadable and the band is up.
+    try testing.expect(!app.legibility(&state.model).readable());
+    try testing.expect(panelMentions(harness, "outranks the theme"));
+
+    // THE REMEDY, on the bare key the panel advertises.
+    try pressCanvasKey(harness, iface, "x", .{});
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    // The screen: high-contrast's own 21:1 is what the readout now measures,
+    // which is the number the row had been advertising all along.
+    const high_contrast = app.themeByName("high-contrast") orelse return error.TestExpectedTheme;
+    try testing.expect(app.legibility(&state.model).readable());
+    try expectClose(
+        app.contrastRatio(high_contrast.foreground, high_contrast.background),
+        app.legibility(&state.model).ratio,
+        0.001,
+    );
+    // The panel: the band is gone and the row tells the truth again.
+    try testing.expect(!panelMentions(harness, "outranks the theme"));
+    const row = themeRowLabel(harness, "high-contrast") orelse return error.TestExpectedThemeRow;
+    try testing.expect(std.mem.indexOf(u8, row, "in effect") != null);
+    // The panel STAYS OPEN, so the readout that just moved is still on screen.
+    try testing.expect(state.model.ws().settings.open);
+
+    // The FILE: the two colour lines are gone and every other byte is where its
+    // author put it. A clear that only held for this launch would be the same
+    // permanent no-op wearing different clothes.
+    var read_buf: [4096]u8 = undefined;
+    const written = try readWholeFile(path, &read_buf);
+    try testing.expectEqualStrings(
+        \\# my terminal
+        \\font-size = 15
+        \\some-future-key = 3
+        \\theme = high-contrast
+        \\
+    , written);
+    // And it survives the re-read, which is the property that makes it a fix
+    // rather than a repaint.
+    const reloaded = app.parseConfig(written);
+    try testing.expect(!reloaded.hasThemeOverride());
+    try testing.expectEqual(
+        high_contrast.foreground.r,
+        (reloaded.resolvedForeground() orelse return error.TestExpectedColor).r,
+    );
+}
+
+test "removing keys keeps comments, unknown keys and terminators, and leaves no duplicate" {
+    var out: [1024]u8 = undefined;
+    const keys = [_][]const u8{ "foreground", "background", "selection-background" };
+
+    const source =
+        \\# a comment nobody may delete
+        \\foreground = #141414
+        \\font-size = 15
+        \\background = #090b0f
+        \\some-future-key = 3
+        \\
+    ;
+    try testing.expectEqualStrings(
+        \\# a comment nobody may delete
+        \\font-size = 15
+        \\some-future-key = 3
+        \\
+    , try app.removeConfigKeys(source, &keys, &out));
+
+    // A key that is not there changes nothing at all.
+    var out2: [1024]u8 = undefined;
+    try testing.expectEqualStrings(
+        "font-size = 15\ntheme = nord\n",
+        try app.removeConfigKeys("font-size = 15\ntheme = nord\n", &keys, &out2),
+    );
+
+    // EVERY occurrence goes, not the first. The parser is last-wins, so a
+    // surviving duplicate would mean this returned success and the key still
+    // won — the silent no-op this whole change exists to end.
+    var out3: [1024]u8 = undefined;
+    const collapsed = try app.removeConfigKeys(
+        "foreground = #141414\ntheme = nord\nforeground = #222222\n",
+        &keys,
+        &out3,
+    );
+    try testing.expectEqualStrings("theme = nord\n", collapsed);
+    try testing.expect(!app.parseConfig(collapsed).hasThemeOverride());
+
+    // A COMMENTED-OUT key is somebody's note, not an assignment, and stays.
+    var out4: [1024]u8 = undefined;
+    try testing.expectEqualStrings(
+        "# foreground = #ffffff\ntheme = nord\n",
+        try app.removeConfigKeys("# foreground = #ffffff\nforeground = #141414\ntheme = nord\n", &keys, &out4),
+    );
+
+    // CRLF stays CRLF, and a final line with no newline keeps not having one.
+    var out5: [1024]u8 = undefined;
+    try testing.expectEqualStrings(
+        "font-size = 15\r\n",
+        try app.removeConfigKeys("font-size = 15\r\nforeground = #141414\r\n", &keys, &out5),
+    );
+    var out6: [1024]u8 = undefined;
+    try testing.expectEqualStrings(
+        "theme = nord",
+        try app.removeConfigKeys("foreground = #141414\ntheme = nord", &keys, &out6),
+    );
+
+    // A buffer that cannot hold the result REFUSES rather than truncating a
+    // person's config into a shorter, differently-meaning file.
+    var tiny: [8]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, app.removeConfigKeys(source, &keys, &tiny));
+}
+
+/// Whether any widget on screen carries `needle` in its accessibility label.
+///
+/// The LABEL, not the drawn text: it is what a screen reader reads and what an
+/// `automate snapshot` matches on, so it is the surface this defect was filed
+/// against — `grep -io 'name="[^"]*overrid[^"]*"'` returning nothing is the
+/// evidence in the bead.
+fn panelMentions(harness: anytype, needle: []const u8) bool {
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.indexOf(u8, node.widget.semantics.label, needle) != null) return true;
+    }
+    return false;
+}
+
+/// One theme row's accessibility label, found by the name it starts with.
+///
+/// Matched on the `"<name>: "` prefix rather than on a substring so the
+/// high-contrast row cannot be confused with a band that happens to quote the
+/// same theme name.
+fn themeRowLabel(harness: anytype, name: []const u8) ?[]const u8 {
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        const label = node.widget.semantics.label;
+        if (label.len <= name.len + 2) continue;
+        if (!std.mem.startsWith(u8, label, name)) continue;
+        if (!std.mem.startsWith(u8, label[name.len..], ": ")) continue;
+        return label;
+    }
+    return null;
+}

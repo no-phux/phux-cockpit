@@ -240,6 +240,12 @@ fn persistThemeChoice(model: *Model) void {
     model.writeConfigTheme(model.provider.io);
 }
 
+/// Delete the explicit colour keys from the user's config file. A leaf wrapper
+/// for the same two reasons `persistThemeChoice` is one.
+fn persistOverrideClear(model: *Model) void {
+    model.clearConfigColorOverrides(model.provider.io);
+}
+
 /// Re-arm the debounce. Starting a timer key that is already active REPLACES
 /// it in place, so a burst of changes leaves exactly one pending expiry.
 fn armTopologyPersist(model: *Model, fx: *Fx) void {
@@ -980,6 +986,21 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             )].name);
             workspace.settings.reset();
             persistThemeChoice(model);
+        },
+        .settings_clear_overrides => {
+            const workspace = model.ws();
+            if (!workspace.settings.open) return;
+            // The model first, and the file only if the model actually moved.
+            // `clearThemeOverrides` returns false when there was nothing to
+            // clear, and rewriting somebody's config to make no change to it is
+            // not a free operation — it is a mtime, a backup tool's diff, and a
+            // chance for the write to go wrong for no gain at all.
+            if (!model.config.clearThemeOverrides()) return;
+            // The panel STAYS OPEN. The point of the remedy is to watch the
+            // readout two bands up come off BELOW AA, and a panel that dismissed
+            // itself would take the only instrument that can confirm the fix off
+            // the screen at the moment it worked.
+            persistOverrideClear(model);
         },
         .close_tab => |index| closeTab(model, fx, index),
         // "Close Others", from the tab's own menu. Walked from the END so a
@@ -1722,6 +1743,17 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
         }
         if (keyIs(event.key, "arrowup") or (mods.control and keyIs(event.key, "p"))) {
             updateModel(model, .{ .settings_step = -1 }, fx);
+            return;
+        }
+        // X clears an explicit colour key that is outranking the theme. Bare,
+        // with no modifier, like every other verb on this panel — the panel has
+        // no text field, so a letter here can only mean a command, and the
+        // surface someone reaches for when the screen is unreadable is the
+        // worst possible place to require a chord. It is inert with nothing to
+        // clear (`settings_clear_overrides` checks), so the key is never a
+        // trap on an ordinary config.
+        if (!mods.control and !primary and keyIs(event.key, "x")) {
+            updateModel(model, .settings_clear_overrides, fx);
             return;
         }
         // cmd+, again, and the chord's own duplicate delivery, are absorbed:

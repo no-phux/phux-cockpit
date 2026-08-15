@@ -1273,6 +1273,46 @@ pub const Model = struct {
         if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(io, parent) catch return;
         cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return;
     }
+
+    /// Delete the explicit `foreground` / `background` / `selection-background`
+    /// lines from the user's config file, leaving every other byte alone.
+    ///
+    /// The written half of the settings panel's "clear the override" remedy.
+    /// Same shape and same reasoning as `writeConfigTheme` above — synchronous
+    /// read-modify-write through the provider's `Io`, a leaf so the two
+    /// `max_config_bytes` buffers live at the bottom of the dispatch frame,
+    /// and once per keypress rather than per frame.
+    ///
+    /// A MISSING FILE IS A NO-OP HERE, and that is the one place this differs
+    /// from `writeConfigTheme`. That function creates a file to hold a choice
+    /// the user just made; this one deletes lines, and there is nothing to
+    /// delete from a file that does not exist. Creating an empty config to
+    /// record the absence of three keys would leave a file behind that says
+    /// nothing at all.
+    pub fn clearConfigColorOverrides(model: *const Model, io: std.Io) void {
+        if (!model.config_file.enabled()) return;
+        const path = model.config_file.path();
+
+        var source_bytes: [config_module.max_config_bytes]u8 = undefined;
+        var rewritten: [config_module.max_config_bytes]u8 = undefined;
+        const cwd = std.Io.Dir.cwd();
+
+        var file = cwd.openFile(io, path, .{}) catch return;
+        const read_len = blk: {
+            defer file.close(io);
+            break :blk file.readPositionalAll(io, &source_bytes, 0) catch return;
+        };
+
+        var spellings: [config_module.ColorKey.count][]const u8 = undefined;
+        for (config_module.ColorKey.all, 0..) |key, index| spellings[index] = key.spelling();
+
+        const encoded = config_module.removeKeys(
+            source_bytes[0..read_len],
+            &spellings,
+            &rewritten,
+        ) catch return;
+        cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return;
+    }
 };
 
 /// Put every restored pane's shell in the directory the snapshot recorded.

@@ -322,6 +322,35 @@ pub fn legibilityOf(tokens: canvas.DesignTokens) Legibility {
     };
 }
 
+/// Whether the theme named in the config is the theme the terminal is actually
+/// wearing.
+///
+/// FALSE is the state `phux-cockpit-aht` died in: `theme = high-contrast` in the
+/// file, high-contrast advertising 21:1 in the panel, and an explicit
+/// `foreground` key one line above it deciding what the screen shows. A row that
+/// says "in effect" in that state is the app asserting something the readout two
+/// bands up is simultaneously denying.
+///
+/// It asks the CONFIG, not the tokens, on purpose. The tokens have already had
+/// the precedence applied to them and cannot say who won — a token set holding
+/// #141414 looks identical whether a theme, a key, or the app's own register put
+/// it there. The precedence lives in `Config`, so the question about it does too.
+pub fn themeFullyInEffect(model: *const Model) bool {
+    if (model.config.resolvedTheme() == null) return false;
+    return !model.config.hasThemeOverride();
+}
+
+/// Every explicit colour key standing between the named theme and the screen,
+/// with the config-file line to go and delete. Straight through to
+/// `Config.themeOverrides`; it exists so the view has one door into the
+/// projection rather than two, the same way `legibility` wraps `legibilityOf`.
+pub fn themeOverrides(
+    model: *const Model,
+    out: []config_module.ThemeOverride,
+) []const config_module.ThemeOverride {
+    return model.config.themeOverrides(out);
+}
+
 /// `canvas.terminalCellMetrics`, corrected for the case the comment above
 /// describes: tokens that carry NO text-measure provider.
 ///

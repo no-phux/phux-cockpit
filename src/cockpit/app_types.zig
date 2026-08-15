@@ -159,6 +159,18 @@ pub const Msg = union(enum) {
     /// which is exactly what an arrow key does. The commit stays a separate
     /// gesture so a click cannot write the file by accident.
     settings_select: u8,
+    /// X, or a press on the override band: delete the explicit `foreground` /
+    /// `background` / `selection-background` keys so the chosen theme is what
+    /// reaches the screen.
+    ///
+    /// The one message in this panel that WRITES THE FILE WITHOUT A COMMIT, and
+    /// deliberately so. Every other gesture here is a preview that Escape can
+    /// take back, but a preview of "your override is gone" is exactly the trap
+    /// the panel already had: the user would watch the colours come right,
+    /// press Escape because they were only looking, and be back where they
+    /// started with no way to tell which of the two states was real. Clearing
+    /// is the remedy the band names, so it lands, once, when it is asked for.
+    settings_clear_overrides,
     /// Close a tab by index — what the strip's own `x` presses.
     close_tab: u8,
     /// Pointer entered/left a tab. Only the close affordance reads it.

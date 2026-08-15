@@ -12,6 +12,7 @@ const pointer_input = @import("../pointer_input.zig");
 const projection = @import("workspace_projection.zig");
 const scene_module = @import("scene.zig");
 const theme_module = @import("../../config/theme.zig");
+const config_module = @import("../../config/config.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -1137,6 +1138,125 @@ fn legibilityReadout(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     });
 }
 
+/// The phrase naming every explicit colour key that outranks the theme, and the
+/// config-file line each sits on: "foreground on line 1", or
+/// "foreground on line 1 and background on line 2".
+///
+/// Built as one string rather than as a row of nodes because it is read as a
+/// sentence — by a person and by a screen reader — and because the panel prints
+/// it in two places (the band and the row that would otherwise claim to be in
+/// effect) which must not be able to drift apart.
+fn overrideKeyPhrase(
+    ui: *TerminalUi,
+    overrides: []const config_module.ThemeOverride,
+) []const u8 {
+    // Three keys is the whole of `ColorKey`, so the cases are enumerable and
+    // there is no loop-with-a-buffer to get wrong. `ui.fmt` copies into the
+    // frame arena, so the nesting here is fine: each call's result outlives the
+    // one that consumed it.
+    return switch (overrides.len) {
+        0 => "",
+        1 => ui.fmt("{s} on line {d}", .{
+            overrides[0].key.spelling(),
+            overrides[0].line,
+        }),
+        2 => ui.fmt("{s} on line {d} and {s} on line {d}", .{
+            overrides[0].key.spelling(),
+            overrides[0].line,
+            overrides[1].key.spelling(),
+            overrides[1].line,
+        }),
+        else => ui.fmt("{s} on line {d}, {s} on line {d} and {s} on line {d}", .{
+            overrides[0].key.spelling(),
+            overrides[0].line,
+            overrides[1].key.spelling(),
+            overrides[1].line,
+            overrides[2].key.spelling(),
+            overrides[2].line,
+        }),
+    };
+}
+
+/// THE BAND THAT SAYS THE LEVER IS DEAD.
+///
+/// `phux-cockpit-aht` ran for four rounds on "I cannot see the text", and the
+/// surface built to end it could still be driven all the way to a green
+/// checkmark without changing a pixel: with `foreground = #141414` in the file,
+/// choosing high-contrast moves the row to "in effect", leaves the readout at
+/// 1.07:1, and writes `theme = high-contrast` into a file whose `foreground`
+/// line will beat it on every future launch. The panel recorded a permanent
+/// no-op as the user's fix and said nothing.
+///
+/// So this band exists whenever an explicit colour key is set, and it carries
+/// the three things a person needs to actually finish: WHICH key, WHICH line,
+/// and a verb that clears it. It sits directly under the readout because that
+/// is the number it explains — the readout says the colours are wrong, and this
+/// says why choosing a theme will not fix them.
+///
+/// It is NOT gated on a theme being named. An empty `theme` is the state a
+/// first-time user opens this panel in, and their first arrow key is already a
+/// no-op; a warning that appears only after the choice has failed is a warning
+/// that arrives one round too late, which is the whole shape of the bug.
+///
+/// An empty phrase collapses it to nothing at all — the same zero-height hidden
+/// stack the tab strip uses at rest, rather than an empty band. A band that is
+/// always present and usually says nothing is chrome; this one is only ever a
+/// finding.
+fn settingsOverrideBand(
+    ui: *TerminalUi,
+    model: *const Model,
+    phrase: []const u8,
+) TerminalUi.Node {
+    if (phrase.len == 0) return ui.el(.stack, .{ .height = 0, .semantics = .{ .hidden = true } }, .{});
+
+    const clear_verb = if (model.config_file.enabled())
+        "press X to clear"
+    else
+        "press X to clear for this run";
+    return ui.el(.stack, .{
+        .width = settings_row_width,
+        .height = projection.chrome_band_height,
+        .on_press = .settings_clear_overrides,
+        .style = .{ .background = settings_ground_raised },
+        .semantics = .{
+            .role = .button,
+            // Spelled out as a whole sentence. This is the label an automation
+            // run and a screen reader both read, and "overrides" alone would
+            // not tell either one what to do about it.
+            .label = ui.fmt(
+                "Theme override: {s} in the config file outranks the theme, so choosing a theme cannot change these colours. Press X to clear it.",
+                .{phrase},
+            ),
+        },
+    }, .{
+        ui.row(.{
+            .width = settings_row_width,
+            .height = projection.chrome_band_height,
+            .gap = projection.chrome_gap,
+            .cross = .center,
+            .padding = projection.chrome_band_inset,
+        }, .{
+            // "alert", not "warning": the SDK's icon set is comptime-checked
+            // (`canvas.icons.known_icon_names`) and "warning" is not in it.
+            ui.icon(.{
+                .width = projection.chrome_icon_extent,
+                .height = projection.chrome_icon_extent,
+                .style = .{ .foreground = settings_fail },
+            }, "alert"),
+            ui.text(.{
+                .grow = 1,
+                .wrap = false,
+                .overflow = .ellipsis,
+                .style = .{ .foreground = settings_fail },
+            }, ui.fmt("{s} outranks the theme", .{phrase})),
+            ui.text(.{
+                .wrap = false,
+                .style = .{ .foreground = settings_ink },
+            }, clear_verb),
+        }),
+    });
+}
+
 /// A hairline between the panel's sections.
 ///
 /// Deliberately carries NO `semantics.hidden`. That flag suppresses RENDERING
@@ -1156,9 +1276,33 @@ fn settingsRule(ui: *TerminalUi) TerminalUi.Node {
 /// produce. The ratio is shown per row so the choice can be made on evidence
 /// rather than on the name — which is the difference between a theme picker
 /// and this.
-fn settingsThemeRow(ui: *TerminalUi, index: usize, highlighted: bool, active: bool) TerminalUi.Node {
+///
+/// "IN EFFECT" IS A CLAIM ABOUT THE SCREEN, NOT ABOUT THE CONFIG KEY. It used to
+/// be printed for whichever row's name matched `theme`, which made it a lie in
+/// the one state that matters: with `foreground = #141414` in the file, the
+/// high-contrast row said "contrast 21.00 to 1, in effect" three rows under a
+/// readout saying 1.07:1 and BELOW AA. Both cannot be true, and the row was the
+/// one that was wrong — the readout measures the painted tokens.
+///
+/// So the row now distinguishes SELECTED from IN EFFECT and says which keys took
+/// its colours, in the row itself, because a person who has clicked a theme and
+/// seen nothing happen is looking at this row and not at the band above it.
+fn settingsThemeRow(
+    ui: *TerminalUi,
+    index: usize,
+    highlighted: bool,
+    active: bool,
+    override_phrase: []const u8,
+) TerminalUi.Node {
     const entry = &theme_module.builtins[index];
     const ratio = theme_module.contrastRatio(entry.foreground, entry.background);
+    const overridden = active and override_phrase.len != 0;
+    const standing = if (!active)
+        ""
+    else if (overridden)
+        ui.fmt(", selected, but {s} overrides it", .{override_phrase})
+    else
+        ", in effect";
     return ui.el(.list_item, .{
         .width = settings_row_width,
         .height = settings_row_height,
@@ -1171,7 +1315,7 @@ fn settingsThemeRow(ui: *TerminalUi, index: usize, highlighted: bool, active: bo
                 entry.name,
                 entry.summary,
                 ratio,
-                if (active) ", in effect" else "",
+                standing,
                 if (highlighted) ", highlighted" else "",
             }),
         },
@@ -1228,6 +1372,12 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
     const cursor = @min(ws.settings.cursor, count - 1);
     const active_name = model.config.theme.slice();
 
+    // Computed ONCE and handed to both readers. The band and the selected row
+    // are two statements about the same fact, and building the phrase twice is
+    // how they would eventually come to disagree.
+    var override_storage: [config_module.ColorKey.count]config_module.ThemeOverride = undefined;
+    const override_phrase = overrideKeyPhrase(ui, projection.themeOverrides(model, &override_storage));
+
     var rows: [theme_module.builtins.len]TerminalUi.Node = undefined;
     for (0..count) |index| {
         rows[index] = settingsThemeRow(
@@ -1235,6 +1385,7 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
             index,
             index == cursor,
             std.ascii.eqlIgnoreCase(theme_module.builtins[index].name, active_name),
+            override_phrase,
         );
     }
     // An explicit slice: `rows[0..count]` with a comptime-known `count` is a
@@ -1254,10 +1405,22 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
             ui.text(.{
                 .wrap = false,
                 .style = .{ .foreground = settings_ink_muted },
-            }, "up/down preview   return save   esc cancel"),
+                // The key legend grows the one verb that only exists while
+                // there is something for it to do. Advertising X unconditionally
+                // would put a chord in the header that does nothing on the
+                // ordinary config, which is the failure this panel is being
+                // fixed for, in miniature.
+            }, if (override_phrase.len == 0)
+                "up/down preview   return save   esc cancel"
+            else
+                "up/down preview   x clear override   return save   esc cancel"),
         }),
         settingsRule(ui),
         legibilityReadout(ui, model),
+        // Directly under the readout, above the rule: it explains the number
+        // immediately above it, and separating them with a rule would file it
+        // as its own section rather than as a footnote to that measurement.
+        settingsOverrideBand(ui, model, override_phrase),
         settingsRule(ui),
         // Gap ZERO, not one. The theme rows are a table read down a column,
         // and the highlight is what separates them; a one-point gutter is

@@ -301,6 +301,42 @@ pub const max_minimum_contrast: f32 = 21;
 /// revealing it. At 3 the grey stays grey.
 pub const default_minimum_contrast: f32 = 3;
 
+/// The three colour keys a `theme` competes with and always loses to.
+///
+/// Spelled as an enum rather than as three loose fields so the settings surface
+/// cannot iterate two of them and quietly forget the third — which is the whole
+/// failure mode this type exists to close. `spelling` is the key EXACTLY as the
+/// config file writes it, because the panel prints it for someone to go and
+/// delete and the rewriter matches on it.
+pub const ColorKey = enum {
+    foreground,
+    background,
+    selection_background,
+
+    pub const count = @typeInfo(ColorKey).@"enum".fields.len;
+    pub const all = [_]ColorKey{ .foreground, .background, .selection_background };
+
+    pub fn spelling(key: ColorKey) []const u8 {
+        return switch (key) {
+            .foreground => "foreground",
+            .background => "background",
+            // Hyphenated in the file, underscored in Zig. Getting this wrong
+            // would make the rewriter a silent no-op on the one key whose two
+            // spellings differ.
+            .selection_background => "selection-background",
+        };
+    }
+};
+
+/// One explicit colour key that is beating the theme, and where to go and
+/// delete it.
+pub const ThemeOverride = struct {
+    key: ColorKey,
+    /// 1-based line in the config file. Never 0 in a value this module hands
+    /// out: an override with no line is one nothing could act on.
+    line: u32,
+};
+
 pub const Config = struct {
     font_family: FontFamily = FontFamily.init(""),
     font_size: f32 = default_font_size,
@@ -336,6 +372,22 @@ pub const Config = struct {
     cursor_color: ?Rgb = null,
     selection_background: ?Rgb = null,
     selection_foreground: ?Rgb = null,
+
+    /// WHERE each of the three theme-outranking colour keys was written, 1-based,
+    /// 0 for "not in the file".
+    ///
+    /// The precedence below is invisible from inside the app without this. A
+    /// panel can see THAT `foreground` is set, but "an explicit foreground is
+    /// winning" is advice nobody can act on until it also says which line of
+    /// which file to go and delete — and the file is hand-written, so the line
+    /// is the only durable address a key has. `phux-cockpit-aht` is what
+    /// happens when the app knows a colour is unreachable and cannot say why.
+    ///
+    /// Only the three keys `resolvedForeground`/`Background`/`SelectionBackground`
+    /// consult. `cursor-color` reaches the emulator through its own override
+    /// channel and no theme competes for it; `selection-foreground` already
+    /// carries an `unsupported_key` diagnostic of its own.
+    override_lines: [ColorKey.count]u32 = [_]u32{0} ** ColorKey.count,
 
     cursor_style: CursorStyle = .block,
     cursor_style_blink: bool = true,
@@ -413,6 +465,81 @@ pub const Config = struct {
         if (config.selection_background) |explicit| return explicit;
         const active = config.resolvedTheme() orelse return null;
         return fromThemeRgb(active.selection_background);
+    }
+
+    /// The explicit value behind one colour key, or null when the file wrote
+    /// none. The read half of the precedence above, keyed rather than named, so
+    /// a caller iterating `ColorKey.all` needs no switch of its own.
+    pub fn explicitColor(config: *const Config, key: ColorKey) ?Rgb {
+        return switch (key) {
+            .foreground => config.foreground,
+            .background => config.background,
+            .selection_background => config.selection_background,
+        };
+    }
+
+    /// EVERY explicit colour key that outranks the theme, in file order, with
+    /// the line each was written on. Returns the prefix of `out` it filled.
+    ///
+    /// THIS IS THE INSTRUMENT THE SETTINGS PANEL WAS MISSING. The panel's one
+    /// action is choosing a theme, and `resolvedForeground` and friends make
+    /// that action a no-op for every colour named here — silently, because the
+    /// precedence is resolved at the read site and nothing on the way there
+    /// reports having overruled anything. `phux-cockpit-aht` is four rounds of
+    /// exactly that: a person changing themes and watching nothing happen.
+    ///
+    /// DELIBERATELY NOT CONDITIONED ON A THEME BEING NAMED. `theme` is empty on
+    /// a config that has never chosen one, and that is precisely the state
+    /// somebody opens this panel in — so gating the warning on a theme already
+    /// being set would hide it from the one user who most needs it, and then
+    /// reveal it a keystroke later once their choice had already failed.
+    ///
+    /// Ordered by LINE, not by enum order, because it is read out as an
+    /// instruction to go and edit a file and the file is read top to bottom. An
+    /// override with a line of 0 cannot happen (`setColor` records the line in
+    /// the same statement that sets the value) and is skipped rather than
+    /// printed as "line 0", which would be a worse answer than silence.
+    pub fn themeOverrides(config: *const Config, out: []ThemeOverride) []const ThemeOverride {
+        var count: usize = 0;
+        for (ColorKey.all) |key| {
+            if (count >= out.len) break;
+            if (config.explicitColor(key) == null) continue;
+            const line = config.override_lines[@intFromEnum(key)];
+            if (line == 0) continue;
+            out[count] = .{ .key = key, .line = line };
+            count += 1;
+        }
+        std.mem.sort(ThemeOverride, out[0..count], {}, struct {
+            fn lessThan(_: void, a: ThemeOverride, b: ThemeOverride) bool {
+                return a.line < b.line;
+            }
+        }.lessThan);
+        return out[0..count];
+    }
+
+    /// Whether any explicit colour key is standing between a theme and the
+    /// screen. The cheap question, for a caller that only needs the boolean.
+    pub fn hasThemeOverride(config: *const Config) bool {
+        var storage: [ColorKey.count]ThemeOverride = undefined;
+        return config.themeOverrides(&storage).len != 0;
+    }
+
+    /// Drop every explicit colour key, so the named theme is what reaches the
+    /// screen. True when something actually changed — the settings surface
+    /// needs that to decide whether the config file is worth rewriting.
+    ///
+    /// The LIVE half of the remedy. The tokens are rebuilt from `Model.config`
+    /// on every frame, so clearing these repaints on the next one; the file
+    /// half is `removeKeys`, and a run where the file write fails still gets
+    /// the colour back for this launch, which is the same bargain
+    /// `writeConfigTheme` already makes.
+    pub fn clearThemeOverrides(config: *Config) bool {
+        if (!config.hasThemeOverride()) return false;
+        config.foreground = null;
+        config.background = null;
+        config.selection_background = null;
+        config.override_lines = [_]u32{0} ** ColorKey.count;
+        return true;
     }
 
     /// Adopt a theme by name, dropping an unknown one rather than storing it.
@@ -556,10 +683,14 @@ fn applyPair(config: *Config, line: u32, key: []const u8, value: []const u8) voi
         config.theme.set(value) catch config.note(line, .too_long, value);
         return;
     }
-    if (eq(key, "background")) return setColor(config, line, &config.background, value);
-    if (eq(key, "foreground")) return setColor(config, line, &config.foreground, value);
+    // The three that outrank a theme go through `setOverridableColor`, which
+    // records WHERE they were written as well as what they say. `cursor-color`
+    // does not: no theme competes for it, so there is nothing for it to be
+    // silently beating.
+    if (eq(key, "background")) return setOverridableColor(config, line, .background, value);
+    if (eq(key, "foreground")) return setOverridableColor(config, line, .foreground, value);
     if (eq(key, "cursor-color")) return setColor(config, line, &config.cursor_color, value);
-    if (eq(key, "selection-background")) return setColor(config, line, &config.selection_background, value);
+    if (eq(key, "selection-background")) return setOverridableColor(config, line, .selection_background, value);
     if (eq(key, "selection-foreground")) {
         // Parsed, but inert: canvas.TerminalGrid carries ONE selection_color
         // and the painter draws a WASH over the cell rather than overriding
@@ -664,6 +795,27 @@ fn setColor(config: *Config, line: u32, field: *?Rgb, value: []const u8) void {
         config.note(line, .bad_value, value);
         return;
     };
+}
+
+/// A colour key that outranks the theme: set it AND remember which line said
+/// so, in one statement, so the two can never disagree.
+///
+/// The line is recorded only when the value parsed. A malformed
+/// `foreground = wat` sets nothing and outranks nothing, and an override
+/// recorded for it would send the settings panel to a line whose deletion
+/// would change no colour at all.
+///
+/// LAST WINS on a duplicate key, matching the parser everywhere else, and the
+/// recorded line moves with the value — so the line the panel names is the line
+/// that is actually in charge, not the first one to mention the key.
+fn setOverridableColor(config: *Config, line: u32, key: ColorKey, value: []const u8) void {
+    const field = switch (key) {
+        .foreground => &config.foreground,
+        .background => &config.background,
+        .selection_background => &config.selection_background,
+    };
+    setColor(config, line, field, value);
+    if (field.* != null) config.override_lines[@intFromEnum(key)] = line;
 }
 
 fn setBool(config: *Config, line: u32, field: *bool, value: []const u8) void {
@@ -804,6 +956,45 @@ pub fn setKey(
         try writer.write(" = ");
         try writer.write(value);
         try writer.write("\n");
+    }
+    return output[0..writer.len];
+}
+
+/// Delete every live assignment of any key in `keys`, leaving the rest of the
+/// file byte-for-byte alone.
+///
+/// The written half of the settings panel's "clear the override" remedy. It
+/// obeys the same rule `setKey` does — this file is hand-written, so anything
+/// that is not one of the named assignments is somebody's own bytes and is
+/// copied through, comments and unknown keys and terminators included.
+///
+/// It DELETES rather than comments out. A `# foreground = #141414` left behind
+/// would be a line the parser ignores and a person reading their own file would
+/// not, which is a slower version of the same confusion: they would see their
+/// colour still written down and believe it was still in force. The value is
+/// not lost either way — the panel names it on screen before this runs.
+///
+/// EVERY occurrence goes, not the first: the parser is last-wins, so leaving a
+/// duplicate later in the file would mean this returned success and the key
+/// still won. That is the silent no-op this whole change exists to end.
+pub fn removeKeys(
+    source: []const u8,
+    keys: []const []const u8,
+    output: []u8,
+) error{NoSpaceLeft}![]const u8 {
+    var writer = Writer{ .buffer = output };
+    var cursor: usize = 0;
+    while (cursor < source.len) {
+        const newline = std.mem.indexOfScalarPos(u8, source, cursor, '\n');
+        const end = if (newline) |index| index + 1 else source.len;
+        const whole = source[cursor..end];
+        cursor = end;
+
+        const doomed = for (keys) |key| {
+            if (lineNamesKey(whole, key)) break true;
+        } else false;
+        if (doomed) continue;
+        try writer.write(whole);
     }
     return output[0..writer.len];
 }
