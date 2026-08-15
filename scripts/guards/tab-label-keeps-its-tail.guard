@@ -25,7 +25,7 @@
 # last character), so the recorded break stopped applying and guard-check said
 # so. That is the staleness check working.
 test: a shrunken tab keeps the END of its name, which is the half that identifies
-red: 2026-08-15 at a09ccdb
+red: 2026-08-15 at b2d8a15
 diff --git a/src/cockpit/native/workspace_projection.zig b/src/cockpit/native/workspace_projection.zig
 index 5785319..6bebc4b 100644
 --- a/src/cockpit/native/workspace_projection.zig

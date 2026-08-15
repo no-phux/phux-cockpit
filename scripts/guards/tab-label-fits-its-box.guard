@@ -11,7 +11,7 @@
 # layout gave it", which is the assertion the old strip could never have
 # passed, at two tabs with real OSC 0 titles in the app's own minimum window.
 test: the strip hands the renderer a label that already fits, so the snapshot cannot lie
-red: 2026-08-15 at 83b55af
+red: 2026-08-15 at b2d8a15
 diff --git a/src/cockpit/native/view.zig b/src/cockpit/native/view.zig
 index 3c97939..f3959c5 100644
 --- a/src/cockpit/native/view.zig
