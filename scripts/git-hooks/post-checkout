@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Say loudly when a claimed worktree gets moved off its branch.
+#
+# Git has no pre-checkout hook, so this cannot refuse. It runs AFTER the switch
+# has already happened -- which is still worth doing, because the failure it
+# reports was silent every time it occurred. Three sessions in one day found out
+# only when a commit landed on the wrong branch, or when a neighbour's work had
+# already been deleted.
+#
+# The commit is blocked separately, by scripts/git-hooks/pre-commit.
+set -euo pipefail
+
+# $3 is 1 for a branch checkout, 0 for a file checkout. A file checkout does not
+# move HEAD and is not what this guards.
+[[ "${3:-0}" == "1" ]] || exit 0
+
+claim_file="$(git rev-parse --git-path worktree-claim)"
+[[ -f "$claim_file" ]] || exit 0
+
+owner_branch="$(head -1 "$claim_file" 2>/dev/null || true)"
+[[ -n "$owner_branch" ]] || exit 0
+
+current_branch="$(git branch --show-current 2>/dev/null || true)"
+[[ "$current_branch" != "$owner_branch" ]] || exit 0
+
+cat >&2 <<EOF
+
+WARNING: this worktree was claimed for a different branch.
+
+  worktree:       $(git rev-parse --show-toplevel)
+  claimed for:    ${owner_branch}
+  now on:         ${current_branch:-<detached>}
+
+If you did not mean to do this, put it back before touching anything:
+
+  git checkout ${owner_branch}
+
+Any commit here will be REFUSED until the branch matches the claim or the claim
+is updated. See scripts/worktree-claim.sh.
+
+EOF
+exit 0
