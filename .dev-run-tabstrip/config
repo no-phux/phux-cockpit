@@ -1,0 +1,6 @@
+# Config for LOCAL DEV RUNS only (scripts/dev-run.sh). Your real config at
+# ~/.config/phux-cockpit/config is never read or written by a dev run, and this
+# file is never read by the installed app. Same keys; see README "Configuration".
+#
+# font-size = 13
+# theme = tokyonight
