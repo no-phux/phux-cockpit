@@ -152,10 +152,10 @@ test "stepping backward to a tab already on screen does not scroll the strip" {
     // driven at 1100pt with nine tabs and seven drawn, but the harness's pty
     // table is four (`native_sdk.max_effect_ptys`), so the SAME regime — more
     // tabs than slots, selection sitting at the right edge — is reached by
-    // making the strip small instead of the tab list long. 640pt of window
-    // leaves 404pt of strip after the padding and the trailing reserve, which
+    // making the strip small instead of the tab list long. 660pt of window
+    // leaves room for three tabs after the strip and cue reserves, which
     // is three tabs at the 120pt floor.
-    const narrow = geometry.SizeF.init(640, 480);
+    const narrow = geometry.SizeF.init(660, 480);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = narrow });
     defer harness.destroy(gpa);
     const state = try startCockpit(harness);
@@ -175,7 +175,7 @@ test "stepping backward to a tab already on screen does not scroll the strip" {
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 3), state.model.ws().selected_tab);
-    try testing.expectApproxEqAbs(@as(f32, 640), state.model.ws().surface_size.width, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 660), state.model.ws().surface_size.width, 0.001);
 
     const band = state.model.ws().surface_size.width - app.windowPadding(&state.model) * 2;
     const start = app.visibleTabWindow(&state.model, band);
