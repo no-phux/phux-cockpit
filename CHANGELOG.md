@@ -3,6 +3,22 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0](https://github.com/phall1/phux-cockpit/compare/v0.10.0...v0.11.0) (2026-08-16)
+
+
+### Features
+
+* **render:** capture the app's real frames without a Screen Recording grant ([#41](https://github.com/phall1/phux-cockpit/issues/41)) ([75553fb](https://github.com/phall1/phux-cockpit/commit/75553fbeb16bd7255fd0e108cfe6794570f9c882))
+
+
+### Bug Fixes
+
+* **chrome:** measure the tab strip's trailing reserve against the row it actually gets ([#47](https://github.com/phall1/phux-cockpit/issues/47)) ([45d84dd](https://github.com/phall1/phux-cockpit/commit/45d84dd77fce55cefff4cdf811f00711de27d93f))
+* **settings:** say so when the config file refuses the theme write ([#46](https://github.com/phall1/phux-cockpit/issues/46)) ([3f34235](https://github.com/phall1/phux-cockpit/commit/3f34235d9c69119fff9d4ff30572bbec812d3af1))
+* **tabs:** elide a shrunken tab's title in the MIDDLE so the strip still names its tabs ([#48](https://github.com/phall1/phux-cockpit/issues/48)) ([f5d8534](https://github.com/phall1/phux-cockpit/commit/f5d853494883241c0972e4315d7d26ff04a7fd9c))
+* **tabs:** scroll into view only when the selection is actually out of view ([#45](https://github.com/phall1/phux-cockpit/issues/45)) ([8884c55](https://github.com/phall1/phux-cockpit/commit/8884c551550a0709b7e3421f68b5e619a8bb952b))
+* **worktree:** refuse a commit that lands in somebody else's worktree ([#44](https://github.com/phall1/phux-cockpit/issues/44)) ([3c7d9a3](https://github.com/phall1/phux-cockpit/commit/3c7d9a3e0b35b7d327a4e69be9c9f911799bab47))
+
 ## [0.10.0](https://github.com/phall1/phux-cockpit/compare/v0.9.0...v0.10.0) (2026-08-15)
 
 
