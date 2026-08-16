@@ -947,7 +947,7 @@ pub fn tabLabelIdentityIn(
     tokens: canvas.DesignTokens,
     band_width: f32,
 ) TabLabelIdentity {
-    const window = visibleTabWindowIn(workspace, band_width);
+    const window = visibleTabWindowIn(model, workspace, band_width);
     var result: TabLabelIdentity = .{ .shown = window.count, .label_width = tabLabelWidth(window.extent) };
     var name_storage: [topology.max_tabs][max_terminal_title_bytes]u8 = undefined;
     var painted_storage: [topology.max_tabs][max_painted_title_bytes]u8 = undefined;

@@ -239,6 +239,8 @@ test "stepping backward to a tab already on screen does not scroll the strip" {
         try testing.expectEqual(want_first, window.first);
         try testing.expect(window.contains(step + 1));
     }
+}
+
 // ------------------------------------------------------- the label the tab
 //                                                          actually paints
 
@@ -286,18 +288,15 @@ test "a shrunken tab keeps the END of its name, which is the half that identifie
     // The geometry is not invented here: it is what the running app reports.
     // Sixteen tabs in an 1100pt window, real bundle, publisher_pid checked
     // against the pid dev-run.sh launched, gpu_present_path=packet with no
-    // fallback -- the strip shows seven tabs 123.428574 apart and every label
-    // text node lands at 51.428574 wide:
-    //
-    //   role=text name="Terminal 10" bounds=(126,29.25 51.428574x17.5)
-    //   role=text name="Terminal 16" bounds=(890.5715,29.25 51.428574x17.5)
+    // fallback. The final strip arithmetic shows eight tabs 120.5pt wide after
+    // paying for the `+` button, per-tab gaps, and both overflow cues.
     var model: app.Model = .{ .provider = undefined };
     model.ws().tab_count = app.max_tabs;
     const window = app.visibleTabWindow(&model, 1100 - app.grid_inset * 2);
-    try testing.expectEqual(@as(usize, 7), window.count);
-    try testing.expectApproxEqAbs(@as(f32, 123.428574), window.extent, 0.001);
+    try testing.expectEqual(@as(usize, 8), window.count);
+    try testing.expectApproxEqAbs(@as(f32, 120.5), window.extent, 0.001);
     const label_width = app.tabLabelWidth(window.extent);
-    try testing.expectApproxEqAbs(@as(f32, 51.428574), label_width, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 48.5), label_width, 0.001);
 
     const tokens = app.cockpitTokens(&model);
     // ASSERT ABSENT FIRST. Every one of these names is far too wide for the
@@ -305,7 +304,7 @@ test "a shrunken tab keeps the END of its name, which is the half that identifie
     // that elides the tail cannot tell them apart, and a test written against
     // a box that happened to fit them would prove nothing at all.
     const names = [_][]const u8{
-        "Terminal 10", "Terminal 11", "Terminal 12", "Terminal 13",
+        "Terminal 9",  "Terminal 10", "Terminal 11", "Terminal 12", "Terminal 13",
         "Terminal 14", "Terminal 15", "Terminal 16",
     };
     for (names) |name| try testing.expect(app.chromeTextWidth(tokens, name) > label_width);
@@ -322,18 +321,15 @@ test "a shrunken tab keeps the END of its name, which is the half that identifie
         try testing.expect(painted[index].len < name.len);
         try testing.expect(std.mem.endsWith(u8, painted[index], name[name.len - 2 ..]));
     }
-    // And the whole point: seven visible tabs, seven different words.
+    // And the whole point: eight visible tabs, eight different words.
     try testing.expect(allDistinct(&painted));
 
-    // FULLSCREEN is the harder box, and the one the bug report counted
-    // fourteen identical words in. 1920 gives the strip 1684pt of usable band,
-    // so it shows fourteen tabs at 120.2857 and the label falls to 48.2857 --
-    // narrower than the floor's own 51.4, because the strip shrinks to the
-    // floor and then windows, and fourteen tabs is what 1684 divides into.
+    // FULLSCREEN is the other reported case. It shows fourteen tabs after
+    // accounting for the button, gaps, and overflow cues.
     const wide = app.visibleTabWindow(&model, 1920 - app.grid_inset * 2);
     try testing.expectEqual(@as(usize, 14), wide.count);
     const wide_label = app.tabLabelWidth(wide.extent);
-    try testing.expectApproxEqAbs(@as(f32, 48.2857), wide_label, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 53.7143), wide_label, 0.001);
     var wide_painted: [names.len][]const u8 = undefined;
     for (names, 0..) |name, index| {
         wide_painted[index] = app.elideTitleMiddleInto(tokens, name, wide_label, &storage[index]);
@@ -482,7 +478,7 @@ test "the strip hands the renderer a label that already fits, so the snapshot ca
 
     const tokens = app.cockpitTokens(&state.model);
     const band = app.window_min_width - app.grid_inset * 2;
-    const window = app.visibleTabWindowIn(state.model.wsConst(), band);
+    const window = app.visibleTabWindowIn(&state.model, state.model.wsConst(), band);
     const label_width = app.tabLabelWidth(window.extent);
 
     // ASSERT ABSENT. Both names are wider than the box, and their shared
