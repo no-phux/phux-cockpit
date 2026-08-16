@@ -157,10 +157,11 @@ test "stepping backward to a tab already on screen does not scroll the strip" {
     // driven at 1100pt with nine tabs and seven drawn, but the harness's pty
     // table is four (`native_sdk.max_effect_ptys`), so the SAME regime — more
     // tabs than slots, selection sitting at the right edge — is reached by
-    // making the strip small instead of the tab list long. 660pt of window
-    // leaves room for three tabs after the strip and cue reserves, which
+    // making the strip small instead of the tab list long. 600pt of window
+    // leaves room for three tabs once the real shell-limit badge is present,
+    // which
     // is three tabs at the 120pt floor.
-    const narrow = geometry.SizeF.init(660, 480);
+    const narrow = geometry.SizeF.init(600, 480);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = narrow });
     defer harness.destroy(gpa);
     const state = try startCockpit(harness);
@@ -177,10 +178,11 @@ test "stepping backward to a tab already on screen does not scroll the strip" {
     // `SkipZigTest`, and passed against the very bug it was written to catch.
     try support.requireLiveShells(4);
     for (0..3) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 3), state.model.ws().selected_tab);
-    try testing.expectApproxEqAbs(@as(f32, 660), state.model.ws().surface_size.width, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 600), state.model.ws().surface_size.width, 0.001);
 
     const band = state.model.ws().surface_size.width - app.windowPadding(&state.model) * 2;
     const start = app.visibleTabWindow(&state.model, band);
@@ -252,16 +254,15 @@ fn announcedCount(label: []const u8) !usize {
 }
 
 test "a strip that hides tabs says so, and says how many" {
-    // Four tabs is the smallest count that windows inside the 660pt window
+    // Four tabs is the smallest count that windows inside the 600pt window
     // below, and four live shells is exactly what the pinned SDK's pty table
     // holds. A pin with a smaller table cannot reach this state at all.
     try support.requireLiveShells(4);
 
     const gpa = testing.allocator;
-    // 660x640, the size the defect was measured at on the real app: a 644pt
-    // band, 424pt of it usable after the trailing reserve, which is three tabs
-    // at the 120pt floor and a fourth with nowhere to go.
-    const narrow = geometry.SizeF.init(660, 640);
+    // Use the app's declared minimum width with the real shell-limit badge,
+    // where three tabs fit and a fourth has nowhere to go.
+    const narrow = geometry.SizeF.init(600, 640);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = narrow });
     defer harness.destroy(gpa);
     const state = try startCockpit(harness);
@@ -274,6 +275,7 @@ test "a strip that hides tabs says so, and says how many" {
         try state.dispatch(&harness.runtime, 1, .new_terminal);
         try testing.expect(state.model.ws().tab_count > before);
     }
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
 
     var labels: [app.max_tabs][]const u8 = undefined;

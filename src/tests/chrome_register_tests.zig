@@ -81,14 +81,14 @@ test "every chrome extent lands on the 4pt grid, or is a pack token" {
     // to be grid-true as well. Everything else is a band, a control, a gutter
     // or a panel.
     const extents = [_]f32{
-        app.chrome_band_height,  app.chrome_band_inset,   app.chrome_control_extent,
-        app.chrome_icon_extent,  app.chrome_gap,          app.chrome_hit_target,
-        app.tab_height,          app.tab_extent,          app.tab_min_extent,
-        app.side_tab_height,     app.side_rail_width,     app.side_rail_gap,
-        app.split_divider_width, app.search_bar_height,   app.config_notice_height,
-        app.palette_width,       app.palette_row_height,  app.palette_padding,
-        app.palette_top_inset,   app.settings_width,      app.settings_row_height,
-        app.settings_padding,    app.settings_margin,     app.field_caret_width,
+        app.chrome_band_height,  app.chrome_band_inset,  app.chrome_control_extent,
+        app.chrome_icon_extent,  app.chrome_gap,         app.chrome_hit_target,
+        app.tab_height,          app.tab_extent,         app.tab_min_extent,
+        app.side_tab_height,     app.side_rail_width,    app.side_rail_gap,
+        app.split_divider_width, app.search_bar_height,  app.config_notice_height,
+        app.palette_width,       app.palette_row_height, app.palette_padding,
+        app.palette_top_inset,   app.settings_width,     app.settings_row_height,
+        app.settings_padding,    app.settings_margin,    app.field_caret_width,
         app.field_caret_height,  app.grid_inset,
     };
     for (extents) |extent| {
@@ -508,10 +508,10 @@ test "the new-tab button stays inside the tab strip and clear of the status" {
                         "  status   : {d:.1} ..{d:.1}\n" ++
                         "  + past the row's right edge by {d:.1}pt, over the status by {d:.1}pt\n",
                     .{
-                        size.width,          size.height,
-                        @tagName(density),   strip.x,
-                        strip.x + strip.width, plus.x,
-                        plus.x + plus.width, status.x,
+                        size.width,              size.height,
+                        @tagName(density),       strip.x,
+                        strip.x + strip.width,   plus.x,
+                        plus.x + plus.width,     status.x,
                         status.x + status.width, past_row,
                         over_status,
                     },
@@ -543,11 +543,11 @@ test "the trailing status fits the room the strip holds back" {
     // what is measured is the status's own intrinsic width.
     const size = geometry.SizeF.init(1600, 900);
 
-    const Case = struct { label: []const u8, prefix: []const u8 };
+    const Case = struct { label: []const u8, prefix: []const u8, reserve: f32 };
     const notices = [_]Case{
-        .{ .label = "shell limit", .prefix = "Shell limit reached" },
-        .{ .label = "window limit", .prefix = "Window limit reached" },
-        .{ .label = "theme save failure", .prefix = "Theme could not be saved" },
+        .{ .label = "shell limit", .prefix = "Shell limit reached", .reserve = app.tab_strip_notice_reserve },
+        .{ .label = "window limit", .prefix = "Window limit reached", .reserve = app.tab_strip_notice_reserve },
+        .{ .label = "theme save failure", .prefix = "Theme could not be saved", .reserve = app.tab_strip_config_notice_reserve },
     };
 
     for (notices, 0..) |case, index| {
@@ -564,9 +564,9 @@ test "the trailing status fits the room the strip holds back" {
             defer tree.free();
             _ = try tree.expect(case.prefix);
             const slot = tree.statusSlot() orelse return error.WidgetMissing;
-            try expectStatusFits(case.label, density, slot.width, app.tab_strip_notice_reserve);
+            try expectStatusFits(case.label, density, slot.width, case.reserve);
             try testing.expectEqual(
-                app.tab_strip_notice_reserve,
+                case.reserve,
                 app.tabStripStatusReserveIn(&state.model, state.model.wsConst()),
             );
         }
@@ -631,16 +631,16 @@ test "the tab run takes every tab the band actually has room for" {
     try testing.expect(window.count > 0);
     try testing.expect(window.extent >= app.tab_min_extent);
 
-    // What the run's children actually cost: one gap per tab (n-1 between them
-    // and one before the button) plus the button itself.
+    // Include the fixed two-ended overflow-cue reserve while windowed.
     const gap = app.chrome_band_inset;
     const drawn = @as(f32, @floatFromInt(window.count));
-    const spent = drawn * window.extent + drawn * gap + app.chrome_control_extent;
+    const cues: f32 = if (window.windowed()) 2 * (app.chrome_hit_target + gap) else 0;
+    const spent = drawn * window.extent + drawn * gap + app.chrome_control_extent + cues;
     try testing.expect(spent <= band + 0.5);
 
     // ...and one more, at the floor, would not have.
     if (window.count < model.ws().tab_count) {
-        const one_more = (drawn + 1) * (app.tab_min_extent + gap) + app.chrome_control_extent;
+        const one_more = (drawn + 1) * (app.tab_min_extent + gap) + app.chrome_control_extent + cues;
         if (one_more <= band) {
             std.debug.print(
                 "\nthe strip drew {d} tabs in a {d:.0}pt band, but {d} at the {d:.0}pt floor " ++
