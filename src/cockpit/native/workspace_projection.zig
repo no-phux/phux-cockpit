@@ -78,11 +78,17 @@ pub const tab_extent: f32 = 168;
 /// Tabs SHRINK before the strip windows, the way every real tab bar does, and
 /// this is where they stop.
 ///
-/// DERIVED, not chosen. A tab's furniture is fixed whatever its width — two
-/// `chrome_gap` shoulders (16), the attention slot (16), two gaps between the
-/// three children (16), and the close affordance (24) — which is 72pt before a
-/// single glyph of title. 120 leaves 48pt of label: six to seven characters of
-/// the pack's 13pt sans, and more room than any other single thing in the tab.
+/// DERIVED, not chosen. A tab's furniture is `tab_label_furniture` — 72pt
+/// before a single glyph of title, whatever the tab's width. 120 leaves 48pt of
+/// label: six to seven characters of the pack's sans, and more room than any
+/// other single thing in the tab.
+///
+/// Six to seven characters is not a NAME, and that gap is what
+/// `elideTitleMiddleInto` closes. This floor buys a readable amount of label;
+/// it cannot buy enough to spell "Terminal 14" out, and raising it until it
+/// could would cost the strip most of its tabs. What the floor owes is room
+/// for a title's distinguishing END, and the elision below is what spends the
+/// room on that end rather than on the prefix every tab shares.
 ///
 /// It was 92, against furniture that was then 54, so the old floor left 38pt —
 /// five characters — while its comment claimed ten. Raising the close
@@ -98,6 +104,30 @@ pub const tab_min_extent: f32 = 120;
 pub const tab_height: f32 = chrome_band_height;
 pub const tab_control_extent: f32 = chrome_hit_target;
 pub const tab_marker_extent: f32 = chrome_icon_extent;
+/// Every point of a tab's extent that is NOT title: two `chrome_gap` shoulders
+/// (16), the attention slot (16), two gaps between the three children (16),
+/// and the close affordance (24). Fixed whatever the tab's width.
+///
+/// A constant rather than a sentence, because three readers now need the same
+/// number — `tab_min_extent`'s derivation, the chrome-register test that pins
+/// it, and `tabLabelWidth`, which the elision below sizes itself against. The
+/// old floor claimed ten characters and delivered five precisely because the
+/// derivation lived in a comment where nothing could disagree with it.
+///
+/// CONFIRMED against the running app, not only derived. Sixteen tabs in an
+/// 1100pt window, real bundle, `publisher_pid` checked against the launched
+/// pid: the strip lays tabs out 123.428574 apart and every tab's label text
+/// node reports `bounds=(...,29.25 51.428574x17.5)`, and 123.428574 -
+/// 51.428574 = 72.
+///
+///   NATIVE_SDK_GPU_COMPOSITE=1 ./scripts/dev-run.sh --automation --detach --fresh
+///   (cd .dev-run && "$NATIVE" automate snapshot | grep 'role=text name="Terminal')
+pub const tab_label_furniture: f32 = chrome_gap * 2 + tab_marker_extent + chrome_gap * 2 + tab_control_extent;
+
+/// The width the TITLE itself gets inside a tab laid out at `extent`.
+pub fn tabLabelWidth(extent: f32) f32 {
+    return @max(0, extent - tab_label_furniture);
+}
 /// The selected tab's accent bar — the Geist pack's own
 /// `metrics.tabs_indicator_thickness`, which is the vocabulary its underline
 /// tab register already speaks.
@@ -696,6 +726,254 @@ fn clampTitle(title: []const u8) []const u8 {
     var end = max_terminal_title_bytes;
     while (end > 0 and title[end] & 0xc0 == 0x80) end -= 1;
     return title[0..end];
+}
+
+/// What a CHROME text leaf measures at, through whatever seam `tokens` carry.
+///
+/// This is `widget_layout.measuredTextWidth` for a default-rung `.text` widget,
+/// spelled out: `typography.font_id` at `typography.body_size`. It has to be
+/// that exact pair — `body_size`, not `label_size` — because the whole point is
+/// to answer, before the fact, the question the SDK's own elision pass is about
+/// to ask about the same string. `body_size` is 14 in the Geist pack, which is
+/// why a tab label's box measures 17.5pt tall in the accessibility snapshot:
+/// `widgetLineHeight` is size x 1.25.
+///
+/// The view builder is handed no text-measure provider — `cockpitTokens` is
+/// built from the pack and only the PAINTER receives the runtime's stamped
+/// tokens — so in the app this resolves to the SDK's estimator. That is sound
+/// HERE in a way it explicitly is not for the terminal cell box (see
+/// `terminalCellMetricsFor`): the estimator's per-character table is written
+/// for `default_sans_font_id`, and `default_sans_font_id` is exactly the id the
+/// chrome asks about. Measured against the real composited frame on
+/// 2026-08-15, at the 51.428574pt label box a 16-tab strip produces:
+///
+///   CoreText, on glass      "Terminal 16" cut to "Termi…"
+///   estimator, this seam    "Termi…"  = 45.122   (fits)
+///                           "Termin…" = 53.256   (does not)
+///
+/// — the same last character survives either way. `.overflow = .ellipsis`
+/// stays on the label as the backstop for the day they disagree: a pre-elided
+/// string that is still a hair too wide gets trimmed by the SDK rather than
+/// painted out past the close button.
+pub fn chromeTextWidth(tokens: canvas.DesignTokens, text: []const u8) f32 {
+    return canvas.measureTextWidthForFont(
+        tokens.text_measure,
+        tokens.typography.font_id,
+        text,
+        tokens.typography.body_size,
+    );
+}
+
+/// The most a painted title can cost: the title, plus the elision marker.
+pub const max_painted_title_bytes: usize = max_terminal_title_bytes + canvas.text_ellipsis.len;
+
+/// The slack held back from a label box before anything is fitted into it.
+///
+/// A GREEDY FIT ALWAYS STOPS AT THE EDGE OF THE BOX, which is exactly where a
+/// measurement disagreement decides the last character. "The estimator and
+/// CoreText agree to the character" (see `chromeTextWidth`) and "they agree at
+/// the boundary" are two different claims, and the second one is false —
+/// measured on real composited pixels, at the 51.428574pt box, with the
+/// elision fitted right up to it:
+///
+///   painted        estimator   CoreText, on glass
+///   "Ter...l 11"      47.642   kept
+///   "Ter...l 12"      50.932   REFUSED, cut to "Ter...l..."
+///   "Ter...l 13"      50.848   kept
+///   "Ter...l 14"      51.156   REFUSED
+///   "Ter...l 15"      51.030   kept
+///   "Ter...l 16"      51.002   REFUSED
+///
+/// Under one percent of disagreement, not even monotone in the estimator's own
+/// number (15 survived at 51.030 while 16 died at 51.002), and it lands on the
+/// one character that identifies the tab. Three of seven tabs came back reading
+/// "Ter...l..." — better than seven identical words, and still not a name.
+///
+/// The reserve is ONE ELLIPSIS ADVANCE, which is derived rather than tuned: it
+/// is exactly what the renderer's backstop needs to reclaim in order to append
+/// its own marker, so holding it back means the backstop can never gain
+/// anything by firing. At the strip's floor that is 8.078pt of 51.4 — about one
+/// character of title — against a measured error under 0.5pt. Confirmed on the
+/// glass afterwards: seven tabs, seven different words.
+pub fn labelFitBudget(tokens: canvas.DesignTokens, max_width: f32) f32 {
+    return max_width - chromeTextWidth(tokens, canvas.text_ellipsis);
+}
+
+/// Fit `title` into `max_width` by eliding its MIDDLE, growing the TAIL first.
+///
+/// THE BUG THIS CLOSES. The SDK elides the tail, which is the right default for
+/// prose and the wrong one for a name. Every name a terminal carries puts its
+/// distinguishing part LAST — `Terminal 14`, `~/src/phux-cockpit`,
+/// `vim src/main.zig` — and at the strip's shrink floor a tab has 51.4pt of
+/// label, which is six characters. Tail elision spends all six on the part
+/// every tab shares: sixteen tabs in an 1100pt window painted `Termi…` seven
+/// times over, fourteen times over in fullscreen, and the only thing telling
+/// one tab from another was the lime bar on the one you were already in. The
+/// accessibility snapshot could not see it either — it reported the full
+/// `Terminal 10`, because the string the app handed over and the string that
+/// reached the glass were two different strings.
+///
+/// That is the second half of the fix and the reason it is done HERE rather
+/// than left to the renderer: what this returns is what gets painted AND what
+/// the snapshot reports, so a strip that has stopped identifying its tabs is
+/// now visible to `native automate snapshot` instead of only to a GPU capture.
+///
+/// The tail grows FIRST and the head second, alternately, which is what makes
+/// the guarantee hold at any width: whatever fits, a kept tail is the first
+/// thing it fits. `Ter… 16` at the floor rather than `Termi…`.
+///
+/// Each candidate is composed and measured WHOLE rather than as head plus
+/// tail: two measurements added together are not the width of the string they
+/// came from.
+pub fn elideTitleMiddleInto(
+    tokens: canvas.DesignTokens,
+    title: []const u8,
+    max_width: f32,
+    out: []u8,
+) []const u8 {
+    if (title.len == 0 or max_width <= 0) return "";
+    // Everything below fits against the BUDGET, not the box: see
+    // `labelFitBudget` for the measurement that says why, and note that the
+    // whole-title check has to use it too. A title inside the box but inside
+    // the disagreement is a title the renderer will cut the tail off, and a
+    // needless elision is a far better outcome than that.
+    const budget = labelFitBudget(tokens, max_width);
+    if (chromeTextWidth(tokens, title) <= budget) return title;
+    // A box too narrow for the marker itself has nothing left to say. Paint
+    // nothing rather than an ellipsis that overruns into the close affordance.
+    if (chromeTextWidth(tokens, canvas.text_ellipsis) > budget) return "";
+
+    var head_end: usize = 0;
+    var tail_start: usize = title.len;
+    // A round that grows neither side is where this stops. Terminating on
+    // "nothing moved" rather than on a character budget is what keeps it right
+    // for a title whose glyphs are not all one width — which is every title,
+    // in a proportional face.
+    var advanced = true;
+    while (advanced) {
+        advanced = false;
+        // TAIL FIRST: the tail is the half that identifies.
+        if (tail_start > head_end) {
+            const next_tail = prevCodepointStart(title, tail_start);
+            if (next_tail > head_end) {
+                if (composeElidedTitle(out, title, head_end, next_tail)) |candidate| {
+                    if (chromeTextWidth(tokens, candidate) <= budget) {
+                        tail_start = next_tail;
+                        advanced = true;
+                    }
+                }
+            }
+        }
+        if (head_end < tail_start) {
+            const next_head = nextCodepointEnd(title, head_end);
+            if (next_head < tail_start) {
+                if (composeElidedTitle(out, title, next_head, tail_start)) |candidate| {
+                    if (chromeTextWidth(tokens, candidate) <= budget) {
+                        head_end = next_head;
+                        advanced = true;
+                    }
+                }
+            }
+        }
+    }
+    // `out` held the last REJECTED candidate, so the accepted one is composed
+    // again rather than remembered: one writer of the returned bytes.
+    return composeElidedTitle(out, title, head_end, tail_start) orelse "";
+}
+
+/// `head` ++ ellipsis ++ `tail` in the caller's buffer, or null when the buffer
+/// cannot hold it. Null rather than a truncation, because a truncated elision
+/// is the bug this function exists to stop, one layer down.
+fn composeElidedTitle(out: []u8, title: []const u8, head_end: usize, tail_start: usize) ?[]const u8 {
+    const marker = canvas.text_ellipsis;
+    const tail_len = title.len - tail_start;
+    const total = head_end + marker.len + tail_len;
+    if (total > out.len) return null;
+    @memcpy(out[0..head_end], title[0..head_end]);
+    @memcpy(out[head_end..][0..marker.len], marker);
+    @memcpy(out[head_end + marker.len ..][0..tail_len], title[tail_start..]);
+    return out[0..total];
+}
+
+/// The end of the codepoint starting at `index` — never a byte into the middle
+/// of one, for the same reason `clampTitle` walks back to a boundary.
+fn nextCodepointEnd(text: []const u8, index: usize) usize {
+    if (index >= text.len) return text.len;
+    const len = std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+    return @min(text.len, index + len);
+}
+
+/// The start of the codepoint ending at `index`.
+fn prevCodepointStart(text: []const u8, index: usize) usize {
+    if (index == 0) return 0;
+    var start = index - 1;
+    while (start > 0 and text[start] & 0xc0 == 0x80) start -= 1;
+    return start;
+}
+
+/// WHETHER THE STRIP CAN STILL TELL ITS TABS APART.
+///
+/// THE INSTRUMENT, in the shape `Legibility` already has, and for the same
+/// reason: nothing in this app could answer "is the tab strip still naming
+/// anything" without an agent driving the real bundle under a GPU capture and
+/// reading pixels. That is how a strip of seven identical words survived — the
+/// widget tree, the accessibility snapshot and every test in the suite all read
+/// the full title, and none of them read what was painted.
+///
+/// `distinct` counts PAINTED labels; `nameable` counts the full names behind
+/// them. The comparison is deliberately between those two rather than between
+/// `distinct` and `shown`: two shells sitting in the same directory genuinely
+/// do have one name between them, and a strip that paints it twice has lost
+/// nothing. Losing identity the model actually carried is the defect.
+pub const TabLabelIdentity = struct {
+    /// Tabs the strip is showing.
+    shown: usize = 0,
+    /// Distinct FULL names among them.
+    nameable: usize = 0,
+    /// Distinct PAINTED labels among them.
+    distinct: usize = 0,
+    /// The label box every visible tab was given.
+    label_width: f32 = 0,
+
+    /// The strip painted away identity its tabs' own names carried.
+    pub fn ambiguous(self: TabLabelIdentity) bool {
+        return self.distinct < self.nameable;
+    }
+};
+
+pub fn tabLabelIdentityIn(
+    model: *const Model,
+    workspace: *const Workspace,
+    tokens: canvas.DesignTokens,
+    band_width: f32,
+) TabLabelIdentity {
+    const window = visibleTabWindowIn(model, workspace, band_width);
+    var result: TabLabelIdentity = .{ .shown = window.count, .label_width = tabLabelWidth(window.extent) };
+    var name_storage: [topology.max_tabs][max_terminal_title_bytes]u8 = undefined;
+    var painted_storage: [topology.max_tabs][max_painted_title_bytes]u8 = undefined;
+    var names: [topology.max_tabs][]const u8 = undefined;
+    var painted: [topology.max_tabs][]const u8 = undefined;
+    var count: usize = 0;
+    for (0..window.count) |offset| {
+        const id = workspace.tabTerminal(window.first + offset) orelse continue;
+        names[count] = terminalTitleInto(model, id, &name_storage[count]);
+        painted[count] = elideTitleMiddleInto(tokens, names[count], result.label_width, &painted_storage[count]);
+        count += 1;
+    }
+    result.nameable = distinctStringCount(names[0..count]);
+    result.distinct = distinctStringCount(painted[0..count]);
+    return result;
+}
+
+fn distinctStringCount(values: []const []const u8) usize {
+    var total: usize = 0;
+    outer: for (values, 0..) |value, index| {
+        for (values[0..index]) |earlier| {
+            if (std.mem.eql(u8, value, earlier)) continue :outer;
+        }
+        total += 1;
+    }
+    return total;
 }
 
 pub fn terminalNeedsAttention(model: *const Model, id: TerminalRef) bool {

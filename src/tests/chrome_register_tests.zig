@@ -134,6 +134,10 @@ test "a tab at its minimum extent still has room for a label" {
     const furniture = app.chrome_gap * 2 + app.tab_marker_extent + app.chrome_gap * 2 + app.tab_control_extent;
     const label_room = app.tab_min_extent - furniture;
     try testing.expectEqual(@as(f32, 72), furniture);
+    // And the constant the strip and the elision both size themselves against
+    // is that same derivation, not a second copy of the number.
+    try testing.expectEqual(furniture, app.tab_label_furniture);
+    try testing.expectEqual(label_room, app.tabLabelWidth(app.tab_min_extent));
     // 48pt, which is six to seven characters of the pack's 13pt sans at its
     // average advance. The number is stated rather than computed from a
     // per-character guess because a guess is what let the old floor claim ten
