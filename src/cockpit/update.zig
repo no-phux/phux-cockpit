@@ -288,11 +288,35 @@ fn drainEveryPane(model: *Model, fx: *Fx) void {
     }
 }
 
+/// Keep every window's tab strip scrolled so its selected tab is on screen.
+///
+/// EDGE triggered off the resulting state, for the same reason topology
+/// persistence is: the arms that can move a tab out of view are select, cycle,
+/// close, reorder, live drag, restore, resize and the placement toggle, and any
+/// one of them is an arm that could forget. Recomputing after every message
+/// cannot forget, and it is a handful of integer comparisons per open window.
+///
+/// EVERY window, not just the active one: a resize or a close in a background
+/// window changes what its strip can show, and it must not be left showing a
+/// window that excludes its own selection until the user happens to click it.
+fn followTabSelection(model: *Model) void {
+    const padding = projection.windowPadding(model);
+    for (0..model_module.max_windows) |window_index| {
+        if (!model.windowOpen(window_index)) continue;
+        const workspace = model.wsAt(window_index) orelse continue;
+        // The same band width every other tab-strip derivation uses (see
+        // `applyTabDrag` and `view.tabStrip`), so the window this records is
+        // the window that will be drawn rather than a second opinion about it.
+        projection.syncTabWindowIn(workspace, workspace.surface_size.width - padding * 2);
+    }
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const focus_before = remoteFocusTarget(model);
     const owner_before = remoteFocusOwner(model);
     updateModel(model, msg, fx);
     acknowledgeVisibleAttention(model);
+    followTabSelection(model);
     // Persistence is EDGE triggered off the shape hash, not wired into the
     // dozen arms that can reshape a workspace (new tab, close, reorder,
     // select, split, divider drag, pane focus, placement toggle, a shell

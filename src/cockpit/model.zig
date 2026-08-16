@@ -395,6 +395,23 @@ pub const Workspace = struct {
     /// — it decides whether that tab shows its close `x` — but it lives here
     /// because the view is a pure function of it.
     hovered_tab: usize = no_hovered_tab,
+    /// Index of the leftmost tab the strip is scrolled to — the one piece of
+    /// memory "scroll into view" needs and a pure derivation cannot have.
+    ///
+    /// Without it the visible window can only be recomputed from the selection
+    /// alone, and the two stateless rules available are both wrong: pinning the
+    /// selection to the last slot scrolls a whole tab width on every BACKWARD
+    /// step even when the target was already on screen, and recentring scrolls
+    /// on every step in both directions. Remembering where the strip already is
+    /// makes the honest rule expressible — move only when the selection is out
+    /// of view, and only far enough to bring it back.
+    ///
+    /// Presentational, like `hovered_tab`: a scroll position is not a workspace
+    /// shape, so it is deliberately absent from `topologySnapshot` and
+    /// `topologyFingerprint`. `projection.visibleTabWindowIn` clamps whatever
+    /// it finds here, so a stale value costs at most one frame of scroll
+    /// position and can never produce a window that hides the selection.
+    tab_window_first: usize = 0,
     /// This window's titlebar inset, from its own chrome event.
     chrome_top: f32 = 0,
     /// This window's canvas size and device scale. Per-window because two

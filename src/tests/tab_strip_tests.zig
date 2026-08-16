@@ -31,6 +31,19 @@ fn tabLabels(harness: anytype, out: [][]const u8) usize {
     return count;
 }
 
+/// The drawn x of the first tab whose label starts with `prefix`, straight out
+/// of the widget layout tree — the same numbers `native automate snapshot`
+/// prints as `role=tab ... bounds=(x,...)`, which is how the strip-scrolling
+/// defect was measured against the running app.
+fn tabX(harness: anytype, prefix: []const u8) ?f32 {
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.semantics.role != .tab) continue;
+        if (!std.mem.startsWith(u8, node.widget.semantics.label, prefix)) continue;
+        return node.frame.x;
+    }
+    return null;
+}
+
 fn hasSemanticsPrefix(harness: anytype, prefix: []const u8) bool {
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (std.mem.startsWith(u8, node.widget.semantics.label, prefix)) return true;
@@ -129,6 +142,95 @@ test "a windowed strip accounts for every tab it is not drawing" {
             const w = app.visibleTabWindow(&model, width);
             try testing.expectEqual(app.max_tabs, w.hiddenBefore() + w.count + w.hiddenAfter());
         }
+    }
+}
+
+// GUARD: tab-window-backward-scroll
+test "stepping backward to a tab already on screen does not scroll the strip" {
+    const gpa = testing.allocator;
+    // A window narrow enough that four tabs do not fit in it. The defect was
+    // driven at 1100pt with nine tabs and seven drawn, but the harness's pty
+    // table is four (`native_sdk.max_effect_ptys`), so the SAME regime — more
+    // tabs than slots, selection sitting at the right edge — is reached by
+    // making the strip small instead of the tab list long. 660pt of window
+    // leaves room for three tabs after the strip and cue reserves, which
+    // is three tabs at the 120pt floor.
+    const narrow = geometry.SizeF.init(660, 480);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = narrow });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+    try support.pumpPaint(harness, iface, app.canvas_label, narrow);
+
+    // Bounded by the chord count, never by the tab count: cmd+T stops
+    // producing tabs at the shell ceiling and the refusal does not latch, so
+    // `while (tab_count < 4)` is an infinite loop on a machine whose pty table
+    // is smaller — the trap that once spun the chrome-register sweep at 100%
+    // CPU for twenty-five minutes. The ceiling is REQUIRED rather than worked
+    // around: the first draft of this test asked for nine shells, got
+    // `SkipZigTest`, and passed against the very bug it was written to catch.
+    try support.requireLiveShells(4);
+    for (0..3) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 3), state.model.ws().selected_tab);
+    try testing.expectApproxEqAbs(@as(f32, 660), state.model.ws().surface_size.width, 0.001);
+
+    const band = state.model.ws().surface_size.width - app.windowPadding(&state.model) * 2;
+    const start = app.visibleTabWindow(&state.model, band);
+    // Without these the whole test is vacuous: a strip roomy enough to draw
+    // every tab never scrolls, so nothing below could ever fail.
+    try testing.expectEqual(@as(usize, 3), start.count);
+    try testing.expectEqual(@as(usize, 1), start.first);
+
+    // Terminal 2 is the leading drawn tab, and it has no business moving while
+    // the selection walks back through tabs that are already on screen. Under
+    // the old rule it slid a full tab width on the FIRST backward step, which
+    // is what put a different terminal under a resting pointer on every
+    // keystroke.
+    const leading_x = tabX(harness, "Terminal 2,") orelse return error.TestExpectedTab;
+
+    // The backward ladder. `first` holds while the target is inside the drawn
+    // window, then follows the selection down one tab at a time once it walks
+    // off the LEFT edge — the mirror of what forward cycling already did off
+    // the right. The old rule produced { 0, 0, 0 }: it scrolled on the very
+    // first step, for a tab that was already on screen.
+    const expected_first = [_]usize{ 1, 1, 0 };
+    for (expected_first, 0..) |want_first, step| {
+        try pressCanvasKey(harness, iface, "[", .{ .primary = true, .shift = true });
+        try releaseCanvasKey(harness, iface, "[", .{ .primary = true, .shift = true });
+        try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+        const want_selected = 2 - step;
+        try testing.expectEqual(want_selected, state.model.ws().selected_tab);
+        const window = app.visibleTabWindow(&state.model, band);
+        try testing.expectEqual(want_first, window.first);
+        try testing.expect(window.contains(want_selected));
+        // Geometry, not just the derivation: while the strip has not scrolled,
+        // every label is still where the pointer last saw it.
+        if (want_first == start.first) {
+            try testing.expectApproxEqAbs(
+                leading_x,
+                tabX(harness, "Terminal 2,") orelse return error.TestExpectedTab,
+                0.001,
+            );
+        }
+    }
+
+    // Forward is UNCHANGED, and it is the direction that was already right: no
+    // scroll while the target is on screen, exactly one tab of scroll when it
+    // is not. Tabs 0..2 are drawn now, so stepping to 3 is the first move that
+    // has to shift anything.
+    const forward_first = [_]usize{ 0, 0, 1 };
+    for (forward_first, 0..) |want_first, step| {
+        try pressCanvasKey(harness, iface, "]", .{ .primary = true, .shift = true });
+        try releaseCanvasKey(harness, iface, "]", .{ .primary = true, .shift = true });
+        try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+        try testing.expectEqual(step + 1, state.model.ws().selected_tab);
+        const window = app.visibleTabWindow(&state.model, band);
+        try testing.expectEqual(want_first, window.first);
+        try testing.expect(window.contains(step + 1));
     }
 }
 
