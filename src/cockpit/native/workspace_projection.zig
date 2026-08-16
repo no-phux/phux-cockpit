@@ -235,11 +235,53 @@ pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindo
     const shown: usize = @max(1, @as(usize, @intFromFloat(@floor(cued / tab_min_extent))));
     const extent = @min(tab_extent, cued / @as(f32, @floatFromInt(shown)));
     const selected = @min(workspace.selected_tab, workspace.tab_count - 1);
-    // Anchor at the left until the selection walks past the right edge, then
-    // keep the selection as the LAST visible tab. Recentering on every step
-    // would make neighbouring tabs jump under the pointer.
-    const first = if (selected < shown) 0 else selected - shown + 1;
-    return .{ .first = first, .count = shown, .total = workspace.tab_count, .extent = extent };
+    // SCROLL INTO VIEW, and only into view: the strip stays exactly where it
+    // is whenever the selection is already on screen, and otherwise moves the
+    // least it can — to the leading edge stepping backward, to the trailing
+    // edge stepping forward.
+    //
+    // The rule this replaced recomputed `first` from the selection alone,
+    // `if (selected < shown) 0 else selected - shown + 1`, which forces any
+    // selection past the right edge into the LAST slot. Forward that reads
+    // correctly, because the selection arrives at the edge it just walked off.
+    // Backward it scrolls a full tab width for a tab that needed no scroll at
+    // all: driven live on 2026-08-15 in a 1100pt window with 9 tabs and 7
+    // drawn, one cmd+shift+[ from Terminal 9 moved Terminal 8 — fully visible
+    // at x=731 — to x=859 and dragged the other six 127.43pt with it, twice in
+    // a row. The old rule was chosen to avoid recentring's jump under the
+    // pointer and then reproduced it on every backward step. Remembering where
+    // the strip already is avoids BOTH.
+    const max_first = workspace.tab_count - shown;
+    const anchor = @min(workspace.tab_window_first, max_first);
+    const first = if (selected < anchor)
+        selected
+    else if (selected >= anchor + shown)
+        selected - shown + 1
+    else
+        anchor;
+    const window = TabWindow{ .first = first, .count = shown, .total = workspace.tab_count, .extent = extent };
+    // The property every caller assumes and none of them re-checks: a strip
+    // that does not draw the selected tab has no visible selection at all.
+    // Absolute rather than differential — it holds for ANY anchor, including a
+    // stale one — so an anchor that stops being maintained fails here instead
+    // of quietly drawing the wrong seven tabs.
+    std.debug.assert(window.contains(selected));
+    return window;
+}
+
+/// Write back where the strip is scrolled to, so the next derivation can tell
+/// "already in view" from "needs to move".
+///
+/// Edge-triggered from `update()` rather than wired into each arm that can
+/// move the selection — select, cycle, close, reorder, drag, restore, resize,
+/// placement toggle. Every one of those is an arm that could forget;
+/// recomputing after the fact cannot, which is the same reason topology
+/// persistence hangs off a fingerprint instead of those arms.
+///
+/// `visibleTabWindowIn` clamps whatever it finds, so the worst a missed call
+/// can cost is a strip left scrolled where it already was.
+pub fn syncTabWindowIn(workspace: *Workspace, band_width: f32) void {
+    workspace.tab_window_first = visibleTabWindowIn(workspace, band_width).first;
 }
 
 pub const side_rail_width: f32 = 184;
