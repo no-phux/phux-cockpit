@@ -1342,14 +1342,31 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
         // Where the choice lands. Said out loud because "it did not persist"
         // and "it persisted somewhere you are not looking" are the two failure
         // modes of a settings page, and only one of them is a bug.
+        //
+        // QUALIFIED by whether the file will actually take the write, which
+        // `settings_open` asked before drawing this. The unqualified version
+        // was a promise made blind: against a read-only config it named a path,
+        // the commit then wrote nothing and said nothing, and the theme the
+        // user chose was gone by the next launch. A line that admits the file
+        // is read-only turns that into a decision the user makes with the facts
+        // in front of them.
+        //
+        // The colour moves with it. Muted grey is the register for "here is
+        // where this goes"; this is a warning, and a warning painted like a
+        // footnote is a footnote.
         ui.text(.{
             .wrap = false,
             .overflow = .ellipsis,
-            .style = .{ .foreground = settings_ink_muted },
-        }, if (model.config_file.enabled())
-            ui.fmt("saves to {s}", .{model.config_file.path()})
+            .style = .{ .foreground = if (model.config_file.enabled() and !ws.settings.config_writable)
+                settings_fail
+            else
+                settings_ink_muted },
+        }, if (!model.config_file.enabled())
+            "no config file location could be resolved, so this run only"
+        else if (!ws.settings.config_writable)
+            ui.fmt("{s} is read-only, so this run only", .{model.config_file.path()})
         else
-            "no config file location could be resolved, so this run only"),
+            ui.fmt("saves to {s}", .{model.config_file.path()})),
         // A pointer path to both verbs. The panel is keyboard-first, but a
         // surface reachable only by keys is one a pointer user cannot finish.
         ui.row(.{ .width = settings_row_width, .gap = projection.chrome_gap, .cross = .center }, .{
@@ -1422,6 +1439,28 @@ fn terminalLimitNotice(ui: *TerminalUi) TerminalUi.Node {
     }, .{});
 }
 
+/// What a settings commit the config file refused says.
+///
+/// The third of these, and the one whose silent version was worst. A refused
+/// cmd+N does nothing, which at least matches what the user sees; a refused
+/// SAVE applies the theme, closes the panel and looks exactly like the save
+/// that worked. Nothing was wrong until the next launch, where the old theme
+/// came back with no explanation available anywhere in the app.
+///
+/// The badge is short because the band is one row; the SPOKEN label carries
+/// the path, because "which file" is the first thing anybody asks and the
+/// panel that named it has already closed.
+fn configWriteNotice(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+    return ui.el(.badge, .{
+        .variant = .destructive,
+        .text = "THEME NOT SAVED",
+        .semantics = .{ .label = ui.fmt(
+            "Theme could not be saved: {s} could not be written, so this theme applies to this run only",
+            .{model.config_file.path()},
+        ) },
+    }, .{});
+}
+
 fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     return ui.panel(.{
         .width = webkit_parking_extent,
@@ -1490,10 +1529,16 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
 
     const chrome = projection.workspaceChromeIn(model, ws, ws.surface_size);
     const focused_ref = projection.workspaceTerminalRef(model, ws);
+    // The two ceilings outrank this one only because they are answers to a
+    // gesture the user made a moment ago and is still waiting on. A refused
+    // save is latched until the next save lands, so it loses nothing by
+    // yielding the row for as long as one of those is up.
     const status = if (model.window_limit_refused)
         windowLimitNotice(ui)
     else if (model.terminal_limit_refused)
         terminalLimitNotice(ui)
+    else if (model.config_write_refused)
+        configWriteNotice(ui, model)
     else if (focused_ref) |id| paneStatus(ui, model, id) else emptyStatusNode(ui);
 
     const revealed = projection.chromeRevealedIn(model, ws);

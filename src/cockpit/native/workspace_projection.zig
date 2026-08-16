@@ -606,6 +606,10 @@ pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     // exactly the state a refused cmd+D leaves behind, and with the band
     // hidden the chord would look unbound rather than refused.
     if (model.terminal_limit_refused) return true;
+    // And for a save the config file refused. At one tab with the chrome
+    // hidden there is nowhere else for it to appear, and the whole defect this
+    // latch exists for is a theme change that reported nothing at all.
+    if (model.config_write_refused) return true;
     if (workspaceTerminalRef(model, workspace) == null) return true;
     for (0..workspace.tab_count) |index| {
         const current = workspace.treeConst(index) orelse continue;

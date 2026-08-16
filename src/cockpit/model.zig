@@ -168,11 +168,31 @@ pub const Settings = struct {
     /// Empty means "no theme was named", which is itself a state Escape has to
     /// be able to return to.
     restore_theme: config_module.ThemeName = config_module.ThemeName.init(""),
+    /// Whether the config file will actually take the write, asked ONCE when
+    /// the surface opens (`Model.configFileWritable`).
+    ///
+    /// The panel names the file it saves to, and that line was a promise it had
+    /// no evidence for: against a read-only config the whole gesture applied a
+    /// theme live, closed, wrote nothing and said nothing, so the next launch
+    /// reverted with no explanation. Knowing BEFORE the commit is what lets the
+    /// promise be qualified instead of broken.
+    ///
+    /// Defaults to true — "no reason to think otherwise" — because a panel that
+    /// cried read-only in every test fixture that never opened it would be a
+    /// worse lie in the other direction. It is only ever meaningful while
+    /// `open` is set, and `reset` puts it back.
+    ///
+    /// A snapshot rather than a live query for the reason `Dir.access`'s own
+    /// documentation gives: this is a time-of-check value, and the write at
+    /// commit remains the only thing that decides whether the bytes landed.
+    /// The band that reports THAT is the backstop for the seconds in between.
+    config_writable: bool = true,
 
     pub fn reset(settings: *Settings) void {
         settings.open = false;
         settings.cursor = 0;
         settings.restore_theme = config_module.ThemeName.init("");
+        settings.config_writable = true;
     }
 };
 
@@ -568,6 +588,16 @@ pub const Model = struct {
     /// permanently blank because its spawn had been rejected. Cleared by the
     /// next successful terminal, and by anything that frees a shell.
     terminal_limit_refused: bool = false,
+    /// A settings commit could not be written to the config file.
+    ///
+    /// The same latch as the two above, for the same reason and against the
+    /// worst version of the failure they exist to prevent: the theme IS applied
+    /// live, so the gesture looks like it worked, and the disagreement between
+    /// the running app and the file surfaces one launch later as "it did not
+    /// persist" with nothing on screen ever having said so. `writeConfigTheme`
+    /// was documented as silent at every failure; this is where that silence
+    /// stops. Cleared by the next save that lands.
+    config_write_refused: bool = false,
     tab_placement: TabPlacement = .top,
     browser_page: BrowserPage = .github,
     browser_navigation_token: u64 = 0,
@@ -1223,17 +1253,31 @@ pub const Model = struct {
     /// and the SDK copies nothing here, so they must exist at the bottom of
     /// the dispatch frame and nowhere up it.
     ///
-    /// Silent at every failure, exactly like `writeWorkspaceState`: a theme
+    /// NON-FATAL at every failure, exactly like `writeWorkspaceState`: a theme
     /// that could not be written down is still applied live, and refusing to
     /// change the colour because a file was read-only would be a worse answer
     /// than changing it for this run.
-    pub fn writeConfigTheme(model: *const Model, io: std.Io) void {
-        if (!model.config_file.enabled()) return;
+    ///
+    /// It used to be SILENT as well, which is a different thing and was the
+    /// bug. Against a read-only config the panel announced the path it saves
+    /// to, applied the theme, closed, wrote nothing, and raised nothing — so
+    /// the running app and the file disagreed, and the next launch put the old
+    /// theme back with no explanation available anywhere. That is precisely
+    /// the "it did not persist" failure this surface exists to avoid, so the
+    /// result is RETURNED now and `update.persistThemeChoice` latches it into
+    /// a band the user can read.
+    ///
+    /// Three outcomes rather than a bool: "there is no config file to write"
+    /// is not a failure — the panel already says so up front, in place of the
+    /// path — and reporting it as one would raise a refusal band on every run
+    /// that could not resolve a config location at all.
+    pub fn writeConfigTheme(model: *const Model, io: std.Io) ConfigWrite {
+        if (!model.config_file.enabled()) return .no_destination;
         // `theme = ` with nothing after it is a `bad_value` to the parser that
         // reads it back. There is no gesture that reaches here with no theme
         // named — the settings cursor always sits on a real one — and this is
         // the guard that keeps it that way rather than trusting it.
-        if (model.config.theme.slice().len == 0) return;
+        if (model.config.theme.slice().len == 0) return .no_destination;
         const path = model.config_file.path();
 
         var source_bytes: [config_module.max_config_bytes]u8 = undefined;
@@ -1255,7 +1299,7 @@ pub const Model = struct {
             "theme",
             model.config.theme.slice(),
             &rewritten,
-        ) catch return;
+        ) catch return .refused;
         // WRITE FIRST, create the directory only if that fails.
         //
         // Not an optimization — a correctness fix, measured. The obvious
@@ -1269,11 +1313,43 @@ pub const Model = struct {
         // means the ordinary case — a directory that already exists, in every
         // shape — never consults the directory at all, and the mkdir is
         // reserved for the first-run case it is actually for.
-        if (cwd.writeFile(io, .{ .sub_path = path, .data = encoded })) |_| return else |_| {}
-        if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(io, parent) catch return;
-        cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return;
+        if (cwd.writeFile(io, .{ .sub_path = path, .data = encoded })) |_| return .written else |_| {}
+        if (std.fs.path.dirname(path)) |parent| cwd.createDirPath(io, parent) catch return .refused;
+        cwd.writeFile(io, .{ .sub_path = path, .data = encoded }) catch return .refused;
+        return .written;
+    }
+
+    /// Whether the config file would take a write RIGHT NOW, asked before the
+    /// user commits rather than after.
+    ///
+    /// The panel is the only place this app promises anything about a file, and
+    /// it made that promise blind. One `access` at open costs a single syscall
+    /// on a surface opened by hand, and it is the difference between "saves to
+    /// <path>" and a line the file can actually honour.
+    ///
+    /// A MISSING file is writable, not unwritable: `writeConfigTheme` creates
+    /// it — and its directory — and the overwhelmingly common case of "no
+    /// config file yet" must not be dressed up as a permissions problem. If the
+    /// creation then fails anyway, the commit's own result is what says so, and
+    /// that path is covered by the band rather than by this.
+    ///
+    /// `enabled() == false` answers true for the same reason `writeConfigTheme`
+    /// returns `.no_destination` for it: the panel already replaces the whole
+    /// "saves to" line in that state, and a second complaint layered onto it
+    /// would be noise.
+    pub fn configFileWritable(model: *const Model, io: std.Io) bool {
+        if (!model.config_file.enabled()) return true;
+        std.Io.Dir.cwd().access(io, model.config_file.path(), .{ .write = true }) catch |err| switch (err) {
+            error.FileNotFound => return true,
+            else => return false,
+        };
+        return true;
     }
 };
+
+/// What `Model.writeConfigTheme` did. See its doc comment for why "there was
+/// nowhere to write" is a third state and not a failure.
+pub const ConfigWrite = enum { written, no_destination, refused };
 
 /// Put every restored pane's shell in the directory the snapshot recorded.
 ///
