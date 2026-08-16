@@ -4,14 +4,14 @@
 # backward then scrolls the whole strip even when the target is already visible,
 # moving every tab under a resting pointer.
 test: stepping backward to a tab already on screen does not scroll the strip
-red: 2026-08-16 at f513785
+red: 2026-08-16 at 46af747
 diff --git a/src/cockpit/native/workspace_projection.zig b/src/cockpit/native/workspace_projection.zig
-index 1e20984..d4128a0 100644
+index 1d4d354..6a39e5c 100644
 --- a/src/cockpit/native/workspace_projection.zig
 +++ b/src/cockpit/native/workspace_projection.zig
-@@ -235,38 +235,10 @@ pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindo
-     const shown: usize = @max(1, @as(usize, @intFromFloat(@floor(cued / tab_min_extent))));
-     const extent = @min(tab_extent, cued / @as(f32, @floatFromInt(shown)));
+@@ -313,38 +313,10 @@ pub fn visibleTabRun(workspace: *const Workspace, run_width: f32) TabWindow {
+     const shown: usize = @max(1, @as(usize, @intFromFloat(@floor(cued / step_floor))));
+     const extent = @min(tab_extent, cued / @as(f32, @floatFromInt(shown)) - chrome_band_inset);
      const selected = @min(workspace.selected_tab, workspace.tab_count - 1);
 -    // SCROLL INTO VIEW, and only into view: the strip stays exactly where it
 -    // is whenever the selection is already on screen, and otherwise moves the

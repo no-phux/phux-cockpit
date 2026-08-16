@@ -102,9 +102,29 @@ pub const tab_marker_extent: f32 = chrome_icon_extent;
 /// `metrics.tabs_indicator_thickness`, which is the vocabulary its underline
 /// tab register already speaks.
 pub const tab_indicator_thickness: f32 = 2;
-/// Room held back at the right of the band for the `+` button and the focused
-/// pane's status, so a full strip never pushes either off the edge.
-pub const tab_strip_trailing_reserve: f32 = 220;
+/// The trailing status's slot, by the kind of status it is.
+///
+/// MEASURED, not chosen, through the same seam layout and paint use —
+/// `canvas.layoutWidgetTreeWithTokens` over the app's real widget tree, at
+/// every density `chrome_register_tests.zig` sweeps. That test re-derives both
+/// numbers on every run and fails with the measurement if a status ever
+/// outgrows its slot ("the trailing status fits the room the strip holds
+/// back"), which is what keeps these from becoming two numbers somebody liked:
+///
+///   "4 SHELL LIMIT"                 96 / 98 / 100    (compact/regular/spacious)
+///   "5 WINDOW LIMIT"               110 / 112 / 114   <- the notice floor
+///   "THEME NOT SAVED"              125 / 127 / 129   <- the config floor
+///   "FAILED" + Restart             124 / 128 / 131
+///   "SPAWN FAILED" + Restart       171 / 175 / 178
+///   "SPAWN REJECTED" + Restart     191 / 195 / 198   <- the pane floor
+///
+/// TWO numbers rather than one because the pane status is 84pt wider than the
+/// refusal notices and it is the RARE one: holding its room unconditionally
+/// would take 84pt off the tab run in every window that is only saying "shell
+/// limit reached".
+pub const tab_strip_notice_reserve: f32 = 116;
+pub const tab_strip_config_notice_reserve: f32 = 132;
+pub const tab_strip_pane_status_reserve: f32 = 200;
 
 /// One EDGE CUE: the chevron the strip shows at whichever end it is hiding
 /// tabs behind.
@@ -204,21 +224,79 @@ pub const TabWindow = struct {
 /// A window that follows selection gives scroll-into-view without putting a
 /// keyboard trap above the terminal.
 pub fn visibleTabWindow(model: *const Model, band_width: f32) TabWindow {
-    return visibleTabWindowIn(model.wsConst(), band_width);
+    return visibleTabWindowIn(model, model.wsConst(), band_width);
 }
 
-pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindow {
+pub fn visibleTabWindowIn(model: *const Model, workspace: *const Workspace, band_width: f32) TabWindow {
+    return visibleTabRun(workspace, tabRunWidthIn(model, workspace, band_width));
+}
+
+/// The width of the status the band's trailing slot will carry — zero when
+/// there is none.
+///
+/// This is the SAME decision `view.viewWindow` makes when it builds that node,
+/// and it has to stay that way: the tab run's width is what is left after this
+/// is held back, so a disagreement here is a `+` button drawn on top of the
+/// badge. Which is exactly what shipped — the old single constant held back
+/// 220 unconditionally, which was too little at the narrow end (it ignored the
+/// leading reserve entirely) and too much at the wide end (it held that room
+/// for a status node that was 0x0).
+pub fn tabStripStatusReserveIn(model: *const Model, workspace: *const Workspace) f32 {
+    if (model.window_limit_refused or model.terminal_limit_refused) return tab_strip_notice_reserve;
+    if (model.config_write_refused) return tab_strip_config_notice_reserve;
+    const id = workspaceTerminalRef(model, workspace) orelse return 0;
+    if (support.providerKind(id) == .phux) return 0;
+    const pane = model.provider.terminalConst(id) orelse return 0;
+    return if (paneLifecycleFailed(pane)) tab_strip_pane_status_reserve else 0;
+}
+
+/// The room the TAB RUN actually gets out of a band `band_width` wide.
+///
+/// Everything the band spends on either side of the run: the traffic-light
+/// reserve and its gap when the strip rides the titlebar, and a gap plus the
+/// status slot when there is a status. What is left is the run's box — and the
+/// run's OWN children have to fit inside that, which is `visibleTabRun`'s job.
+///
+/// Derive the numbers this produces against the running app with:
+///
+///   ./scripts/dev-run.sh --automation --detach --fresh
+///   native automate resize 900 640 && native automate snapshot
+///
+/// and compare `role=group name="Terminal tabs"` against the `+` button's own
+/// bounds. They were 22pt apart at the app's declared minimum width.
+pub fn tabRunWidthIn(model: *const Model, workspace: *const Workspace, band_width: f32) f32 {
+    const leading: f32 = if (tabsRideTitlebarIn(model, workspace))
+        titlebar_tab_leading_reserve + chrome_gap
+    else
+        0;
+    const status = tabStripStatusReserveIn(model, workspace);
+    const trailing: f32 = if (status > 0) chrome_gap + status else 0;
+    return band_width - leading - trailing;
+}
+
+/// The run itself: how many tabs fit in `run_width`, and how wide each is.
+///
+/// The `+` button and ONE `chrome_band_inset` per tab are children of the run
+/// and come out of the same box the tabs do — n tabs cost `n*extent + n*gap +
+/// button`, because there are n-1 gaps between the tabs and one more before
+/// the button. The derivation this replaces counted neither, so a strip its
+/// arithmetic called a fit was always a button and a gap-per-tab too wide.
+pub fn visibleTabRun(workspace: *const Workspace, run_width: f32) TabWindow {
     if (workspace.tab_count == 0) return .{};
-    const usable = @max(tab_min_extent, band_width - tab_strip_trailing_reserve);
+    // One tab plus its gap is the step this windows in, and one whole step is
+    // the floor: a run too narrow for even that still draws one tab, because a
+    // strip with no tab in it cannot show the selection.
+    const step_floor = tab_min_extent + chrome_band_inset;
+    const usable = @max(step_floor, run_width - chrome_control_extent);
     // Shrink first, window second. A strip that windowed at full tab width
     // would hide tab 4 in a 900pt window while leaving 200pt of gutter.
-    const capacity: usize = @max(1, @as(usize, @intFromFloat(@floor(usable / tab_min_extent))));
+    const capacity: usize = @max(1, @as(usize, @intFromFloat(@floor(usable / step_floor))));
     if (capacity >= workspace.tab_count) {
         // Every tab fits. No cue is drawn and none is paid for, which is why
         // this case has to be decided BEFORE the reserve below: charging a
         // strip that shows the whole list for an edge cue it will never draw
         // would shrink tabs for nothing.
-        const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(workspace.tab_count)));
+        const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(workspace.tab_count)) - chrome_band_inset);
         return .{ .first = 0, .count = workspace.tab_count, .total = workspace.tab_count, .extent = extent };
     }
 
@@ -231,9 +309,9 @@ pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindo
     // reserve also keeps this derivation non-circular: the cue count depends
     // on `first`, `first` depends on how many tabs fit, and how many fit would
     // otherwise depend on the cue count.
-    const cued = @max(tab_min_extent, usable - 2 * tab_overflow_cue_reserve);
-    const shown: usize = @max(1, @as(usize, @intFromFloat(@floor(cued / tab_min_extent))));
-    const extent = @min(tab_extent, cued / @as(f32, @floatFromInt(shown)));
+    const cued = @max(step_floor, usable - 2 * tab_overflow_cue_reserve);
+    const shown: usize = @max(1, @as(usize, @intFromFloat(@floor(cued / step_floor))));
+    const extent = @min(tab_extent, cued / @as(f32, @floatFromInt(shown)) - chrome_band_inset);
     const selected = @min(workspace.selected_tab, workspace.tab_count - 1);
     // SCROLL INTO VIEW, and only into view: the strip stays exactly where it
     // is whenever the selection is already on screen, and otherwise moves the
@@ -280,8 +358,8 @@ pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindo
 ///
 /// `visibleTabWindowIn` clamps whatever it finds, so the worst a missed call
 /// can cost is a strip left scrolled where it already was.
-pub fn syncTabWindowIn(workspace: *Workspace, band_width: f32) void {
-    workspace.tab_window_first = visibleTabWindowIn(workspace, band_width).first;
+pub fn syncTabWindowIn(model: *const Model, workspace: *Workspace, band_width: f32) void {
+    workspace.tab_window_first = visibleTabWindowIn(model, workspace, band_width).first;
 }
 
 pub const side_rail_width: f32 = 184;

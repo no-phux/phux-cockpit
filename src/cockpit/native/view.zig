@@ -1505,7 +1505,7 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     // rather than siblings of it in the row's tuple because a windowed strip
     // and a complete one need a different number of children, and a row child
     // that collapses to zero width still costs the row its gap.
-    const window = projection.visibleTabWindowIn(ws, ws.surface_size.width - windowPadding(model) * 2);
+    const window = projection.visibleTabWindowIn(model, ws, ws.surface_size.width - windowPadding(model) * 2);
     var strip_nodes: [max_tabs + 2]TerminalUi.Node = undefined;
     var rail_nodes: [max_tabs]TerminalUi.Node = undefined;
     var strip_written: usize = 0;
@@ -1529,6 +1529,10 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
 
     const chrome = projection.workspaceChromeIn(model, ws, ws.surface_size);
     const focused_ref = projection.workspaceTerminalRef(model, ws);
+    // KEEP IN STEP with `projection.tabStripStatusReserveIn`, which decides how
+    // much room the tab run above gives up for this node. A disagreement puts
+    // the `+` button underneath the badge.
+    //
     // The two ceilings outrank this one only because they are answers to a
     // gesture the user made a moment ago and is still waiting on. A refused
     // save is latched until the next save lands, so it loses nothing by

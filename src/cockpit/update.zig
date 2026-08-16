@@ -307,7 +307,7 @@ fn followTabSelection(model: *Model) void {
         // The same band width every other tab-strip derivation uses (see
         // `applyTabDrag` and `view.tabStrip`), so the window this records is
         // the window that will be drawn rather than a second opinion about it.
-        projection.syncTabWindowIn(workspace, workspace.surface_size.width - padding * 2);
+        projection.syncTabWindowIn(model, workspace, workspace.surface_size.width - padding * 2);
     }
 }
 
@@ -1251,7 +1251,7 @@ fn applyTabDrag(model: *Model, drag: @FieldType(Msg, "tab_drag")) void {
     // sideways pointer means a vertical reorder is how a UI gets a reputation
     // for moving things by itself.
     if (model.tab_placement != .top) return;
-    const window = projection.visibleTabWindowIn(workspace, workspace.surface_size.width - projection.windowPadding(model) * 2);
+    const window = projection.visibleTabWindowIn(model, workspace, workspace.surface_size.width - projection.windowPadding(model) * 2);
     switch (drag.phase) {
         // `change`
         0 => {
