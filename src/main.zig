@@ -801,6 +801,7 @@ test {
     _ = @import("tests/provider_identity_tests.zig");
     _ = @import("tests/work_identity_tests.zig");
     _ = @import("tests/work_event_store_tests.zig");
+    _ = @import("tests/work_blob_store_tests.zig");
     _ = @import("tests/terminal_keyboard_tests.zig");
     _ = @import("tests/clipboard_tests.zig");
     _ = @import("tests/outbound_io_tests.zig");

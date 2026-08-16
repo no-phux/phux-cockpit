@@ -140,6 +140,29 @@ test "event codec is canonical bounded opaque for unknown versions and validates
     try testing.expectError(error.InvalidStreamSequence, invalid.validate());
 }
 
+test "artifact revision payload is strict canonical and commits digest context" {
+    const artifact = id(identity.ArtifactId, 7);
+    const payload = event.ArtifactRevisionPayload{
+        .artifact_id = artifact.bytes,
+        .revision_ordinal = 1,
+        .digest = [_]u8{0xa5} ** 32,
+        .byte_length = 42,
+        .media_kind = .artifact,
+        .redaction = .contains_secrets,
+        .producer_session_id = null,
+        .media_type = "application/octet-stream",
+    };
+    const encoded = try payload.encode(testing.allocator);
+    defer testing.allocator.free(encoded);
+    const decoded = try event.ArtifactRevisionPayload.decode(encoded);
+    try testing.expectEqualDeep(payload.digest, decoded.digest);
+    try testing.expectEqualStrings(payload.media_type, decoded.media_type);
+    var malformed = try testing.allocator.dupe(u8, encoded);
+    defer testing.allocator.free(malformed);
+    malformed[24] = 99;
+    try testing.expectError(error.InvalidArtifactRevisionPayload, event.ArtifactRevisionPayload.decode(malformed));
+}
+
 test "append is ordered idempotent paged and integrity replay stays bounded" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -410,6 +433,19 @@ test "foreign and newer stores are refused before side effects or byte mutation"
     defer testing.allocator.free(newer_after);
     try testing.expectEqualSlices(u8, newer_before, newer_after);
     try testing.expect(c.access(newer_lock.ptr, c.F_OK) != 0);
+}
+
+test "unsupported unshipped draft schemas are refused rather than assigned fabricated context" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tempPath(&tmp, &path_buffer);
+    var initialized = try store_mod.Store.open(testing.allocator, path);
+    initialized.close();
+    const database = try childPath(testing.allocator, path, "work.sqlite3");
+    defer testing.allocator.free(database);
+    try sqliteExec(database.ptr, "PRAGMA journal_mode=DELETE; PRAGMA user_version=2");
+    try testing.expectError(error.UnsupportedDraftSchema, store_mod.Store.open(testing.allocator, path));
 }
 
 test "newer schema present only in WAL is refused without mutating files or creating lock" {

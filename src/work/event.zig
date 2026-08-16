@@ -12,6 +12,11 @@ pub const checksum_size: usize = 32;
 pub const StreamKind = enum(u8) { objective, run, session, artifact, signal, provider };
 pub const Trust = enum(u8) { local, verified_provider, unverified_provider };
 pub const Provenance = enum(u8) { local_authority, provider_event, imported };
+pub const DigestAlgorithm = enum(u8) { blake3 = 1 };
+pub const ArtifactMediaKind = enum(u8) { binary, terminal_output, terminal_snapshot, artifact };
+pub const Redaction = enum(u8) { none, contains_secrets, redacted };
+pub const max_media_type_bytes: usize = 255;
+pub const max_artifact_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
 pub const PayloadKind = enum(u16) {
     objective_created = 1,
@@ -92,16 +97,101 @@ pub const WorkEvent = struct {
             _ = try EvidenceGap.decode(value.payload);
         if (value.payload_version == 1 and value.payload_kind == @intFromEnum(PayloadKind.source_transition))
             _ = try SourceTransition.decode(value.payload);
+        if (value.payload_version == 1 and value.payload_kind == @intFromEnum(PayloadKind.artifact_revision_committed)) {
+            const revision = try ArtifactRevisionPayload.decode(value.payload);
+            if (value.stream_kind != .artifact or value.ids.artifact_id == null or
+                !std.mem.eql(u8, &value.stream_id, &revision.artifact_id) or
+                !std.mem.eql(u8, &value.ids.artifact_id.?.bytes, &revision.artifact_id))
+                return error.InvalidArtifactRevisionPayload;
+            if (revision.producer_session_id) |session| {
+                if (value.ids.session_id == null or !std.mem.eql(u8, &session, &value.ids.session_id.?.bytes))
+                    return error.InvalidArtifactRevisionPayload;
+            } else if (value.ids.session_id != null) return error.InvalidArtifactRevisionPayload;
+        }
     }
 
     pub fn projectable(value: WorkEvent) bool {
         if (value.payload_version != 1) return false;
         const kind = std.enums.fromInt(PayloadKind, value.payload_kind) orelse return false;
-        return kind == .evidence_gap or kind == .source_transition;
+        return kind == .evidence_gap or kind == .source_transition or kind == .artifact_revision_committed;
     }
 
     pub fn isEvidenceGap(value: WorkEvent) bool {
         return value.payload_kind == @intFromEnum(PayloadKind.evidence_gap) and value.payload_version == 1;
+    }
+};
+
+/// Canonical artifact revision metadata. The containing WorkEvent.event_id is
+/// the immutable revision identity; `revision_ordinal` orders revisions of the
+/// logical ArtifactId and is not a separately mintable identity.
+pub const ArtifactRevisionPayload = struct {
+    artifact_id: [16]u8,
+    revision_ordinal: u64,
+    digest_algorithm: DigestAlgorithm = .blake3,
+    digest: [32]u8,
+    byte_length: u64,
+    media_kind: ArtifactMediaKind,
+    redaction: Redaction,
+    producer_session_id: ?[16]u8,
+    media_type: []const u8,
+
+    const fixed_size = 16 + 8 + 1 + 32 + 8 + 1 + 1 + 1 + 16 + 2;
+
+    pub fn encode(value: ArtifactRevisionPayload, allocator: std.mem.Allocator) Error![]u8 {
+        try value.validate();
+        const out = try allocator.alloc(u8, ArtifactRevisionPayload.fixed_size + value.media_type.len);
+        var cursor: usize = 0;
+        putBytes(out, &cursor, &value.artifact_id);
+        putInt(u64, out, &cursor, value.revision_ordinal);
+        putInt(u8, out, &cursor, @intFromEnum(value.digest_algorithm));
+        putBytes(out, &cursor, &value.digest);
+        putInt(u64, out, &cursor, value.byte_length);
+        putInt(u8, out, &cursor, @intFromEnum(value.media_kind));
+        putInt(u8, out, &cursor, @intFromEnum(value.redaction));
+        putOptionalBytes(out, &cursor, value.producer_session_id);
+        putInt(u16, out, &cursor, @intCast(value.media_type.len));
+        putBytes(out, &cursor, value.media_type);
+        return out;
+    }
+
+    pub fn decode(bytes: []const u8) Error!ArtifactRevisionPayload {
+        if (bytes.len < ArtifactRevisionPayload.fixed_size) return error.InvalidArtifactRevisionPayload;
+        var cursor: usize = 0;
+        var artifact_id: [16]u8 = undefined;
+        @memcpy(&artifact_id, take(bytes, &cursor, 16) catch return error.InvalidArtifactRevisionPayload);
+        const ordinal = getInt(u64, bytes, &cursor) catch return error.InvalidArtifactRevisionPayload;
+        const algorithm = std.enums.fromInt(DigestAlgorithm, getInt(u8, bytes, &cursor) catch return error.InvalidArtifactRevisionPayload) orelse return error.InvalidArtifactRevisionPayload;
+        var digest: [32]u8 = undefined;
+        @memcpy(&digest, take(bytes, &cursor, 32) catch return error.InvalidArtifactRevisionPayload);
+        const length = getInt(u64, bytes, &cursor) catch return error.InvalidArtifactRevisionPayload;
+        const media_kind = std.enums.fromInt(ArtifactMediaKind, getInt(u8, bytes, &cursor) catch return error.InvalidArtifactRevisionPayload) orelse return error.InvalidArtifactRevisionPayload;
+        const redaction = std.enums.fromInt(Redaction, getInt(u8, bytes, &cursor) catch return error.InvalidArtifactRevisionPayload) orelse return error.InvalidArtifactRevisionPayload;
+        const producer = getOptionalBytes(bytes, &cursor) catch return error.InvalidArtifactRevisionPayload;
+        const media_len = getInt(u16, bytes, &cursor) catch return error.InvalidArtifactRevisionPayload;
+        if (media_len != bytes.len - cursor) return error.InvalidArtifactRevisionPayload;
+        const value: ArtifactRevisionPayload = .{
+            .artifact_id = artifact_id,
+            .revision_ordinal = ordinal,
+            .digest_algorithm = algorithm,
+            .digest = digest,
+            .byte_length = length,
+            .media_kind = media_kind,
+            .redaction = redaction,
+            .producer_session_id = producer,
+            .media_type = bytes[cursor..],
+        };
+        try value.validate();
+        return value;
+    }
+
+    pub fn validate(value: ArtifactRevisionPayload) Error!void {
+        _ = identity.ArtifactId.fromStorage(&value.artifact_id) catch return error.InvalidArtifactRevisionPayload;
+        if (value.revision_ordinal == 0 or value.revision_ordinal > std.math.maxInt(i64) or
+            value.byte_length > max_artifact_bytes or value.byte_length > std.math.maxInt(i64) or
+            value.media_type.len == 0 or value.media_type.len > max_media_type_bytes or
+            std.mem.indexOfScalar(u8, value.media_type, 0) != null or !std.unicode.utf8ValidateSlice(value.media_type))
+            return error.InvalidArtifactRevisionPayload;
+        if (value.producer_session_id) |session| _ = identity.SessionId.fromStorage(&session) catch return error.InvalidArtifactRevisionPayload;
     }
 };
 
@@ -169,6 +259,7 @@ pub const Error = error{
     TerminalOutputTooLarge,
     InvalidEvidenceGapPayload,
     InvalidSourceTransitionPayload,
+    InvalidArtifactRevisionPayload,
     ChecksumMismatch,
 } || std.mem.Allocator.Error;
 
@@ -284,7 +375,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!WorkEvent {
 
 pub fn checksum(bytes: []const u8) [checksum_size]u8 {
     var digest: [checksum_size]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
     return digest;
 }
 

@@ -1,19 +1,22 @@
 //! Single-writer crash-safe SQLite event store.
 
 const std = @import("std");
+const blob = @import("blob.zig");
 const event = @import("event.zig");
 const identity = @import("identity.zig");
 
 const c = @cImport({
+    @cInclude("dirent.h");
     @cInclude("sqlite3.h");
     @cInclude("errno.h");
     @cInclude("fcntl.h");
     @cInclude("sys/file.h");
     @cInclude("sys/stat.h");
+    @cInclude("time.h");
     @cInclude("unistd.h");
 });
 
-pub const schema_version: u32 = 1;
+pub const schema_version: u32 = 3;
 pub const application_id: u32 = 0x50485558; // "PHUX"
 pub const default_page_budget: PageBudget = .{};
 
@@ -34,6 +37,9 @@ pub const ReplayPage = struct {
     }
 };
 
+pub const IntegrityPage = struct { next_store_sequence: u64, has_more: bool };
+pub const RecoveryPage = struct { processed: usize, has_more: bool };
+
 pub const Failpoint = enum {
     none,
     before_begin,
@@ -42,6 +48,10 @@ pub const Failpoint = enum {
     before_commit,
     after_commit,
     before_checkpoint,
+    before_reference_transaction,
+    after_reference_commit,
+    after_revision_insert,
+    after_purge_mark,
 };
 
 pub const AppendResult = union(enum) {
@@ -49,7 +59,19 @@ pub const AppendResult = union(enum) {
     duplicate: u64,
 };
 
-pub const Error = event.Error || std.mem.Allocator.Error || error{
+pub const EvidenceGapDescriptor = struct {
+    event_id: identity.EventId,
+    artifact_id: identity.ArtifactId,
+    revision_ordinal: u64,
+    run_id: ?identity.RunId,
+    reason: blob.IntegrityGap,
+};
+
+/// Transient detection result only. p1q.10.3 is responsible for appending and
+/// projecting the durable evidence-gap Signal.
+pub const ArtifactReadResult = union(enum) { streamed, gap: EvidenceGapDescriptor };
+
+pub const Error = event.Error || blob.Error || std.mem.Allocator.Error || error{
     InvalidStatePath,
     UnsafeStatePath,
     PermissionDenied,
@@ -75,23 +97,29 @@ pub const Error = event.Error || std.mem.Allocator.Error || error{
     StoreSequenceOverflow,
     InvalidStoreSequence,
     InvalidPageBudget,
+    BlobMetadataConflict,
+    BlobReferenceConflict,
+    BlobStillReferenced,
+    BlobNotFound,
+    InvalidArtifactRevision,
+    UnsupportedDraftSchema,
 };
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
     db: *c.sqlite3,
     lock_fd: c_int,
+    /// Direct blob access is diagnostic/test-only. Product operations use the
+    /// lifecycle-fenced Store APIs below.
+    blobs: blob.BlobStore,
     failpoint: Failpoint = .none,
+    lifecycle_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn open(allocator: std.mem.Allocator, state_dir: []const u8) Error!Store {
         if (state_dir.len == 0 or state_dir[0] != '/' or std.mem.indexOfScalar(u8, state_dir, 0) != null)
             return error.InvalidStatePath;
 
-        _ = try ensureStateDirectory(allocator, state_dir);
-        const dir_z = try allocator.dupeZ(u8, state_dir);
-        defer allocator.free(dir_z);
-        const dir_fd = c.open(dir_z.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
-        if (dir_fd < 0) return pathError();
+        const dir_fd = try blob.openAbsoluteDirectory(state_dir, true);
         defer _ = c.close(dir_fd);
         try validateFd(dir_fd, true);
 
@@ -112,12 +140,18 @@ pub const Store = struct {
         }
 
         var initialized_file = false;
+        var database_fd: c_int = -1;
         if (!database_exists) {
             const fd = c.openat(dir_fd, "work.sqlite3", c.O_RDWR | c.O_CREAT | c.O_EXCL | c.O_NOFOLLOW | c.O_CLOEXEC, @as(c_uint, 0o600));
             if (fd < 0) return pathError();
             initialized_file = true;
-            _ = c.close(fd);
+            database_fd = fd;
+        } else {
+            database_fd = c.openat(dir_fd, "work.sqlite3", c.O_RDWR | c.O_NOFOLLOW | c.O_CLOEXEC);
+            if (database_fd < 0) return pathError();
         }
+        defer _ = c.close(database_fd);
+        try validateFd(database_fd, false);
         errdefer if (initialized_file) {
             _ = c.unlinkat(dir_fd, "work.sqlite3-wal", 0);
             _ = c.unlinkat(dir_fd, "work.sqlite3-shm", 0);
@@ -134,21 +168,36 @@ pub const Store = struct {
         }
         const db = db_opt.?;
         errdefer _ = c.sqlite3_close(db);
+        // SQLite requires a pathname for its WAL sidecars. Keep the descriptor-
+        // rooted file open across sqlite3_open_v2 and fail closed unless the
+        // pathname still resolves to that exact inode after SQLite opened it.
+        const proof_fd = c.openat(dir_fd, "work.sqlite3", c.O_RDONLY | c.O_NOFOLLOW | c.O_CLOEXEC);
+        if (proof_fd < 0) return pathError();
+        defer _ = c.close(proof_fd);
+        if (!try sameFile(database_fd, proof_fd)) return error.UnsafeStatePath;
         if (c.sqlite3_limit(db, c.SQLITE_LIMIT_LENGTH, @intCast(event.max_envelope_bytes)) < 0)
             return error.SqliteFailure;
 
-        var store: Store = .{ .allocator = allocator, .db = db, .lock_fd = lock_fd };
+        var blob_store = try blob.BlobStore.openAt(allocator, dir_fd);
+        errdefer blob_store.close();
+        var store: Store = .{ .allocator = allocator, .db = db, .lock_fd = lock_fd, .blobs = blob_store };
         try store.configureBase();
         try store.migrate(initialized_file);
         try store.configureDurability();
+        _ = try store.recoverDeletingBlobsPage(256);
+        _ = try store.blobs.recoverTemps(c.time(null), 3600, 256);
         try validateKnownFile(dir_fd, "work.sqlite3");
         try validateKnownFile(dir_fd, "work.sqlite3-wal");
         try validateKnownFile(dir_fd, "work.sqlite3-shm");
-        try store.verifyIntegrity();
+        _ = try store.verifyEventIntegrityPage(0, 256);
+        _ = try store.verifyArtifactProjectionPage(0, 256);
+        try store.verifyStreamHeads();
+        try store.verifyBlobReferenceCounts();
         return store;
     }
 
     pub fn close(store: *Store) void {
+        store.blobs.close();
         _ = c.sqlite3_close(store.db);
         _ = c.flock(store.lock_fd, c.LOCK_UN);
         _ = c.close(store.lock_fd);
@@ -163,8 +212,10 @@ pub const Store = struct {
         try value.validate();
         if (value.payload_kind == @intFromEnum(event.PayloadKind.source_transition))
             return error.InvalidSourceTransition;
+        if (value.payload_kind == @intFromEnum(event.PayloadKind.artifact_revision_committed))
+            return error.InvalidArtifactRevision;
         if (expected_prior_sequence > std.math.maxInt(i64)) return error.InvalidStreamSequence;
-        return store.appendInternal(expected_prior_sequence, null, value);
+        return store.appendInternal(expected_prior_sequence, null, value, null);
     }
 
     /// Changes a logical stream's authority/incarnation. The transition event's
@@ -185,7 +236,7 @@ pub const Store = struct {
         return store.appendInternal(0, .{
             .source = expected_source,
             .incarnation = expected_incarnation,
-        }, value);
+        }, value, null);
     }
 
     pub fn lookup(store: *Store, allocator: std.mem.Allocator, event_id: identity.EventId) Error!?event.StoredEvent {
@@ -253,19 +304,80 @@ pub const Store = struct {
         try store.expectPragmaOk("PRAGMA quick_check");
         try store.requireNoForeignKeyViolations();
 
+        var cursor: u64 = 0;
+        while (true) {
+            const page = try store.verifyEventIntegrityPage(cursor, 256);
+            cursor = page.next_store_sequence;
+            if (!page.has_more) break;
+        }
+        cursor = 0;
+        while (true) {
+            const page = try store.verifyArtifactProjectionPage(cursor, 256);
+            cursor = page.next_store_sequence;
+            if (!page.has_more) break;
+        }
+        try store.verifyStreamHeads();
+        try store.verifyBlobReferenceCounts();
+    }
+
+    /// Bounded background/startup event verification. Callers persist `next`
+    /// and schedule another page rather than monopolizing startup.
+    pub fn verifyEventIntegrityPage(store: *Store, after_store_sequence: u64, limit: usize) Error!IntegrityPage {
+        if (limit == 0 or limit > 4096) return error.InvalidPageBudget;
+
         const statement = try store.prepare(
             "SELECT store_seq,event_id,source_provider_id,stream_kind,stream_id,stream_incarnation,stream_seq,encoded,row_checksum " ++
-                "FROM events ORDER BY store_seq ASC",
+                "FROM events WHERE store_seq>?1 ORDER BY store_seq ASC LIMIT ?2",
         );
         defer _ = c.sqlite3_finalize(statement);
+        try bindU64(statement, 1, after_store_sequence, error.InvalidStoreSequence);
+        try bindI64(statement, 2, limit + 1);
+        var count: usize = 0;
+        var next = after_store_sequence;
         while (true) {
             const rc = c.sqlite3_step(statement);
             if (rc == c.SQLITE_DONE) break;
             if (rc != c.SQLITE_ROW) return store.sqliteError();
+            if (count == limit) return .{ .next_store_sequence = next, .has_more = true };
             var decoded = decodeRow(statement, store.allocator) catch return error.IntegrityFailure;
+            next = decoded.store_seq;
             decoded.deinit(store.allocator);
+            count += 1;
         }
-        try store.verifyStreamHeads();
+        return .{ .next_store_sequence = next, .has_more = false };
+    }
+
+    /// Bounded verification that immutable artifact projections exactly match
+    /// their canonical encoded events.
+    pub fn verifyArtifactProjectionPage(store: *Store, after_store_sequence: u64, limit: usize) Error!IntegrityPage {
+        if (after_store_sequence > std.math.maxInt(i64)) return error.InvalidStoreSequence;
+        if (limit == 0 or limit > 4096) return error.InvalidPageBudget;
+        const statement = try store.prepare(
+            "SELECT e.store_seq,e.encoded,r.event_id,r.artifact_id,r.revision_ordinal,r.algorithm,r.digest,r.byte_length," ++
+                "r.media_type,r.media_kind,r.redaction,r.trust,r.provenance,r.producer_id,r.producer_session_id,r.run_id " ++
+                "FROM events e LEFT JOIN artifact_revisions r ON r.event_id=e.event_id " ++
+                "WHERE e.store_seq>?1 ORDER BY e.store_seq ASC LIMIT ?2",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindU64(statement, 1, after_store_sequence, error.InvalidStoreSequence);
+        try bindI64(statement, 2, limit + 1);
+        var count: usize = 0;
+        var next = after_store_sequence;
+        while (true) {
+            const rc = c.sqlite3_step(statement);
+            if (rc == c.SQLITE_DONE) return .{ .next_store_sequence = next, .has_more = false };
+            if (rc != c.SQLITE_ROW) return store.sqliteError();
+            if (count == limit) return .{ .next_store_sequence = next, .has_more = true };
+            next = try positiveInteger(statement, 0);
+            const encoded = try checkedBlob(statement, 1, event.checksum_size, event.max_envelope_bytes);
+            const decoded = event.decode(store.allocator, encoded) catch return error.IntegrityFailure;
+            verifyArtifactProjectionRow(statement, decoded) catch |err| {
+                store.allocator.free(decoded.payload);
+                return err;
+            };
+            store.allocator.free(decoded.payload);
+            count += 1;
+        }
     }
 
     pub fn checkpoint(store: *Store) Error!void {
@@ -280,14 +392,308 @@ pub const Store = struct {
         if (log_frames != checkpointed) return error.CheckpointFailure;
     }
 
-    /// Metadata boundary for later blob materialization. The event store does
-    /// not claim a blob is durable until a later writer commits a reference.
-    pub const BlobMetadata = struct {
-        digest: [32]u8,
-        length: u64,
-        media_type: []const u8,
-        reference_count: u64,
-    };
+    pub fn publishBytes(store: *Store, bytes: []const u8) Error!blob.PublishedBlob {
+        lock(&store.lifecycle_mutex);
+        defer store.lifecycle_mutex.unlock();
+        return store.blobs.putBytes(bytes);
+    }
+
+    /// The only artifact-reference admission operation. Physical verification,
+    /// event append/head advance, inventory, and immutable revision evidence are
+    /// one BEGIN IMMEDIATE transaction. Trust/provenance come only from `value`.
+    pub fn commitArtifactRevision(store: *Store, expected_prior_sequence: u64, value: event.WorkEvent, published: blob.PublishedBlob) Error!AppendResult {
+        try value.validate();
+        if (value.payload_kind != @intFromEnum(event.PayloadKind.artifact_revision_committed) or value.payload_version != 1)
+            return error.InvalidArtifactRevision;
+        const revision = event.ArtifactRevisionPayload.decode(value.payload) catch return error.InvalidArtifactRevision;
+        if (!std.mem.eql(u8, &revision.digest, &published.digest.bytes) or revision.byte_length != published.length)
+            return error.InvalidArtifactRevision;
+        if (value.ids.run_id == null) return error.InvalidArtifactRevision;
+        // p1q.11.7 will add authenticated admission context for verified
+        // provider evidence. Until then this exact matrix is the only seam.
+        const admitted = switch (value.provenance) {
+            .local_authority => value.trust == .local,
+            .provider_event, .imported => value.trust == .unverified_provider,
+        };
+        if (!admitted) return error.InvalidArtifactRevision;
+        lock(&store.lifecycle_mutex);
+        defer store.lifecycle_mutex.unlock();
+        if ((try store.blobs.verify(published.digest, published.length)) != .verified) return error.IntegrityFailure;
+        try store.fire(.before_reference_transaction);
+        return store.appendInternal(expected_prior_sequence, null, value, revision);
+    }
+
+    pub fn reconcileArtifactRevision(store: *Store, value: event.WorkEvent) Error!bool {
+        try value.validate();
+        const revision = event.ArtifactRevisionPayload.decode(value.payload) catch return error.InvalidArtifactRevision;
+        const encoded = try event.encode(store.allocator, value);
+        defer store.allocator.free(encoded);
+        const found = try store.findDuplicate(&value.event_id.bytes, encoded) orelse return false;
+        _ = found;
+        const statement = try store.prepare(
+            "SELECT 1 FROM artifact_revisions WHERE event_id=?1 AND artifact_id=?2 AND revision_ordinal=?3 AND digest=?4 AND byte_length=?5 AND media_type=?6 AND media_kind=?7 AND redaction=?8 AND trust=?9 AND provenance=?10 AND producer_id=?11 AND producer_session_id IS ?12 AND run_id IS ?13",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindBlob(statement, 1, &value.event_id.bytes);
+        try bindBlob(statement, 2, &revision.artifact_id);
+        try bindU64(statement, 3, revision.revision_ordinal, error.InvalidArtifactRevision);
+        try bindBlob(statement, 4, &revision.digest);
+        try bindU64(statement, 5, revision.byte_length, error.InvalidArtifactRevision);
+        try bindText(statement, 6, revision.media_type);
+        try bindI64(statement, 7, @intFromEnum(revision.media_kind));
+        try bindI64(statement, 8, @intFromEnum(revision.redaction));
+        try bindI64(statement, 9, @intFromEnum(value.trust));
+        try bindI64(statement, 10, @intFromEnum(value.provenance));
+        try bindBlob(statement, 11, &value.source_provider_id.bytes);
+        try bindOptionalId(statement, 12, &revision.producer_session_id);
+        const run_bytes: ?[16]u8 = if (value.ids.run_id) |run| run.bytes else null;
+        try bindOptionalId(statement, 13, &run_bytes);
+        const rc = c.sqlite3_step(statement);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return store.sqliteError();
+    }
+
+    pub fn blobReferenceCount(store: *Store, digest: blob.BlobDigest) Error!u64 {
+        const statement = try store.prepare("SELECT reference_count FROM blobs WHERE digest=?1");
+        defer _ = c.sqlite3_finalize(statement);
+        try bindBlob(statement, 1, &digest.bytes);
+        const rc = c.sqlite3_step(statement);
+        if (rc == c.SQLITE_DONE) return 0;
+        if (rc != c.SQLITE_ROW) return store.sqliteError();
+        return positiveOrZeroInteger(statement, 0);
+    }
+
+    pub fn purgeUnreferencedBlob(store: *Store, digest: blob.BlobDigest) Error!bool {
+        lock(&store.lifecycle_mutex);
+        defer store.lifecycle_mutex.unlock();
+        try store.exec("BEGIN IMMEDIATE");
+        var transaction_done = false;
+        defer if (!transaction_done) store.exec("ROLLBACK") catch {};
+        const inspect = try store.prepare("SELECT reference_count,state FROM blobs WHERE algorithm=1 AND digest=?1");
+        defer _ = c.sqlite3_finalize(inspect);
+        try bindBlob(inspect, 1, &digest.bytes);
+        const rc = c.sqlite3_step(inspect);
+        if (rc == c.SQLITE_DONE) {
+            try store.exec("ROLLBACK");
+            transaction_done = true;
+            return false;
+        }
+        if (rc != c.SQLITE_ROW) return store.sqliteError();
+        if (try positiveOrZeroInteger(inspect, 0) != 0) return error.BlobStillReferenced;
+        const state = try positiveOrZeroInteger(inspect, 1);
+        if (state > 2) return error.IntegrityFailure;
+        if (c.sqlite3_step(inspect) != c.SQLITE_DONE) return store.sqliteError();
+        if (state == 0) {
+            const mark = try store.prepare("UPDATE blobs SET state=1 WHERE algorithm=1 AND digest=?1 AND reference_count=0 AND state=0");
+            defer _ = c.sqlite3_finalize(mark);
+            try bindBlob(mark, 1, &digest.bytes);
+            try store.stepDone(mark);
+            if (c.sqlite3_changes(store.db) != 1) return error.ConcurrentWriter;
+        }
+        try store.exec("COMMIT");
+        transaction_done = true;
+        if (state == 0 and store.failpoint == .after_purge_mark) {
+            store.failpoint = .none;
+            return error.CommitOutcomeUnknown;
+        }
+        const removed = try store.blobs.remove(digest);
+        try store.exec("BEGIN IMMEDIATE");
+        var deletion_done = false;
+        defer if (!deletion_done) store.exec("ROLLBACK") catch {};
+        const statement = try store.prepare("DELETE FROM blobs WHERE algorithm=1 AND digest=?1 AND reference_count=0 AND state IN (1,2)");
+        defer _ = c.sqlite3_finalize(statement);
+        try bindBlob(statement, 1, &digest.bytes);
+        try store.stepDone(statement);
+        if (c.sqlite3_changes(store.db) != 1) return error.IntegrityFailure;
+        try store.exec("COMMIT");
+        deletion_done = true;
+        return removed;
+    }
+
+    /// Deterministic bounded deletion recovery ordered by digest. Startup runs
+    /// one page; p1q.10.3 schedules subsequent pages when `has_more` is true.
+    pub fn recoverDeletingBlobsPage(store: *Store, limit: usize) Error!RecoveryPage {
+        if (limit == 0 or limit > 4096) return error.InvalidPageBudget;
+        var digests: std.ArrayList(blob.BlobDigest) = .empty;
+        defer digests.deinit(store.allocator);
+        var has_more = false;
+        {
+            const statement = try store.prepare("SELECT digest FROM blobs WHERE state IN (1,2) AND reference_count=0 ORDER BY digest ASC LIMIT ?1");
+            var finalized = false;
+            defer {
+                if (!finalized) _ = c.sqlite3_finalize(statement);
+            }
+            try bindI64(statement, 1, limit + 1);
+            while (true) {
+                const rc = c.sqlite3_step(statement);
+                if (rc == c.SQLITE_DONE) break;
+                if (rc != c.SQLITE_ROW) return store.sqliteError();
+                if (digests.items.len == limit) {
+                    has_more = true;
+                    break;
+                }
+                const raw = try checkedBlob(statement, 0, 32, 32);
+                var digest: blob.BlobDigest = undefined;
+                @memcpy(&digest.bytes, raw);
+                try digests.append(store.allocator, digest);
+            }
+            const finalize_rc = c.sqlite3_finalize(statement);
+            finalized = true;
+            if (finalize_rc != c.SQLITE_OK) return store.sqliteError();
+        }
+        for (digests.items) |digest| _ = try store.purgeUnreferencedBlob(digest);
+        return .{ .processed = digests.items.len, .has_more = has_more };
+    }
+
+    pub fn streamArtifactRevision(store: *Store, event_id: identity.EventId, sink: blob.StreamSink) Error!ArtifactReadResult {
+        lock(&store.lifecycle_mutex);
+        defer store.lifecycle_mutex.unlock();
+        const statement = try store.prepare("SELECT artifact_id,revision_ordinal,digest,byte_length,run_id FROM artifact_revisions WHERE event_id=?1");
+        defer _ = c.sqlite3_finalize(statement);
+        try bindBlob(statement, 1, &event_id.bytes);
+        if (c.sqlite3_step(statement) != c.SQLITE_ROW) return error.BlobNotFound;
+        const artifact_raw = try checkedBlob(statement, 0, 16, 16);
+        const ordinal = try positiveInteger(statement, 1);
+        const digest_raw = try checkedBlob(statement, 2, 32, 32);
+        const length = try positiveOrZeroInteger(statement, 3);
+        const run_id = try optionalStoredId(identity.RunId, statement, 4);
+        var digest: blob.BlobDigest = undefined;
+        @memcpy(&digest.bytes, digest_raw);
+        const artifact_id = identity.ArtifactId.fromStorage(artifact_raw) catch return error.IntegrityFailure;
+        const result = try store.blobs.streamVerified(digest, length, sink);
+        return switch (result) {
+            .verified => .streamed,
+            .gap => |reason| .{ .gap = .{
+                .event_id = event_id,
+                .artifact_id = artifact_id,
+                .revision_ordinal = ordinal,
+                .run_id = run_id,
+                .reason = reason,
+            } },
+        };
+    }
+
+    /// Paged orphan cleanup. Directory offsets are best-effort across external
+    /// directory mutation; every completed cycle resets and revisits all shards.
+    pub fn reconcileOrphanFiles(store: *Store, now_seconds: i64, grace_seconds: u64, entry_budget: usize) Error!usize {
+        if (entry_budget == 0) return 0;
+        lock(&store.lifecycle_mutex);
+        defer store.lifecycle_mutex.unlock();
+        var cursor = try store.orphanCursor();
+        var physical = store.blobs.lockPhysical();
+        defer physical.release();
+        var examined: usize = 0;
+        var removed: usize = 0;
+        var shards_examined: usize = 0;
+        while (examined < entry_budget and shards_examined < 256) {
+            shards_examined += 1;
+            var shard_name: [3:0]u8 = undefined;
+            const alphabet = "0123456789abcdef";
+            shard_name[0] = alphabet[cursor.shard >> 4];
+            shard_name[1] = alphabet[cursor.shard & 15];
+            shard_name[2] = 0;
+            const shard_fd = c.openat(physical.rootFd(), &shard_name, c.O_RDONLY | c.O_DIRECTORY | c.O_NOFOLLOW | c.O_CLOEXEC);
+            if (shard_fd >= 0) {
+                const duplicate = c.dup(shard_fd);
+                if (duplicate < 0) return pathError();
+                const directory = c.fdopendir(duplicate) orelse {
+                    _ = c.close(duplicate);
+                    return pathError();
+                };
+                if (cursor.offset != 0) c.seekdir(directory, cursor.offset);
+                var reached_eof = false;
+                while (examined < entry_budget) {
+                    errnoPtr().* = 0;
+                    const entry = c.readdir(directory) orelse {
+                        if (errno() != 0) {
+                            _ = c.closedir(directory);
+                            _ = c.close(shard_fd);
+                            return pathError();
+                        }
+                        reached_eof = true;
+                        break;
+                    };
+                    examined += 1;
+                    const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+                    if (name.len != 62 or !lowerHex(name)) continue;
+                    var status: c.struct_stat = undefined;
+                    if (c.fstatat(shard_fd, @ptrCast(&entry.*.d_name), &status, c.AT_SYMLINK_NOFOLLOW) != 0 or
+                        (status.st_mode & c.S_IFMT) != c.S_IFREG or status.st_uid != c.geteuid() or
+                        (status.st_mode & 0o077) != 0 or status.st_nlink != 1 or status.st_size < 0) continue;
+                    const age = if (now_seconds > status.st_mtimespec.tv_sec) @as(u64, @intCast(now_seconds - status.st_mtimespec.tv_sec)) else 0;
+                    if (age < grace_seconds) continue;
+                    var full: [64]u8 = undefined;
+                    full[0] = shard_name[0];
+                    full[1] = shard_name[1];
+                    @memcpy(full[2..], name);
+                    const digest = blob.BlobDigest.parse(&full) catch continue;
+                    if (try store.hasBlobInventory(digest)) continue;
+                    if ((try physical.verify(digest, @intCast(status.st_size))) != .verified) continue;
+                    if (c.unlinkat(shard_fd, @ptrCast(&entry.*.d_name), 0) == 0) {
+                        removed += 1;
+                        if (c.fsync(shard_fd) != 0) return pathError();
+                    }
+                }
+                if (!reached_eof and examined >= entry_budget) {
+                    const position = c.telldir(directory);
+                    if (position < 0) {
+                        _ = c.closedir(directory);
+                        _ = c.close(shard_fd);
+                        return pathError();
+                    }
+                    cursor.offset = position;
+                    try store.setOrphanCursor(cursor);
+                    _ = c.closedir(directory);
+                    _ = c.close(shard_fd);
+                    break;
+                }
+                _ = c.closedir(directory);
+                _ = c.close(shard_fd);
+            } else if (errno() != c.ENOENT) return pathError();
+            cursor = .{ .shard = (cursor.shard + 1) % 256, .offset = 0 };
+            try store.setOrphanCursor(cursor);
+            if (examined >= entry_budget) break;
+        }
+        return removed;
+    }
+
+    const OrphanCursor = struct { shard: usize, offset: c_long };
+
+    fn orphanCursor(store: *Store) Error!OrphanCursor {
+        const statement = try store.prepare("SELECT " ++
+            "COALESCE((SELECT CAST(value AS INTEGER) FROM store_meta WHERE key='orphan_shard_cursor'),0)," ++
+            "COALESCE((SELECT CAST(value AS INTEGER) FROM store_meta WHERE key='orphan_dir_offset'),0)");
+        defer _ = c.sqlite3_finalize(statement);
+        if (c.sqlite3_step(statement) != c.SQLITE_ROW) return error.IntegrityFailure;
+        const shard = try positiveOrZeroInteger(statement, 0);
+        const offset = try positiveOrZeroInteger(statement, 1);
+        if (shard > 255 or offset > std.math.maxInt(c_long)) return error.IntegrityFailure;
+        return .{ .shard = @intCast(shard), .offset = @intCast(offset) };
+    }
+
+    fn setOrphanCursor(store: *Store, cursor: OrphanCursor) Error!void {
+        const statement = try store.prepare("INSERT INTO store_meta(key,value) VALUES('orphan_shard_cursor',?1),('orphan_dir_offset',?2) " ++
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value");
+        defer _ = c.sqlite3_finalize(statement);
+        var shard_buffer: [3]u8 = undefined;
+        var offset_buffer: [32]u8 = undefined;
+        const shard_text = std.fmt.bufPrint(&shard_buffer, "{d}", .{cursor.shard}) catch unreachable;
+        const offset_text = std.fmt.bufPrint(&offset_buffer, "{d}", .{cursor.offset}) catch unreachable;
+        try bindText(statement, 1, shard_text);
+        try bindText(statement, 2, offset_text);
+        try store.stepDone(statement);
+    }
+
+    fn hasBlobInventory(store: *Store, digest: blob.BlobDigest) Error!bool {
+        const statement = try store.prepare("SELECT 1 FROM blobs WHERE algorithm=1 AND digest=?1");
+        defer _ = c.sqlite3_finalize(statement);
+        try bindBlob(statement, 1, &digest.bytes);
+        const rc = c.sqlite3_step(statement);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return store.sqliteError();
+    }
 
     const TransitionFence = struct { source: [16]u8, incarnation: u64 };
     const Head = struct { sequence: u64, source: [16]u8, incarnation: u64 };
@@ -297,6 +703,7 @@ pub const Store = struct {
         expected_prior_sequence: u64,
         transition: ?TransitionFence,
         value: event.WorkEvent,
+        revision: ?event.ArtifactRevisionPayload,
     ) Error!AppendResult {
         const encoded = try event.encode(store.allocator, value);
         defer store.allocator.free(encoded);
@@ -308,6 +715,7 @@ pub const Store = struct {
         try store.fire(.after_begin);
 
         if (try store.findDuplicate(&value.event_id.bytes, encoded)) |result| {
+            if (revision != null and !try store.revisionTupleExists(value, revision.?)) return error.DuplicateConflict;
             try store.exec("COMMIT");
             committed = true;
             return result;
@@ -361,6 +769,48 @@ pub const Store = struct {
         try bindU64(update, 5, value.stream_seq, error.InvalidStreamSequence);
         try store.stepDone(update);
 
+        if (revision) |artifact| {
+            const insert_blob = try store.prepare(
+                "INSERT INTO blobs(algorithm,digest,length,state,reference_count) VALUES(1,?1,?2,0,0) ON CONFLICT(algorithm,digest) DO NOTHING",
+            );
+            defer _ = c.sqlite3_finalize(insert_blob);
+            try bindBlob(insert_blob, 1, &artifact.digest);
+            try bindU64(insert_blob, 2, artifact.byte_length, error.BlobTooLarge);
+            try store.stepDone(insert_blob);
+            const physical = try store.prepare("SELECT length,state FROM blobs WHERE algorithm=1 AND digest=?1");
+            defer _ = c.sqlite3_finalize(physical);
+            try bindBlob(physical, 1, &artifact.digest);
+            if (c.sqlite3_step(physical) != c.SQLITE_ROW or try positiveOrZeroInteger(physical, 0) != artifact.byte_length or try positiveOrZeroInteger(physical, 1) != 0)
+                return error.BlobMetadataConflict;
+
+            const insert_revision = try store.prepare(
+                "INSERT INTO artifact_revisions(event_id,artifact_id,revision_ordinal,algorithm,digest,byte_length,media_type,media_kind,redaction,trust,provenance,producer_id,producer_session_id,run_id) " ++
+                    "VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            );
+            defer _ = c.sqlite3_finalize(insert_revision);
+            try bindBlob(insert_revision, 1, &value.event_id.bytes);
+            try bindBlob(insert_revision, 2, &artifact.artifact_id);
+            try bindU64(insert_revision, 3, artifact.revision_ordinal, error.InvalidArtifactRevision);
+            try bindBlob(insert_revision, 4, &artifact.digest);
+            try bindU64(insert_revision, 5, artifact.byte_length, error.InvalidArtifactRevision);
+            try bindText(insert_revision, 6, artifact.media_type);
+            try bindI64(insert_revision, 7, @intFromEnum(artifact.media_kind));
+            try bindI64(insert_revision, 8, @intFromEnum(artifact.redaction));
+            try bindI64(insert_revision, 9, @intFromEnum(value.trust));
+            try bindI64(insert_revision, 10, @intFromEnum(value.provenance));
+            try bindBlob(insert_revision, 11, &value.source_provider_id.bytes);
+            try bindOptionalId(insert_revision, 12, &artifact.producer_session_id);
+            const run_bytes: ?[16]u8 = if (value.ids.run_id) |run| run.bytes else null;
+            try bindOptionalId(insert_revision, 13, &run_bytes);
+            try store.stepDone(insert_revision);
+            const increment = try store.prepare("UPDATE blobs SET reference_count=reference_count+1 WHERE algorithm=1 AND digest=?1 AND state=0");
+            defer _ = c.sqlite3_finalize(increment);
+            try bindBlob(increment, 1, &artifact.digest);
+            try store.stepDone(increment);
+            if (c.sqlite3_changes(store.db) != 1) return error.IntegrityFailure;
+            try store.fire(.after_revision_insert);
+        }
+
         try store.fire(.after_insert);
         try store.fire(.before_commit);
         try store.exec("COMMIT");
@@ -369,7 +819,36 @@ pub const Store = struct {
             store.failpoint = .none;
             return error.CommitOutcomeUnknown;
         }
+        if (revision != null and store.failpoint == .after_reference_commit) {
+            store.failpoint = .none;
+            return error.CommitOutcomeUnknown;
+        }
         return .{ .appended = store_sequence };
+    }
+
+    fn revisionTupleExists(store: *Store, value: event.WorkEvent, revision: event.ArtifactRevisionPayload) Error!bool {
+        const statement = try store.prepare(
+            "SELECT 1 FROM artifact_revisions WHERE event_id=?1 AND artifact_id=?2 AND revision_ordinal=?3 AND digest=?4 AND byte_length=?5 AND media_type=?6 AND media_kind=?7 AND redaction=?8 AND trust=?9 AND provenance=?10 AND producer_id=?11 AND producer_session_id IS ?12 AND run_id IS ?13",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        try bindBlob(statement, 1, &value.event_id.bytes);
+        try bindBlob(statement, 2, &revision.artifact_id);
+        try bindU64(statement, 3, revision.revision_ordinal, error.InvalidArtifactRevision);
+        try bindBlob(statement, 4, &revision.digest);
+        try bindU64(statement, 5, revision.byte_length, error.InvalidArtifactRevision);
+        try bindText(statement, 6, revision.media_type);
+        try bindI64(statement, 7, @intFromEnum(revision.media_kind));
+        try bindI64(statement, 8, @intFromEnum(revision.redaction));
+        try bindI64(statement, 9, @intFromEnum(value.trust));
+        try bindI64(statement, 10, @intFromEnum(value.provenance));
+        try bindBlob(statement, 11, &value.source_provider_id.bytes);
+        try bindOptionalId(statement, 12, &revision.producer_session_id);
+        const run_bytes: ?[16]u8 = if (value.ids.run_id) |run| run.bytes else null;
+        try bindOptionalId(statement, 13, &run_bytes);
+        const rc = c.sqlite3_step(statement);
+        if (rc == c.SQLITE_ROW) return true;
+        if (rc == c.SQLITE_DONE) return false;
+        return store.sqliteError();
     }
 
     fn configureBase(store: *Store) Error!void {
@@ -394,6 +873,9 @@ pub const Store = struct {
             try store.verifyStoreMeta();
             return;
         }
+        // Versions 1 and 2 were unshipped drafts. Their blob rows lack enough
+        // information for a lossless context/trust migration; refuse honestly.
+        if (!new_file and (version == 1 or version == 2)) return error.UnsupportedDraftSchema;
         if (!new_file) return error.ForeignStore;
         if (version != 0) return error.MigrationFailure;
 
@@ -404,7 +886,7 @@ pub const Store = struct {
             "PRAGMA application_id=1346917720;" ++
                 "CREATE TABLE store_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);" ++
                 "INSERT INTO store_meta VALUES('format','phux-work-event-store');" ++
-                "INSERT INTO store_meta VALUES('schema_version','1');" ++
+                "INSERT INTO store_meta VALUES('schema_version','3');" ++
                 "CREATE TABLE events(" ++
                 " store_seq INTEGER PRIMARY KEY CHECK(store_seq>0)," ++
                 " event_id BLOB NOT NULL UNIQUE CHECK(typeof(event_id)='blob' AND length(event_id)=16)," ++
@@ -418,12 +900,32 @@ pub const Store = struct {
                 " UNIQUE(stream_kind,stream_id,stream_incarnation,stream_seq));" ++
                 "CREATE INDEX events_stream_order ON events(stream_kind,stream_id,stream_incarnation,stream_seq);" ++
                 "CREATE TABLE stream_heads(" ++
-                " stream_kind INTEGER NOT NULL,stream_id BLOB NOT NULL,source_provider_id BLOB NOT NULL," ++
-                " stream_incarnation INTEGER NOT NULL,stream_seq INTEGER NOT NULL," ++
+                " stream_kind INTEGER NOT NULL CHECK(typeof(stream_kind)='integer' AND stream_kind BETWEEN 0 AND 5)," ++
+                "stream_id BLOB NOT NULL CHECK(typeof(stream_id)='blob' AND length(stream_id)=16)," ++
+                "source_provider_id BLOB NOT NULL CHECK(typeof(source_provider_id)='blob' AND length(source_provider_id)=16)," ++
+                " stream_incarnation INTEGER NOT NULL CHECK(typeof(stream_incarnation)='integer' AND stream_incarnation>0)," ++
+                "stream_seq INTEGER NOT NULL CHECK(typeof(stream_seq)='integer' AND stream_seq>0)," ++
                 " PRIMARY KEY(stream_kind,stream_id));" ++
-                "CREATE TABLE blobs(digest BLOB PRIMARY KEY CHECK(typeof(digest)='blob' AND length(digest)=32)," ++
-                "length INTEGER NOT NULL,media_type TEXT NOT NULL,reference_count INTEGER NOT NULL CHECK(reference_count>=0));" ++
-                "PRAGMA user_version=1",
+                "CREATE TABLE blobs(algorithm INTEGER NOT NULL CHECK(algorithm=1),digest BLOB NOT NULL CHECK(typeof(digest)='blob' AND length(digest)=32)," ++
+                "length INTEGER NOT NULL CHECK(length>=0 AND length<=2147483648),state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 2)," ++
+                "reference_count INTEGER NOT NULL CHECK(reference_count>=0),PRIMARY KEY(algorithm,digest));" ++
+                "CREATE TABLE artifact_revisions(" ++
+                "event_id BLOB PRIMARY KEY CHECK(typeof(event_id)='blob' AND length(event_id)=16) REFERENCES events(event_id) ON DELETE RESTRICT," ++
+                "artifact_id BLOB NOT NULL CHECK(typeof(artifact_id)='blob' AND length(artifact_id)=16)," ++
+                "revision_ordinal INTEGER NOT NULL CHECK(typeof(revision_ordinal)='integer' AND revision_ordinal>0)," ++
+                "algorithm INTEGER NOT NULL CHECK(typeof(algorithm)='integer' AND algorithm=1)," ++
+                "digest BLOB NOT NULL CHECK(typeof(digest)='blob' AND length(digest)=32)," ++
+                "byte_length INTEGER NOT NULL CHECK(typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND 2147483648)," ++
+                "media_type TEXT NOT NULL CHECK(typeof(media_type)='text' AND length(media_type) BETWEEN 1 AND 255)," ++
+                "media_kind INTEGER NOT NULL CHECK(typeof(media_kind)='integer' AND media_kind BETWEEN 0 AND 3)," ++
+                "redaction INTEGER NOT NULL CHECK(typeof(redaction)='integer' AND redaction BETWEEN 0 AND 2)," ++
+                "trust INTEGER NOT NULL CHECK(typeof(trust)='integer' AND trust BETWEEN 0 AND 2)," ++
+                "provenance INTEGER NOT NULL CHECK(typeof(provenance)='integer' AND provenance BETWEEN 0 AND 2)," ++
+                "producer_id BLOB NOT NULL CHECK(typeof(producer_id)='blob' AND length(producer_id)=16)," ++
+                "producer_session_id BLOB CHECK(producer_session_id IS NULL OR (typeof(producer_session_id)='blob' AND length(producer_session_id)=16))," ++
+                "run_id BLOB CHECK(run_id IS NULL OR (typeof(run_id)='blob' AND length(run_id)=16))," ++
+                "UNIQUE(artifact_id,revision_ordinal),FOREIGN KEY(algorithm,digest) REFERENCES blobs(algorithm,digest) ON DELETE RESTRICT);" ++
+                "PRAGMA user_version=3",
         );
         try store.requireNoForeignKeyViolations();
         try store.verifyStoreMeta();
@@ -445,7 +947,7 @@ pub const Store = struct {
         const version_length = c.sqlite3_column_bytes(statement, 1);
         const version = c.sqlite3_column_text(statement, 1) orelse return error.ForeignStore;
         if (format_length != 21 or !std.mem.eql(u8, format[0..21], "phux-work-event-store") or
-            version_length != 1 or !std.mem.eql(u8, version[0..1], "1"))
+            version_length != 1 or !std.mem.eql(u8, version[0..1], "3"))
             return error.ForeignStore;
         if (c.sqlite3_step(statement) != c.SQLITE_DONE) return error.ForeignStore;
     }
@@ -497,6 +999,14 @@ pub const Store = struct {
                 "e.stream_incarnation=h.stream_incarnation AND e.stream_seq=h.stream_seq) OR EXISTS (SELECT 1 FROM events e WHERE " ++
                 "e.stream_kind=h.stream_kind AND e.stream_id=h.stream_id AND " ++
                 "(e.stream_incarnation>h.stream_incarnation OR (e.stream_incarnation=h.stream_incarnation AND e.stream_seq>h.stream_seq))) LIMIT 1",
+        );
+        defer _ = c.sqlite3_finalize(statement);
+        if (c.sqlite3_step(statement) != c.SQLITE_DONE) return error.IntegrityFailure;
+    }
+
+    fn verifyBlobReferenceCounts(store: *Store) Error!void {
+        const statement = try store.prepare(
+            "SELECT 1 FROM blobs b WHERE b.reference_count!=(SELECT COUNT(*) FROM artifact_revisions r WHERE r.algorithm=b.algorithm AND r.digest=b.digest) LIMIT 1",
         );
         defer _ = c.sqlite3_finalize(statement);
         if (c.sqlite3_step(statement) != c.SQLITE_DONE) return error.IntegrityFailure;
@@ -578,6 +1088,35 @@ pub const Store = struct {
     }
 };
 
+fn verifyArtifactProjectionRow(statement: *c.sqlite3_stmt, value: event.WorkEvent) Error!void {
+    const is_revision = value.payload_kind == @intFromEnum(event.PayloadKind.artifact_revision_committed) and value.payload_version == 1;
+    const has_projection = c.sqlite3_column_type(statement, 2) != c.SQLITE_NULL;
+    if (is_revision != has_projection) return error.IntegrityFailure;
+    if (!is_revision) return;
+    const revision = event.ArtifactRevisionPayload.decode(value.payload) catch return error.IntegrityFailure;
+    const event_id = try checkedBlob(statement, 2, 16, 16);
+    const artifact_id = try checkedBlob(statement, 3, 16, 16);
+    const ordinal = try positiveInteger(statement, 4);
+    const algorithm = try positiveInteger(statement, 5);
+    const digest = try checkedBlob(statement, 6, 32, 32);
+    const length = try positiveOrZeroInteger(statement, 7);
+    const media_type = try checkedText(statement, 8, 1, event.max_media_type_bytes);
+    const media_kind = try positiveOrZeroInteger(statement, 9);
+    const redaction = try positiveOrZeroInteger(statement, 10);
+    const trust = try positiveOrZeroInteger(statement, 11);
+    const provenance = try positiveOrZeroInteger(statement, 12);
+    const producer = try checkedBlob(statement, 13, 16, 16);
+    if (!std.mem.eql(u8, event_id, &value.event_id.bytes) or
+        !std.mem.eql(u8, artifact_id, &revision.artifact_id) or ordinal != revision.revision_ordinal or
+        algorithm != 1 or !std.mem.eql(u8, digest, &revision.digest) or length != revision.byte_length or
+        !std.mem.eql(u8, media_type, revision.media_type) or media_kind != @intFromEnum(revision.media_kind) or
+        redaction != @intFromEnum(revision.redaction) or trust != @intFromEnum(value.trust) or
+        provenance != @intFromEnum(value.provenance) or !std.mem.eql(u8, producer, &value.source_provider_id.bytes) or
+        !optionalBytesEqual(statement, 14, revision.producer_session_id) or
+        !optionalBytesEqual(statement, 15, if (value.ids.run_id) |run| run.bytes else null))
+        return error.IntegrityFailure;
+}
+
 fn decodeRow(statement: *c.sqlite3_stmt, allocator: std.mem.Allocator) Error!event.StoredEvent {
     const store_sequence = try positiveInteger(statement, 0);
     const event_id = try checkedBlob(statement, 1, 16, 16);
@@ -606,7 +1145,7 @@ fn decodeRow(statement: *c.sqlite3_stmt, allocator: std.mem.Allocator) Error!eve
 }
 
 fn rowChecksum(store_sequence: u64, value: event.WorkEvent, encoded: []const u8) [event.checksum_size]u8 {
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("phux-work-store-row-v1\x00");
     hashInt(&hash, store_sequence);
     hash.update(&value.event_id.bytes);
@@ -631,6 +1170,17 @@ fn bindBlob(statement: *c.sqlite3_stmt, index: c_int, bytes: []const u8) Error!v
     if (bytes.len > std.math.maxInt(c_int)) return error.EnvelopeTooLarge;
     if (c.sqlite3_bind_blob(statement, index, bytes.ptr, @intCast(bytes.len), null) != c.SQLITE_OK)
         return error.SqliteFailure;
+}
+
+fn bindText(statement: *c.sqlite3_stmt, index: c_int, text: []const u8) Error!void {
+    if (text.len > std.math.maxInt(c_int)) return error.InvalidArtifactRevision;
+    if (c.sqlite3_bind_text(statement, index, text.ptr, @intCast(text.len), null) != c.SQLITE_OK)
+        return error.SqliteFailure;
+}
+
+fn bindOptionalId(statement: *c.sqlite3_stmt, index: c_int, value: *const ?[16]u8) Error!void {
+    if (value.*) |_| return bindBlob(statement, index, &value.*.?);
+    if (c.sqlite3_bind_null(statement, index) != c.SQLITE_OK) return error.SqliteFailure;
 }
 
 fn bindI64(statement: *c.sqlite3_stmt, index: c_int, value: anytype) Error!void {
@@ -670,6 +1220,28 @@ fn checkedBlob(statement: *c.sqlite3_stmt, column: c_int, minimum: usize, maximu
     return @as([*]const u8, @ptrCast(pointer))[0..length];
 }
 
+fn checkedText(statement: *c.sqlite3_stmt, column: c_int, minimum: usize, maximum: usize) Error![]const u8 {
+    if (c.sqlite3_column_type(statement, column) != c.SQLITE_TEXT) return error.IntegrityFailure;
+    const length = c.sqlite3_column_bytes(statement, column);
+    if (length < minimum or length > maximum) return error.IntegrityFailure;
+    const pointer = c.sqlite3_column_text(statement, column) orelse return error.IntegrityFailure;
+    return pointer[0..@intCast(length)];
+}
+
+fn optionalBytesEqual(statement: *c.sqlite3_stmt, column: c_int, expected: ?[16]u8) bool {
+    if (expected) |bytes| {
+        const actual = checkedBlob(statement, column, 16, 16) catch return false;
+        return std.mem.eql(u8, actual, &bytes);
+    }
+    return c.sqlite3_column_type(statement, column) == c.SQLITE_NULL;
+}
+
+fn optionalStoredId(comptime Id: type, statement: *c.sqlite3_stmt, column: c_int) Error!?Id {
+    if (c.sqlite3_column_type(statement, column) == c.SQLITE_NULL) return null;
+    const raw = try checkedBlob(statement, column, 16, 16);
+    return Id.fromStorage(raw) catch error.IntegrityFailure;
+}
+
 fn ensureStateDirectory(allocator: std.mem.Allocator, path: []const u8) Error!bool {
     var end: usize = 1;
     while (end <= path.len) {
@@ -693,6 +1265,25 @@ fn ensureStateDirectory(allocator: std.mem.Allocator, path: []const u8) Error!bo
         end = slash + 1;
     }
     return false;
+}
+
+fn sameFile(first: c_int, second: c_int) Error!bool {
+    var a: c.struct_stat = undefined;
+    var b: c.struct_stat = undefined;
+    if (c.fstat(first, &a) != 0 or c.fstat(second, &b) != 0) return pathError();
+    return a.st_dev == b.st_dev and a.st_ino == b.st_ino;
+}
+
+fn lowerHex(bytes: []const u8) bool {
+    for (bytes) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn lock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
 
 fn preflightDatabase(dir_fd: c_int) Error!bool {
@@ -786,6 +1377,7 @@ fn validateStat(status: c.struct_stat, directory: bool) Error!void {
     if ((status.st_mode & c.S_IFMT) != expected) return error.UnsafeStatePath;
     if (status.st_uid != c.geteuid()) return error.PermissionDenied;
     if ((status.st_mode & 0o077) != 0) return error.PermissionDenied;
+    if (!directory and status.st_nlink != 1) return error.IntegrityFailure;
 }
 
 fn pathError() Error {
@@ -799,5 +1391,9 @@ fn pathError() Error {
 }
 
 fn errno() c_int {
-    return c.__error().*;
+    return errnoPtr().*;
+}
+
+fn errnoPtr() *c_int {
+    return c.__error();
 }
