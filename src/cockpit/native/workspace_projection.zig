@@ -106,6 +106,24 @@ pub const tab_indicator_thickness: f32 = 2;
 /// pane's status, so a full strip never pushes either off the edge.
 pub const tab_strip_trailing_reserve: f32 = 220;
 
+/// One EDGE CUE: the chevron the strip shows at whichever end it is hiding
+/// tabs behind.
+///
+/// `chrome_hit_target`, the same 24 the tab's own close `x` uses, because it is
+/// the same kind of thing — a small ghost icon control riding inside a tab-band
+/// row — and because the cue has to be pressable: it opens the switcher, which
+/// is the only way an AX user who just learned tabs are hidden can reach them.
+///
+/// It is deliberately NOT `chrome_control_extent` (32, the `+`'s rung). The
+/// reserve below is paid twice out of the room the tabs lay out in, and the
+/// difference is a whole tab: at the 660pt window this bug was measured in,
+/// `floor((644 - 220 - 2*(24 + 4)) / 120)` is 3 and the same expression with 32
+/// is 2. A cue that costs a tab to announce a tab is not a trade worth making.
+pub const tab_overflow_cue_extent: f32 = chrome_hit_target;
+
+/// What one cue costs the strip: itself plus the row's own gap before it.
+const tab_overflow_cue_reserve: f32 = tab_overflow_cue_extent + chrome_band_inset;
+
 /// Room at the LEADING edge of the titlebar band for the three traffic
 /// lights, so a strip hosted there starts clear of them.
 ///
@@ -146,12 +164,32 @@ fn titlebarBandHeight(model: *const Model, workspace: *const Workspace) f32 {
 pub const TabWindow = struct {
     first: usize = 0,
     count: usize = 0,
+    /// How many tabs the workspace actually has. Carried rather than left to
+    /// the caller to re-read, because it is what turns this struct from "here
+    /// is a run of tabs" into "here is a run of tabs AND how much of the list
+    /// it is not". The strip cannot draw an honest edge cue without it, and
+    /// every caller that asked the workspace separately was one refactor away
+    /// from asking a different workspace.
+    total: usize = 0,
     /// The width each visible tab lays out at, between `tab_min_extent` and
     /// `tab_extent`.
     extent: f32 = tab_extent,
 
     pub fn contains(window: TabWindow, index: usize) bool {
         return index >= window.first and index < window.first + window.count;
+    }
+
+    /// Whether this run is a WINDOW onto a longer list rather than the list.
+    pub fn windowed(window: TabWindow) bool {
+        return window.count < window.total;
+    }
+
+    pub fn hiddenBefore(window: TabWindow) usize {
+        return window.first;
+    }
+
+    pub fn hiddenAfter(window: TabWindow) usize {
+        return window.total - window.first - window.count;
     }
 };
 
@@ -175,15 +213,33 @@ pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindo
     // Shrink first, window second. A strip that windowed at full tab width
     // would hide tab 4 in a 900pt window while leaving 200pt of gutter.
     const capacity: usize = @max(1, @as(usize, @intFromFloat(@floor(usable / tab_min_extent))));
-    const shown = @min(capacity, workspace.tab_count);
-    const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(shown)));
-    if (shown == workspace.tab_count) return .{ .first = 0, .count = shown, .extent = extent };
+    if (capacity >= workspace.tab_count) {
+        // Every tab fits. No cue is drawn and none is paid for, which is why
+        // this case has to be decided BEFORE the reserve below: charging a
+        // strip that shows the whole list for an edge cue it will never draw
+        // would shrink tabs for nothing.
+        const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(workspace.tab_count)));
+        return .{ .first = 0, .count = workspace.tab_count, .total = workspace.tab_count, .extent = extent };
+    }
+
+    // From here the strip IS a window onto a longer list, and it says so at
+    // both ends. Room is held for BOTH cues even when only one of them is
+    // drawn — the leading one is absent exactly while `first` is 0 — because
+    // the alternative is that every tab in the strip changes width the moment
+    // the selection walks past the right edge, which is the same "tabs jump
+    // under the pointer" the anchoring rule below exists to avoid. A fixed
+    // reserve also keeps this derivation non-circular: the cue count depends
+    // on `first`, `first` depends on how many tabs fit, and how many fit would
+    // otherwise depend on the cue count.
+    const cued = @max(tab_min_extent, usable - 2 * tab_overflow_cue_reserve);
+    const shown: usize = @max(1, @as(usize, @intFromFloat(@floor(cued / tab_min_extent))));
+    const extent = @min(tab_extent, cued / @as(f32, @floatFromInt(shown)));
     const selected = @min(workspace.selected_tab, workspace.tab_count - 1);
     // Anchor at the left until the selection walks past the right edge, then
     // keep the selection as the LAST visible tab. Recentering on every step
     // would make neighbouring tabs jump under the pointer.
     const first = if (selected < shown) 0 else selected - shown + 1;
-    return .{ .first = first, .count = shown, .extent = extent };
+    return .{ .first = first, .count = shown, .total = workspace.tab_count, .extent = extent };
 }
 
 pub const side_rail_width: f32 = 184;
@@ -416,6 +472,59 @@ fn paneNeedsAttention(model: *const Model, pane: *const Pane) bool {
 /// off a screen.
 pub const max_terminal_title_bytes: usize = 96;
 
+/// Where a terminal LIVES, in the only coordinates anyone can act on: which
+/// tab holds it, and which pane inside that tab. Both 1-based, because both
+/// are read aloud and written on screen rather than used to index anything.
+///
+/// `tab` is exactly the digit `cmd+N` carries.
+pub const TerminalAddress = struct {
+    tab: usize,
+    pane: usize,
+    /// How many panes the tab holds. One means `pane` says nothing `tab` has
+    /// not already said, and the name drops it.
+    pane_count: usize,
+};
+
+/// The address a terminal answers to, or null when it sits in no tab at all.
+///
+/// This is deliberately NOT the registry slot, which is what the `Terminal N`
+/// fallback used to number by. The slot is MINT ORDER and only ever moves
+/// forward — `LocalProvider.next_terminal_raw` is incremented on every create
+/// and never rewound, because an identity that repeated would let a late event
+/// for a retired terminal resolve to a live one. That is right for identity
+/// and wrong for a name: one cmd+W followed by one cmd+T left the fourth tab
+/// holding slot 5 while cmd+4 went on selecting it, and the tab announced BOTH
+/// numbers in a single sentence —
+///
+///   "Terminal 5, native terminal, 1 pane(s); …; shortcut CMD+4"
+///
+/// Two integers in the same row, in the same font, one of them wrong; every
+/// further close/open widened the gap. Position cannot drift from the chord
+/// because it IS the chord.
+///
+/// The pane half is what keeps position from LOSING something the slot had.
+/// Two panes split inside one tab share a tab digit, so numbering by tab alone
+/// would name both of them "Terminal 3" and offer two identical "Restart
+/// Terminal 3" buttons — trading a wrong number for an ambiguous one. The pane
+/// digit is the tab's own leaf order (`Tree.terminals`), which is the order the
+/// splits laid them out in and the order `cycle_pane` walks.
+pub fn terminalAddress(model: *const Model, id: TerminalRef) ?TerminalAddress {
+    const where = model.locateTerminal(id) orelse return null;
+    const workspace = model.wsAtConst(where.window) orelse return null;
+    const tree = workspace.treeConst(where.tab) orelse return null;
+    var refs: [layout.max_panes]TerminalRef = undefined;
+    const count = tree.terminals(&refs);
+    for (refs[0..count], 0..) |ref, index| {
+        if (!ref.eql(id)) continue;
+        return .{ .tab = where.tab + 1, .pane = index + 1, .pane_count = count };
+    }
+    // `locateTerminal` found this terminal by walking the same trees, so
+    // failing to find it here means the two walks disagree. Null rather than a
+    // tab-only address: a plausible answer assembled from half a lookup is how
+    // the contradiction above stayed invisible for as long as it did.
+    return null;
+}
+
 /// The name for a terminal, in the order a terminal user reads it:
 ///
 ///   1. the SHELL's own title (OSC 0/2). A prompt with title integration is
@@ -424,8 +533,8 @@ pub const max_terminal_title_bytes: usize = 96;
 ///   2. the last component of the working directory (OSC 7), which is what
 ///      Ghostty and Terminal.app fall back to and what most shells report even
 ///      without title integration.
-///   3. `Terminal N`, the mint-order number, which is always true and never
-///      useful.
+///   3. `Terminal N`, or `Terminal N.M` for one pane of a split — the terminal's
+///      ADDRESS. See `terminalAddress` for why this is not the registry slot.
 ///
 /// A Phux terminal borrows the title its coordinator published; the local
 /// chain does not apply because there is no local session to ask.
@@ -436,7 +545,7 @@ pub const max_terminal_title_bytes: usize = 96;
 /// notification banner are the same name, and a second implementation of this
 /// chain is a second set of titles to keep in agreement.
 pub fn terminalTitleInto(model: *const Model, id: TerminalRef, out: []u8) []const u8 {
-    if (provider_contract.localId(id)) |local_id| {
+    if (provider_contract.isLocal(id)) {
         if (model.provider.terminalConst(id)) |pane| {
             const shell_title = pane.title();
             if (shell_title.len > 0) return clampTitle(shell_title);
@@ -448,8 +557,13 @@ pub fn terminalTitleInto(model: *const Model, id: TerminalRef, out: []u8) []cons
                 if (leaf.len > 0) return clampTitle(leaf);
             }
         }
-        const number = @intFromEnum(local_id) - @intFromEnum(support.LocalTerminalId.terminal_1) + 1;
-        return std.fmt.bufPrint(out, "Terminal {d}", .{number}) catch "Terminal";
+        // The tree walk this costs runs only on THIS branch — a terminal with
+        // a shell title or a pwd, which is nearly every terminal a second
+        // after it starts, has already returned — so the strip pays it for
+        // unnamed panes and nothing else.
+        const at = terminalAddress(model, id) orelse return "Terminal";
+        if (at.pane_count <= 1) return std.fmt.bufPrint(out, "Terminal {d}", .{at.tab}) catch "Terminal";
+        return std.fmt.bufPrint(out, "Terminal {d}.{d}", .{ at.tab, at.pane }) catch "Terminal";
     }
     const presentation = model.remotePresentation(id) orelse return "Phux";
     return if (presentation.title.len == 0) "Phux" else clampTitle(presentation.title);

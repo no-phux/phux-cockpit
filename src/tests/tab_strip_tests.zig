@@ -84,7 +84,121 @@ test "every tab is reachable: the window follows the selection past the edge" {
     }
 }
 
+test "a windowed strip accounts for every tab it is not drawing" {
+    var model: app.Model = .{ .provider = undefined };
+
+    // The whole list fits, so there is nothing to account for and the window
+    // is not a window. This half is the negative control for the half below:
+    // a `hiddenAfter` that is zero here and non-zero there is the difference
+    // the strip's edge cue is derived from.
+    model.ws().tab_count = 2;
+    const whole = app.visibleTabWindow(&model, 1600);
+    try testing.expect(!whole.windowed());
+    try testing.expectEqual(@as(usize, 0), whole.hiddenBefore());
+    try testing.expectEqual(@as(usize, 0), whole.hiddenAfter());
+
+    // 16 tabs in the 1100pt default window: this is the case the bug was
+    // reported against, where 7 were drawn and 9 were simply gone.
+    model.ws().tab_count = app.max_tabs;
+    model.ws().selected_tab = 0;
+    const head = app.visibleTabWindow(&model, 1100 - 16);
+    try testing.expect(head.windowed());
+    try testing.expectEqual(@as(usize, 0), head.hiddenBefore());
+    try testing.expectEqual(app.max_tabs - head.count, head.hiddenAfter());
+    try testing.expectEqual(app.max_tabs, head.total);
+
+    // Walking the selection to the end moves the hidden tabs to the OTHER
+    // side, which is why the strip needs a cue at each end rather than one.
+    model.ws().selected_tab = app.max_tabs - 1;
+    const tail = app.visibleTabWindow(&model, 1100 - 16);
+    try testing.expect(tail.hiddenBefore() > 0);
+    try testing.expectEqual(@as(usize, 0), tail.hiddenAfter());
+
+    // And in the middle, both ends hide something at once.
+    model.ws().selected_tab = head.count + 1;
+    const middle = app.visibleTabWindow(&model, 1100 - 16);
+    try testing.expect(middle.hiddenBefore() > 0);
+    try testing.expect(middle.hiddenAfter() > 0);
+
+    // The accounting holds at every selection and every width the app can be:
+    // drawn plus hidden IS the tab count, or the strip is lying about how much
+    // of the list it is showing.
+    for ([_]f32{ 300, 660, 900, 1100, 1920 }) |width| {
+        for (0..app.max_tabs) |index| {
+            model.ws().selected_tab = index;
+            const w = app.visibleTabWindow(&model, width);
+            try testing.expectEqual(app.max_tabs, w.hiddenBefore() + w.count + w.hiddenAfter());
+        }
+    }
+}
+
 // -------------------------------------------------------------- the strip
+
+/// The count a cue announces, read back out of its accessible name.
+///
+/// Parsed rather than reconstructed on purpose: the number a test builds from
+/// the model is the number the model has, and asserting it against itself
+/// proves nothing. This is the number a screen reader would actually be told.
+fn announcedCount(label: []const u8) !usize {
+    const end = std.mem.indexOfScalar(u8, label, ' ') orelse return error.TestUnexpectedResult;
+    return std.fmt.parseInt(usize, label[0..end], 10);
+}
+
+test "a strip that hides tabs says so, and says how many" {
+    // Four tabs is the smallest count that windows inside the 660pt window
+    // below, and four live shells is exactly what the pinned SDK's pty table
+    // holds. A pin with a smaller table cannot reach this state at all.
+    try support.requireLiveShells(4);
+
+    const gpa = testing.allocator;
+    // 660x640, the size the defect was measured at on the real app: a 644pt
+    // band, 424pt of it usable after the trailing reserve, which is three tabs
+    // at the 120pt floor and a fourth with nowhere to go.
+    const narrow = geometry.SizeF.init(660, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = narrow });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+    state.model.ws().surface_size = narrow;
+
+    while (state.model.ws().tab_count < 4) {
+        const before = state.model.ws().tab_count;
+        try state.dispatch(&harness.runtime, 1, .new_terminal);
+        try testing.expect(state.model.ws().tab_count > before);
+    }
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    var labels: [app.max_tabs][]const u8 = undefined;
+    const drawn = tabLabels(harness, &labels);
+    // THE NEGATIVE CONTROL. Every assertion below is about a strip that is
+    // hiding something; if the strip drew all four tabs there would be nothing
+    // to announce and finding no cue would be correct rather than a bug.
+    try testing.expect(drawn < state.model.ws().tab_count);
+    const missing = state.model.ws().tab_count - drawn;
+
+    // The tree has to carry what the strip cannot draw. Before this cue
+    // existed the loop below found nothing: the four-tab, three-drawn strip
+    // published seven widgets in its band and not one of them said the list
+    // went on, so a screen reader was told "Terminal tabs" containing three
+    // tabs and the fourth was not in the tree in any form.
+    var cues: usize = 0;
+    var announced: usize = 0;
+    var reaches_switcher = true;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        const label = node.widget.semantics.label;
+        if (std.mem.indexOf(u8, label, "not shown in the strip") == null) continue;
+        cues += 1;
+        announced += try announcedCount(label);
+        // A cue that names tabs it gives no way to reach has only moved the
+        // problem: the switcher is the escape hatch and the cue is the only
+        // thing that tells anyone it is there.
+        if (std.mem.indexOf(u8, label, "CMD+SHIFT+P") == null) reaches_switcher = false;
+    }
+    try testing.expect(cues >= 1);
+    try testing.expect(reaches_switcher);
+    try testing.expectEqual(missing, announced);
+}
 
 test "the strip shows terminals only and still reaches the web surface" {
     const gpa = testing.allocator;
@@ -220,6 +334,89 @@ test "a tab prefers the shell title, then the pwd leaf, then its number" {
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     count = tabLabels(harness, &labels);
     try testing.expect(std.mem.startsWith(u8, labels[0], "zig build test,"));
+}
+
+/// The integer in a tab label's `Terminal N, ...` name, or null when the tab is
+/// not wearing the numeric fallback at all. Null is a FAILURE for the caller
+/// below, never a skip: a test that quietly stops looking when the name format
+/// moves is a test that cannot fail for the reason it was written.
+fn fallbackNameNumber(label: []const u8) ?usize {
+    const prefix = "Terminal ";
+    if (!std.mem.startsWith(u8, label, prefix)) return null;
+    const rest = label[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, rest, ',') orelse return null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
+}
+
+/// The integer the same label announces as the tab's chord.
+fn spokenShortcutNumber(label: []const u8) ?usize {
+    const marker = "shortcut CMD+";
+    const at = std.mem.indexOf(u8, label, marker) orelse return null;
+    const rest = label[at + marker.len ..];
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
+}
+
+/// Every tab says ONE number: the digit in its name is the digit in its
+/// shortcut, and both are its position in the strip.
+fn expectTabNumbersAgree(harness: anytype, expected_tabs: usize) !void {
+    var labels: [app.max_tabs][]const u8 = undefined;
+    const count = tabLabels(harness, &labels);
+    try testing.expectEqual(expected_tabs, count);
+    for (labels[0..count], 0..) |label, index| {
+        const named = fallbackNameNumber(label) orelse {
+            std.debug.print("tab {d} carries no `Terminal N` name: {s}\n", .{ index, label });
+            return error.TestExpectedNumberedTab;
+        };
+        const spoken = spokenShortcutNumber(label) orelse {
+            std.debug.print("tab {d} announces no shortcut digit: {s}\n", .{ index, label });
+            return error.TestExpectedSpokenShortcut;
+        };
+        if (named != spoken or named != index + 1) {
+            std.debug.print(
+                "tab {d} is named {d} and answers to CMD+{d}: {s}\n",
+                .{ index, named, spoken, label },
+            );
+            return error.TestTabNumberDisagreesWithShortcut;
+        }
+    }
+}
+
+test "a tab's number and its shortcut stay one number across a close-then-open" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    // The NEGATIVE CONTROL for the assertion itself. Four freshly minted tabs
+    // hold registry slots 1-4, so slot order and position order coincide and
+    // every tab agrees with itself. If this half ever fails, the check below
+    // is measuring something other than the drift it was written for.
+    try expectTabNumbersAgree(harness, 4);
+
+    // One cmd+W and one cmd+T is the whole reproduction. The registry never
+    // reuses a freed identity -- `next_terminal_raw` only moves forward -- so
+    // the replacement tab used to be minted as slot 5 and named "Terminal 5"
+    // while cmd+4 went on selecting it. Both counts are asserted so a refused
+    // close or a refused create (see phux-cockpit-sbn) cannot leave this test
+    // comparing an untouched strip against itself and passing.
+    try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
+    try state.dispatch(&harness.runtime, 1, .close_terminal);
+    try testing.expectEqual(@as(usize, 3), state.model.ws().tab_count);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    try expectTabNumbersAgree(harness, 4);
 }
 
 // ---------------------------------------------------------------- the bell

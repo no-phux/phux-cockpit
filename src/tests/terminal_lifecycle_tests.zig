@@ -156,9 +156,15 @@ test "a split pane carries its lifecycle in accessibility, not in a pane header"
     var writer = std.Io.Writer.fixed(buffer);
     try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("split-status"), &writer);
     const snapshot = writer.buffered();
-    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1, native terminal, RUNNING") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 2, native terminal, SPAWN FAILED") != null);
-    try testing.expect(std.mem.indexOf(u8, snapshot, "Restart Terminal 2") != null);
+    // `N.M` is the terminal's ADDRESS: tab 1, panes 1 and 2. These used to
+    // read "Terminal 1" and "Terminal 2" — the registry slots — which stopped
+    // meaning anything the moment a tab was closed and another opened, because
+    // the registry never reuses a freed slot. `terminalAddress` numbers by
+    // position instead, and the pane half is what keeps two panes of one split
+    // from collapsing onto the single digit their shared tab answers to.
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1.1, native terminal, RUNNING") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Terminal 1.2, native terminal, SPAWN FAILED") != null);
+    try testing.expect(std.mem.indexOf(u8, snapshot, "Restart Terminal 1.2") != null);
     // No pane header text of any kind is painted.
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         try testing.expect(std.mem.indexOf(u8, node.widget.text, "TERMINAL 1 /") == null);
@@ -258,10 +264,12 @@ test "restart targets the focused pane, and only a failed spawn offers it" {
     try testing.expectEqual(@as(usize, 2), app_state.model.ws().tabs[0].paneCount());
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 
-    // The split focused the pane it created — terminal 2 — so the band
-    // offers exactly that pane's Restart.
+    // The split focused the pane it created — tab 1's second pane — so the
+    // band offers exactly that pane's Restart. The name is the ADDRESS
+    // (`terminalAddress`), not the registry slot it used to be; the two agreed
+    // here only because nothing had been closed yet.
     try testing.expect(app_state.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
-    const second_restart = widgetFrameBySemantics(harness, "Restart Terminal 2") orelse return error.TestExpectedRestart;
+    const second_restart = widgetFrameBySemantics(harness, "Restart Terminal 1.2") orelse return error.TestExpectedRestart;
     const second_generation = app_state.model.provider.slots[1].session_generation;
     const second_target = rectCenter(second_restart);
     try clickCanvas(harness, app_iface, second_target.x, second_target.y);

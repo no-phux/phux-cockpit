@@ -208,11 +208,13 @@ pub const pane_focus_command_id_base: u64 = 0x0c30;
 /// The focus edge's thickness, in points.
 pub const pane_focus_edge_thickness: f32 = 1;
 
-/// Phux has one visual register regardless of the system appearance: deep
-/// graphite surfaces, porcelain text, and lime reserved for focus/action.
-fn terminalNumber(id: LocalTerminalId) u64 {
-    return @intFromEnum(id) - first_terminal_raw + 1;
-}
+// A `terminalNumber(LocalTerminalId)` used to sit here, turning a registry
+// slot into a display number, with no callers left and a doc comment about the
+// colour register that had drifted onto it. It is deleted rather than left
+// dormant: a second answer to "what number is this terminal" is exactly what
+// produced a tab named "Terminal 5" wearing the CMD+4 chord, and the next
+// reader in a hurry would have found it first. `projection.terminalAddress` is
+// the only answer now.
 
 /// The tab label for a terminal. The chain itself lives in
 /// `workspace_projection.terminalTitleInto`, because the tab strip is no
@@ -343,7 +345,21 @@ fn paneStatus(ui: *TerminalUi, model: *const Model, terminal_ref: TerminalRef) T
 /// strip: a screen reader still gets the whole diagnostic sentence the eye no
 /// longer sees.
 fn tabSemantics(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_index: usize, id: TerminalRef, title: []const u8, selected: bool) []const u8 {
-    const shortcut = ui.fmt("CMD+{d}", .{tab_index + 1});
+    // The digit spoken here and the digit that opens `title` are the SAME
+    // CALL, not two derivations that happen to agree. They did not agree: this
+    // line read `tab_index + 1` while the name came from the registry slot, so
+    // one close-then-open was enough to make a tab say "Terminal 5 … shortcut
+    // CMD+4" out loud. `terminalAddress` is now the only place either number
+    // is decided.
+    //
+    // A terminal the model cannot locate is announced with no digit at all
+    // rather than with `tab_index + 1`: a strip drawing an id that lives in no
+    // tab is a broken invariant, and answering it with a plausible-looking
+    // number is how the original contradiction stayed invisible for so long.
+    const shortcut = if (projection.terminalAddress(model, id)) |at|
+        ui.fmt("CMD+{d}", .{at.tab})
+    else
+        "unavailable";
     const panes_in_tab = if (ws.treeConst(tab_index)) |current| current.paneCount() else 1;
     const kind_label = if (provider_contract.isLocal(id)) "native terminal" else "phux terminal";
     return if (model.provider.terminalConst(id)) |terminal|
@@ -596,6 +612,64 @@ fn newTabButton(ui: *TerminalUi) TerminalUi.Node {
         // the toolkit's own coverage guard names ⌘ as one of the codepoints
         // that renders as a tofu box on the reference and mobile paths.
     }, ""), "New Terminal (Cmd+T)");
+}
+
+/// Which end of the strip a cue speaks for.
+const TabOverflowSide = enum { before, after };
+
+/// The EDGE CUE: what a windowed strip says about the tabs it is not drawing.
+///
+/// Until this existed the strip drew its contiguous run and stopped, and
+/// nothing anywhere said the run was a window. Measured on the real app at 4
+/// terminals in a 660pt window: 4 tray items in the model, 3 `role=tab` widgets
+/// in the tree, and `grep -icE 'more|overflow|chevron|scroll'` over the whole
+/// published snapshot returned 0. "Terminal 1" was not faint or clipped or
+/// scrolled off — it was not in the accessibility tree at all, so a screen
+/// reader user could not discover it existed, and the `+` sitting immediately
+/// after the last drawn tab read as the end of the list. That is this repo's
+/// dominant bug class exactly: a thing that silently does nothing and says
+/// nothing about it.
+///
+/// So the cue is three separate answers to that, not one:
+///   - a chevron in the PIXELS, at the end that is hiding tabs, which is what
+///     every tab bar that windows shows;
+///   - the exact count in the ACCESSIBILITY NAME, so the tree carries what the
+///     strip cannot draw;
+///   - `palette_open` on press, because a cue that announces unreachable tabs
+///     and offers no way to reach them has only moved the problem. The
+///     switcher (cmd+shift+P) lists every tab and always did; what it lacked
+///     was anything that told you to go looking for it.
+///
+/// The empty case is a HIDDEN SPACER of the same width rather than nothing.
+/// `visibleTabWindowIn` reserves both ends whenever the strip windows, so a
+/// collapsing slot would slide every tab sideways by 28pt the moment the
+/// selection walked past the right edge and the leading cue appeared.
+fn tabOverflowCue(ui: *TerminalUi, side: TabOverflowSide, hidden: usize) TerminalUi.Node {
+    if (hidden == 0) return ui.el(.stack, .{
+        .width = projection.tab_overflow_cue_extent,
+        .semantics = .{ .hidden = true },
+    }, .{});
+    const where = switch (side) {
+        .before => "before",
+        .after => "after",
+    };
+    const plural = if (hidden == 1) "" else "s";
+    return tipped(ui, ui.button(.{
+        .width = projection.tab_overflow_cue_extent,
+        .height = projection.tab_overflow_cue_extent,
+        .size = .icon,
+        .variant = .ghost,
+        .icon = switch (side) {
+            .before => "chevron-left",
+            .after => "chevron-right",
+        },
+        .on_press = .palette_open,
+        // Spelled out rather than ⌘, for the reason `newTabButton` gives.
+        .semantics = .{ .label = ui.fmt(
+            "{d} more tab{s} {s} this one, not shown in the strip; open the tab switcher, shortcut CMD+SHIFT+P",
+            .{ hidden, plural, where },
+        ) },
+    }, ""), ui.fmt("{d} more tab{s} {s} (Cmd+Shift+P)", .{ hidden, plural, where }));
 }
 
 /// The spoken identity of a terminal SURFACE.
@@ -1386,16 +1460,32 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     //
     // The top strip draws a derived window that always contains the selected
     // tab; the side rail is a vertical list and draws every tab.
+    //
+    // A windowed strip carries a cue at each end (`tabOverflowCue`), so the
+    // array is two wider than the tab ceiling. They are part of the SLICE
+    // rather than siblings of it in the row's tuple because a windowed strip
+    // and a complete one need a different number of children, and a row child
+    // that collapses to zero width still costs the row its gap.
     const window = projection.visibleTabWindowIn(ws, ws.surface_size.width - windowPadding(model) * 2);
-    var strip_nodes: [max_tabs]TerminalUi.Node = undefined;
+    var strip_nodes: [max_tabs + 2]TerminalUi.Node = undefined;
     var rail_nodes: [max_tabs]TerminalUi.Node = undefined;
+    var strip_written: usize = 0;
+    if (window.windowed()) {
+        strip_nodes[strip_written] = tabOverflowCue(ui, .before, window.hiddenBefore());
+        strip_written += 1;
+    }
     for (0..window.count) |offset| {
-        strip_nodes[offset] = terminalTabTrigger(ui, model, ws, window.first + offset, tokens, window.extent);
+        strip_nodes[strip_written] = terminalTabTrigger(ui, model, ws, window.first + offset, tokens, window.extent);
+        strip_written += 1;
+    }
+    if (window.windowed()) {
+        strip_nodes[strip_written] = tabOverflowCue(ui, .after, window.hiddenAfter());
+        strip_written += 1;
     }
     for (0..ws.tab_count) |index| {
         rail_nodes[index] = terminalRailTrigger(ui, model, ws, index);
     }
-    const strip_slice = strip_nodes[0..window.count];
+    const strip_slice = strip_nodes[0..strip_written];
     const rail_slice = rail_nodes[0..ws.tab_count];
 
     const chrome = projection.workspaceChromeIn(model, ws, ws.surface_size);
@@ -1509,9 +1599,11 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     const workspace = if (ws.settings.open)
         // The settings surface rides above everything, on the same terms as
         // the palette below, and takes precedence over it in the tree because
-        // `settings_open` dismisses the palette — the two can never both be
-        // open, and if a bug ever made them so, the one that just took the
-        // keyboard is the one that should be on top.
+        // the two can never both be open: `settings_open` dismisses the
+        // palette and `palette_open` dismisses settings. This `else if` is a
+        // belt-and-braces ordering, not the thing that enforces the
+        // invariant — when it WAS the only thing enforcing it, the surface it
+        // hid was still open in the model and surfaced on the next Escape.
         ui.el(.stack, .{ .grow = 1 }, .{
             laid_out,
             ui.el(.stack, .{
