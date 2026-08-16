@@ -264,6 +264,73 @@ test "cmd+, opens settings and nothing typed into it reaches the pty" {
     try testing.expect(state.effects.ptyWrittenBytes(app.ptyKey(0)).len > reopened);
 }
 
+test "the menu's terminal switcher cannot open underneath the settings panel" {
+    // phux-cockpit-1l9. The keyboard cannot reach `palette_open` while the
+    // settings panel is up — the settings gate in `handleKey` swallows every
+    // chord — but the MENU BAR can, and it went straight to the model. The
+    // view renders the settings surface INSTEAD of the palette, so Window >
+    // "Go to Terminal…" left a switcher open with nothing on screen to say
+    // so, and the Escape the user pressed to get back to their shell closed
+    // settings and revealed it. Two modal surfaces must never both be open.
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    const buffer = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(buffer);
+
+    // ABSENT: neither modal is up, and neither scrim is painted. Without this
+    // half, "the palette is not on screen" below would also hold on a build
+    // that never paints a palette at all.
+    try testing.expect(!state.model.ws().settings.open);
+    try testing.expect(!state.model.ws().palette.open);
+    try testing.expect(!hasLabel(try a11yText(harness, iface, buffer), palette_scrim_label));
+    try testing.expect(!hasLabel(try a11yText(harness, iface, buffer), settings_scrim_label));
+
+    // The same menu command with NOTHING up: it opens the switcher, and the
+    // switcher is on screen. This is the control that proves the assertions
+    // after the defect step can move at all.
+    try openTerminalSwitcherFromMenu(harness, iface);
+    try testing.expect(state.model.ws().palette.open);
+    try testing.expect(hasLabel(try a11yText(harness, iface, buffer), palette_scrim_label));
+
+    // View > Settings over the open palette is the direction that already
+    // worked: settings takes the keyboard and the palette is dismissed rather
+    // than stacked. It has to be the MENU here too — the palette's own key
+    // gate swallows cmd+, exactly as the settings gate swallows cmd+shift+P,
+    // so the menu bar is the only door either surface leaves open.
+    try openSettingsFromMenu(harness, iface);
+    try testing.expect(state.model.ws().settings.open);
+    try testing.expect(!state.model.ws().palette.open);
+    try testing.expect(hasLabel(try a11yText(harness, iface, buffer), settings_scrim_label));
+    try testing.expect(!hasLabel(try a11yText(harness, iface, buffer), palette_scrim_label));
+
+    // THE DEFECT: the menu command, this time with the settings panel up.
+    try openTerminalSwitcherFromMenu(harness, iface);
+
+    // THE contract, stated as the absolute invariant rather than as a
+    // difference between two surfaces: never both.
+    try testing.expect(!(state.model.ws().settings.open and state.model.ws().palette.open));
+    // And the surface the model says is open is the one that is PAINTED. An
+    // open-but-unpainted modal is the whole defect: it is a keyboard owner
+    // the user cannot see and did not ask for.
+    const after_menu = try a11yText(harness, iface, buffer);
+    try testing.expectEqual(state.model.ws().palette.open, hasLabel(after_menu, palette_scrim_label));
+    try testing.expectEqual(state.model.ws().settings.open, hasLabel(after_menu, settings_scrim_label));
+
+    // ONE Escape gets the keyboard back to the shell. Under the defect the
+    // first Escape closed settings and handed over the switcher instead.
+    try pressCanvasKey(harness, iface, "escape", .{});
+    try testing.expect(!state.model.ws().settings.open);
+    try testing.expect(!state.model.ws().palette.open);
+    const after_escape = try a11yText(harness, iface, buffer);
+    try testing.expect(!hasLabel(after_escape, palette_scrim_label));
+    try testing.expect(!hasLabel(after_escape, settings_scrim_label));
+}
+
 test "arrow keys preview a theme live and escape puts back the one in effect" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
@@ -483,6 +550,49 @@ test "writing a key preserves comments, unknown keys, and everything else" {
 
 const black = theme.Rgb{ .r = 0, .g = 0, .b = 0 };
 const white = theme.Rgb{ .r = 255, .g = 255, .b = 255 };
+
+/// The two scrims, by their accessibility labels. A scrim is the honest
+/// question to ask of a modal — it exists only while its surface is up, and it
+/// is the element that takes the pointer, so its presence is "this surface owns
+/// the input", not merely "some text was laid out".
+const palette_scrim_label = "Dismiss the terminal switcher";
+const settings_scrim_label = "Dismiss settings without saving";
+
+fn hasLabel(a11y: []const u8, label: []const u8) bool {
+    return std.mem.indexOf(u8, a11y, label) != null;
+}
+
+/// The accessibility text of the current frame. `frame_requested` first,
+/// because the tree the snapshot reads is the one the last frame built.
+fn a11yText(harness: anytype, iface: anytype, storage: []u8) ![]const u8 {
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    var writer = std.Io.Writer.fixed(storage);
+    try native_sdk.automation.snapshot.writeA11yText(
+        harness.runtime.automationSnapshot("settings-modality"),
+        &writer,
+    );
+    return writer.buffered();
+}
+
+/// Window > "Go to Terminal…", as the menu bar delivers it. The keyboard
+/// cannot stand in for this: `handleKey`'s settings gate swallows cmd+
+/// shift+P, which is exactly why the menu path was the one that got through.
+fn openTerminalSwitcherFromMenu(harness: anytype, iface: anytype) !void {
+    try harness.runtime.dispatchPlatformEvent(iface, .{ .menu_command = .{
+        .name = "tabs.palette",
+        .window_id = 1,
+    } });
+}
+
+/// View > Settings, as the menu bar delivers it. The keyboard cannot stand in
+/// for this one either while the palette is up: the palette's gate swallows
+/// cmd+, the same way.
+fn openSettingsFromMenu(harness: anytype, iface: anytype) !void {
+    try harness.runtime.dispatchPlatformEvent(iface, .{ .menu_command = .{
+        .name = "settings.open",
+        .window_id = 1,
+    } });
+}
 
 fn rgb(r: u8, g: u8, b: u8) theme.Rgb {
     return .{ .r = r, .g = g, .b = b };

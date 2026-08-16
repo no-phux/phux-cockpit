@@ -84,7 +84,121 @@ test "every tab is reachable: the window follows the selection past the edge" {
     }
 }
 
+test "a windowed strip accounts for every tab it is not drawing" {
+    var model: app.Model = .{ .provider = undefined };
+
+    // The whole list fits, so there is nothing to account for and the window
+    // is not a window. This half is the negative control for the half below:
+    // a `hiddenAfter` that is zero here and non-zero there is the difference
+    // the strip's edge cue is derived from.
+    model.ws().tab_count = 2;
+    const whole = app.visibleTabWindow(&model, 1600);
+    try testing.expect(!whole.windowed());
+    try testing.expectEqual(@as(usize, 0), whole.hiddenBefore());
+    try testing.expectEqual(@as(usize, 0), whole.hiddenAfter());
+
+    // 16 tabs in the 1100pt default window: this is the case the bug was
+    // reported against, where 7 were drawn and 9 were simply gone.
+    model.ws().tab_count = app.max_tabs;
+    model.ws().selected_tab = 0;
+    const head = app.visibleTabWindow(&model, 1100 - 16);
+    try testing.expect(head.windowed());
+    try testing.expectEqual(@as(usize, 0), head.hiddenBefore());
+    try testing.expectEqual(app.max_tabs - head.count, head.hiddenAfter());
+    try testing.expectEqual(app.max_tabs, head.total);
+
+    // Walking the selection to the end moves the hidden tabs to the OTHER
+    // side, which is why the strip needs a cue at each end rather than one.
+    model.ws().selected_tab = app.max_tabs - 1;
+    const tail = app.visibleTabWindow(&model, 1100 - 16);
+    try testing.expect(tail.hiddenBefore() > 0);
+    try testing.expectEqual(@as(usize, 0), tail.hiddenAfter());
+
+    // And in the middle, both ends hide something at once.
+    model.ws().selected_tab = head.count + 1;
+    const middle = app.visibleTabWindow(&model, 1100 - 16);
+    try testing.expect(middle.hiddenBefore() > 0);
+    try testing.expect(middle.hiddenAfter() > 0);
+
+    // The accounting holds at every selection and every width the app can be:
+    // drawn plus hidden IS the tab count, or the strip is lying about how much
+    // of the list it is showing.
+    for ([_]f32{ 300, 660, 900, 1100, 1920 }) |width| {
+        for (0..app.max_tabs) |index| {
+            model.ws().selected_tab = index;
+            const w = app.visibleTabWindow(&model, width);
+            try testing.expectEqual(app.max_tabs, w.hiddenBefore() + w.count + w.hiddenAfter());
+        }
+    }
+}
+
 // -------------------------------------------------------------- the strip
+
+/// The count a cue announces, read back out of its accessible name.
+///
+/// Parsed rather than reconstructed on purpose: the number a test builds from
+/// the model is the number the model has, and asserting it against itself
+/// proves nothing. This is the number a screen reader would actually be told.
+fn announcedCount(label: []const u8) !usize {
+    const end = std.mem.indexOfScalar(u8, label, ' ') orelse return error.TestUnexpectedResult;
+    return std.fmt.parseInt(usize, label[0..end], 10);
+}
+
+test "a strip that hides tabs says so, and says how many" {
+    // Four tabs is the smallest count that windows inside the 660pt window
+    // below, and four live shells is exactly what the pinned SDK's pty table
+    // holds. A pin with a smaller table cannot reach this state at all.
+    try support.requireLiveShells(4);
+
+    const gpa = testing.allocator;
+    // 660x640, the size the defect was measured at on the real app: a 644pt
+    // band, 424pt of it usable after the trailing reserve, which is three tabs
+    // at the 120pt floor and a fourth with nowhere to go.
+    const narrow = geometry.SizeF.init(660, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = narrow });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+    state.model.ws().surface_size = narrow;
+
+    while (state.model.ws().tab_count < 4) {
+        const before = state.model.ws().tab_count;
+        try state.dispatch(&harness.runtime, 1, .new_terminal);
+        try testing.expect(state.model.ws().tab_count > before);
+    }
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    var labels: [app.max_tabs][]const u8 = undefined;
+    const drawn = tabLabels(harness, &labels);
+    // THE NEGATIVE CONTROL. Every assertion below is about a strip that is
+    // hiding something; if the strip drew all four tabs there would be nothing
+    // to announce and finding no cue would be correct rather than a bug.
+    try testing.expect(drawn < state.model.ws().tab_count);
+    const missing = state.model.ws().tab_count - drawn;
+
+    // The tree has to carry what the strip cannot draw. Before this cue
+    // existed the loop below found nothing: the four-tab, three-drawn strip
+    // published seven widgets in its band and not one of them said the list
+    // went on, so a screen reader was told "Terminal tabs" containing three
+    // tabs and the fourth was not in the tree in any form.
+    var cues: usize = 0;
+    var announced: usize = 0;
+    var reaches_switcher = true;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        const label = node.widget.semantics.label;
+        if (std.mem.indexOf(u8, label, "not shown in the strip") == null) continue;
+        cues += 1;
+        announced += try announcedCount(label);
+        // A cue that names tabs it gives no way to reach has only moved the
+        // problem: the switcher is the escape hatch and the cue is the only
+        // thing that tells anyone it is there.
+        if (std.mem.indexOf(u8, label, "CMD+SHIFT+P") == null) reaches_switcher = false;
+    }
+    try testing.expect(cues >= 1);
+    try testing.expect(reaches_switcher);
+    try testing.expectEqual(missing, announced);
+}
 
 test "the strip shows terminals only and still reaches the web surface" {
     const gpa = testing.allocator;

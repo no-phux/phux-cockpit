@@ -106,6 +106,24 @@ pub const tab_indicator_thickness: f32 = 2;
 /// pane's status, so a full strip never pushes either off the edge.
 pub const tab_strip_trailing_reserve: f32 = 220;
 
+/// One EDGE CUE: the chevron the strip shows at whichever end it is hiding
+/// tabs behind.
+///
+/// `chrome_hit_target`, the same 24 the tab's own close `x` uses, because it is
+/// the same kind of thing — a small ghost icon control riding inside a tab-band
+/// row — and because the cue has to be pressable: it opens the switcher, which
+/// is the only way an AX user who just learned tabs are hidden can reach them.
+///
+/// It is deliberately NOT `chrome_control_extent` (32, the `+`'s rung). The
+/// reserve below is paid twice out of the room the tabs lay out in, and the
+/// difference is a whole tab: at the 660pt window this bug was measured in,
+/// `floor((644 - 220 - 2*(24 + 4)) / 120)` is 3 and the same expression with 32
+/// is 2. A cue that costs a tab to announce a tab is not a trade worth making.
+pub const tab_overflow_cue_extent: f32 = chrome_hit_target;
+
+/// What one cue costs the strip: itself plus the row's own gap before it.
+const tab_overflow_cue_reserve: f32 = tab_overflow_cue_extent + chrome_band_inset;
+
 /// Room at the LEADING edge of the titlebar band for the three traffic
 /// lights, so a strip hosted there starts clear of them.
 ///
@@ -146,12 +164,32 @@ fn titlebarBandHeight(model: *const Model, workspace: *const Workspace) f32 {
 pub const TabWindow = struct {
     first: usize = 0,
     count: usize = 0,
+    /// How many tabs the workspace actually has. Carried rather than left to
+    /// the caller to re-read, because it is what turns this struct from "here
+    /// is a run of tabs" into "here is a run of tabs AND how much of the list
+    /// it is not". The strip cannot draw an honest edge cue without it, and
+    /// every caller that asked the workspace separately was one refactor away
+    /// from asking a different workspace.
+    total: usize = 0,
     /// The width each visible tab lays out at, between `tab_min_extent` and
     /// `tab_extent`.
     extent: f32 = tab_extent,
 
     pub fn contains(window: TabWindow, index: usize) bool {
         return index >= window.first and index < window.first + window.count;
+    }
+
+    /// Whether this run is a WINDOW onto a longer list rather than the list.
+    pub fn windowed(window: TabWindow) bool {
+        return window.count < window.total;
+    }
+
+    pub fn hiddenBefore(window: TabWindow) usize {
+        return window.first;
+    }
+
+    pub fn hiddenAfter(window: TabWindow) usize {
+        return window.total - window.first - window.count;
     }
 };
 
@@ -175,15 +213,33 @@ pub fn visibleTabWindowIn(workspace: *const Workspace, band_width: f32) TabWindo
     // Shrink first, window second. A strip that windowed at full tab width
     // would hide tab 4 in a 900pt window while leaving 200pt of gutter.
     const capacity: usize = @max(1, @as(usize, @intFromFloat(@floor(usable / tab_min_extent))));
-    const shown = @min(capacity, workspace.tab_count);
-    const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(shown)));
-    if (shown == workspace.tab_count) return .{ .first = 0, .count = shown, .extent = extent };
+    if (capacity >= workspace.tab_count) {
+        // Every tab fits. No cue is drawn and none is paid for, which is why
+        // this case has to be decided BEFORE the reserve below: charging a
+        // strip that shows the whole list for an edge cue it will never draw
+        // would shrink tabs for nothing.
+        const extent = @min(tab_extent, usable / @as(f32, @floatFromInt(workspace.tab_count)));
+        return .{ .first = 0, .count = workspace.tab_count, .total = workspace.tab_count, .extent = extent };
+    }
+
+    // From here the strip IS a window onto a longer list, and it says so at
+    // both ends. Room is held for BOTH cues even when only one of them is
+    // drawn — the leading one is absent exactly while `first` is 0 — because
+    // the alternative is that every tab in the strip changes width the moment
+    // the selection walks past the right edge, which is the same "tabs jump
+    // under the pointer" the anchoring rule below exists to avoid. A fixed
+    // reserve also keeps this derivation non-circular: the cue count depends
+    // on `first`, `first` depends on how many tabs fit, and how many fit would
+    // otherwise depend on the cue count.
+    const cued = @max(tab_min_extent, usable - 2 * tab_overflow_cue_reserve);
+    const shown: usize = @max(1, @as(usize, @intFromFloat(@floor(cued / tab_min_extent))));
+    const extent = @min(tab_extent, cued / @as(f32, @floatFromInt(shown)));
     const selected = @min(workspace.selected_tab, workspace.tab_count - 1);
     // Anchor at the left until the selection walks past the right edge, then
     // keep the selection as the LAST visible tab. Recentering on every step
     // would make neighbouring tabs jump under the pointer.
     const first = if (selected < shown) 0 else selected - shown + 1;
-    return .{ .first = first, .count = shown, .extent = extent };
+    return .{ .first = first, .count = shown, .total = workspace.tab_count, .extent = extent };
 }
 
 pub const side_rail_width: f32 = 184;
