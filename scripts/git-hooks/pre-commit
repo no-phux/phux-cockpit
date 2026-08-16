@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Refuse a commit in a worktree that belongs to somebody else.
+#
+# WHY THIS EXISTS. On 2026-08-15 a shared worktree was flipped onto another
+# session's branch three separate times while work was in flight. The damage was
+# not the checkout itself, it was what came after:
+#
+#   - an agent committed onto a branch it did not own, sweeping ~1200 lines of a
+#     neighbour's uncommitted work into its own commit;
+#   - a `git checkout -- . && git clean -fd` run to "restore a clean tree"
+#     destroyed an agent's uncommitted work outright;
+#   - a build ran in a sibling worktree and reported a green exit code that
+#     described somebody else's code.
+#
+# Git has no pre-checkout hook, so a branch switch cannot be blocked. What CAN
+# be blocked is the commit that turns a switch into lost or misattributed work,
+# and that is the expensive half.
+#
+# The claim lives at `git rev-parse --git-path worktree-claim`, which resolves
+# per-worktree and is never tracked, so claiming one worktree cannot affect
+# another. See scripts/worktree-claim.sh.
+set -euo pipefail
+
+claim_file="$(git rev-parse --git-path worktree-claim)"
+[[ -f "$claim_file" ]] || exit 0
+
+owner_branch="$(head -1 "$claim_file" 2>/dev/null || true)"
+[[ -n "$owner_branch" ]] || exit 0
+
+current_branch="$(git branch --show-current 2>/dev/null || true)"
+[[ "$current_branch" != "$owner_branch" ]] || exit 0
+
+worktree="$(git rev-parse --show-toplevel)"
+cat >&2 <<EOF
+
+REFUSING TO COMMIT: this worktree is claimed by another branch.
+
+  worktree:        ${worktree}
+  claimed for:     ${owner_branch}
+  HEAD is now on:  ${current_branch:-<detached>}
+
+Something moved this worktree off the branch it was claimed for. Committing now
+would attribute this work to a branch you do not own, and would sweep up any
+uncommitted changes belonging to whoever claimed it.
+
+If the working tree is dirty, that dirt is very likely somebody else's. Preserve
+it before doing anything else:
+
+  git stash push -u -m "preserved-by-\$(whoami)-\$\$"
+  git stash list --format='%H %gs' | head -1     # record the sha, do not rely on stash@{0}
+
+Then work somewhere of your own:
+
+  git worktree add ../wt-\$\$ -b <your-branch>
+
+Or, if this worktree really is yours and the claim is stale:
+
+  ./scripts/worktree-claim.sh claim          # re-claim for the current branch
+  ./scripts/worktree-claim.sh release        # give it up entirely
+
+EOF
+exit 1
