@@ -1,29 +1,10 @@
 # GUARD settings-save-refusal-is-reported
 #
-# `writeConfigTheme` was documented as "silent at every failure" and it was.
-# Against a config file at mode 0444 the settings panel announced the path it
-# saves to, return applied the theme live, the panel closed, nothing was
-# written, and nothing anywhere said so -- no band, no changed line, no log the
-# user can see. The disagreement between the running app and the file only
-# surfaced at the next launch, as a theme that reverted for no visible reason.
-#
-# The break puts that silence back, and only that. It leaves the model plumbing
-# (`ConfigWrite`, `config_write_refused`, `Settings.config_writable`,
-# `configFileWritable`) in place so the tree still COMPILES -- a break that
-# stops compilation exits non-zero for the wrong reason and proves nothing --
-# and removes the two lines that make the plumbing reach a person: the latch in
-# `persistThemeChoice` and the writability probe in `settings_open`. Every
-# conditional downstream then reads its default, which is exactly the old
-# behaviour: "saves to <path>", unqualified, and no band afterwards.
-#
-# The test fails at the FIRST of the two halves it asserts, the panel line, so
-# a red run names line 379 rather than the latch. The latch half was proved red
-# on its own as well, with the `persistThemeChoice` hunk of this patch applied
-# alone: `config_write_refused` stays false through a commit the file refused.
+# Describe the defect this test exists to catch, and what removing the
+# fix below puts back. Prose here is preserved across re-runs.
 test: a config file that refuses the write is reported, not swallowed
-red: 2026-08-15 at 0c34cc1
 diff --git a/src/cockpit/update.zig b/src/cockpit/update.zig
-index b693658..1b37435 100644
+index a7cf1d7..7166315 100644
 --- a/src/cockpit/update.zig
 +++ b/src/cockpit/update.zig
 @@ -246,11 +246,7 @@ fn writeTopologySnapshot(model: *Model, fx: *Fx) void {
@@ -39,15 +20,11 @@ index b693658..1b37435 100644
  }
  
  /// Re-arm the debounce. Starting a timer key that is already active REPLACES
-@@ -950,11 +946,6 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
-             // Open ON the theme in effect, so the first arrow key is a step
-             // away from where the user is rather than a jump to row zero.
-             workspace.settings.cursor = theme_module.indexOf(model.config.theme.slice()) orelse 0;
--            // Ask the file, ONCE, whether it will take the write this panel is
--            // about to promise. Here rather than per frame because a `view` is
--            // pure and must not touch a disk, and because the answer only has
--            // to be true at the moment the user reads the line.
+@@ -993,7 +989,6 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
+             // about to promise. Here rather than per frame because a `view` is
+             // pure and must not touch a disk, and because the answer only has
+             // to be true at the moment the user reads the line.
 -            workspace.settings.config_writable = model.configFileWritable(model.provider.io);
+             workspace.settings.config_exists = model.configFileExists(model.provider.io);
          },
          .settings_close => {
-             const workspace = model.ws();
