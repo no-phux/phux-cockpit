@@ -452,8 +452,8 @@ fn solveAt(
 // from the band width, but the 78pt traffic-light reserve and the two 8pt gaps
 // around the row were not — so the strip laid out believing it had 94pt more
 // room than it had, and the `+` walked out of its own row and under the badge.
-// Driven live at the app's declared minimum width, five keystrokes from a
-// fresh launch (fill to the shell ceiling, then one more cmd+T):
+// Driven live at the app's declared minimum width after filling the shell
+// table and refusing one more split:
 //
 //   ### width=900  tabs_drawn=4
 //     strip row:    94.0 ..   784.0     (role=group name="Terminal tabs")
@@ -471,11 +471,11 @@ test "the new-tab button stays inside the tab strip and clear of the status" {
     const state = try support.startCockpit(harness);
     defer support.stopCockpit(state);
 
-    // The state five keystrokes reach from a fresh launch. Bounded by the CHORD
-    // count and not by the tab count: cmd+T stops producing tabs at the shell
-    // ceiling, and a loop that waits for a tab it will never get spins forever.
+    // Fill the process-wide table across bounded tabs and panes, then ask for
+    // one more shell through a split (a new tab would stop at max_tabs first).
     try testing.expect(!state.model.terminal_limit_refused);
-    for (0..app.max_tabs) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try support.fillLiveShells(state);
+    try state.dispatch(&harness.runtime, 1, .split_right);
     // Assert-absent, act, assert-present: without this the geometry below would
     // be checked in a state that has no status node at all, and it would pass
     // for the wrong reason forever.

@@ -483,6 +483,32 @@ test "a config file that refuses the write is reported, not swallowed" {
 
 // -------------------------------------------------- the panel stays readable
 
+test "settings can reveal the exact active config file in Finder" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config", .data = "theme = nord\n" });
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/config", .{tmp.sub_path});
+    defer gpa.free(path);
+    state.model.config_file.setPath(path);
+
+    try testing.expectEqualStrings("", harness.null_platform.lastRevealedPath());
+    try state.dispatch(&harness.runtime, 1, .settings_open);
+    try testing.expect(state.model.ws().settings.config_exists);
+    // Native host sends are intentionally inert under the fake executor. The
+    // initial shell is already parked, so switching only for this synchronous
+    // service call exercises the real UiApp binding without spawning work.
+    state.effects.executor = .real;
+    try state.dispatch(&harness.runtime, 1, .settings_reveal_config);
+    try testing.expectEqualStrings(path, harness.null_platform.lastRevealedPath());
+    try testing.expect(state.model.ws().settings.open);
+}
+
 test "the settings surface stays readable when the theme is broken" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
@@ -780,4 +806,3 @@ fn readWholeFile(path: []const u8, storage: []u8) ![]const u8 {
     const read = try file.readPositionalAll(testing.io, storage, 0);
     return storage[0..read];
 }
-

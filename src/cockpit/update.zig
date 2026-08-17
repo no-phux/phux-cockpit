@@ -994,6 +994,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // pure and must not touch a disk, and because the answer only has
             // to be true at the moment the user reads the line.
             workspace.settings.config_writable = model.configFileWritable(model.provider.io);
+            workspace.settings.config_exists = model.configFileExists(model.provider.io);
         },
         .settings_close => {
             const workspace = model.ws();
@@ -1037,6 +1038,12 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             )].name);
             workspace.settings.reset();
             persistThemeChoice(model);
+        },
+        .settings_reveal_config => {
+            const workspace = model.ws();
+            if (!workspace.settings.open or !workspace.settings.config_exists) return;
+            if (!model.config_file.enabled()) return;
+            fx.hostSend("native-sdk.os.revealPath", model.config_file.path());
         },
         .close_tab => |index| closeTab(model, fx, index),
         // "Close Others", from the tab's own menu. Walked from the END so a

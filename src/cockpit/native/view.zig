@@ -375,7 +375,7 @@ fn tabSemantics(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_
     // tab is a broken invariant, and answering it with a plausible-looking
     // number is how the original contradiction stayed invisible for so long.
     const shortcut = if (projection.terminalAddress(model, id)) |at|
-        ui.fmt("CMD+{d}", .{at.tab})
+        if (at.tab <= 5) ui.fmt("CMD+{d}", .{at.tab}) else "not assigned"
     else
         "unavailable";
     const panes_in_tab = if (ws.treeConst(tab_index)) |current| current.paneCount() else 1;
@@ -445,7 +445,7 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
     // The close `x` shows on the SELECTED tab and on whatever the pointer is
     // over. Showing it on every tab turns a strip of names into a strip of
     // buttons; showing it on none makes closing a mouse-only user's problem.
-    const show_close = selected or ws.hovered_tab == tab_index;
+    const show_close = provider_contract.isLocal(id) and (selected or ws.hovered_tab == tab_index);
     const close_node = if (show_close)
         ui.button(.{
             .width = tab_control_extent,
@@ -1362,21 +1362,14 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
         // panel that was on no scale at all.
         ui.list(.{ .gap = 0, .semantics = .{ .label = "Themes" } }, row_slice),
         settingsRule(ui),
-        // Where the choice lands. Said out loud because "it did not persist"
-        // and "it persisted somewhere you are not looking" are the two failure
-        // modes of a settings page, and only one of them is a bug.
-        //
-        // QUALIFIED by whether the file will actually take the write, which
-        // `settings_open` asked before drawing this. The unqualified version
-        // was a promise made blind: against a read-only config it named a path,
-        // the commit then wrote nothing and said nothing, and the theme the
-        // user chose was gone by the next launch. A line that admits the file
-        // is read-only turns that into a decision the user makes with the facts
-        // in front of them.
-        //
-        // The colour moves with it. Muted grey is the register for "here is
-        // where this goes"; this is a warning, and a warning painted like a
-        // footnote is a footnote.
+        ui.row(.{ .width = settings_row_width, .gap = projection.chrome_gap, .cross = .center }, .{
+            ui.text(.{ .wrap = false, .style = .{ .foreground = settings_ink } }, "Configuration"),
+            ui.spacer(1),
+            if (ws.settings.config_exists)
+                settingsAction(ui, "Show in Finder", .settings_reveal_config, false)
+            else
+                ui.el(.stack, .{ .width = 88, .height = projection.chrome_control_extent, .semantics = .{ .hidden = true } }, .{}),
+        }),
         ui.text(.{
             .wrap = false,
             .overflow = .ellipsis,
@@ -1384,12 +1377,18 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
                 settings_fail
             else
                 settings_ink_muted },
+            .semantics = .{ .label = if (model.config_file.enabled())
+                ui.fmt("Active configuration file: {s}", .{model.config_file.path()})
+            else
+                "No configuration file location could be resolved" },
         }, if (!model.config_file.enabled())
-            "no config file location could be resolved, so this run only"
+            "No config location could be resolved; changes apply to this run only."
         else if (!ws.settings.config_writable)
-            ui.fmt("{s} is read-only, so this run only", .{model.config_file.path()})
+            ui.fmt("{s} is read-only; changes apply to this run only.", .{model.config_file.path()})
+        else if (!ws.settings.config_exists)
+            ui.fmt("{s} will be created when you save.", .{model.config_file.path()})
         else
-            ui.fmt("saves to {s}", .{model.config_file.path()})),
+            model.config_file.path()),
         // A pointer path to both verbs. The panel is keyboard-first, but a
         // surface reachable only by keys is one a pointer user cannot finish.
         ui.row(.{ .width = settings_row_width, .gap = projection.chrome_gap, .cross = .center }, .{

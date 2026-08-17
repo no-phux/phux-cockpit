@@ -25,6 +25,10 @@ const typeCanvasText = support.typeCanvasText;
 const pressCanvasKey = support.pressCanvasKey;
 const releaseCanvasKey = support.releaseCanvasKey;
 
+test "the SDK PTY table covers Cockpit's bounded terminal registry" {
+    try testing.expect(local.max_live_shells >= app.max_terminals);
+}
+
 test "a hidden tab's terminal stays live and input and resize follow identity" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });

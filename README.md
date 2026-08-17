@@ -337,7 +337,7 @@ actually looking at.
 - Internet access on the first source build to fetch pinned dependencies
 
 native-sdk is pinned to
-[`phall1/native@cff21978`](https://github.com/phall1/native/commit/cff219789c456715266d64a9785b1588dd0cb77b),
+[`phall1/native@87917c45`](https://github.com/phall1/native/commit/87917c454432de5dd1eceb52d8a55575d5581289),
 the head of that fork's `cockpit/v0.9.0` branch: upstream v0.9.0 plus Cockpit's
 terminal interaction, viewport, and font seams, the packed `cell_grid` canvas
 command with its AppKit decoder and wire format v6, macOS glyph smoothing, the

@@ -1,9 +1,8 @@
 # SDK patches
 
-Changes Cockpit needs in the pinned Native SDK, kept here as patch files until
-someone decides where they land. Nothing in this directory is applied
-automatically: the pin in `build.zig.zon` is a tarball sha, and a patch that
-the build silently applied would make the sha a lie.
+Historical and pending changes Cockpit needs in the Native SDK. Nothing in this
+directory is applied automatically: the pin in `build.zig.zon` is a tarball
+sha, and a patch that the build silently applied would make the sha a lie.
 
 To try one, clone the pinned sha into a sandbox and point the build at it:
 
@@ -21,6 +20,9 @@ git -C .zig-cache/pinned-sdk-patched apply ../../docs/sdk-patches/<name>.patch
 ---
 
 ## raise-pty-ceiling.patch
+
+Landed in `phall1/native@87917c45` and pinned by Cockpit. The patch remains as
+the measured rationale and as a reproducible view of the fork change.
 
 `native_sdk.max_effect_ptys`: **4 -> 32**, plus a comptime budget on what the
 pty table costs inline.

@@ -72,27 +72,11 @@ pub fn activeSlots(model: *app.Model) []app.Pane {
 /// `splitFocusedPane` hands the minted terminal back rather than leaking it,
 /// and sets no latch — so it is safe to use as the probe for "this tab is
 /// full". The caller gets a model with no refusal latched.
-/// Skip a test whose CAPABILITY the pinned SDK does not have yet.
-///
-/// Only two tests need this and both are phux-cockpit-ipg's deliverable: the
-/// window ceiling needs `max_windows` shells and the tab ceiling needs
-/// `max_tabs` of them, and under the SDK's old 4-shell pty table neither was
-/// reachable at all. A skip rather than a hard failure because the branch
-/// carrying the SDK patch (`docs/sdk-patches/raise-pty-ceiling.patch`) cannot
-/// move the pin itself — it can only stop pretending the capability is there.
-///
-/// Both were watched FAILING against the unpatched pin before this existed,
-/// which is the only thing that makes a skip trustworthy:
-///
-///   registry ... : try testing.expect(app.max_tabs <= local.max_live_shells);
-///   sixth window : try testing.expect(local.max_live_shells >= app.max_windows);
-///   355 pass, 5 skip, 2 fail
-///
-/// The condition is comptime-known, so the day the pin moves these arm
-/// themselves with no edit. Nothing else in the suite needs it —
-/// `fillLiveShells` is ceiling-agnostic and its callers pass at either size.
+/// Require the SDK resource table to back the app-owned topology a test needs.
+/// This used to skip under the four-PTY pin, which made the tests disappear at
+/// exactly the capacity regression they were meant to expose.
 pub fn requireLiveShells(needed: usize) !void {
-    if (local.max_live_shells < needed) return error.SkipZigTest;
+    try testing.expect(local.max_live_shells >= needed);
 }
 
 pub fn fillLiveShells(state: *TerminalApp) !void {

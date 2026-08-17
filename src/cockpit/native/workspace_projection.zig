@@ -626,7 +626,9 @@ pub const max_terminal_title_bytes: usize = 96;
 /// tab holds it, and which pane inside that tab. Both 1-based, because both
 /// are read aloud and written on screen rather than used to index anything.
 ///
-/// `tab` is exactly the digit `cmd+N` carries.
+/// `tab` is the displayed one-based position. Tabs 1-5 also carry cmd+N;
+/// later positions remain reachable through the switcher rather than claiming
+/// a shortcut the key handler does not implement.
 pub const TerminalAddress = struct {
     tab: usize,
     pane: usize,

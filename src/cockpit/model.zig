@@ -187,12 +187,17 @@ pub const Settings = struct {
     /// commit remains the only thing that decides whether the bytes landed.
     /// The band that reports THAT is the backstop for the seconds in between.
     config_writable: bool = true,
+    /// Whether the active config path named an existing file when Settings
+    /// opened. A missing target may still be writable, but Finder cannot reveal
+    /// a file that has not been created yet.
+    config_exists: bool = false,
 
     pub fn reset(settings: *Settings) void {
         settings.open = false;
         settings.cursor = 0;
         settings.restore_theme = config_module.ThemeName.init("");
         settings.config_writable = true;
+        settings.config_exists = false;
     }
 };
 
@@ -484,6 +489,7 @@ pub const Workspace = struct {
 
     pub fn dropTab(workspace: *Workspace, index: usize) void {
         if (index >= workspace.tab_count) return;
+        if (index < workspace.selected_tab) workspace.selected_tab -= 1;
         var cursor = index;
         while (cursor + 1 < workspace.tab_count) : (cursor += 1) workspace.tabs[cursor] = workspace.tabs[cursor + 1];
         workspace.tab_count -= 1;
@@ -1360,6 +1366,12 @@ pub const Model = struct {
             error.FileNotFound => return true,
             else => return false,
         };
+        return true;
+    }
+
+    pub fn configFileExists(model: *const Model, io: std.Io) bool {
+        if (!model.config_file.enabled()) return false;
+        std.Io.Dir.cwd().access(io, model.config_file.path(), .{}) catch return false;
         return true;
     }
 };

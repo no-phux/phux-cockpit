@@ -153,14 +153,9 @@ test "a windowed strip accounts for every tab it is not drawing" {
 // GUARD: tab-window-backward-scroll
 test "stepping backward to a tab already on screen does not scroll the strip" {
     const gpa = testing.allocator;
-    // A window narrow enough that four tabs do not fit in it. The defect was
-    // driven at 1100pt with nine tabs and seven drawn, but the harness's pty
-    // table is four (`native_sdk.max_effect_ptys`), so the SAME regime — more
-    // tabs than slots, selection sitting at the right edge — is reached by
-    // making the strip small instead of the tab list long. 600pt of window
-    // leaves room for three tabs once the real shell-limit badge is present,
-    // which
-    // is three tabs at the 120pt floor.
+    // A titlebar strip narrow enough that four tabs do not fit. The behavior
+    // under test is the strip's selection window, so no unrelated failure
+    // badge is needed to manufacture pressure.
     const narrow = geometry.SizeF.init(600, 480);
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = narrow });
     defer harness.destroy(gpa);
@@ -169,16 +164,12 @@ test "stepping backward to a tab already on screen does not scroll the strip" {
     const iface = state.app();
     try support.pumpPaint(harness, iface, app.canvas_label, narrow);
 
-    // Bounded by the chord count, never by the tab count: cmd+T stops
-    // producing tabs at the shell ceiling and the refusal does not latch, so
-    // `while (tab_count < 4)` is an infinite loop on a machine whose pty table
-    // is smaller — the trap that once spun the chrome-register sweep at 100%
-    // CPU for twenty-five minutes. The ceiling is REQUIRED rather than worked
-    // around: the first draft of this test asked for nine shells, got
-    // `SkipZigTest`, and passed against the very bug it was written to catch.
+    // Bounded by the chord count, never by the tab count: a refused terminal
+    // request must never turn a test-driving loop into an infinite loop.
     try support.requireLiveShells(4);
     for (0..3) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
-    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    state.model.ws().chrome_top = 66;
+    try state.dispatch(&harness.runtime, 1, .{ .select_position = 3 });
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
     try testing.expectEqual(@as(usize, 4), state.model.ws().tab_count);
     try testing.expectEqual(@as(usize, 3), state.model.ws().selected_tab);
@@ -548,6 +539,44 @@ test "a tab carries a close affordance and the strip ends in a new-tab button" {
     try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
 }
 
+test "closing an earlier tab preserves the selected terminal" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .{ .select_position = 2 });
+    const selected = state.model.ws().tabTerminal(2).?;
+
+    try state.dispatch(&harness.runtime, 1, .{ .close_tab = 0 });
+    try testing.expectEqual(@as(usize, 1), state.model.ws().selected_tab);
+    try testing.expect(state.model.ws().tabTerminal(state.model.ws().selected_tab).?.eql(selected));
+}
+
+test "a coordinator-owned tab exposes no enabled close affordance" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    const remote = try support.remoteTerminalRef(41);
+    try testing.expect(state.model.admitTab(remote));
+    try testing.expect(state.model.selectTerminal(remote));
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+
+    var closes: usize = 0;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.startsWith(u8, node.widget.semantics.label, "Close ")) closes += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), closes);
+}
+
 test "the new-tab button mints a tab through the same path as cmd+T" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
@@ -716,6 +745,28 @@ test "a tab's number and its shortcut stay one number across a close-then-open" 
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
 
     try expectTabNumbersAgree(harness, 4);
+}
+
+test "tab semantics advertise only shortcuts the key handler implements" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(1600, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    for (0..5) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
+    var labels: [app.max_tabs][]const u8 = undefined;
+    const count = tabLabels(harness, &labels);
+    try testing.expectEqual(@as(usize, 6), count);
+    for (labels[0..5], 0..) |label, index| {
+        const expected = try std.fmt.allocPrint(gpa, "shortcut CMD+{d}", .{index + 1});
+        defer gpa.free(expected);
+        try testing.expect(std.mem.indexOf(u8, label, expected) != null);
+    }
+    try testing.expect(std.mem.indexOf(u8, labels[5], "shortcut CMD+6") == null);
+    try testing.expect(std.mem.indexOf(u8, labels[5], "shortcut not assigned") != null);
 }
 
 // ---------------------------------------------------------------- the bell

@@ -155,6 +155,9 @@ pub const Msg = union(enum) {
     settings_step: i8,
     /// Enter: keep the previewed theme and write it to the config file.
     settings_commit,
+    /// Reveal the existing active config file in Finder. This is deliberately
+    /// not called "edit": the SDK exposes Finder reveal, not editor launch.
+    settings_reveal_config,
     /// A pointer press on a theme row: put the highlight there and preview it,
     /// which is exactly what an arrow key does. The commit stays a separate
     /// gesture so a click cannot write the file by accident.
