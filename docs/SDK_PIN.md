@@ -32,12 +32,13 @@ would have.
 | Build against the pin | `.github/workflows/ci.yml`, every push and PR | Does Cockpit compile and pass against the SDK it claims to use? |
 | Build against the branch head | `.github/workflows/sdk-head.yml`, daily at 07:17 UTC and on dispatch | Has the fork moved somewhere Cockpit cannot follow? |
 | Pin documentation agrees | `scripts/check-sdk-pin.sh`, run first in CI | Does README describe the sha that is actually built? |
-| Glyph weight holds | `scripts/host-raster-check.sh --min-solid 4000`, every push and PR | Does the pinned host still ink text as thickly as it did? |
+| Glyph weight holds | `scripts/host-raster-check.sh --min-solid 4000`, in CI and SDK-head | Does the pinned host and the fork's branch head still ink text as thickly as they did? |
 
-The last one is aimed squarely at a pin bump. Compiling proves the SDK's API did
-not move; it says nothing about what CoreText draws, and no screenshot this repo
-can take is able to see the difference — see docs/RENDER_FIDELITY.md. A bump
-that thins every glyph in the terminal passes the other three checks.
+The last one is aimed squarely at SDK movement. Compiling proves the SDK's API
+did not move; it says nothing about what CoreText draws, and no screenshot this
+repo can take is able to see the difference — see docs/RENDER_FIDELITY.md. A
+branch-head change or pin bump that thins every glyph in the terminal passes
+the other three checks.
 
 CI covers **both** build graphs — the default local-terminal graph and the
 production Phux provider under `-Dphux-enabled=true`. That matters, because
@@ -80,7 +81,16 @@ branch name or full sha is also accepted.
 ./scripts/repoint-sdk.sh --ref f3678832fd282b81241993d0c08105cd5170f39f
 ```
 
-**3. Test BOTH graphs.** Running only the first proves nothing about the
+**3. Check the host rasterizer.** Materialize the newly written pin, then run
+the same glyph-weight floor as CI and SDK-head. The raster check refuses a
+cached checkout that does not match `build.zig.zon`.
+
+```sh
+./scripts/build-automation-cli.sh --checkout-only
+./scripts/host-raster-check.sh --min-solid 4000
+```
+
+**4. Test BOTH graphs.** Running only the first proves nothing about the
 provider, because `-Dphux-enabled` defaults to false.
 
 ```sh
@@ -100,7 +110,7 @@ else:
 zig build test -Dplatform=null > /tmp/t.log 2>&1; echo "exit=$?"
 ```
 
-**4. Build the executable on both graphs.** The tests compile the test root, not
+**5. Build the executable on both graphs.** The tests compile the test root, not
 the AppKit binary, and the platform layer is where an SDK signature change
 lands.
 
@@ -113,14 +123,14 @@ zig build -Dphux-enabled=true \
   --summary all
 ```
 
-**5. Update the documentation, and prove it.** Rewrite the pin paragraph under
+**6. Update the documentation, and prove it.** Rewrite the pin paragraph under
 [Requirements](../README.md#requirements) to the new sha, then:
 
 ```sh
 ./scripts/check-sdk-pin.sh
 ```
 
-**6. Describe the change, not the sha.** The `.zon` comment above `.native_sdk`
+**7. Describe the change, not the sha.** The `.zon` comment above `.native_sdk`
 is this fork's changelog — it is where a future reader learns why the pin is
 where it is. Say what the new commits change for Cockpit.
 
