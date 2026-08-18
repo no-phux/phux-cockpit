@@ -7,8 +7,13 @@ Terminal and TUI-agent workflows are the proving ground, not a disposable
 prototype. Input, rendering, focus, process lifecycle, accessibility, and
 failure recovery must feel native and exceptionally polished.
 
-`libghostty-vt` is the terminal engine. Phux Cockpit owns the product model,
-native interaction, orchestration, and presentation.
+`libghostty-vt` is the terminal engine. Phux Cockpit owns the native command
+surface, client projection model, interaction, and presentation. Phux owns
+durable work identity, execution authority, applied Run policy state, ordered
+evidence, artifacts, and shared attention state. Cockpit may author product and
+formation policy, but Phux records and enforces the selected policy. Durable
+local work uses local Phux; Cockpit's direct local PTY path is explicitly
+ephemeral and never grows a second coordinator.
 
 ## North Star
 
