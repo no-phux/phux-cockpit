@@ -83,7 +83,8 @@ branch name or full sha is also accepted.
 
 **3. Check the host rasterizer.** Materialize the newly written pin, then run
 the same glyph-weight floor as CI and SDK-head. The raster check refuses a
-cached checkout that does not match `build.zig.zon`.
+cached checkout whose commit does not match `build.zig.zon` or whose tracked or
+untracked source is dirty.
 
 ```sh
 ./scripts/build-automation-cli.sh --checkout-only

@@ -226,7 +226,9 @@ This is not a replica. The context creation, the smoothing calls, the CoreText
 draw, the face resolution, the two-pass cell order and the colour space are the
 host's own code. A future SDK bump that changes any of them moves these numbers
 without this repo being touched. `scripts/host-raster-check.sh` refuses to run
-against a checkout at any commit other than the one `build.zig.zon` pins.
+against a checkout at any commit other than the one `build.zig.zon` pins, or
+against that commit with tracked or untracked source changes. Ignored build
+artifacts do not make the checkout dirty.
 
 It needs no window, no focus, no Screen Recording permission, and no running
 app, so it runs in CI.

@@ -73,7 +73,7 @@ jobs:
       # Repointing rewrites build.zig.zon but does not create an SDK source
       # checkout. Materialize that newly-written pin through the same helper as
       # ci.yml, so host-raster-check.sh keeps enforcing its normal refusal to
-      # measure any commit other than the one the app now declares.
+      # measure another commit or a checkout with local source changes.
       - name: Materialize the SDK branch head source
         run: ./scripts/build-automation-cli.sh --checkout-only
       # Compile the branch head's real AppKit host into the headless CoreText
