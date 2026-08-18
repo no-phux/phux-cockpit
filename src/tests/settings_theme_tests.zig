@@ -483,6 +483,7 @@ test "a config file that refuses the write is reported, not swallowed" {
 
 // -------------------------------------------------- the panel stays readable
 
+// GUARD: settings-config-reveal
 test "settings can reveal the exact active config file in Finder" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
