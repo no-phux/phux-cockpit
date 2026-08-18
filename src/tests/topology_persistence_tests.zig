@@ -409,6 +409,40 @@ test "the debounced write carries the live layout and a second one waits for it"
     try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
 }
 
+// GUARD: failed-topology-write-retries
+test "a failed topology write retries without spinning forever" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    state.model.state.setPath(state_path);
+    app.update(&state.model, .new_terminal, &state.effects);
+
+    app.update(&state.model, debounceFired(), &state.effects);
+    try testing.expect(state.model.state.inflight);
+    try testing.expect(!state.model.state.pending);
+
+    // The failed write is still owed, and retrying is delayed through the
+    // existing one-shot timer rather than posted recursively from its result.
+    app.update(&state.model, writeCompleted(.io_failed), &state.effects);
+    try testing.expect(!state.model.state.inflight);
+    try testing.expect(state.model.state.pending);
+    try testing.expect(state.model.state.write_failed);
+    try testing.expectEqual(@as(u8, 1), state.model.state.retry_count);
+    try state.effects.fireTimer(app.topology_persist_timer_key);
+
+    // Three retries are enough to cover transient failures, but a permanently
+    // unwritable path stops with explicit state and no live timer.
+    for (2..5) |failure_count| {
+        app.update(&state.model, writeCompleted(.io_failed), &state.effects);
+        try testing.expectEqual(@as(u8, @intCast(@min(failure_count, 3))), state.model.state.retry_count);
+        if (failure_count <= 3) try state.effects.fireTimer(app.topology_persist_timer_key);
+    }
+    try testing.expect(state.model.state.pending);
+    try testing.expect(state.model.state.write_failed);
+    try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+}
+
 test "the shutdown flush writes through a symlinked parent directory" {
     // The layout has to survive a state path whose PARENT is a symlink to a
     // directory, because that is the ordinary shape of the place people put

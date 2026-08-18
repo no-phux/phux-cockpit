@@ -90,8 +90,15 @@ pub const StatePersistence = struct {
     /// a live key is rejected by the SDK, so one waits rather than racing.
     inflight: bool = false,
     /// The topology moved while that write was in flight, so another is owed
-    /// the moment it lands.
+    /// the moment it lands. A failed write also restores this bit until a
+    /// retry succeeds or a clean shutdown flushes the live state.
     pending: bool = false,
+    /// Consecutive retries for the current topology. Bounded so a permanently
+    /// unwritable destination cannot keep the effect loop busy forever.
+    retry_count: u8 = 0,
+    /// The most recent write did not land. Success clears the latch; exhausting
+    /// retries leaves it explicit even though no further timer is armed.
+    write_failed: bool = false,
 
     pub fn path(state: *const StatePersistence) []const u8 {
         return state.path_storage[0..state.path_len];

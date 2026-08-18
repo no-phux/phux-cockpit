@@ -211,6 +211,10 @@ pub const topology_persist_timer_key: u64 = 200;
 /// shutdown flush covers the window between the last change and this expiry.
 pub const topology_persist_debounce_ms: u64 = 750;
 
+/// A stable topology gets three delayed retries before persistence waits for
+/// another topology change or the synchronous shutdown flush.
+const topology_persist_retry_limit: u8 = 3;
+
 /// Take a snapshot and hand it to the SDK's file writer.
 ///
 /// A LEAF function on purpose: the serialized buffer is `max_state_bytes` of
@@ -326,6 +330,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     if (fingerprint != model.state.fingerprint) {
         model.state.fingerprint = fingerprint;
         model.state.pending = true;
+        model.state.retry_count = 0;
         armTopologyPersist(model, fx);
     }
     const focus_after = remoteFocusTarget(model);
@@ -1136,8 +1141,20 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // here would be posted to a worker and lost to the exit.
             model.writeWorkspaceState(model.provider.io);
         },
-        .topology_persisted => {
+        .topology_persisted => |result| {
             model.state.inflight = false;
+            if (result.outcome == .ok) {
+                model.state.retry_count = 0;
+                model.state.write_failed = false;
+            } else {
+                model.state.pending = true;
+                model.state.write_failed = true;
+                if (model.state.retry_count < topology_persist_retry_limit) {
+                    model.state.retry_count += 1;
+                    armTopologyPersist(model, fx);
+                }
+                return;
+            }
             // The shape moved while the write was out. Re-arm rather than
             // writing immediately: whatever moved it may still be moving.
             if (model.state.pending) armTopologyPersist(model, fx);
