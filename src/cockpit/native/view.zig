@@ -1523,6 +1523,19 @@ fn configWriteNotice(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     }, .{});
 }
 
+/// What an exhausted workspace-state write says. It shares the existing save
+/// notice slot: both are destructive badges about a file that did not land.
+fn topologyWriteNotice(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+    return ui.el(.badge, .{
+        .variant = .destructive,
+        .text = "LAYOUT UNSAVED",
+        .semantics = .{ .label = ui.fmt(
+            "Workspace layout could not be saved: {s} could not be written; changes may be lost if the app exits unexpectedly",
+            .{model.state.path()},
+        ) },
+    }, .{});
+}
+
 fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     return ui.panel(.{
         .width = webkit_parking_extent,
@@ -1605,6 +1618,8 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
         terminalLimitNotice(ui)
     else if (model.config_write_refused)
         configWriteNotice(ui, model)
+    else if (model.state.write_failed)
+        topologyWriteNotice(ui, model)
     else if (focused_ref) |id| paneStatus(ui, model, id) else emptyStatusNode(ui);
 
     const revealed = projection.chromeRevealedIn(model, ws);

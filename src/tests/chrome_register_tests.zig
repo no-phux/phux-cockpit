@@ -354,6 +354,10 @@ test "the chrome survives the layout audit in every state it has" {
     try sweep(state, "the settings panel");
     try support.pressCanvasKey(harness, iface, "escape", .{});
 
+    state.model.state.write_failed = true;
+    try sweep(state, "the exhausted layout-save notice");
+    state.model.state.write_failed = false;
+
     state.model.tab_placement = .side;
     try sweep(state, "the side rail");
 }
@@ -552,16 +556,19 @@ test "the trailing status fits the room the strip holds back" {
         .{ .label = "shell limit", .prefix = "Shell limit reached", .reserve = app.tab_strip_notice_reserve },
         .{ .label = "window limit", .prefix = "Window limit reached", .reserve = app.tab_strip_notice_reserve },
         .{ .label = "theme save failure", .prefix = "Theme could not be saved", .reserve = app.tab_strip_config_notice_reserve },
+        .{ .label = "layout save failure", .prefix = "Workspace layout could not be saved", .reserve = app.tab_strip_config_notice_reserve },
     };
 
     for (notices, 0..) |case, index| {
         state.model.terminal_limit_refused = index == 0;
         state.model.window_limit_refused = index == 1;
         state.model.config_write_refused = index == 2;
+        state.model.state.write_failed = index == 3;
         defer {
             state.model.terminal_limit_refused = false;
             state.model.window_limit_refused = false;
             state.model.config_write_refused = false;
+            state.model.state.write_failed = false;
         }
         for ([_]canvas.Density{ .compact, .regular, .spacious }) |density| {
             const tree = try solveAt(state, arena_bytes, size, density);

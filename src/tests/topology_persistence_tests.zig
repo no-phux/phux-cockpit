@@ -175,6 +175,16 @@ fn writeCompleted(outcome: native_sdk.EffectFileOutcome) app.Msg {
     } };
 }
 
+fn fireTopologyTimer(harness: anytype, state: anytype) !void {
+    try state.effects.fireTimer(app.topology_persist_timer_key);
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+}
+
+fn completeTopologyWrite(harness: anytype, state: anytype, outcome: native_sdk.EffectFileOutcome) !void {
+    try state.effects.feedFileResult(app.topology_state_file_key, outcome, "");
+    try harness.runtime.dispatchPlatformEvent(state.app(), .wake);
+}
+
 const state_path = "/tmp/phux-cockpit-tests/workspace.state";
 
 test "the state file round trips a split workspace, its divider, and its working directories" {
@@ -418,29 +428,69 @@ test "a failed topology write retries without spinning forever" {
     state.model.state.setPath(state_path);
     app.update(&state.model, .new_terminal, &state.effects);
 
-    app.update(&state.model, debounceFired(), &state.effects);
+    try fireTopologyTimer(harness, state);
     try testing.expect(state.model.state.inflight);
     try testing.expect(!state.model.state.pending);
+    try testing.expectEqual(@as(usize, 1), state.effects.pendingFileCount());
 
-    // The failed write is still owed, and retrying is delayed through the
-    // existing one-shot timer rather than posted recursively from its result.
-    app.update(&state.model, writeCompleted(.io_failed), &state.effects);
+    // Move the topology while that snapshot is out. Its failure is stale: it
+    // still makes the current layout owed, but cannot spend the new layout's
+    // retry budget or claim that the current layout has exhausted its writes.
+    app.update(&state.model, .split_right, &state.effects);
+    try completeTopologyWrite(harness, state, .io_failed);
     try testing.expect(!state.model.state.inflight);
     try testing.expect(state.model.state.pending);
-    try testing.expect(state.model.state.write_failed);
-    try testing.expectEqual(@as(u8, 1), state.model.state.retry_count);
-    try state.effects.fireTimer(app.topology_persist_timer_key);
+    try testing.expect(!state.model.state.write_failed);
+    try testing.expectEqual(@as(u8, 0), state.model.state.retry_count);
+    try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
 
-    // Three retries are enough to cover transient failures, but a permanently
-    // unwritable path stops with explicit state and no live timer.
-    for (2..5) |failure_count| {
-        app.update(&state.model, writeCompleted(.io_failed), &state.effects);
-        try testing.expectEqual(@as(u8, @intCast(@min(failure_count, 3))), state.model.state.retry_count);
-        if (failure_count <= 3) try state.effects.fireTimer(app.topology_persist_timer_key);
+    // The delayed retry posts a genuinely new fake file request, carrying the
+    // CURRENT split rather than replaying the stale pre-split bytes.
+    try fireTopologyTimer(harness, state);
+    try testing.expectEqual(@as(usize, 1), state.effects.pendingFileCount());
+    const retry = state.effects.pendingFileAt(0) orelse return error.TestExpectedFileRequest;
+    var parsed: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(retry.bytes, &parsed));
+    try testing.expectEqualDeep(try state.model.topologySnapshot(), try app.migrateTopologySnapshot(parsed));
+
+    // A successful current write retires the debt and clears all failure state.
+    try completeTopologyWrite(harness, state, .ok);
+    try testing.expect(!state.model.state.inflight);
+    try testing.expect(!state.model.state.pending);
+    try testing.expect(!state.model.state.write_failed);
+    try testing.expectEqual(@as(u8, 0), state.model.state.retry_count);
+
+    // A fresh topology gets one initial attempt and exactly three retries.
+    app.update(&state.model, .new_terminal, &state.effects);
+    try fireTopologyTimer(harness, state);
+    for (0..4) |failure_index| {
+        try testing.expectEqual(@as(usize, 1), state.effects.pendingFileCount());
+        try completeTopologyWrite(harness, state, .io_failed);
+        if (failure_index < 3) {
+            try testing.expectEqual(@as(u8, @intCast(failure_index + 1)), state.model.state.retry_count);
+            try testing.expect(!state.model.state.write_failed);
+            try fireTopologyTimer(harness, state);
+        }
     }
     try testing.expect(state.model.state.pending);
     try testing.expect(state.model.state.write_failed);
+    try testing.expectEqual(@as(u8, 3), state.model.state.retry_count);
+    try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
     try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+
+    // Exhaustion is operator-visible even in the normally hidden one-tab
+    // chrome, and accessibility says which file failed rather than exposing a
+    // test-only boolean.
+    try testing.expect(app.chromeRevealed(&state.model));
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+    var saw_badge = false;
+    var saw_accessible_path = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, "LAYOUT UNSAVED")) saw_badge = true;
+        if (std.mem.indexOf(u8, node.widget.semantics.label, state_path) != null) saw_accessible_path = true;
+    }
+    try testing.expect(saw_badge);
+    try testing.expect(saw_accessible_path);
 }
 
 test "the shutdown flush writes through a symlinked parent directory" {

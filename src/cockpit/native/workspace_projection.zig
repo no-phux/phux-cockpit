@@ -143,7 +143,8 @@ pub const tab_indicator_thickness: f32 = 2;
 ///
 ///   "4 SHELL LIMIT"                 96 / 98 / 100    (compact/regular/spacious)
 ///   "5 WINDOW LIMIT"               110 / 112 / 114   <- the notice floor
-///   "THEME NOT SAVED"              125 / 127 / 129   <- the config floor
+///   "THEME NOT SAVED"              125 / 127 / 129   <- the save-notice floor
+///   "LAYOUT UNSAVED"                shorter than that same measured slot
 ///   "FAILED" + Restart             124 / 128 / 131
 ///   "SPAWN FAILED" + Restart       171 / 175 / 178
 ///   "SPAWN REJECTED" + Restart     191 / 195 / 198   <- the pane floor
@@ -273,7 +274,7 @@ pub fn visibleTabWindowIn(model: *const Model, workspace: *const Workspace, band
 /// for a status node that was 0x0).
 pub fn tabStripStatusReserveIn(model: *const Model, workspace: *const Workspace) f32 {
     if (model.window_limit_refused or model.terminal_limit_refused) return tab_strip_notice_reserve;
-    if (model.config_write_refused) return tab_strip_config_notice_reserve;
+    if (model.config_write_refused or model.state.write_failed) return tab_strip_config_notice_reserve;
     const id = workspaceTerminalRef(model, workspace) orelse return 0;
     if (support.providerKind(id) == .phux) return 0;
     const pane = model.provider.terminalConst(id) orelse return 0;
@@ -1017,6 +1018,9 @@ pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     // hidden there is nowhere else for it to appear, and the whole defect this
     // latch exists for is a theme change that reported nothing at all.
     if (model.config_write_refused) return true;
+    // Exhausted topology retries are equally silent without the band, and can
+    // otherwise leave the next unclean launch restoring an older workspace.
+    if (model.state.write_failed) return true;
     if (workspaceTerminalRef(model, workspace) == null) return true;
     for (0..workspace.tab_count) |index| {
         const current = workspace.treeConst(index) orelse continue;

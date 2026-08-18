@@ -225,6 +225,7 @@ fn writeTopologySnapshot(model: *Model, fx: *Fx) void {
     const snapshot = model.topologySnapshot() catch return;
     const encoded = session_state.serialize(&snapshot, &bytes) catch return;
     model.state.inflight = true;
+    model.state.inflight_fingerprint = model.state.fingerprint;
     model.state.pending = false;
     fx.writeFile(.{
         .key = topology_state_file_key,
@@ -1143,15 +1144,25 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         },
         .topology_persisted => |result| {
             model.state.inflight = false;
+            // This result belongs to the snapshot captured when the write was
+            // posted. A topology that moved since then has its own fresh retry
+            // budget; an old failure cannot spend it, nor can an old success
+            // clear a warning owed by newer state.
+            if (model.state.inflight_fingerprint != model.state.fingerprint) {
+                model.state.pending = true;
+                armTopologyPersist(model, fx);
+                return;
+            }
             if (result.outcome == .ok) {
                 model.state.retry_count = 0;
                 model.state.write_failed = false;
             } else {
                 model.state.pending = true;
-                model.state.write_failed = true;
                 if (model.state.retry_count < topology_persist_retry_limit) {
                     model.state.retry_count += 1;
                     armTopologyPersist(model, fx);
+                } else {
+                    model.state.write_failed = true;
                 }
                 return;
             }
