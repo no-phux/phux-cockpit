@@ -751,6 +751,7 @@ test "a tab's number and its shortcut stay one number across a close-then-open" 
     try expectTabNumbersAgree(harness, 4);
 }
 
+// GUARD: tab-shortcut-semantics
 test "tab semantics advertise only shortcuts the key handler implements" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(1600, 640) });
