@@ -568,6 +568,8 @@ test "a coordinator-owned tab exposes no enabled close affordance" {
     const iface = state.app();
 
     const remote = try support.remoteTerminalRef(41);
+    try testing.expect(!app.tabCanClose(remote));
+    try testing.expect(app.tabCanClose(app.localTerminalRef(.terminal_1)));
     try testing.expect(state.model.admitTab(remote));
     try testing.expect(state.model.selectTerminal(remote));
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);

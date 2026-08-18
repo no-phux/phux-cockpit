@@ -206,6 +206,7 @@ pub const chromeTextWidth = projection.chromeTextWidth;
 pub const elideTitleMiddleInto = projection.elideTitleMiddleInto;
 pub const max_painted_title_bytes = projection.max_painted_title_bytes;
 pub const TabLabelIdentity = projection.TabLabelIdentity;
+pub const tabCanClose = projection.tabCanClose;
 pub const tabLabelIdentityIn = projection.tabLabelIdentityIn;
 pub const pane_dim_command_id_base = view_module.pane_dim_command_id_base;
 pub const pane_focus_command_id_base = view_module.pane_focus_command_id_base;

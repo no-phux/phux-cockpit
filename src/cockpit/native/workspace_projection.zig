@@ -622,6 +622,13 @@ fn paneNeedsAttention(model: *const Model, pane: *const Pane) bool {
 /// off a screen.
 pub const max_terminal_title_bytes: usize = 96;
 
+/// Whether Cockpit owns the lifetime behind a tab's close action. A Phux
+/// terminal belongs to its coordinator, so presenting an enabled local close
+/// verb would be an action that can only silently do nothing.
+pub fn tabCanClose(id: TerminalRef) bool {
+    return provider_contract.isLocal(id);
+}
+
 /// Where a terminal LIVES, in the only coordinates anyone can act on: which
 /// tab holds it, and which pane inside that tab. Both 1-based, because both
 /// are read aloud and written on screen rather than used to index anything.

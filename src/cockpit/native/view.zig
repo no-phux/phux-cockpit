@@ -445,7 +445,7 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
     // The close `x` shows on the SELECTED tab and on whatever the pointer is
     // over. Showing it on every tab turns a strip of names into a strip of
     // buttons; showing it on none makes closing a mouse-only user's problem.
-    const show_close = provider_contract.isLocal(id) and (selected or ws.hovered_tab == tab_index);
+    const show_close = projection.tabCanClose(id) and (selected or ws.hovered_tab == tab_index);
     const close_node = if (show_close)
         ui.button(.{
             .width = tab_control_extent,
@@ -487,7 +487,7 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
             // A Phux terminal's lifetime belongs to its coordinator, exactly
             // as it does for cmd+W: an item that looks live and does nothing
             // is worse than one that says it cannot.
-            .enabled = provider_contract.isLocal(id),
+            .enabled = projection.tabCanClose(id),
         },
         .{
             .label = "Close Others",
