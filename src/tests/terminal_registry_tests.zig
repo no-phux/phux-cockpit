@@ -25,6 +25,7 @@ const typeCanvasText = support.typeCanvasText;
 const pressCanvasKey = support.pressCanvasKey;
 const releaseCanvasKey = support.releaseCanvasKey;
 
+// GUARD: sdk-pty-capacity
 test "the SDK PTY table covers Cockpit's bounded terminal registry" {
     try testing.expect(local.max_live_shells >= app.max_terminals);
 }
