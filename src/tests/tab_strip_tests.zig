@@ -539,6 +539,7 @@ test "a tab carries a close affordance and the strip ends in a new-tab button" {
     try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
 }
 
+// GUARD: tab-close-preserves-selection
 test "closing an earlier tab preserves the selected terminal" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
