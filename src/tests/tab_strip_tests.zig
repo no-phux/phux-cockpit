@@ -558,6 +558,7 @@ test "closing an earlier tab preserves the selected terminal" {
     try testing.expect(state.model.ws().tabTerminal(state.model.ws().selected_tab).?.eql(selected));
 }
 
+// GUARD: remote-tab-close-affordance
 test "a coordinator-owned tab exposes no enabled close affordance" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
