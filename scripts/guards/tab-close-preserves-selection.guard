@@ -11,7 +11,7 @@ index 9253b0b..67dd79c 100644
 --- a/src/cockpit/model.zig
 +++ b/src/cockpit/model.zig
 @@ -489,7 +489,6 @@ pub const Workspace = struct {
- 
+
      pub fn dropTab(workspace: *Workspace, index: usize) void {
          if (index >= workspace.tab_count) return;
 -        if (index < workspace.selected_tab) workspace.selected_tab -= 1;
