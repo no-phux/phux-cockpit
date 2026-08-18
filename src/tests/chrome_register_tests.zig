@@ -555,8 +555,8 @@ test "the trailing status fits the room the strip holds back" {
     const notices = [_]Case{
         .{ .label = "shell limit", .prefix = "Shell limit reached", .reserve = app.tab_strip_notice_reserve },
         .{ .label = "window limit", .prefix = "Window limit reached", .reserve = app.tab_strip_notice_reserve },
-        .{ .label = "theme save failure", .prefix = "Theme could not be saved", .reserve = app.tab_strip_config_notice_reserve },
-        .{ .label = "layout save failure", .prefix = "Workspace layout could not be saved", .reserve = app.tab_strip_config_notice_reserve },
+        .{ .label = "theme save failure", .prefix = "Theme could not be saved", .reserve = app.tab_strip_save_notice_reserve },
+        .{ .label = "layout save failure", .prefix = "Workspace layout could not be saved", .reserve = app.tab_strip_save_notice_reserve },
     };
 
     for (notices, 0..) |case, index| {
