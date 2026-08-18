@@ -566,17 +566,6 @@ pub fn build(b: *std.Build) void {
     addImportToArtifacts(artifacts, "test_options", test_options.createModule());
 
     addProviderContractModules(b, artifacts);
-    const sdk_root = b.sysroot orelse @panic("macOS SDK sysroot is required for system SQLite");
-    // Zig 0.16's linkSystemLibrary emits -lsqlite3 here without an SDK library
-    // search path; link the sysroot stub directly until that graph is fixed.
-    const sqlite_stub: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk_root, "usr/lib/libsqlite3.tbd" }) };
-    const sdk_headers: std.Build.LazyPath = .{ .cwd_relative = b.pathJoin(&.{ sdk_root, "usr/include" }) };
-    app_module.addSystemIncludePath(sdk_headers);
-    app_module.addObjectFile(sqlite_stub);
-    if (artifacts.tests.root_module != app_module) {
-        artifacts.tests.root_module.addSystemIncludePath(sdk_headers);
-        artifacts.tests.root_module.addObjectFile(sqlite_stub);
-    }
     if (phux_enabled) addPhuxModules(b, artifacts, ffi.?);
 
     const ghostty = b.dependency("ghostty", .{

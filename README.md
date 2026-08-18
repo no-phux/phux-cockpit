@@ -9,10 +9,24 @@ TUI-agent work. Its stable execution and interaction primitives grow into a
 native control environment for large-scale directed machine work. See
 [Product Direction](docs/PRODUCT_DIRECTION.md).
 
+## Authority boundary
+
+Cockpit is a native command surface and projection client. Phux owns durable
+work identity, execution authority, applied Run policy state, ordered evidence,
+artifacts, and shared attention state. Cockpit owns product policy, windows,
+tabs, splits, focus, input routing, rendering, accessibility, and other
+presentation state.
+
+The direct local provider remains an intentionally ephemeral terminal path: its
+process and emulator live inside the app and end with it. Durable local work
+uses a local Phux coordinator. Cockpit does not maintain a second authoritative
+work database, artifact store, or process-owning daemon. See
+[Durable Work Architecture](docs/DURABLE_WORK_ARCHITECTURE.md).
+
 ## Spatial runtime
 
 - Cockpit launches with **one terminal** and one shell process, up to 32. Each
-  has a durable terminal ID and owns its own PTY, emulator, scrollback,
+  has a stable in-process terminal ID and owns its own PTY, emulator, scrollback,
   selection, input queue, and retained-rendering namespace. Tab order and
   visible placement do not own execution.
 - **A tab owns a pane tree**, not a terminal. A leaf is a terminal; a branch

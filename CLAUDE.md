@@ -2,6 +2,17 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## Product Boundary
+
+Cockpit owns the native command surface, client projection model, interaction,
+and presentation. Phux owns durable work identity, execution authority, applied
+Run policy state, ordered evidence, artifacts, and shared attention state.
+Cockpit may author product and formation policy, but Phux records and enforces
+the selected policy. Durable local work uses local Phux; Cockpit's direct local
+PTY path is explicitly ephemeral and never grows a second coordinator. Read
+`docs/PRODUCT_DIRECTION.md` and `docs/DURABLE_WORK_ARCHITECTURE.md` before
+changing identity or orchestration.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 
