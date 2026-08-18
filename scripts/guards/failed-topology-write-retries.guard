@@ -1,0 +1,34 @@
+# GUARD failed-topology-write-retries
+#
+# A debounced topology write cleared pending when it started, then discarded
+# the terminal file outcome. Removing the fix below restores that completion
+# arm, so an IO failure leaves no save owed, no retry timer, and no failure
+# state even though the live topology never reached disk.
+test: a failed topology write retries without spinning forever
+red: 2026-08-18 at 163b13a
+diff --git a/src/cockpit/update.zig b/src/cockpit/update.zig
+index 67ad750..89cb5fc 100644
+--- a/src/cockpit/update.zig
++++ b/src/cockpit/update.zig
+@@ -1141,20 +1141,8 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
+             // here would be posted to a worker and lost to the exit.
+             model.writeWorkspaceState(model.provider.io);
+         },
+-        .topology_persisted => |result| {
++        .topology_persisted => {
+             model.state.inflight = false;
+-            if (result.outcome == .ok) {
+-                model.state.retry_count = 0;
+-                model.state.write_failed = false;
+-            } else {
+-                model.state.pending = true;
+-                model.state.write_failed = true;
+-                if (model.state.retry_count < topology_persist_retry_limit) {
+-                    model.state.retry_count += 1;
+-                    armTopologyPersist(model, fx);
+-                }
+-                return;
+-            }
+             // The shape moved while the write was out. Re-arm rather than
+             // writing immediately: whatever moved it may still be moving.
+             if (model.state.pending) armTopologyPersist(model, fx);
