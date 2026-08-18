@@ -15,7 +15,9 @@ pub const enabled = true;
 pub const max_terminals: usize = 16;
 pub const max_notices: usize = 64;
 pub const max_search_results: usize = 256;
+pub const max_sessions: usize = 256;
 pub const max_title_bytes: usize = 4096;
+pub const max_session_name_bytes: usize = 4096;
 pub const max_notice_bytes: usize = 64 * 1024;
 /// Admission is bounded independently from one frame's text budget. The
 /// painter degrades rows atomically; the provider retains the complete valid
@@ -43,6 +45,18 @@ pub const Notice = struct {
     terminal_ref: provider.TerminalRef,
     generation: provider.Generation,
     bytes: []u8,
+};
+pub const SessionSummary = struct {
+    id: u32,
+    name: []u8,
+    created_at_unix_secs: i64,
+    window_count: u16,
+    attached_client_count: u16,
+    focused: bool,
+
+    fn deinit(session: *SessionSummary, gpa: std.mem.Allocator) void {
+        gpa.free(session.name);
+    }
 };
 pub const Error = error{
     InvalidState,
@@ -126,6 +140,7 @@ pub const Host = struct {
     client: *c.PhuxClient,
     bridge: *transport.Bridge,
     terminals: std.ArrayListUnmanaged(Terminal) = .empty,
+    sessions: std.ArrayListUnmanaged(SessionSummary) = .empty,
     search_results: std.ArrayListUnmanaged(SearchResult) = .empty,
     search_owner: ?provider.ReplicaOwner = null,
     notices: std.ArrayListUnmanaged(Notice) = .empty,
@@ -143,6 +158,8 @@ pub const Host = struct {
         host.clearSearchResults(null);
         for (host.terminals.items) |*terminal| terminal.deinit(host.gpa);
         host.terminals.deinit(host.gpa);
+        host.clearSessions();
+        host.sessions.deinit(host.gpa);
         for (host.notices.items) |notice| host.gpa.free(notice.bytes);
         host.notices.deinit(host.gpa);
         host.search_results.deinit(host.gpa);
@@ -169,13 +186,22 @@ pub const Host = struct {
 
     pub fn attach(host: *Host, session: []const u8, viewport: provider.Viewport) !void {
         try outboundSize(session.len);
+        try host.queueAttach(c.PHUX_ATTACH_CREATE_IF_MISSING, 0, session, viewport);
+    }
+
+    pub fn attachSessionId(host: *Host, session_id: u32, viewport: provider.Viewport) !void {
+        if (session_id == 0) return error.InvalidIdentity;
+        try host.queueAttach(c.PHUX_ATTACH_BY_ID, session_id, &.{}, viewport);
+    }
+
+    fn queueAttach(host: *Host, target_kind: u32, session_id: u32, name: []const u8, viewport: provider.Viewport) !void {
         const options: c.PhuxAttachOptions = .{
             .size = @sizeOf(c.PhuxAttachOptions),
             .version = c.PHUX_CLIENT_ABI_VERSION,
             .attach_id = 1,
-            .target_kind = c.PHUX_ATTACH_CREATE_IF_MISSING,
-            .session_id = 0,
-            .name = bytes(session),
+            .target_kind = target_kind,
+            .session_id = session_id,
+            .name = bytes(name),
             .cols = viewport.cols,
             .rows = viewport.rows,
             .has_pixel_size = viewport.pixels != null,
@@ -228,6 +254,7 @@ pub const Host = struct {
             defer host.bridge.incoming.release(frame);
             try resultError(c.phux_client_feed_frame(host.client, frame.ptr, frame.len));
         }
+        if (host.state() == .attached and !host.attach_barrier_seen) try host.refreshSessions();
         try host.captureEffects();
         delta.detached = host.state() == .detached;
         if (host.state() == .attached and !host.attach_barrier_seen) {
@@ -251,6 +278,10 @@ pub const Host = struct {
             count += 1;
         }
         return @min(count, out.len);
+    }
+
+    pub fn sessionCatalog(host: *const Host) []const SessionSummary {
+        return host.sessions.items;
     }
 
     pub fn contains(host: *const Host, terminal_ref: provider.TerminalRef) bool {
@@ -480,6 +511,36 @@ pub const Host = struct {
             try host.publishDirty(&ignored);
         }
         try host.stageOutgoing();
+    }
+
+    fn refreshSessions(host: *Host) !void {
+        const count = c.phux_client_session_count(host.client);
+        if (count > max_sessions) return error.Protocol;
+
+        var next: std.ArrayListUnmanaged(SessionSummary) = .empty;
+        errdefer {
+            for (next.items) |*session| session.deinit(host.gpa);
+            next.deinit(host.gpa);
+        }
+        try next.ensureTotalCapacity(host.gpa, count);
+        for (0..count) |index| {
+            var raw: c.PhuxSessionInfo = undefined;
+            try resultError(c.phux_client_session_get(host.client, index, &raw));
+            const session = try copySessionSummary(host.gpa, raw);
+            next.append(host.gpa, session) catch {
+                var owned = session;
+                owned.deinit(host.gpa);
+                return error.OutOfMemory;
+            };
+        }
+        host.clearSessions();
+        host.sessions.deinit(host.gpa);
+        host.sessions = next;
+    }
+
+    fn clearSessions(host: *Host) void {
+        for (host.sessions.items) |*session| session.deinit(host.gpa);
+        host.sessions.items.len = 0;
     }
 
     fn captureEffects(host: *Host) !void {
@@ -780,6 +841,20 @@ fn outboundSize(len: usize) !void {
     if (len > c.PHUX_CLIENT_MAX_OUTBOUND_BYTES) return error.InvalidState;
 }
 
+fn copySessionSummary(gpa: std.mem.Allocator, raw: c.PhuxSessionInfo) !SessionSummary {
+    const name = try effectSlice(raw.name);
+    if (raw.session_id == 0 or name.len > max_session_name_bytes) return error.Protocol;
+    _ = std.unicode.Utf8View.init(name) catch return error.Protocol;
+    return .{
+        .id = raw.session_id,
+        .name = gpa.dupe(u8, name) catch return error.OutOfMemory,
+        .created_at_unix_secs = raw.created_at_unix_secs,
+        .window_count = raw.window_count,
+        .attached_client_count = raw.attached_client_count,
+        .focused = raw.focused,
+    };
+}
+
 test "contains hides terminals until their canvas is published" {
     var bridge = transport.Bridge.init(std.testing.allocator);
     defer bridge.deinit();
@@ -793,6 +868,37 @@ test "contains hides terminals until their canvas is published" {
     try std.testing.expect(!host.contains(terminal_ref));
     host.terminals.items[0].published = true;
     try std.testing.expect(host.contains(terminal_ref));
+}
+
+test "session summaries copy every server field and own their names" {
+    var source = [_]u8{ 'b', 'u', 'i', 'l', 'd' };
+    var summary = try copySessionSummary(std.testing.allocator, .{
+        .session_id = 17,
+        .name = bytes(&source),
+        .created_at_unix_secs = 1234,
+        .window_count = 3,
+        .attached_client_count = 2,
+        .focused = true,
+    });
+    defer summary.deinit(std.testing.allocator);
+
+    source[0] = 'x';
+    try std.testing.expectEqual(@as(u32, 17), summary.id);
+    try std.testing.expectEqualStrings("build", summary.name);
+    try std.testing.expectEqual(@as(i64, 1234), summary.created_at_unix_secs);
+    try std.testing.expectEqual(@as(u16, 3), summary.window_count);
+    try std.testing.expectEqual(@as(u16, 2), summary.attached_client_count);
+    try std.testing.expect(summary.focused);
+
+    var invalid_utf8 = [_]u8{0xff};
+    try std.testing.expectError(error.Protocol, copySessionSummary(std.testing.allocator, .{
+        .session_id = 18,
+        .name = bytes(&invalid_utf8),
+        .created_at_unix_secs = 0,
+        .window_count = 0,
+        .attached_client_count = 0,
+        .focused = false,
+    }));
 }
 
 test "grid damage freezes a published canvas until replacement copy" {

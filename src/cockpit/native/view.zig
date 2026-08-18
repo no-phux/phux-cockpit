@@ -48,6 +48,14 @@ const workspaceChrome = projection.workspaceChrome;
 const resolvePanes = projection.resolvePanes;
 const terminalNeedsAttention = projection.terminalNeedsAttention;
 const paneLifecycleFailed = projection.paneLifecycleFailed;
+
+const PaletteRow = struct {
+    label: []const u8,
+    detail: []const u8,
+    on_press: Msg,
+    semantics: []const u8,
+    terminal: ?TerminalRef,
+};
 const paneHasConfirmedLoss = projection.paneHasConfirmedLoss;
 const selectedTerminalCanClose = projection.selectedTerminalCanClose;
 const paneReportsMouse = pointer_input.paneReportsMouse;
@@ -1034,8 +1042,8 @@ fn configNoticeBand(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignT
 /// churn this round set out to remove. So it is drawn as an overlay in a
 /// `.stack` above the panes, and `workspaceChrome` never hears about it.
 fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens: canvas.DesignTokens) TerminalUi.Node {
-    var rows: [max_tabs]usize = undefined;
-    const count = projection.paletteRowsIn(model, ws, &rows);
+    var rows: [projection.palette_max_entries]projection.PaletteEntry = undefined;
+    const count = projection.paletteEntriesIn(model, ws, &rows);
     const needle = ws.palette.needle();
     const cursor = if (count == 0) 0 else @min(ws.palette.cursor, count - 1);
     // Which of the matches this panel is tall enough to DRAW. The match set
@@ -1047,13 +1055,54 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
     const window = projection.paletteWindowFor(count, cursor);
 
     var row_nodes: [projection.palette_max_visible_rows]TerminalUi.Node = undefined;
-    for (rows[window.first..][0..window.count], 0..) |tab_index, offset| {
-        const id = ws.tabTerminal(tab_index) orelse {
-            row_nodes[offset] = ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
-            continue;
-        };
+    for (rows[window.first..][0..window.count], 0..) |entry, offset| {
         const highlighted = window.first + offset == cursor;
-        const title = terminalTitle(ui, model, id);
+        const row: PaletteRow = switch (entry) {
+            .tab => |tab_index| blk: {
+                const id = ws.tabTerminal(tab_index) orelse {
+                    row_nodes[offset] = ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
+                    continue;
+                };
+                const title = terminalTitle(ui, model, id);
+                break :blk .{
+                    .label = title,
+                    .detail = if (tab_index < 5) ui.fmt("CMD+{d}", .{tab_index + 1}) else "TERMINAL",
+                    .on_press = Msg{ .select_position = @intCast(tab_index) },
+                    .semantics = ui.fmt("{s}, terminal {d} of {d}{s}", .{
+                        title,
+                        tab_index + 1,
+                        ws.tab_count,
+                        if (highlighted) ", highlighted" else "",
+                    }),
+                    .terminal = @as(?TerminalRef, id),
+                };
+            },
+            .session => |session_index| blk: {
+                const remote = model.phuxConst() orelse continue;
+                const catalog = remote.sessionCatalog();
+                if (session_index >= catalog.len) continue;
+                const session = catalog[session_index];
+                const selected = remote.selectedSessionId() == session.id;
+                break :blk .{
+                    .label = ui.fmt("{s}", .{session.name}),
+                    .detail = ui.fmt("PHUX / {d} WIN / {d} CLIENT{s}", .{
+                        session.window_count,
+                        session.attached_client_count,
+                        if (selected) " / CURRENT" else "",
+                    }),
+                    .on_press = Msg{ .palette_select_session = session.id },
+                    .semantics = ui.fmt("{s}, Phux session {d}, {d} windows, {d} attached clients{s}{s}", .{
+                        session.name,
+                        session.id,
+                        session.window_count,
+                        session.attached_client_count,
+                        if (selected) ", current" else "",
+                        if (highlighted) ", highlighted" else "",
+                    }),
+                    .terminal = @as(?TerminalRef, null),
+                };
+            },
+        };
         row_nodes[offset] = ui.el(.list_item, .{
             // Explicit, and both levels of it. A `grow` inside a container
             // that was never told how wide it is has nothing to grow against,
@@ -1062,16 +1111,11 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
             .width = palette_row_width,
             .height = palette_row_height,
             .selected = highlighted,
-            .on_press = .{ .select_position = @intCast(tab_index) },
+            .on_press = row.on_press,
             .style = .{ .background = if (highlighted) tokens.colors.surface_pressed else tokens.colors.surface },
             .semantics = .{
-                .role = .tab,
-                .label = ui.fmt("{s}, terminal {d} of {d}{s}", .{
-                    title,
-                    tab_index + 1,
-                    ws.tab_count,
-                    if (highlighted) ", highlighted" else "",
-                }),
+                .role = if (row.terminal != null) .tab else .button,
+                .label = row.semantics,
             },
         }, .{
             ui.row(.{ .width = palette_row_width, .height = palette_row_height, .cross = .center }, .{
@@ -1088,20 +1132,17 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
                     .style = .{ .background = if (highlighted) tokens.colors.accent else tokens.colors.surface },
                 }, .{}),
                 ui.row(.{ .grow = 1, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
-                    tabAttentionMarker(ui, model, id, tokens),
+                    if (row.terminal) |id| tabAttentionMarker(ui, model, id, tokens) else ui.spacer(projection.chrome_icon_extent),
                     ui.text(.{
                         .grow = 1,
                         .wrap = false,
                         .overflow = .ellipsis,
                         .style = .{ .foreground = if (highlighted) tokens.colors.text else tokens.colors.text_muted },
-                    }, title),
-                    // The chord that also reaches this tab, for the first five.
-                    // Past five there is no chord, and the row says nothing rather
-                    // than naming one that does not exist.
+                    }, row.label),
                     ui.text(.{
                         .wrap = false,
                         .style = .{ .foreground = tokens.colors.text_muted },
-                    }, if (tab_index < 5) ui.fmt("CMD+{d}", .{tab_index + 1}) else ""),
+                    }, row.detail),
                 }),
             }),
         });
@@ -1109,10 +1150,10 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
 
     const body = if (count == 0)
         ui.el(.stack, .{ .height = palette_row_height, .padding = projection.chrome_gap }, .{
-            ui.text(.{ .style = .{ .foreground = tokens.colors.warning } }, "No terminal matches"),
+            ui.text(.{ .style = .{ .foreground = tokens.colors.warning } }, "No destination matches"),
         })
     else
-        ui.list(.{ .gap = projection.chrome_band_inset, .semantics = .{ .label = "Matching terminals" } }, row_nodes[0..window.count]);
+        ui.list(.{ .gap = projection.chrome_band_inset, .semantics = .{ .label = "Matching destinations" } }, row_nodes[0..window.count]);
 
     return ui.column(.{
         .width = palette_width,
@@ -1120,10 +1161,9 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
         .padding = palette_padding,
         .style = .{ .background = tokens.colors.surface },
         .semantics = .{
-            .label = ui.fmt("Go to terminal, {s}, {d} of {d} matching", .{
+            .label = ui.fmt("Go to terminal or Phux session, {s}, {d} matching", .{
                 if (needle.len == 0) "type to filter" else needle,
                 count,
-                ws.tab_count,
             }),
         },
     }, .{
@@ -1140,7 +1180,7 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
                 .wrap = false,
                 .overflow = .ellipsis,
                 .style = .{ .foreground = if (needle.len == 0) tokens.colors.text_muted else tokens.colors.text },
-            }, if (needle.len == 0) "Go to terminal…" else needle),
+            }, if (needle.len == 0) "Go to terminal or Phux session…" else needle),
             ui.el(.stack, .{
                 .width = field_caret_width,
                 .height = field_caret_height,

@@ -8,6 +8,7 @@ const transport = @import("phux_transport");
 const extension = @import("phux_extension");
 
 pub const enabled = true;
+pub const max_sessions = host_mod.max_sessions;
 pub const Endpoint = extension.Endpoint;
 pub const State = host_mod.State;
 pub const SyncDelta = host_mod.SyncDelta;
@@ -16,6 +17,7 @@ pub const DocumentPoint = host_mod.DocumentPoint;
 pub const Anchor = host_mod.Anchor;
 pub const SearchResult = host_mod.SearchResult;
 pub const Notice = host_mod.Notice;
+pub const SessionSummary = host_mod.SessionSummary;
 pub const Error = host_mod.Error;
 
 const OwnedEndpoint = union(enum) {
@@ -50,6 +52,7 @@ pub const PhuxProvider = struct {
     worker: ?*extension.Worker = null,
     endpoint: OwnedEndpoint,
     session: []u8,
+    session_id: ?u32 = null,
     client_name: []u8,
     attach_viewport: provider.Viewport = .{ .cols = 80, .rows = 24 },
     attach_queued: bool = false,
@@ -99,6 +102,25 @@ pub const PhuxProvider = struct {
     /// Preserve provider identity, terminal order, and the last complete canvas
     /// while replacing only the generation-bound client and socket worker.
     pub fn reconnect(self: *PhuxProvider, handle: native_sdk.ChannelHandle) !void {
+        try self.restartConnection(handle);
+    }
+
+    pub fn selectSession(self: *PhuxProvider, session_id: u32) !bool {
+        if (session_id == 0) return error.InvalidIdentity;
+        var found = false;
+        for (self.host.sessionCatalog()) |session| {
+            if (session.id == session_id) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return error.InvalidIdentity;
+        if (self.selectedSessionId() == session_id or self.session_id == session_id) return false;
+        self.session_id = session_id;
+        return true;
+    }
+
+    fn restartConnection(self: *PhuxProvider, handle: native_sdk.ChannelHandle) !void {
         self.host.freezePublished();
         errdefer self.host.freezePublished();
         if (self.worker) |worker| worker.stop();
@@ -119,8 +141,19 @@ pub const PhuxProvider = struct {
             return delta;
         }
         if (!self.attach_queued and self.host.state() == .negotiated) {
-            try self.host.attach(self.session, self.attach_viewport);
+            if (self.session_id) |session_id|
+                try self.host.attachSessionId(session_id, self.attach_viewport)
+            else
+                try self.host.attach(self.session, self.attach_viewport);
             self.attach_queued = true;
+        }
+        if (self.host.state() == .attached and self.session_id == null) {
+            for (self.host.sessionCatalog()) |session| {
+                if (session.focused) {
+                    self.session_id = session.id;
+                    break;
+                }
+            }
         }
         return delta;
     }
@@ -131,6 +164,13 @@ pub const PhuxProvider = struct {
 
     pub fn terminalRefs(self: *const PhuxProvider, out: []provider.TerminalRef) usize {
         return self.host.terminalRefs(out);
+    }
+    pub fn sessionCatalog(self: *const PhuxProvider) []const SessionSummary {
+        return self.host.sessionCatalog();
+    }
+    pub fn selectedSessionId(self: *const PhuxProvider) ?u32 {
+        for (self.host.sessionCatalog()) |session| if (session.focused) return session.id;
+        return null;
     }
     pub fn contains(self: *const PhuxProvider, terminal_ref: provider.TerminalRef) bool {
         return self.host.contains(terminal_ref);
@@ -227,6 +267,43 @@ test "reconnect allocation failure after queue reset leaves old generation froze
     const presentation_value = self.presentation(terminal_ref);
     try std.testing.expect(presentation_value != null);
     try std.testing.expectEqual(provider.Phase.frozen, presentation_value.?.phase);
+}
+
+test "session selection accepts only server-advertised stable ids" {
+    const self = try PhuxProvider.create(
+        std.testing.allocator,
+        std.testing.io,
+        .{ .unix = "/unused" },
+        "session",
+        "cockpit",
+    );
+    defer self.destroy();
+
+    try self.host.sessions.append(self.gpa, .{
+        .id = 71,
+        .name = try self.gpa.dupe(u8, "shared-build"),
+        .created_at_unix_secs = 100,
+        .window_count = 2,
+        .attached_client_count = 3,
+        .focused = true,
+    });
+    try self.host.sessions.append(self.gpa, .{
+        .id = 72,
+        .name = try self.gpa.dupe(u8, "shared-test"),
+        .created_at_unix_secs = 200,
+        .window_count = 1,
+        .attached_client_count = 1,
+        .focused = false,
+    });
+    try std.testing.expectEqual(@as(usize, 2), self.sessionCatalog().len);
+    try std.testing.expectEqual(@as(?u32, 71), self.selectedSessionId());
+    try std.testing.expectError(error.InvalidIdentity, self.selectSession(99));
+    try std.testing.expect(!try self.selectSession(71));
+    try std.testing.expect(try self.selectSession(72));
+    try std.testing.expectEqual(@as(?u32, 71), self.selectedSessionId());
+    self.host.sessions.items[0].focused = false;
+    self.host.sessions.items[1].focused = true;
+    try std.testing.expectEqual(@as(?u32, 72), self.selectedSessionId());
 }
 
 test "provider lookups keep remote identity across reordered enumeration" {

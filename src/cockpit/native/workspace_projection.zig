@@ -1175,6 +1175,38 @@ pub fn paletteRowsIn(model: *const Model, workspace: *const Workspace, out: []us
     return written;
 }
 
+pub const PaletteEntry = union(enum) {
+    tab: usize,
+    session: usize,
+};
+
+pub const palette_max_entries: usize = model_module.max_tabs + support.max_remote_sessions;
+
+/// All destinations in the summoned switcher. Session rows are copied from the
+/// provider's latest ATTACHED catalog; their indexes are valid only for the
+/// current dispatch/frame, exactly like the borrowed terminal presentations.
+pub fn paletteEntriesIn(model: *const Model, workspace: *const Workspace, out: []PaletteEntry) usize {
+    const needle = workspace.palette.needle();
+    var written: usize = 0;
+    for (0..workspace.tab_count) |index| {
+        if (written >= out.len) return written;
+        if (needle.len == 0 or paletteTabMatches(model, workspace, index, needle)) {
+            out[written] = .{ .tab = index };
+            written += 1;
+        }
+    }
+    const remote = model.phuxConst() orelse return written;
+    for (remote.sessionCatalog(), 0..) |session, index| {
+        if (written >= out.len) break;
+        var digits: [16]u8 = undefined;
+        const id = std.fmt.bufPrint(&digits, "{d}", .{session.id}) catch "";
+        if (needle.len != 0 and !containsIgnoreCase(session.name, needle) and !containsIgnoreCase(id, needle)) continue;
+        out[written] = .{ .session = index };
+        written += 1;
+    }
+    return written;
+}
+
 /// The most rows the switcher DRAWS at once.
 ///
 /// A cap is not a limit on what the switcher can REACH — `paletteRowsIn` above
@@ -1253,6 +1285,13 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 pub fn paletteSelectedTabIn(model: *const Model, workspace: *const Workspace) ?usize {
     var rows: [model_module.max_tabs]usize = undefined;
     const count = paletteRowsIn(model, workspace, &rows);
+    if (count == 0) return null;
+    return rows[@min(workspace.palette.cursor, count - 1)];
+}
+
+pub fn paletteSelectedEntryIn(model: *const Model, workspace: *const Workspace) ?PaletteEntry {
+    var rows: [palette_max_entries]PaletteEntry = undefined;
+    const count = paletteEntriesIn(model, workspace, &rows);
     if (count == 0) return null;
     return rows[@min(workspace.palette.cursor, count - 1)];
 }

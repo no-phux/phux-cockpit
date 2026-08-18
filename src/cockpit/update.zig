@@ -936,8 +936,8 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .palette_step => |delta| {
             const workspace = model.ws();
             if (!workspace.palette.open) return;
-            var rows: [model_module.max_tabs]usize = undefined;
-            const count = projection.paletteRowsIn(model, workspace, &rows);
+            var rows: [projection.palette_max_entries]projection.PaletteEntry = undefined;
+            const count = projection.paletteEntriesIn(model, workspace, &rows);
             if (count == 0) return;
             // Wraps, because a switcher you can walk off the end of makes the
             // last row harder to reach than the first.
@@ -948,13 +948,30 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .palette_commit => {
             const workspace = model.ws();
             if (!workspace.palette.open) return;
-            const target = projection.paletteSelectedTabIn(model, workspace);
+            const target = projection.paletteSelectedEntryIn(model, workspace);
             workspace.palette.reset();
             // A commit with nothing matching still DISMISSES. Leaving the
             // palette up on an Enter that found nothing reads as a stuck
             // keyboard.
-            const index = target orelse return;
-            updateModel(model, .{ .select_position = @intCast(index) }, fx);
+            const entry = target orelse return;
+            switch (entry) {
+                .tab => |index| updateModel(model, .{ .select_position = @intCast(index) }, fx),
+                .session => |index| {
+                    const remote = model.phux() orelse return;
+                    const catalog = remote.sessionCatalog();
+                    if (index >= catalog.len) return;
+                    updateModel(model, .{ .palette_select_session = catalog[index].id }, fx);
+                },
+            }
+        },
+        .palette_select_session => |session_id| {
+            const remote = model.phux() orelse return;
+            const changed = remote.selectSession(session_id) catch return;
+            model.ws().palette.reset();
+            if (!changed) return;
+            remote.stop();
+            fx.closeChannel(phux_channel_key);
+            openPhuxChannel(model, fx, true);
         },
         .palette_input => |text| {
             const workspace = model.ws();

@@ -29,6 +29,14 @@ pub const phux_enabled = phux_options.enabled;
 const DisabledPhuxProvider = struct {
     const State = enum { new };
     const Anchor = struct { opaque_id: u64 = 0 };
+    pub const SessionSummary = struct {
+        id: u32,
+        name: []u8,
+        created_at_unix_secs: i64,
+        window_count: u16,
+        attached_client_count: u16,
+        focused: bool,
+    };
     const SyncDelta = struct {
         ready_published: bool = false,
         generation_changed: bool = false,
@@ -58,6 +66,15 @@ const DisabledPhuxProvider = struct {
         return .new;
     }
     pub fn drainReadiness(_: *DisabledPhuxProvider) error{Disabled}!SyncDelta {
+        return error.Disabled;
+    }
+    pub fn sessionCatalog(_: *const DisabledPhuxProvider) []const @This().SessionSummary {
+        return &.{};
+    }
+    pub fn selectedSessionId(_: *const DisabledPhuxProvider) ?u32 {
+        return null;
+    }
+    pub fn selectSession(_: *DisabledPhuxProvider, _: u32) error{Disabled}!bool {
         return error.Disabled;
     }
     pub fn terminalRefs(_: *const DisabledPhuxProvider, _: []TerminalRef) usize {
@@ -112,6 +129,8 @@ pub const PhuxProvider = if (phux_enabled)
     @import("phux_provider").PhuxProvider
 else
     DisabledPhuxProvider;
+pub const SessionSummary = PhuxProvider.SessionSummary;
+pub const max_remote_sessions: usize = if (phux_enabled) @import("phux_provider").max_sessions else 0;
 
 const DisabledPointerModule = struct {
     pub const EventQueue = struct {};

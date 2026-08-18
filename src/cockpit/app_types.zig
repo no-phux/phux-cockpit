@@ -128,6 +128,9 @@ pub const Msg = union(enum) {
     palette_step: i8,
     /// Enter: select the highlighted tab and dismiss.
     palette_commit,
+    /// Select a server-owned Phux session exposed by the current ATTACHED
+    /// catalog. The update loop reconnects by this stable server ID.
+    palette_select_session: u32,
     /// A typed character reaching the needle rather than the shell.
     palette_input: []const u8,
     palette_backspace,
