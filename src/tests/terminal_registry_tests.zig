@@ -214,6 +214,7 @@ test "the registry mints unique terminals up to the shells it can back" {
     try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
     try testing.expectEqual(app.max_tabs, state.effects.pendingPtyCount());
     try testing.expect(state.model.provider.liveShellCount() < local.max_live_shells);
+
     // Cmd+W over the Web surface owns no terminal, so it closes nothing.
     app.update(&state.model, .{ .select_surface = .web }, &state.effects);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .shortcut = .{
