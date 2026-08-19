@@ -31,9 +31,11 @@
 # those. See docs/RENDER_FIDELITY.md for what each instrument can and cannot
 # see, for the evidence behind that split, and for how the CI floor was derived.
 #
-# .github/workflows/ci.yml runs this on every push and pull request with
-# `--min-solid 4000`, after `scripts/build-automation-cli.sh --checkout-only`
-# materializes the pin it insists on below.
+# .github/workflows/ci.yml runs this on every push and pull request, and
+# .github/workflows/sdk-head.yml runs it after repointing at the fork's branch
+# head. Both use `--min-solid 4000` after
+# `scripts/build-automation-cli.sh --checkout-only` materializes the pin this
+# script insists on below.
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -52,7 +54,7 @@ done
 # The SDK source must be the one the app is PINNED to, or the numbers describe
 # a rasterizer the app does not ship. Resolve it the way
 # scripts/build-automation-cli.sh does, and refuse a checkout at any other
-# commit rather than measuring it quietly.
+# commit or with local source changes rather than measuring it quietly.
 SDK_SRC="${PHUX_COCKPIT_SDK_SRC:-}"
 if [[ -z "$SDK_SRC" ]]; then
     if [[ ! -d "${PIN_CACHE}/.git" ]]; then
@@ -74,6 +76,13 @@ if [[ -z "$SDK_SRC" ]]; then
     if [[ "$have" != "$sha" ]]; then
         printf 'error: %s is at %s, but build.zig.zon pins %s\n' "$PIN_CACHE" "${have:0:9}" "${sha:0:9}" >&2
         printf '       run ./scripts/build-automation-cli.sh to re-checkout the pin\n' >&2
+        exit 1
+    fi
+    dirty="$(git -C "$PIN_CACHE" status --porcelain --untracked-files=all)"
+    if [[ -n "$dirty" ]]; then
+        printf 'error: %s is at the pinned commit but has local source changes:\n' "$PIN_CACHE" >&2
+        printf '%s\n' "$dirty" >&2
+        printf '       restore a clean checkout before measuring it\n' >&2
         exit 1
     fi
     SDK_SRC="$PIN_CACHE"

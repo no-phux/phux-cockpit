@@ -226,7 +226,9 @@ This is not a replica. The context creation, the smoothing calls, the CoreText
 draw, the face resolution, the two-pass cell order and the colour space are the
 host's own code. A future SDK bump that changes any of them moves these numbers
 without this repo being touched. `scripts/host-raster-check.sh` refuses to run
-against a checkout at any commit other than the one `build.zig.zon` pins.
+against a checkout at any commit other than the one `build.zig.zon` pins, or
+against that commit with tracked or untracked source changes. Ignored build
+artifacts do not make the checkout dirty.
 
 It needs no window, no focus, no Screen Recording permission, and no running
 app, so it runs in CI.
@@ -269,9 +271,11 @@ Deriving command: `./scripts/host-raster-check.sh`
 
 ### The floor CI asserts, and how it was chosen
 
-`.github/workflows/ci.yml` runs the check on every push and pull request, after
-`scripts/build-automation-cli.sh --checkout-only` materializes the pinned SDK
-source:
+`.github/workflows/ci.yml` runs the check on every push and pull request, and
+`.github/workflows/sdk-head.yml` runs it after repointing `build.zig.zon` at the
+fork's branch head. In both jobs,
+`scripts/build-automation-cli.sh --checkout-only` materializes the SDK source
+declared by the current pin before the check runs:
 
 ```
 ./scripts/host-raster-check.sh --min-solid 4000

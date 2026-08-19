@@ -70,6 +70,20 @@ jobs:
         run: ./scripts/repoint-sdk.sh --ref "${SDK_REF}"
         env:
           SDK_REF: ${{ inputs.ref || 'auto' }}
+      # Repointing rewrites build.zig.zon but does not create an SDK source
+      # checkout. Materialize that newly-written pin through the same helper as
+      # ci.yml, so host-raster-check.sh keeps enforcing its normal refusal to
+      # measure another commit or a checkout with local source changes.
+      - name: Materialize the SDK branch head source
+        run: ./scripts/build-automation-cli.sh --checkout-only
+      # Compile the branch head's real AppKit host into the headless CoreText
+      # harness. This catches a glyph-weight regression while it is still the
+      # SDK's change instead of waiting for Cockpit's next pin-bump PR.
+      - name: Check the SDK branch head's glyph weight
+        run: |
+          defaults -currentHost read -g AppleFontSmoothing 2>/dev/null \
+            || echo 'AppleFontSmoothing: unset (the state the floor was derived on)'
+          ./scripts/host-raster-check.sh --min-solid 4000
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: phall1/phux
