@@ -1,0 +1,20 @@
+# GUARD split-close-preserves-tab-refusal
+#
+# Closing one pane of a split frees a shell but not its tab slot. The break
+# restores the unconditional clear, making a full workspace retract its tab
+# refusal even though it still cannot admit another tab.
+test: closing one pane of a full tab does not clear tab admission refusal
+red: 2026-08-18 at 43e2b15
+diff --git a/src/cockpit/update.zig b/src/cockpit/update.zig
+index e18153a..5977d61 100644
+--- a/src/cockpit/update.zig
++++ b/src/cockpit/update.zig
+@@ -1463,7 +1463,7 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
+     // Every pane close gives a shell slot back. A TAB slot only comes back when
+     // the last pane closes and the tree is dropped.
+     model.terminal_limit_refused = false;
+-    if (tab_removed) workspace.tab_limit_refused = false;
++    workspace.tab_limit_refused = false;
+     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
+ }
+ /// A window whose last tab just closed.
