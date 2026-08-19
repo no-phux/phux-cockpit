@@ -326,7 +326,6 @@ test "repeated canvas Cmd+T presses complete their key edges" {
     try testing.expectEqual(@as(u64, 0), state.model.consumed_shortcut_keys_held);
 }
 
-// GUARD: full-tab-strip-chrome-arrangements
 test "a full tab strip passes the layout audit in titlebar and fullscreen" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
@@ -336,11 +335,9 @@ test "a full tab strip passes the layout audit in titlebar and fullscreen" {
     try support.requireLiveShells(app.max_tabs);
     for (1..app.max_tabs) |_| app.update(&state.model, .new_terminal, &state.effects);
     try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
-
     state.model.ws().chrome_top = 66;
     try testing.expect(app.tabsRideTitlebarIn(&state.model, state.model.wsConst()));
     try sweep(state, "full tab strip in the titlebar");
-
     state.model.ws().chrome_top = 0;
     try testing.expect(!app.tabsRideTitlebarIn(&state.model, state.model.wsConst()));
     try sweep(state, "full tab strip in fullscreen");

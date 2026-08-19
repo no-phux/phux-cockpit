@@ -233,7 +233,6 @@ test "the registry mints unique terminals up to the shells it can back" {
     try testing.expect(app.onCommand("tab.move-right") != null);
 }
 
-// GUARD: tab-admission-refusal-visible
 test "a refused tab admission names the tab ceiling in chrome" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
@@ -244,9 +243,15 @@ test "a refused tab admission names the tab ceiling in chrome" {
     for (1..app.max_tabs) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
     try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
     try testing.expect(!state.model.ws().tab_limit_refused);
+    const active_before = state.model.provider.activeCount();
+    const pending_before = state.effects.pendingPtyCount();
 
+    // No precheck: this mints a terminal, reaches Workspace.admitTab, then
+    // destroys the unadmitted terminal without ever staging a PTY.
     try state.dispatch(&harness.runtime, 1, .new_terminal);
     try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expectEqual(active_before, state.model.provider.activeCount());
+    try testing.expectEqual(pending_before, state.effects.pendingPtyCount());
     try testing.expect(state.model.ws().tab_limit_refused);
     try testing.expect(app.chromeRevealed(&state.model));
 
@@ -258,6 +263,34 @@ test "a refused tab admission names the tab ceiling in chrome" {
     try testing.expect(saw_tab_limit);
 
     app.update(&state.model, .close_terminal, &state.effects);
+    try testing.expect(!state.model.ws().tab_limit_refused);
+}
+
+test "closing one pane of a full tab does not clear tab admission refusal" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    try support.requireLiveShells(app.max_tabs + 1);
+    for (1..app.max_tabs) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try state.dispatch(&harness.runtime, 1, .split_right);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 2), state.model.selectedTree().?.paneCount());
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expect(state.model.ws().tab_limit_refused);
+
+    // A shell slot was freed, but the split's surviving pane still occupies
+    // the same tab slot, so the refusal remains true and visible.
+    try state.dispatch(&harness.runtime, 1, .close_terminal);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expectEqual(@as(usize, 1), state.model.selectedTree().?.paneCount());
+    try testing.expect(state.model.ws().tab_limit_refused);
+
+    // Closing the final pane drops the tab and genuinely frees capacity.
+    try state.dispatch(&harness.runtime, 1, .close_terminal);
+    try testing.expectEqual(app.max_tabs - 1, state.model.ws().tab_count);
     try testing.expect(!state.model.ws().tab_limit_refused);
 }
 

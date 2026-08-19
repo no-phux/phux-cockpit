@@ -772,12 +772,8 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             endHiddenCaptures(model, fx);
         },
         .new_terminal => {
-            // A new terminal is a new TAB. Capacity is bounded on both ends:
-            // tab slots and registry slots.
-            if (model.ws().tab_count >= max_tabs) {
-                model.ws().tab_limit_refused = true;
-                return;
-            }
+            // A new terminal is a new TAB. Admission owns the tab bound and
+            // this transaction rolls the minted terminal back if it refuses.
             const origin = model.selectedTerminalRef();
             const pane = model.provider.createTerminal() catch {
                 // Refused, visibly. See `view.terminalLimitNotice`.
@@ -1460,14 +1456,14 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
         if (kill_pty and had_live_pty) fx.ptyKill(pty_key);
     }
 
-    if (current.isEmpty()) workspace.dropTab(tab_index);
+    const tab_removed = current.isEmpty();
+    if (tab_removed) workspace.dropTab(tab_index);
     endHiddenCaptures(model, fx);
 
-    // A pane closing gives a shell slot back, so whatever the last refused
-    // cmd+T was told is no longer true. Cleared unconditionally: closing a
-    // pane that never held a pty still cannot leave a stale notice up.
+    // Every pane close gives a shell slot back. A TAB slot only comes back when
+    // the last pane closes and the tree is dropped.
     model.terminal_limit_refused = false;
-    workspace.tab_limit_refused = false;
+    if (tab_removed) workspace.tab_limit_refused = false;
 
     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
 }
