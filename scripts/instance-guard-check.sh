@@ -71,6 +71,7 @@ VIEW='  view @w1/phux-cockpit-canvas kind=gpu_surface role="Phux Cockpit canvas"
 healthy_snapshot() { printf "${HEADER}\n%s\n%s\n" "$1" "$WINDOW" "$VIEW"; }
 # THE CORPSE (phux-cockpit-2ml.10): a `ready=true` header and nothing under it.
 # The app had logged event=stop and window_closed; the dropbox still answered.
+# shellcheck disable=SC2059 # HEADER is intentionally the fixture's format
 corpse_snapshot()  { printf "${HEADER}\n" "$1"; }
 
 printf 'decisions (no app required)\n'
@@ -100,6 +101,31 @@ expect_accept 'our pid is frontmost'                app_instance_check_frontmost
 expect_refuse 'another app is frontmost'            app_instance_check_frontmost 4242 4243
 expect_refuse 'System Events named no frontmost'    app_instance_check_frontmost 4242 ''
 
+# 5. Forced stop. A child that ignores SIGTERM deterministically takes the
+# timeout/SIGKILL branch; app_instance_stop must still wait it out and reap it.
+# Watched red with the final wait removed: kill -0 still saw the zombie.
+STOP_WORK="$(mktemp -d)"
+bash -c 'trap "" TERM; printf ready >"$1"; while :; do :; done' \
+    bash "${STOP_WORK}/ready" &
+STOP_PID=$!
+for _ in $(seq 1 100); do [[ -f "${STOP_WORK}/ready" ]] && break; sleep 0.01; done
+if [[ ! -f "${STOP_WORK}/ready" ]]; then
+    fail 'TERM-resistant stop fixture became ready'
+    kill -9 "$STOP_PID" 2>/dev/null || true
+    wait "$STOP_PID" 2>/dev/null || true
+elif app_instance_stop "$STOP_PID" 0 2>"${STOP_WORK}/stop.err"; then
+    if kill -0 "$STOP_PID" 2>/dev/null; then
+        fail 'forced SIGKILL stop returned with child still present'
+    elif grep -q 'sending SIGKILL' "${STOP_WORK}/stop.err"; then
+        pass 'forced SIGKILL stop waits and reaps before return'
+    else
+        fail 'forced stop did not exercise the SIGKILL timeout branch'
+    fi
+else
+    fail 'forced SIGKILL stop returned non-zero'
+fi
+rm -rf "$STOP_WORK"
+
 if [[ "$UNIT_ONLY" == "1" ]]; then
     printf '\n%s\n' "$([[ $FAILURES -eq 0 ]] && echo 'guard decisions: ok' || echo "guard decisions: ${FAILURES} FAILED")"
     exit $(( FAILURES > 0 ))
@@ -122,6 +148,7 @@ mkdir -p "$WORK"
 printf 'font-size = 13\n' >"${WORK}/config"
 
 PIDS=()
+# shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
     local p
     for p in ${PIDS[@]+"${PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done

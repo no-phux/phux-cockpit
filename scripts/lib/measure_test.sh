@@ -130,6 +130,18 @@ else
     bad 'raster comparison basis omitted refs or override sources'
 fi
 
+equal_before="$(measure_raster_worktree_source /work before same-sha)"
+equal_after="$(measure_raster_worktree_source /work after same-sha)"
+# Watched red when `side` was removed from the path: both resolved to
+# /work/same-sha and the second worktree collided with the first.
+if [[ "$equal_before" == /work/before-same-sha \
+    && "$equal_after" == /work/after-same-sha \
+    && "$equal_before" != "$equal_after" ]]; then
+    ok
+else
+    bad 'equivalent raster refs did not receive distinct worktree paths'
+fi
+
 catalog="$("${ROOT}/scripts/measure.sh")"
 if [[ "$catalog" == *'automate-smoke'* && "$catalog" == *'host-raster-check'* ]]; then
     ok

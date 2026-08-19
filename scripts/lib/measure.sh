@@ -133,6 +133,12 @@ measure_raster_comparison_basis() {
         "$derive"
 }
 
+measure_raster_worktree_source() {
+    local work="$1" side="$2" ref="$3"
+    case "$side" in before|after) ;; *) return 2 ;; esac
+    printf '%s/%s-%s\n' "$work" "$side" "$ref"
+}
+
 # Package, identity-stage, and launch from HOME. The app and CLI both use HOME
 # as cwd, giving this run a private automation dropbox. Sets MEASURE_APP_PID and
 # replaces NATIVE with a cwd-pinned wrapper for subsequent automation calls.

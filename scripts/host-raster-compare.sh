@@ -75,8 +75,8 @@ resolve_ref() {
 }
 BEFORE_SHA="$(resolve_ref "$BEFORE")"
 AFTER_SHA="$(resolve_ref "$AFTER")"
-BEFORE_SOURCE="${WORK}/${BEFORE_SHA}"
-AFTER_SOURCE="${WORK}/${AFTER_SHA}"
+BEFORE_SOURCE="$(measure_raster_worktree_source "$WORK" before "$BEFORE_SHA")"
+AFTER_SOURCE="$(measure_raster_worktree_source "$WORK" after "$AFTER_SHA")"
 cleanup() {
     for source in "$BEFORE_SOURCE" "$AFTER_SOURCE"; do
         git -C "$PIN_CACHE" worktree remove --force "$source" 2>/dev/null || true

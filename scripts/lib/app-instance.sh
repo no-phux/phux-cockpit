@@ -243,19 +243,27 @@ app_instance_snapshot() {
 # it covers a pid that is not (an app relaunched by something else), where
 # `wait` returns immediately with an error.
 app_instance_stop() {
-    local pid="${1:-}" deadline
+    local pid="${1:-}" timeout_s="${2:-10}" deadline state
     [[ -n "$pid" ]] || return 0
     kill "$pid" 2>/dev/null || true
-    deadline=$((SECONDS + 10))
+    deadline=$((SECONDS + timeout_s))
     while kill -0 "$pid" 2>/dev/null; do
+        # A terminated child remains killable while it is a zombie; waiting for
+        # kill -0 to fail before reaping it turns every clean exit into a false
+        # timeout. Break to the unconditional wait below as soon as ps says Z.
+        state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+        [[ "$state" == Z* ]] && break
         if [[ "$SECONDS" -ge "$deadline" ]]; then
-            printf 'warning: pid %s did not exit 10s after SIGTERM; sending SIGKILL.\n' "$pid" >&2
+            printf 'warning: pid %s did not exit %ss after SIGTERM; sending SIGKILL.\n' \
+                "$pid" "$timeout_s" >&2
             kill -9 "$pid" 2>/dev/null || true
-            sleep 1
-            return 0
+            break
         fi
         sleep 0.2
     done
+    # This is deliberately unconditional, including the SIGKILL timeout path.
+    # Returning before wait leaves our child as a zombie and makes the next
+    # serial automation run observe stale process state.
     wait "$pid" 2>/dev/null || true
 }
 
