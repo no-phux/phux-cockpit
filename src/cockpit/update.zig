@@ -1464,7 +1464,6 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
     // the last pane closes and the tree is dropped.
     model.terminal_limit_refused = false;
     if (tab_removed) workspace.tab_limit_refused = false;
-
     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
 }
 
