@@ -6,6 +6,7 @@
 #   ./scripts/host-raster-check.sh --min-solid N   # ...and fail below N
 #   ./scripts/host-raster-check.sh --png-prefix P  # keep the rasters
 #   PHUX_COCKPIT_SDK_SRC=<dir> ./scripts/host-raster-check.sh   # a different SDK
+# measures: pinned SDK host/CoreText glyph rasterization
 #
 # WHAT THIS IS FOR
 # ----------------
@@ -39,8 +40,8 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=scripts/lib/zon.sh
-source "${ROOT}/scripts/lib/zon.sh"
+# shellcheck source=scripts/lib/measure.sh
+source "${ROOT}/scripts/lib/measure.sh"
 PIN_CACHE="${PHUX_COCKPIT_SDK_CACHE:-${ROOT}/.zig-cache/pinned-sdk}"
 ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -113,4 +114,7 @@ clang -w -fobjc-arc -fno-sanitize=builtin -ObjC -mmacosx-version-min=11.0 \
     -framework IOKit -framework Carbon -framework Accelerate \
     -framework MediaToolbox
 
+measure_basis host_raster \
+    'JetBrains Mono NL regular, fixed terminal row, host CoreText rasterizer' \
+    './scripts/host-raster-check.sh'
 "$BIN" "${ROOT}/src/fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf" "${ARGS[@]+"${ARGS[@]}"}"

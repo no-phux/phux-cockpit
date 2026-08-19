@@ -2,6 +2,7 @@
 # Did an SDK change actually move the glyph pixels? Two numbers, one basis.
 #
 #   ./scripts/host-raster-compare.sh <ref-before> [ref-after]
+# measures: host raster pixels at two SDK commits that both shipped
 #
 # `ref-before` and `ref-after` are commits of the pinned SDK fork. `ref-after`
 # defaults to the commit build.zig.zon pins, so the common call is

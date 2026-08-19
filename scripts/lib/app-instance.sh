@@ -152,7 +152,7 @@ app_instance_check_snapshot() {
         printf 'REFUSING: the snapshot has no publisher_pid - it is not a snapshot.\n' >&2
         printf 'The automation dropbox published nothing readable. Do not treat the\n' >&2
         printf 'empty result as a statement about the UI.\n' >&2
-        printf '--- what came back ---\n%s\n----------------------\n' "$snapshot" >&2
+        printf -- '--- what came back ---\n%s\n----------------------\n' "$snapshot" >&2
         return 1
     fi
     if [[ "$publisher" != "$expected" ]]; then
@@ -176,7 +176,7 @@ app_instance_check_snapshot() {
         printf 'with no UI to report, which on 2026-08-12 was an app that had already\n' >&2
         printf 'logged event=stop and window_closed. Read the app log before reading\n' >&2
         printf 'this as a product defect (phux-cockpit-2ml.10).\n' >&2
-        printf '--- what came back ---\n%s\n----------------------\n' "$snapshot" >&2
+        printf -- '--- what came back ---\n%s\n----------------------\n' "$snapshot" >&2
         return 1
     fi
     return 0
@@ -246,7 +246,6 @@ app_instance_stop() {
     local pid="${1:-}" deadline
     [[ -n "$pid" ]] || return 0
     kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
     deadline=$((SECONDS + 10))
     while kill -0 "$pid" 2>/dev/null; do
         if [[ "$SECONDS" -ge "$deadline" ]]; then
@@ -257,6 +256,7 @@ app_instance_stop() {
         fi
         sleep 0.2
     done
+    wait "$pid" 2>/dev/null || true
 }
 
 # The unix id of whatever is frontmost right now, per System Events. Empty if

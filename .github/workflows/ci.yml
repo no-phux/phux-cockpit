@@ -31,6 +31,10 @@ jobs:
       # shipped once; the sha a reader trusts has to be the sha that is built.
       - name: Check dependency pin documentation
         run: ./scripts/check-sdk-pin.sh
+      - name: Test measurement shell libraries
+        run: |
+          ./scripts/lib/zon_test.sh
+          ./scripts/lib/measure_test.sh
       # The SDK source the rasterizer check measures, materialized from the sha
       # in build.zig.zon rather than from a ref repeated here - a second copy of
       # the pin in this file would be one more thing a bump has to remember, and

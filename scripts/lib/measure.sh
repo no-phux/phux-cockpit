@@ -1,0 +1,117 @@
+# shellcheck shell=bash
+# Shared measurement conventions. Source this file; do not execute it.
+
+[[ -n "${MEASURE_LIB_SOURCED:-}" ]] && return 0
+MEASURE_LIB_SOURCED=1
+
+MEASURE_LIB_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MEASURE_ROOT="$(CDPATH='' cd -- "${MEASURE_LIB_DIR}/../.." && pwd)"
+
+# shellcheck source=scripts/lib/zon.sh
+source "${MEASURE_ROOT}/scripts/lib/zon.sh"
+# shellcheck source=scripts/lib/dev-app.sh
+source "${MEASURE_ROOT}/scripts/lib/dev-app.sh"
+# shellcheck source=scripts/lib/app-instance.sh
+source "${MEASURE_ROOT}/scripts/lib/app-instance.sh"
+
+MEASURE_SAMPLE_FLOOR=200
+
+# Print enough context to reproduce and compare a number without changing the
+# existing MEASURED lines cited by documentation and issues.
+measure_basis() {
+    local name="$1" basis="$2" derive="$3"
+    printf 'MEASURED-BASIS %s host=%s when=%s basis="%s" derive="%s"\n' \
+        "$name" "$(uname -m)-$(sw_vers -productVersion 2>/dev/null || printf unknown)" \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$basis" "$derive"
+}
+
+measure_require_sample_floor() {
+    local label="$1" count="${2:-}" floor="${3:-$MEASURE_SAMPLE_FLOOR}"
+    if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        printf 'REFUSING TO REPORT: %s sample count is %s, not a number.\n' \
+            "$label" "${count:-<missing>}" >&2
+        return 1
+    fi
+    if (( count < floor )); then
+        printf 'REFUSING TO REPORT: %s has %s samples, below the floor of %s.\n' \
+            "$label" "$count" "$floor" >&2
+        printf 'A percentile over that few samples is not evidence.\n' >&2
+        return 1
+    fi
+}
+
+# Validate every stage independently before printing its percentiles. This
+# keeps a busy host_draw counter from laundering a near-empty plan/rebuild
+# stage, while still reporting stages that have enough evidence.
+measure_print_frame_profile() {
+    local name="$1" basis="$2" derive="$3" snapshot="$4"
+    local profile token label count found=0 reportable=0 allowed='|'
+    profile="$(printf '%s\n' "$snapshot" | grep -o 'frame_profile.*' | head -1)"
+    if [[ -z "$profile" ]]; then
+        printf 'REFUSING TO REPORT: snapshot has no frame_profile.\n' >&2
+        return 1
+    fi
+    for token in $profile; do
+        case "$token" in
+            *_n=*)
+                label="${token%%_n=*}"
+                count="${token##*=}"
+                found=$((found + 1))
+                if measure_require_sample_floor "$label" "$count"; then
+                    allowed="${allowed}${label}|"
+                    reportable=$((reportable + 1))
+                fi
+                ;;
+        esac
+    done
+    if (( found == 0 )); then
+        printf 'REFUSING TO REPORT: frame_profile has no stage sample counts.\n' >&2
+        return 1
+    fi
+    if (( reportable == 0 )); then
+        printf 'REFUSING TO REPORT: no frame-profile stage meets the sample floor.\n' >&2
+        return 1
+    fi
+    measure_basis "$name" "$basis" "$derive"
+    for token in $profile; do
+        case "$token" in
+            *_n=*) printf '%s\n' "$token" ;;
+            *_p50_us=*|*_p90_us=*)
+                label="${token%%_p[59]0_us=*}"
+                [[ "$allowed" == *"|${label}|"* ]] && printf '%s\n' "$token"
+                ;;
+        esac
+    done
+    return 0
+}
+
+# Package, identity-stage, and launch from HOME. The app and CLI both use HOME
+# as cwd, giving this run a private automation dropbox. Sets MEASURE_APP_PID and
+# replaces NATIVE with a cwd-pinned wrapper for subsequent automation calls.
+measure_launch_isolated() {
+    local home="$1" config="$2" log="$3"
+    local source_app staged_app executable native_real wrapper
+    source_app="${MEASURE_ROOT}/zig-out/package/phux-cockpit.app"
+    staged_app="${home}/Phux Cockpit (measure).app"
+    native_real="${NATIVE:?set NATIVE to the automation CLI before launching}"
+
+    printf 'packaging with automation...\n'
+    ( cd "$MEASURE_ROOT" && zig build package -Dautomation=true >/dev/null )
+    executable="$(dev_app_stage "$source_app" "$staged_app")"
+
+    # dev_app_stage gives measurements a process identity distinct from the
+    # installed app. Refuse another staged dev/measurement process because
+    # System Events still targets this name globally.
+    # shellcheck disable=SC2034 # consumed by app-instance.sh after sourcing
+    APP_INSTANCE_NAME="$(basename -- "$executable")"
+    app_instance_require_free
+
+    wrapper="${home}/native-in-measure-home"
+    printf '#!/usr/bin/env bash\nexec env -C %q %q "$@"\n' "$home" "$native_real" >"$wrapper"
+    chmod +x "$wrapper"
+    NATIVE="$wrapper"
+
+    dev_app_launch "$executable" "$home" "$config" "$log"
+    # shellcheck disable=SC2034 # output variable consumed by the caller
+    MEASURE_APP_PID="$DEV_APP_PID"
+}
