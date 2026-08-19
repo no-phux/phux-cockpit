@@ -1,6 +1,7 @@
 const std = @import("std");
 const native_sdk = @import("native_sdk");
 const grid = @import("../../terminal/grid.zig");
+const url_module = @import("../../terminal/url.zig");
 const provider_contract = @import("provider_contract");
 const support = @import("../phux_support.zig");
 const local_terminal = @import("../../providers/local/provider.zig");
@@ -215,10 +216,17 @@ pub const pane_dim_command_id_base: u64 = 0x0c10;
 pub const pane_focus_command_id_base: u64 = 0x0c30;
 /// The focus edge's thickness, in points.
 pub const pane_focus_edge_thickness: f32 = 1;
-/// Pane-local OSC 8 target preview commands. One pair per resolved pane.
+/// Pane-local OSC 8 target preview commands.
 pub const link_preview_ground_command_id_base: u64 = 0x0c50;
 pub const link_preview_text_command_id_base: u64 = 0x0c70;
-const link_preview_command_count: usize = 2;
+pub const link_preview_authority_command_id_base: u64 = 0x0c90;
+const link_preview_command_count: usize = 3;
+
+pub fn linkPreviewCommandReserve(session: *grid.Session) usize {
+    const target = session.hoveredOsc8Target() orelse return 0;
+    const identity = url_module.targetIdentity(target) orelse return 0;
+    return if (identity.effective_authority != null) link_preview_command_count else 0;
+}
 
 // A `terminalNumber(LocalTerminalId)` used to sit here, turning a registry
 // slot into a display number, with no callers left and a doc comment about the
@@ -717,7 +725,11 @@ fn terminalSurfaceLabel(ui: *TerminalUi, model: *const Model, id: TerminalRef) [
     if (model.provider.terminalConst(id)) |pane| {
         const diagnostics = paneDiagnostics(ui, model, pane);
         if (pane.session.hoveredOsc8Target()) |target| {
-            return ui.fmt("{s}; link target {s}", .{ diagnostics, target });
+            const identity = url_module.targetIdentity(target).?;
+            if (identity.effective_authority) |authority| {
+                return ui.fmt("{s}; link target {s}; effective authority {s}", .{ diagnostics, target, authority });
+            }
+            return ui.fmt("{s}; link target {s}; mismatched non-HTTP targets remain disabled", .{ diagnostics, target });
         }
         return diagnostics;
     }
@@ -730,16 +742,47 @@ fn terminalSurfaceLabel(ui: *TerminalUi, model: *const Model, id: TerminalRef) [
 
 /// Paint the allowlisted OSC 8 href over the bottom of its pane without
 /// changing the pane rect, grid rect, widget tree, or PTY dimensions.
+fn authorityPreviewText(builder: *canvas.Builder, tokens: canvas.DesignTokens, authority: []const u8, width: f32) !?[]const u8 {
+    const text_size = tokens.typography.label_size;
+    if (canvas.measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, authority, text_size) <= width) return authority;
+    const marker = "...";
+    if (canvas.measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, marker ++ "x", text_size) > width) return null;
+
+    var start = authority.len;
+    while (start > 0) {
+        start -= 1;
+        const candidate_width = canvas.measureTextWidthForFont(
+            tokens.text_measure,
+            tokens.typography.font_id,
+            authority[start..],
+            text_size,
+        );
+        const marker_width = canvas.measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, marker, text_size);
+        if (candidate_width + marker_width > width) {
+            start += 1;
+            break;
+        }
+    }
+    var staged: [url_module.max_url_bytes]u8 = undefined;
+    @memcpy(staged[0..marker.len], marker);
+    @memcpy(staged[marker.len..][0 .. authority.len - start], authority[start..]);
+    return try builder.allocTextBytes(staged[0 .. marker.len + authority.len - start]);
+}
+
 fn paintLinkTargetPreview(
     pane: *const Pane,
     pane_index: usize,
     rect: geometry.RectF,
     tokens: canvas.DesignTokens,
     builder: *canvas.Builder,
+    target: []const u8,
 ) !void {
-    const target = pane.session.hoveredOsc8Target() orelse return;
+    const identity = url_module.targetIdentity(target) orelse return;
+    // Non-authority schemes are still announced, but a URL-shaped mismatch
+    // remains conservative because there is no HTTP authority to isolate.
+    const authority = identity.effective_authority orelse return;
     const inset = projection.chrome_band_inset;
-    const height = projection.chrome_control_extent;
+    const height = projection.chrome_band_height;
     const frame = geometry.RectF.init(
         rect.x + inset,
         rect.y + @max(0, rect.height - height - inset),
@@ -747,6 +790,8 @@ fn paintLinkTargetPreview(
         @min(height, rect.height),
     );
     if (frame.width <= 0 or frame.height <= 0) return;
+    const text_width = @max(0, frame.width - inset * 2);
+    const authority_text = try authorityPreviewText(builder, tokens, authority, text_width) orelse return;
 
     try builder.fillRect(.{
         .id = link_preview_ground_command_id_base + pane_index,
@@ -754,23 +799,45 @@ fn paintLinkTargetPreview(
         .fill = .{ .color = tokens.colors.surface },
     });
     const text_size = tokens.typography.label_size;
+    const line_height = frame.height / 2;
+    try builder.drawText(.{
+        .id = link_preview_authority_command_id_base + pane_index,
+        .font_id = tokens.typography.font_id,
+        .size = text_size,
+        .origin = geometry.PointF.init(
+            frame.x + inset,
+            frame.y + (line_height + text_size * 0.7) * 0.5,
+        ),
+        .color = tokens.colors.accent,
+        .text = authority_text,
+        .text_layout = .{
+            .max_width = text_width,
+            .line_height = line_height,
+            .wrap = .none,
+            .overflow = .clip,
+            .measure = tokens.text_measure,
+        },
+    });
     try builder.drawText(.{
         .id = link_preview_text_command_id_base + pane_index,
         .font_id = tokens.typography.font_id,
         .size = text_size,
         .origin = geometry.PointF.init(
             frame.x + inset,
-            frame.y + (frame.height + text_size * 0.7) * 0.5,
+            frame.y + line_height + (line_height + text_size * 0.7) * 0.5,
         ),
         .color = tokens.colors.text,
         .text = target,
         .text_layout = .{
-            .max_width = @max(0, frame.width - inset * 2),
-            .line_height = frame.height,
+            .max_width = text_width,
+            .line_height = line_height,
             .wrap = .none,
             .measure = tokens.text_measure,
         },
     });
+    // Receipt is written only after every command needed to identify the
+    // destination made it into the display list.
+    pane.session.markOsc8PreviewRendered(target);
 }
 
 /// A single pane's interaction surface. No pane header: Ghostty has none,
@@ -1973,6 +2040,8 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
         const window_active = model.focused and window_index == model.active_window;
         const options_focused = window_active and pane.node == focus_node;
         if (model.provider.terminalConst(pane.terminal)) |terminal| {
+            const preview_target = terminal.session.hoveredOsc8Target();
+            const preview_reserve = linkPreviewCommandReserve(terminal.session);
             try grid.paint(terminal.session, builder, .{
                 .frame = pane.rect,
                 .background_frame = pane.rect,
@@ -1980,10 +2049,9 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
                 .running = terminal.phase == .live or terminal.phase == .starting,
                 .focused = options_focused,
                 .selecting = terminal.selecting,
-                // Hold two slots for the non-layout href preview. The builder's
-                // running length already includes earlier panes' previews, so
-                // subtracting once preserves this pane's cumulative envelope.
-                .command_budget = command_budget -| link_preview_command_count,
+                // Reserve only while a preview is actually pending. Quiet and
+                // saturated grids retain the entire terminal envelope.
+                .command_budget = command_budget -| preview_reserve,
                 .text_reserve = text_reserve,
                 .glyph_budget = glyph_budget,
                 .path_reserve = path_reserve,
@@ -1991,7 +2059,7 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
                 .minimum_contrast = model.config.minimum_contrast,
                 .id_base = grid.paneIdBase(terminalPaintIndex(model, pane.terminal)),
             });
-            try paintLinkTargetPreview(terminal, index, pane.rect, tokens, builder);
+            if (preview_target) |target| try paintLinkTargetPreview(terminal, index, pane.rect, tokens, builder, target);
         } else {
             const remote = model.phuxConst() orelse continue;
             const presentation = remote.presentation(pane.terminal) orelse continue;
