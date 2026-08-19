@@ -242,11 +242,11 @@ test "a refused tab admission names the tab ceiling in chrome" {
     try support.requireLiveShells(app.max_tabs);
     for (1..app.max_tabs) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
     try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
-    try testing.expect(!state.model.tab_limit_refused);
+    try testing.expect(!state.model.ws().tab_limit_refused);
 
     try state.dispatch(&harness.runtime, 1, .new_terminal);
     try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
-    try testing.expect(state.model.tab_limit_refused);
+    try testing.expect(state.model.ws().tab_limit_refused);
     try testing.expect(app.chromeRevealed(&state.model));
 
     try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
@@ -257,7 +257,7 @@ test "a refused tab admission names the tab ceiling in chrome" {
     try testing.expect(saw_tab_limit);
 
     app.update(&state.model, .close_terminal, &state.effects);
-    try testing.expect(!state.model.tab_limit_refused);
+    try testing.expect(!state.model.ws().tab_limit_refused);
 }
 
 test "close frees the terminal eagerly and its slot is immediately reusable" {

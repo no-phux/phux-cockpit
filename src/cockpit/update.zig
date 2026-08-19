@@ -775,7 +775,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // A new terminal is a new TAB. Capacity is bounded on both ends:
             // tab slots and registry slots.
             if (model.ws().tab_count >= max_tabs) {
-                model.tab_limit_refused = true;
+                model.ws().tab_limit_refused = true;
                 return;
             }
             const origin = model.selectedTerminalRef();
@@ -787,12 +787,12 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             adoptWorkingDirectory(model, origin, pane);
             if (!model.admitTab(pane.id)) {
                 _ = model.provider.destroyTerminal(pane.id);
-                model.tab_limit_refused = true;
+                model.ws().tab_limit_refused = true;
                 return;
             }
             _ = model.selectTerminal(pane.id);
             model.terminal_limit_refused = false;
-            model.tab_limit_refused = false;
+            model.ws().tab_limit_refused = false;
             endHiddenCaptures(model, fx);
             spawnConfiguredPane(model, pane, fx);
         },
@@ -1467,7 +1467,7 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
     // cmd+T was told is no longer true. Cleared unconditionally: closing a
     // pane that never held a pty still cannot leave a stale notice up.
     model.terminal_limit_refused = false;
-    model.tab_limit_refused = false;
+    workspace.tab_limit_refused = false;
 
     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
 }

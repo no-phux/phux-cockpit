@@ -1626,7 +1626,7 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     // yielding the row for as long as one of those is up.
     const status = if (model.window_limit_refused)
         windowLimitNotice(ui)
-    else if (model.tab_limit_refused)
+    else if (ws.tab_limit_refused)
         tabLimitNotice(ui)
     else if (model.terminal_limit_refused)
         terminalLimitNotice(ui)

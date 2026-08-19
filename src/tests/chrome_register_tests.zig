@@ -588,13 +588,13 @@ test "the trailing status fits the room the strip holds back" {
     for (notices, 0..) |case, index| {
         state.model.terminal_limit_refused = index == 0;
         state.model.window_limit_refused = index == 1;
-        state.model.tab_limit_refused = index == 2;
+        state.model.ws().tab_limit_refused = index == 2;
         state.model.config_write_refused = index == 3;
         state.model.state.write_failed = index == 4;
         defer {
             state.model.terminal_limit_refused = false;
             state.model.window_limit_refused = false;
-            state.model.tab_limit_refused = false;
+            state.model.ws().tab_limit_refused = false;
             state.model.config_write_refused = false;
             state.model.state.write_failed = false;
         }

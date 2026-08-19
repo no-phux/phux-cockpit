@@ -273,7 +273,7 @@ pub fn visibleTabWindowIn(model: *const Model, workspace: *const Workspace, band
 /// leading reserve entirely) and too much at the wide end (it held that room
 /// for a status node that was 0x0).
 pub fn tabStripStatusReserveIn(model: *const Model, workspace: *const Workspace) f32 {
-    if (model.window_limit_refused or model.tab_limit_refused or model.terminal_limit_refused) return tab_strip_notice_reserve;
+    if (model.window_limit_refused or workspace.tab_limit_refused or model.terminal_limit_refused) return tab_strip_notice_reserve;
     if (model.config_write_refused or model.state.write_failed) return tab_strip_save_notice_reserve;
     const id = workspaceTerminalRef(model, workspace) orelse return 0;
     if (support.providerKind(id) == .phux) return 0;
@@ -1012,7 +1012,7 @@ pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     if (model.window_limit_refused) return true;
     // Reaching the workspace's tab ceiling is just as visible as reaching the
     // process's shell ceiling, but names the resource the gesture exhausted.
-    if (model.tab_limit_refused) return true;
+    if (workspace.tab_limit_refused) return true;
     // Same rule for the shell ceiling, and it matters more at ONE tab: that is
     // exactly the state a refused cmd+D leaves behind, and with the band
     // hidden the chord would look unbound rather than refused.
