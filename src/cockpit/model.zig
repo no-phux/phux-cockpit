@@ -605,6 +605,10 @@ pub const Model = struct {
     /// that is not bound. The chrome reads it, and the next successful window
     /// open — or any other window closing — clears it.
     window_limit_refused: bool = false,
+    /// A cmd+T was refused because the active workspace already has every tab
+    /// slot it can represent. Separate from the shell ceiling: no shell was
+    /// requested, and closing a tab is the action that makes this true again.
+    tab_limit_refused: bool = false,
     /// The startup config notice has been read and dismissed.
     ///
     /// A latch on the MODEL, not on a workspace: the config is app-wide, and a

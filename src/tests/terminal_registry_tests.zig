@@ -214,7 +214,6 @@ test "the registry mints unique terminals up to the shells it can back" {
     try testing.expectEqual(app.max_tabs, state.model.provider.activeCount());
     try testing.expectEqual(app.max_tabs, state.effects.pendingPtyCount());
     try testing.expect(state.model.provider.liveShellCount() < local.max_live_shells);
-
     // Cmd+W over the Web surface owns no terminal, so it closes nothing.
     app.update(&state.model, .{ .select_surface = .web }, &state.effects);
     try harness.runtime.dispatchPlatformEvent(state.app(), .{ .shortcut = .{
@@ -231,6 +230,33 @@ test "the registry mints unique terminals up to the shells it can back" {
     try testing.expect(app.onCommand("pane.split-down") != null);
     try testing.expect(app.onCommand("tab.move-left") != null);
     try testing.expect(app.onCommand("tab.move-right") != null);
+}
+
+test "a refused tab admission names the tab ceiling in chrome" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    try support.requireLiveShells(app.max_tabs);
+    for (1..app.max_tabs) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expect(!state.model.tab_limit_refused);
+
+    try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expect(state.model.tab_limit_refused);
+    try testing.expect(app.chromeRevealed(&state.model));
+
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+    var saw_tab_limit = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.startsWith(u8, node.widget.semantics.label, "Tab limit reached")) saw_tab_limit = true;
+    }
+    try testing.expect(saw_tab_limit);
+
+    app.update(&state.model, .close_terminal, &state.effects);
+    try testing.expect(!state.model.tab_limit_refused);
 }
 
 test "close frees the terminal eagerly and its slot is immediately reusable" {

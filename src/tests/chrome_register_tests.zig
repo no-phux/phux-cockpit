@@ -309,6 +309,41 @@ fn sweep(state: *support.TerminalApp, label: []const u8) !void {
     }
 }
 
+test "repeated canvas Cmd+T presses complete their key edges" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try support.startCockpit(harness);
+    defer support.stopCockpit(state);
+    const iface = state.app();
+
+    try support.requireLiveShells(app.max_tabs);
+    for (1..app.max_tabs) |_| {
+        try support.pressCanvasKey(harness, iface, "t", .{ .primary = true });
+        try support.releaseCanvasKey(harness, iface, "t", .{ .primary = true });
+    }
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+    try testing.expectEqual(@as(u64, 0), state.model.consumed_shortcut_keys_held);
+}
+
+test "a full tab strip passes the layout audit in titlebar and fullscreen" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try support.startCockpit(harness);
+    defer support.stopCockpit(state);
+
+    try support.requireLiveShells(app.max_tabs);
+    for (1..app.max_tabs) |_| app.update(&state.model, .new_terminal, &state.effects);
+    try testing.expectEqual(app.max_tabs, state.model.ws().tab_count);
+
+    state.model.ws().chrome_top = 66;
+    try testing.expect(app.tabsRideTitlebarIn(&state.model, state.model.wsConst()));
+    try sweep(state, "full tab strip in the titlebar");
+
+    state.model.ws().chrome_top = 0;
+    try testing.expect(!app.tabsRideTitlebarIn(&state.model, state.model.wsConst()));
+    try sweep(state, "full tab strip in fullscreen");
+}
+
 test "the chrome survives the layout audit in every state it has" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(1100, 640) });
@@ -321,20 +356,8 @@ test "the chrome survives the layout audit in every state it has" {
 
     try sweep(state, "split panes");
 
-    // As FULL a strip as this machine will give. The window derivation is what
-    // keeps it honest at the narrow end, and it is exactly where a tab that
-    // outgrew its own furniture would show up.
-    //
-    // The loop is bounded by the chord count rather than by the tab count, and
-    // that is not defensive style — an unbounded `while (tab_count < max_tabs)`
-    // spun this test at 100% CPU for twenty-five minutes, because cmd+T stops
-    // producing tabs at the SHELL ceiling and a refusal that does not latch
-    // leaves the condition permanently false.
-    for (0..app.max_tabs) |_| {
-        try support.pressCanvasKey(harness, iface, "t", .{ .primary = true });
-    }
-    try testing.expect(state.model.ws().tab_count > 1);
-    try sweep(state, "as full a tab strip as we can open");
+    for (0..3) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try sweep(state, "four-tab strip");
 
     try support.pressCanvasKey(harness, iface, "f", .{ .primary = true });
     try support.typeCanvasText(harness, iface, "a needle long enough to crowd the band");
@@ -555,6 +578,7 @@ test "the trailing status fits the room the strip holds back" {
     const notices = [_]Case{
         .{ .label = "shell limit", .prefix = "Shell limit reached", .reserve = app.tab_strip_notice_reserve },
         .{ .label = "window limit", .prefix = "Window limit reached", .reserve = app.tab_strip_notice_reserve },
+        .{ .label = "tab limit", .prefix = "Tab limit reached", .reserve = app.tab_strip_notice_reserve },
         .{ .label = "theme save failure", .prefix = "Theme could not be saved", .reserve = app.tab_strip_save_notice_reserve },
         .{ .label = "layout save failure", .prefix = "Workspace layout could not be saved", .reserve = app.tab_strip_save_notice_reserve },
     };
@@ -562,11 +586,13 @@ test "the trailing status fits the room the strip holds back" {
     for (notices, 0..) |case, index| {
         state.model.terminal_limit_refused = index == 0;
         state.model.window_limit_refused = index == 1;
-        state.model.config_write_refused = index == 2;
-        state.model.state.write_failed = index == 3;
+        state.model.tab_limit_refused = index == 2;
+        state.model.config_write_refused = index == 3;
+        state.model.state.write_failed = index == 4;
         defer {
             state.model.terminal_limit_refused = false;
             state.model.window_limit_refused = false;
+            state.model.tab_limit_refused = false;
             state.model.config_write_refused = false;
             state.model.state.write_failed = false;
         }

@@ -1482,6 +1482,18 @@ fn windowLimitNotice(ui: *TerminalUi) TerminalUi.Node {
     }, .{});
 }
 
+/// What a cmd+T at the active workspace's tab ceiling says.
+fn tabLimitNotice(ui: *TerminalUi) TerminalUi.Node {
+    return ui.el(.badge, .{
+        .variant = .destructive,
+        .text = ui.fmt("{d} TAB LIMIT", .{max_tabs}),
+        .semantics = .{ .label = ui.fmt(
+            "Tab limit reached: {d} tabs is the maximum one window can open; close one to open another",
+            .{max_tabs},
+        ) },
+    }, .{});
+}
+
 /// What a cmd+T or cmd+D at the SHELL ceiling says.
 ///
 /// The window notice above exists because a chord that quietly does nothing
@@ -1614,6 +1626,8 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     // yielding the row for as long as one of those is up.
     const status = if (model.window_limit_refused)
         windowLimitNotice(ui)
+    else if (model.tab_limit_refused)
+        tabLimitNotice(ui)
     else if (model.terminal_limit_refused)
         terminalLimitNotice(ui)
     else if (model.config_write_refused)
