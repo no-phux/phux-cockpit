@@ -267,6 +267,7 @@ test "a refused tab admission names the tab ceiling in chrome" {
     try testing.expect(!state.model.ws().tab_limit_refused);
 }
 
+// GUARD: split-close-preserves-tab-refusal
 test "closing one pane of a full tab does not clear tab admission refusal" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
