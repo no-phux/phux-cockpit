@@ -1,0 +1,19 @@
+# GUARD tab-admission-refusal-visible
+#
+# Cmd+T returned silently when a workspace already held all 16 tabs, before
+# terminal admission could expose any failure. The break restores that silent
+# return, so no tab-limit latch or visible badge answers the refused gesture.
+test: a refused tab admission names the tab ceiling in chrome
+red: 2026-08-18 at 29602ae
+diff --git a/src/cockpit/update.zig b/src/cockpit/update.zig
+index 841af4c..e884553 100644
+--- a/src/cockpit/update.zig
++++ b/src/cockpit/update.zig
+@@ -775,7 +775,6 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
+             // A new terminal is a new TAB. Capacity is bounded on both ends:
+             // tab slots and registry slots.
+             if (model.ws().tab_count >= max_tabs) {
+-                model.tab_limit_refused = true;
+                 return;
+             }
+             const origin = model.selectedTerminalRef();
