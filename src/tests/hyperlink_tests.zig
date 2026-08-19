@@ -398,6 +398,7 @@ test "cmd+click follows an OSC 8 href, not the words it is wrapped around" {
     try testing.expectEqualStrings("https://example.com/docs", model.openedUrl());
 }
 
+// GUARD: osc8-pane-local-target-preview
 test "OSC 8 mismatch previews the real target without changing terminal geometry" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
