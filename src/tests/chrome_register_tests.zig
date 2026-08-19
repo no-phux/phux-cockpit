@@ -194,6 +194,7 @@ test "state is said with the accent, because elevation cannot say it" {
     try testing.expect(ratio(colors.accent, colors.background) >= 3);
 }
 
+// GUARD: side-rail-selection-accent
 test "the selected side rail tab carries a non-elevation accent marker" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
