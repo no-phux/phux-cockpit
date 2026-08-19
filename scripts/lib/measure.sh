@@ -14,7 +14,11 @@ source "${MEASURE_ROOT}/scripts/lib/dev-app.sh"
 # shellcheck source=scripts/lib/app-instance.sh
 source "${MEASURE_ROOT}/scripts/lib/app-instance.sh"
 
-MEASURE_SAMPLE_FLOOR=200
+# The pinned SDK keeps a 128-entry rolling ring PER STAGE. Snapshot `_n` is the
+# lifetime total, while each percentile's actual population is min(_n, 128).
+# A floor above this cap is a false claim and is refused by the helper below.
+MEASURE_SAMPLE_CAP=128
+MEASURE_SAMPLE_FLOOR=128
 
 # Print enough context to reproduce and compare a number without changing the
 # existing MEASURED lines cited by documentation and issues.
@@ -26,18 +30,50 @@ measure_basis() {
 }
 
 measure_require_sample_floor() {
-    local label="$1" count="${2:-}" floor="${3:-$MEASURE_SAMPLE_FLOOR}"
+    local label="$1" count="${2:-}" floor="${3:-$MEASURE_SAMPLE_FLOOR}" population
+    if [[ ! "$floor" =~ ^[0-9]+$ ]] || (( floor > MEASURE_SAMPLE_CAP )); then
+        printf 'REFUSING TO REPORT: %s sample floor %s exceeds the SDK rolling cap of %s.\n' \
+            "$label" "${floor:-<missing>}" "$MEASURE_SAMPLE_CAP" >&2
+        return 1
+    fi
     if [[ ! "$count" =~ ^[0-9]+$ ]]; then
         printf 'REFUSING TO REPORT: %s sample count is %s, not a number.\n' \
             "$label" "${count:-<missing>}" >&2
         return 1
     fi
-    if (( count < floor )); then
-        printf 'REFUSING TO REPORT: %s has %s samples, below the floor of %s.\n' \
-            "$label" "$count" "$floor" >&2
+    population=$((count < MEASURE_SAMPLE_CAP ? count : MEASURE_SAMPLE_CAP))
+    if (( population < floor )); then
+        printf 'REFUSING TO REPORT: %s percentile population is %s (lifetime_n=%s), below the floor of %s.\n' \
+            "$label" "$population" "$count" "$floor" >&2
         printf 'A percentile over that few samples is not evidence.\n' >&2
         return 1
     fi
+}
+
+# Require every named stage to be present and independently populated. Churn
+# uses this before printing anything, so a full host_draw ring cannot stand in
+# for absent topology work.
+measure_require_profile_stages() {
+    local snapshot="$1" floor="$2"
+    shift 2
+    local profile stage token count failed=0
+    profile="$(printf '%s\n' "$snapshot" | grep -o 'frame_profile.*' | head -1)"
+    if [[ -z "$profile" ]]; then
+        printf 'REFUSING TO REPORT: snapshot has no frame_profile.\n' >&2
+        return 1
+    fi
+    for stage in "$@"; do
+        count=""
+        for token in $profile; do
+            case "$token" in
+                "${stage}_n="*) count="${token##*=}"; break ;;
+            esac
+        done
+        if ! measure_require_sample_floor "$stage" "$count" "$floor"; then
+            failed=1
+        fi
+    done
+    (( failed == 0 ))
 }
 
 # Validate every stage independently before printing its percentiles. This
@@ -45,7 +81,7 @@ measure_require_sample_floor() {
 # stage, while still reporting stages that have enough evidence.
 measure_print_frame_profile() {
     local name="$1" basis="$2" derive="$3" snapshot="$4"
-    local profile token label count found=0 reportable=0 allowed='|'
+    local profile token label count population found=0 reportable=0 allowed='|'
     profile="$(printf '%s\n' "$snapshot" | grep -o 'frame_profile.*' | head -1)"
     if [[ -z "$profile" ]]; then
         printf 'REFUSING TO REPORT: snapshot has no frame_profile.\n' >&2
@@ -75,7 +111,12 @@ measure_print_frame_profile() {
     measure_basis "$name" "$basis" "$derive"
     for token in $profile; do
         case "$token" in
-            *_n=*) printf '%s\n' "$token" ;;
+            *_n=*)
+                label="${token%%_n=*}"
+                count="${token##*=}"
+                population=$((count < MEASURE_SAMPLE_CAP ? count : MEASURE_SAMPLE_CAP))
+                printf '%s\n%s_population_n=%s\n' "$token" "$label" "$population"
+                ;;
             *_p50_us=*|*_p90_us=*)
                 label="${token%%_p[59]0_us=*}"
                 [[ "$allowed" == *"|${label}|"* ]] && printf '%s\n' "$token"
@@ -83,6 +124,13 @@ measure_print_frame_profile() {
         esac
     done
     return 0
+}
+
+measure_raster_comparison_basis() {
+    local before_ref="$1" after_ref="$2" before_source="$3" after_source="$4" derive="$5"
+    measure_basis host_raster_comparison \
+        "PHUX_COCKPIT_SDK_SRC override per side; before=${before_ref} source=${before_source}; after=${after_ref} source=${after_source}" \
+        "$derive"
 }
 
 # Package, identity-stage, and launch from HOME. The app and CLI both use HOME
@@ -110,8 +158,18 @@ measure_launch_isolated() {
     printf '#!/usr/bin/env bash\nexec env -C %q %q "$@"\n' "$home" "$native_real" >"$wrapper"
     chmod +x "$wrapper"
     NATIVE="$wrapper"
+    # shellcheck disable=SC2034 # output variable consumed by --keep callers
+    MEASURE_DROPBOX="${home}/.zig-cache/native-sdk-automation"
 
     dev_app_launch "$executable" "$home" "$config" "$log"
     # shellcheck disable=SC2034 # output variable consumed by the caller
     MEASURE_APP_PID="$DEV_APP_PID"
+}
+
+measure_print_retained_run() {
+    local pid="$1" wrapper="$2" dropbox="$3"
+    printf '\nretained app pid: %s\n' "$pid"
+    printf 'retained automation command: '
+    printf '%q' "$wrapper"
+    printf ' automate snapshot\nretained automation dropbox: %s\n' "$dropbox"
 }

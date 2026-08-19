@@ -57,6 +57,7 @@ done
 # scripts/build-automation-cli.sh does, and refuse a checkout at any other
 # commit or with local source changes rather than measuring it quietly.
 SDK_SRC="${PHUX_COCKPIT_SDK_SRC:-}"
+SDK_MODE=pinned
 if [[ -z "$SDK_SRC" ]]; then
     if [[ ! -d "${PIN_CACHE}/.git" ]]; then
         printf 'error: no pinned SDK checkout at %s\n' "$PIN_CACHE" >&2
@@ -89,6 +90,7 @@ if [[ -z "$SDK_SRC" ]]; then
     SDK_SRC="$PIN_CACHE"
     printf 'sdk: %s at %s (pinned)\n' "$PIN_CACHE" "${have:0:9}"
 else
+    SDK_MODE=override
     printf 'sdk: %s (PHUX_COCKPIT_SDK_SRC override - NOT the pin)\n' "$SDK_SRC"
 fi
 
@@ -114,7 +116,13 @@ clang -w -fobjc-arc -fno-sanitize=builtin -ObjC -mmacosx-version-min=11.0 \
     -framework IOKit -framework Carbon -framework Accelerate \
     -framework MediaToolbox
 
+SDK_REF="$(git -C "$SDK_SRC" rev-parse HEAD 2>/dev/null || printf non-git)"
+if [[ "$SDK_MODE" == override ]]; then
+    DERIVE="PHUX_COCKPIT_SDK_SRC=${SDK_SRC} ./scripts/host-raster-check.sh"
+else
+    DERIVE='./scripts/host-raster-check.sh'
+fi
 measure_basis host_raster \
-    'JetBrains Mono NL regular, fixed terminal row, host CoreText rasterizer' \
-    './scripts/host-raster-check.sh'
+    "JetBrains Mono NL regular, fixed terminal row, host CoreText rasterizer; sdk_mode=${SDK_MODE}; sdk_source=${SDK_SRC}; sdk_ref=${SDK_REF}" \
+    "$DERIVE"
 "$BIN" "${ROOT}/src/fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf" "${ARGS[@]+"${ARGS[@]}"}"

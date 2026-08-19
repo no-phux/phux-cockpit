@@ -60,6 +60,9 @@ cleanup() {
     if [[ -n "$APP_PID" && "$KEEP" == "0" ]]; then
         app_instance_stop "$APP_PID"
     fi
+    if [[ -n "$APP_PID" && "$KEEP" == "1" ]]; then
+        measure_print_retained_run "$APP_PID" "$NATIVE" "$MEASURE_DROPBOX"
+    fi
     [[ "$KEEP" == "1" ]] || rm -rf "$WORK"
 }
 trap cleanup EXIT

@@ -49,8 +49,8 @@ if [[ ! -d "${PIN_CACHE}/.git" ]]; then
     exit 1
 fi
 
-# shellcheck source=scripts/lib/zon.sh
-source "${ROOT}/scripts/lib/zon.sh"
+# shellcheck source=scripts/lib/measure.sh
+source "${ROOT}/scripts/lib/measure.sh"
 # Block-scoped read: the old one-liner answered a local `.path` override with
 # GHOSTTY's url, which would have made this compare two ghostty commits while
 # reporting them as SDK pins. See phux-cockpit-yo5.
@@ -67,27 +67,37 @@ BEFORE="$1"
 AFTER="${2:-$pinned_sha}"
 
 WORK="$(mktemp -d)"
+resolve_ref() {
+    local ref="$1"
+    git -C "$PIN_CACHE" cat-file -e "${ref}^{commit}" 2>/dev/null || \
+        git -C "$PIN_CACHE" fetch --quiet origin "$ref"
+    git -C "$PIN_CACHE" rev-parse "${ref}^{commit}"
+}
+BEFORE_SHA="$(resolve_ref "$BEFORE")"
+AFTER_SHA="$(resolve_ref "$AFTER")"
+BEFORE_SOURCE="${WORK}/${BEFORE_SHA}"
+AFTER_SOURCE="${WORK}/${AFTER_SHA}"
 cleanup() {
-    for ref in "$BEFORE" "$AFTER"; do
-        git -C "$PIN_CACHE" worktree remove --force "${WORK}/${ref}" 2>/dev/null || true
+    for source in "$BEFORE_SOURCE" "$AFTER_SOURCE"; do
+        git -C "$PIN_CACHE" worktree remove --force "$source" 2>/dev/null || true
     done
     rm -rf "$WORK"
 }
 trap cleanup EXIT
 
+measure_raster_comparison_basis "$BEFORE_SHA" "$AFTER_SHA" \
+    "$BEFORE_SOURCE" "$AFTER_SOURCE" \
+    "./scripts/host-raster-compare.sh ${BEFORE} ${AFTER}"
+
 measure() {
-    local ref="$1" label="$2"
-    # Fetch on demand: the checkout was cloned at the pin, so an older commit
-    # is usually not present.
-    git -C "$PIN_CACHE" cat-file -e "${ref}^{commit}" 2>/dev/null || \
-        git -C "$PIN_CACHE" fetch --quiet origin "$ref"
-    git -C "$PIN_CACHE" worktree add --quiet --detach "${WORK}/${ref}" "$ref"
+    local ref="$1" source="$2" label="$3"
+    git -C "$PIN_CACHE" worktree add --quiet --detach "$source" "$ref"
     printf '\n--- %s (%s) ---\n' "$label" "${ref:0:9}"
-    PHUX_COCKPIT_SDK_SRC="${WORK}/${ref}" "${ROOT}/scripts/host-raster-check.sh" | grep -v '^sdk'
+    PHUX_COCKPIT_SDK_SRC="$source" "${ROOT}/scripts/host-raster-check.sh" | grep -v '^sdk'
 }
 
-measure "$BEFORE" before
-measure "$AFTER" after
+measure "$BEFORE_SHA" "$BEFORE_SOURCE" before
+measure "$AFTER_SHA" "$AFTER_SOURCE" after
 
 printf '\nRead the two cell_grid lines against each other. Equal numbers mean the\n'
 printf 'change did not move a single glyph pixel, whatever its diff says.\n'

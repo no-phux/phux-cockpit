@@ -10,15 +10,20 @@ can drift.
    re-runnable derivation is a guess wearing a constant's clothes.
 2. Measurements print `MEASURED-BASIS` before results. Existing `MEASURED`
    records remain stable because they are cited verbatim elsewhere.
-3. Each stage's percentiles are printed only if that stage independently meets
-   `MEASURE_SAMPLE_FLOOR` from `scripts/lib/measure.sh`; counts remain visible
-   and refusals name omitted stages. A high draw count does not make a low plan
-   or rebuild count meaningful.
+3. The pinned SDK keeps a rolling 128-sample ring per stage. Snapshot `_n` is a
+   lifetime total, not percentile population; the harness therefore prints
+   `*_population_n=min(*_n,128)` and never permits a floor above 128. Each
+   stage's percentiles are printed only if that actual population independently
+   meets `MEASURE_SAMPLE_FLOOR`. Churn additionally refuses success until the
+   named topology stages (`rebuild`, `layout`, `reconcile`, `emit`, `a11y`,
+   `plan`, `patch`, and `encode`) all hold a full rolling population.
 4. Driven app measurements launch through `scripts/lib/dev-app.sh`: the bundle
    is identity-staged and re-signed, config and state are isolated, and both app
    and CLI run from a private working directory so they share a private
    automation dropbox. `scripts/lib/app-instance.sh` still binds every read to
-   the launched pid and refuses a same-name sibling or an empty tree.
+   the launched pid and refuses a same-name sibling or an empty tree. A
+   retained `--keep` run prints the exact cwd-pinned wrapper command and
+   dropbox path needed to inspect that same instance.
 5. Dependency pins continue to be read only by `scripts/lib/zon.sh`. A local
    `.path` override is a named refusal, never permission to consume the next
    dependency's URL.

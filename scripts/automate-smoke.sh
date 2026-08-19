@@ -51,6 +51,7 @@ WORK="${TMPDIR:-/tmp}/phux-cockpit-smoke.$$"
 PROFILE=0
 CHURN=0
 CHURN_ACTIONS=160
+CHURN_REQUIRED_STAGES=(rebuild layout reconcile emit a11y plan patch encode)
 KEEP=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,6 +85,9 @@ cleanup() {
     # machine that is about to be idle. See app_instance_stop.
     if [[ -n "$APP_PID" && "$KEEP" == "0" ]]; then
         app_instance_stop "$APP_PID"
+    fi
+    if [[ -n "$APP_PID" && "$KEEP" == "1" ]]; then
+        measure_print_retained_run "$APP_PID" "$NATIVE" "$MEASURE_DROPBOX"
     fi
     [[ "$KEEP" == "1" ]] || rm -rf "$WORK"
 }
@@ -216,14 +220,18 @@ expect_pane_transition() {
 }
 
 wait_for_profile_floor() {
-    local required="$1" deadline=$((SECONDS + 60)) snapshot count
+    local floor="$1"
+    shift
+    local -a required=("$@")
+    local deadline=$((SECONDS + 60)) snapshot
     while :; do
         snapshot="$(app_instance_snapshot)" || return 1
-        count="$(printf '%s\n' "$snapshot" | grep -o "${required}_n=[0-9]*" | head -1 | cut -d= -f2 || true)"
-        [[ "$count" =~ ^[0-9]+$ ]] && (( count >= MEASURE_SAMPLE_FLOOR )) \
-            && { printf '%s\n' "$snapshot"; return 0; }
+        if measure_require_profile_stages "$snapshot" "$floor" "${required[@]}" 2>/dev/null; then
+            printf '%s\n' "$snapshot"
+            return 0
+        fi
         if [[ "$SECONDS" -ge "$deadline" ]]; then
-            measure_require_sample_floor "$required" "$count"
+            measure_require_profile_stages "$snapshot" "$floor" "${required[@]}"
             return 1
         fi
         sleep 1
@@ -248,7 +256,7 @@ if [[ "$PROFILE" == "1" ]]; then
 
     "$NATIVE" automate profile on >/dev/null 2>&1
 
-    profile_snapshot="$(wait_for_profile_floor host_draw)"
+    profile_snapshot="$(wait_for_profile_floor "$MEASURE_SAMPLE_FLOOR" host_draw)"
     printf '\n--- frame profile (4 panes, continuous repaint) ---\n'
     measure_print_frame_profile steady_repaint \
         '4 panes, 45-row continuous repaint, font-size 13' \
@@ -268,10 +276,10 @@ if [[ "$CHURN" == "1" ]]; then
         (( action % 20 != 0 )) || printf '  proven actions: %s/%s\n' "$action" "$CHURN_ACTIONS"
     done
     [[ "$(pane_count)" == 1 ]] || { printf 'REFUSING TO REPORT: churn did not return to one pane.\n' >&2; exit 1; }
-    profile_snapshot="$(wait_for_profile_floor host_draw)"
+    profile_snapshot="$(wait_for_profile_floor "$MEASURE_SAMPLE_FLOOR" "${CHURN_REQUIRED_STAGES[@]}")"
     printf '\n--- frame profile (split/close churn) ---\n'
     measure_print_frame_profile split_close_churn \
-        "${CHURN_ACTIONS} alternating cmd+d/cmd+w actions, each pane transition asserted, paced continuous repaint" \
+        "${CHURN_ACTIONS} alternating cmd+d/cmd+w actions, each pane transition asserted; required full 128-sample rolling populations for ${CHURN_REQUIRED_STAGES[*]}; paced continuous repaint" \
         "./scripts/automate-smoke.sh --churn --churn-actions ${CHURN_ACTIONS}" "$profile_snapshot"
 fi
 
