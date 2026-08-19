@@ -50,7 +50,12 @@ pub fn isAllowedTarget(target: []const u8) bool {
     // well-formed URL. Refusing the class means `https://ok\x00javascript:...`
     // cannot survive as its harmless-looking prefix.
     for (target) |byte| {
-        if (byte <= 0x20 or byte == 0x7f) return false;
+        // OSC 8 has no visual target of its own. Keep its destination in the
+        // same ASCII alphabet as the heuristic so Unicode bidi/formatting
+        // controls cannot make the hover preview read as a different URL.
+        // Internationalized destinations remain representable in their URL
+        // forms (punycode and percent encoding).
+        if (byte <= 0x20 or byte >= 0x7f) return false;
     }
     const scheme = matchScheme(target) orelse return false;
     // A bare scheme names no target.

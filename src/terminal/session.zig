@@ -1767,18 +1767,12 @@ pub const Session = struct {
     ///     falls back to the heuristic, so a `javascript:` href wrapped around
     ///     visible link text still opens the VISIBLE link and nothing else.
     ///
-    ///  2. When the display text under the pointer is ITSELF a URL and it
-    ///     disagrees with the href, the DISPLAY TEXT WINS. This is the
-    ///     phishing shape OSC 8 makes possible: the sequence chooses both what
-    ///     you read and where you go, so `\x1b]8;;https://evil.example\x1b\\`
-    ///     wrapped around the text `https://bank.example` reads as one
-    ///     destination and navigates to another. Cockpit has no hover preview
-    ///     to show the real target with, so the invariant it can actually keep
-    ///     is that a link which LOOKS like a URL goes where it looks. A
-    ///     mismatch costs the program its indirection; it never costs the user
-    ///     a surprise destination. Where the display text is not a URL
-    ///     (`click here`, a file name, an issue number) there is nothing to
-    ///     disagree with and the href is used as written.
+    ///  2. The same Cmd-hover chord that advertises the click exposes the REAL
+    ///     href in a pane-local preview and in the terminal's accessibility
+    ///     label. That closes OSC 8's phishing gap before its indirection is
+    ///     honored: `https://bank.example` may display over an href of
+    ///     `https://evil.example`, but the target is visible before the click
+    ///     and is the target the click opens.
     ///
     /// The emulator is read LIVE here rather than through the render state:
     /// this runs on pointer input, arbitrarily long after the last paint, and
@@ -1796,10 +1790,6 @@ pub const Session = struct {
         const shown = session.textLinkAtCell(coordinate);
         if (session.hyperlinkUriAtCell(coordinate)) |href| explicit: {
             if (!url_module.isAllowedTarget(href)) break :explicit;
-            // The display text claims a different destination — see (2) above.
-            if (shown) |text_link| {
-                if (!std.mem.eql(u8, text_link.url, href)) break :explicit;
-            }
             return .{
                 .url = session.rememberLink(href) orelse return null,
                 .source = .osc8,
@@ -1893,6 +1883,21 @@ pub const Session = struct {
             if (point) |new| return old.x != new.x or old.y != new.y;
         }
         return true;
+    }
+
+    /// The real OSC 8 destination under the armed hover point.
+    ///
+    /// This deliberately does not return heuristic links: their target is
+    /// already the text on glass. The returned explicit target has passed the
+    /// same allowlist as a click and is copied into session storage, so both
+    /// the visual preview and accessibility surface announce exactly what the
+    /// click path can hand to the OS.
+    pub fn hoveredOsc8Target(session: *Session) ?[]const u8 {
+        const point = session.hover_point orelse return null;
+        const coordinate = session.pointerViewportCoordinate(point.x, point.y) orelse return null;
+        const href = session.hyperlinkUriAtCell(coordinate) orelse return null;
+        if (!url_module.isAllowedTarget(href)) return null;
+        return session.rememberLink(href);
     }
 
     /// The link the hover point resolves to right now, or null.

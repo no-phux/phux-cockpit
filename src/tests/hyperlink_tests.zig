@@ -146,6 +146,9 @@ test "REFUSED: an OSC 8 href carrying control bytes or no target at all" {
 
     // Refused at the module seam too, where the reasoning lives.
     try testing.expect(!url.isAllowedTarget("https://ok.example\x00javascript:alert(1)"));
+    // U+202E RIGHT-TO-LEFT OVERRIDE could make the preview itself lie about
+    // its visible order, so explicit targets stay in the URL ASCII alphabet.
+    try testing.expect(!url.isAllowedTarget("https://bank.example/\xe2\x80\xaeevil.example"));
     try testing.expect(!url.isAllowedTarget("https://ok.example/a b"));
     try testing.expect(!url.isAllowedTarget("https://"));
     try testing.expect(!url.isAllowedTarget(""));
@@ -153,7 +156,22 @@ test "REFUSED: an OSC 8 href carrying control bytes or no target at all" {
     try testing.expect(url.isAllowedTarget("mailto:a@example.com"));
 }
 
-test "a display text that disagrees with its href opens what is on screen" {
+test "REFUSED: a spoofing OSC 8 target neither previews nor overrides visible URL text" {
+    const session = try createSession(80, 6);
+    defer session.destroy();
+    session.setMeasuredCell(10, 20);
+    const shown = "https://bank.example";
+    session.feed(open_link ++ "https://bank.example/\xe2\x80\xaeevil.example" ++ st ++ shown ++ close_link ++ "\r\n");
+    session.refreshScreenText();
+
+    _ = session.setHoverPoint(cellPoint(session, 5, 0));
+    try testing.expect(session.hoveredOsc8Target() == null);
+    const fallback = linkAtCell(session, 5, 0) orelse return error.TestExpectedLink;
+    try testing.expectEqualStrings(shown, fallback.url);
+    try testing.expectEqual(grid.Session.LinkSource.text, fallback.source);
+}
+
+test "a display text that disagrees with its href previews and opens the real target" {
     const session = try createSession(60, 6);
     defer session.destroy();
     session.setMeasuredCell(10, 20);
@@ -161,11 +179,30 @@ test "a display text that disagrees with its href opens what is on screen" {
     session.feed(open_link ++ "https://evil.example/steal" ++ st ++ "https://bank.example" ++ close_link ++ "\r\n");
     session.refreshScreenText();
 
+    // The target is absent until the link chord is armed over these cells.
+    try testing.expect(session.hoveredOsc8Target() == null);
+    _ = session.setHoverPoint(cellPoint(session, 5, 0));
+    try testing.expectEqualStrings("https://evil.example/steal", session.hoveredOsc8Target().?);
+
     const link = linkAtCell(session, 5, 0) orelse return error.TestExpectedLink;
-    try testing.expectEqualStrings("https://bank.example", link.url);
-    // ...and it is reported as read from the TEXT, because that is what it is:
-    // the explicit channel lost its indirection, not just its destination.
-    try testing.expectEqual(grid.Session.LinkSource.text, link.source);
+    try testing.expectEqualStrings("https://evil.example/steal", link.url);
+    try testing.expectEqual(grid.Session.LinkSource.osc8, link.source);
+}
+
+fn previewGround(display_list: canvas.DisplayList, pane_index: usize) ?geometry.RectF {
+    for (display_list.commands) |command| switch (command) {
+        .fill_rect => |fill| if (fill.id == app.link_preview_ground_command_id_base + pane_index) return fill.rect,
+        else => {},
+    };
+    return null;
+}
+
+fn previewText(display_list: canvas.DisplayList, pane_index: usize) ?[]const u8 {
+    for (display_list.commands) |command| switch (command) {
+        .draw_text => |text| if (text.id == app.link_preview_text_command_id_base + pane_index) return text.text,
+        else => {},
+    };
+    return null;
 }
 
 test "a display text that AGREES with its href stays an explicit link" {
@@ -359,6 +396,73 @@ test "cmd+click follows an OSC 8 href, not the words it is wrapped around" {
     try pointerInput(harness, app_iface, .pointer_down, on_link, 0, .{ .command = true }, 0);
     try testing.expectEqual(@as(u32, 1), model.opened_url_count);
     try testing.expectEqualStrings("https://example.com/docs", model.openedUrl());
+}
+
+test "OSC 8 mismatch previews the real target without changing terminal geometry" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    const host = try startPointerHost(gpa, harness, size);
+    defer gpa.destroy(host);
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    const app_iface = host.app();
+    const model = &host.inner.model;
+    const pane = model.provider.terminal(app.initialTerminalRef(0)) orelse return error.TestExpectedTerminal;
+    const href = "https://evil.example/steal";
+    const shown = "https://bank.example";
+
+    // Make containment meaningful: the target pane occupies only half of the
+    // window, so a window-level preview would fail the bounds assertions.
+    app.update(model, .split_right, &host.inner.effects);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    try host.inner.effects.feedPtyOutput(pane.pty_key, open_link ++ href ++ st ++ shown ++ close_link ++ "\r\n");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .wake);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    const frame_before = terminalInteractionFrame(harness, shown) orelse
+        return error.TestExpectedTerminalInteractionSurface;
+    const cols_before = pane.cols;
+    const rows_before = pane.rows;
+    const cell_before = pane.session.measuredCell().?;
+
+    var bare_commands: [native_sdk.runtime.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+    var bare_builder = canvas.Builder.init(&bare_commands);
+    _ = try paintHostGrid(host, &bare_builder);
+    try testing.expect(previewGround(bare_builder.displayList(), 0) == null);
+
+    const on_link = terminalCellPoint(pane, frame_before, 5, 0);
+    try pointerInput(harness, app_iface, .pointer_move, on_link, 0, .{ .command = true }, 0);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    var hovered_commands: [native_sdk.runtime.max_canvas_commands_per_view]canvas.CanvasCommand = undefined;
+    var hovered_builder = canvas.Builder.init(&hovered_commands);
+    _ = try paintHostGrid(host, &hovered_builder);
+    const preview = previewGround(hovered_builder.displayList(), 0) orelse return error.TestExpectedLinkPreview;
+    try testing.expectEqualStrings(href, previewText(hovered_builder.displayList(), 0) orelse return error.TestExpectedLinkPreview);
+    try testing.expect(preview.x >= frame_before.x and preview.y >= frame_before.y);
+    try testing.expect(preview.x + preview.width <= frame_before.x + frame_before.width);
+    try testing.expect(preview.y + preview.height <= frame_before.y + frame_before.height);
+
+    const frame_after = terminalInteractionFrame(harness, shown) orelse
+        return error.TestExpectedTerminalInteractionSurface;
+    try testing.expectEqual(frame_before, frame_after);
+    try testing.expectEqual(cols_before, pane.cols);
+    try testing.expectEqual(rows_before, pane.rows);
+    try testing.expectEqual(cell_before, pane.session.measuredCell().?);
+
+    var accessible_targets: usize = 0;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind != .terminal) continue;
+        if (std.mem.indexOf(u8, node.widget.semantics.label, href) != null) accessible_targets += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), accessible_targets);
+
+    try pointerInput(harness, app_iface, .pointer_down, on_link, 0, .{ .command = true }, 0);
+    try testing.expectEqual(@as(u32, 1), model.opened_url_count);
+    try testing.expectEqualStrings(href, model.openedUrl());
 }
 
 test "the link chord arms the hover underline, and a bare pointer does not" {

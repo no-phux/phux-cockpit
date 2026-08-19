@@ -215,6 +215,10 @@ pub const pane_dim_command_id_base: u64 = 0x0c10;
 pub const pane_focus_command_id_base: u64 = 0x0c30;
 /// The focus edge's thickness, in points.
 pub const pane_focus_edge_thickness: f32 = 1;
+/// Pane-local OSC 8 target preview commands. One pair per resolved pane.
+pub const link_preview_ground_command_id_base: u64 = 0x0c50;
+pub const link_preview_text_command_id_base: u64 = 0x0c70;
+const link_preview_command_count: usize = 2;
 
 // A `terminalNumber(LocalTerminalId)` used to sit here, turning a registry
 // slot into a display number, with no callers left and a doc comment about the
@@ -710,12 +714,63 @@ fn tabOverflowCue(ui: *TerminalUi, side: TabOverflowSide, hidden: usize) Termina
 /// thing in the tree that can tell a screen reader what this terminal is and
 /// how it is doing.
 fn terminalSurfaceLabel(ui: *TerminalUi, model: *const Model, id: TerminalRef) []const u8 {
-    if (model.provider.terminalConst(id)) |pane| return paneDiagnostics(ui, model, pane);
+    if (model.provider.terminalConst(id)) |pane| {
+        const diagnostics = paneDiagnostics(ui, model, pane);
+        if (pane.session.hoveredOsc8Target()) |target| {
+            return ui.fmt("{s}; link target {s}", .{ diagnostics, target });
+        }
+        return diagnostics;
+    }
     const phase = if (model.remotePresentation(id)) |presentation|
         remoteLifecycleText(presentation.phase)
     else
         "UNAVAILABLE";
     return ui.fmt("{s}, phux terminal, {s}", .{ terminalTitle(ui, model, id), phase });
+}
+
+/// Paint the allowlisted OSC 8 href over the bottom of its pane without
+/// changing the pane rect, grid rect, widget tree, or PTY dimensions.
+fn paintLinkTargetPreview(
+    pane: *const Pane,
+    pane_index: usize,
+    rect: geometry.RectF,
+    tokens: canvas.DesignTokens,
+    builder: *canvas.Builder,
+) !void {
+    const target = pane.session.hoveredOsc8Target() orelse return;
+    const inset = projection.chrome_band_inset;
+    const height = projection.chrome_control_extent;
+    const frame = geometry.RectF.init(
+        rect.x + inset,
+        rect.y + @max(0, rect.height - height - inset),
+        @max(0, rect.width - inset * 2),
+        @min(height, rect.height),
+    );
+    if (frame.width <= 0 or frame.height <= 0) return;
+
+    try builder.fillRect(.{
+        .id = link_preview_ground_command_id_base + pane_index,
+        .rect = frame,
+        .fill = .{ .color = tokens.colors.surface },
+    });
+    const text_size = tokens.typography.label_size;
+    try builder.drawText(.{
+        .id = link_preview_text_command_id_base + pane_index,
+        .font_id = tokens.typography.font_id,
+        .size = text_size,
+        .origin = geometry.PointF.init(
+            frame.x + inset,
+            frame.y + (frame.height + text_size * 0.7) * 0.5,
+        ),
+        .color = tokens.colors.text,
+        .text = target,
+        .text_layout = .{
+            .max_width = @max(0, frame.width - inset * 2),
+            .line_height = frame.height,
+            .wrap = .none,
+            .measure = tokens.text_measure,
+        },
+    });
 }
 
 /// A single pane's interaction surface. No pane header: Ghostty has none,
@@ -1925,7 +1980,10 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
                 .running = terminal.phase == .live or terminal.phase == .starting,
                 .focused = options_focused,
                 .selecting = terminal.selecting,
-                .command_budget = command_budget,
+                // Hold two slots for the non-layout href preview. The builder's
+                // running length already includes earlier panes' previews, so
+                // subtracting once preserves this pane's cumulative envelope.
+                .command_budget = command_budget -| link_preview_command_count,
                 .text_reserve = text_reserve,
                 .glyph_budget = glyph_budget,
                 .path_reserve = path_reserve,
@@ -1933,6 +1991,7 @@ fn paintWindow(model: *const Model, builder: *canvas.Builder, window_index: usiz
                 .minimum_contrast = model.config.minimum_contrast,
                 .id_base = grid.paneIdBase(terminalPaintIndex(model, pane.terminal)),
             });
+            try paintLinkTargetPreview(terminal, index, pane.rect, tokens, builder);
         } else {
             const remote = model.phuxConst() orelse continue;
             const presentation = remote.presentation(pane.terminal) orelse continue;
