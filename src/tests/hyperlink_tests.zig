@@ -555,7 +555,7 @@ test "long OSC 8 userinfo cannot hide the rendered effective authority" {
     host_prefix[55] = '.';
     host_prefix[111] = '.';
     host_prefix[167] = '.';
-    const href = try std.fmt.allocPrint(gpa, "https://{s}@{s}.evil.example/steal", .{ userinfo, host_prefix });
+    const href = try std.fmt.allocPrint(gpa, "https://{s}@{s}.EVIL.Example/steal", .{ userinfo, host_prefix });
     defer gpa.free(href);
     try testing.expect(href.len <= url.max_url_bytes);
     const output = try std.fmt.allocPrint(gpa, "{s}{s}{s}{s}{s}\r\n", .{ open_link, href, st, "https://bank.example", close_link });

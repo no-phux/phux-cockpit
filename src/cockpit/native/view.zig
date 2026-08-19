@@ -743,18 +743,23 @@ fn terminalSurfaceLabel(ui: *TerminalUi, model: *const Model, id: TerminalRef) [
 /// Paint the allowlisted OSC 8 href over the bottom of its pane without
 /// changing the pane rect, grid rect, widget tree, or PTY dimensions.
 fn authorityPreviewText(builder: *canvas.Builder, tokens: canvas.DesignTokens, authority: []const u8, width: f32) !?[]const u8 {
+    var canonical_buf: [url_module.max_url_bytes]u8 = undefined;
+    for (authority, 0..) |byte, index| canonical_buf[index] = std.ascii.toLower(byte);
+    const canonical = canonical_buf[0..authority.len];
     const text_size = tokens.typography.label_size;
-    if (canvas.measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, authority, text_size) <= width) return authority;
+    if (canvas.measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, canonical, text_size) <= width) {
+        return try builder.allocTextBytes(canonical);
+    }
     const marker = "...";
     if (canvas.measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, marker ++ "x", text_size) > width) return null;
 
-    var start = authority.len;
+    var start = canonical.len;
     while (start > 0) {
         start -= 1;
         const candidate_width = canvas.measureTextWidthForFont(
             tokens.text_measure,
             tokens.typography.font_id,
-            authority[start..],
+            canonical[start..],
             text_size,
         );
         const marker_width = canvas.measureTextWidthForFont(tokens.text_measure, tokens.typography.font_id, marker, text_size);
@@ -765,8 +770,8 @@ fn authorityPreviewText(builder: *canvas.Builder, tokens: canvas.DesignTokens, a
     }
     var staged: [url_module.max_url_bytes]u8 = undefined;
     @memcpy(staged[0..marker.len], marker);
-    @memcpy(staged[marker.len..][0 .. authority.len - start], authority[start..]);
-    return try builder.allocTextBytes(staged[0 .. marker.len + authority.len - start]);
+    @memcpy(staged[marker.len..][0 .. canonical.len - start], canonical[start..]);
+    return try builder.allocTextBytes(staged[0 .. marker.len + canonical.len - start]);
 }
 
 fn paintLinkTargetPreview(
