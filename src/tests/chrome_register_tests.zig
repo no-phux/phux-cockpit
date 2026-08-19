@@ -194,6 +194,53 @@ test "state is said with the accent, because elevation cannot say it" {
     try testing.expect(ratio(colors.accent, colors.background) >= 3);
 }
 
+test "the selected side rail tab carries a non-elevation accent marker" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try support.startCockpit(harness);
+    defer support.stopCockpit(state);
+
+    app.update(&state.model, .new_terminal, &state.effects);
+    state.model.tab_placement = .side;
+    state.model.ws().surface_size = geometry.SizeF.init(app.window_width, app.window_height);
+
+    const arena_bytes = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(arena_bytes);
+    var fixed = std.heap.FixedBufferAllocator.init(arena_bytes);
+    var ui = support.TerminalApp.Ui.init(fixed.allocator());
+    const tokens = app.cockpitTokens(&state.model);
+    const root = app.viewWindow(&ui, &state.model, 0);
+    const tree = try ui.finalizeWithTokens(root, tokens);
+    const nodes = try testing.allocator.alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
+    defer testing.allocator.free(nodes);
+    const bounds = geometry.RectF.init(0, 0, app.window_width, app.window_height);
+    const solved = try canvas.layoutWidgetTreeWithTokens(tree.root, bounds, tokens, nodes);
+
+    var tab_count: usize = 0;
+    var selected_count: usize = 0;
+    for (solved.nodes) |tab| {
+        if (tab.widget.kind != .list_item or tab.widget.semantics.role != .tab) continue;
+        tab_count += 1;
+        try testing.expectEqual(app.side_rail_width, tab.frame.width);
+        try testing.expectEqual(app.side_tab_height, tab.frame.height);
+
+        const selected = std.mem.endsWith(u8, tab.widget.semantics.label, ", selected");
+        if (selected) selected_count += 1;
+        var marker_count: usize = 0;
+        for (solved.nodes) |candidate| {
+            const background = candidate.widget.style.background orelse continue;
+            if (!std.meta.eql(background, tokens.colors.accent)) continue;
+            if (candidate.frame.x != tab.frame.x or candidate.frame.y != tab.frame.y) continue;
+            if (candidate.frame.width != app.tab_indicator_thickness or candidate.frame.height != tab.frame.height) continue;
+            marker_count += 1;
+            try testing.expect(ratio(background, tab.widget.style.background.?) >= 3);
+        }
+        try testing.expectEqual(@as(usize, if (selected) 1 else 0), marker_count);
+    }
+    try testing.expectEqual(@as(usize, 2), tab_count);
+    try testing.expectEqual(@as(usize, 1), selected_count);
+}
+
 test "every ink the chrome paints clears AA on every ground it paints on" {
     const colors = packTokens().colors;
     const inks = [_]canvas.Color{ colors.text, colors.text_muted, colors.accent, colors.warning, colors.destructive };
