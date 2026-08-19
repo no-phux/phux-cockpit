@@ -326,7 +326,6 @@ test "repeated canvas Cmd+T presses complete their key edges" {
     try testing.expectEqual(@as(u64, 0), state.model.consumed_shortcut_keys_held);
 }
 
-// GUARD: full-tab-strip-chrome-arrangements
 test "a full tab strip passes the layout audit in titlebar and fullscreen" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);

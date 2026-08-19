@@ -232,7 +232,6 @@ test "the registry mints unique terminals up to the shells it can back" {
     try testing.expect(app.onCommand("tab.move-right") != null);
 }
 
-// GUARD: tab-admission-refusal-visible
 test "a refused tab admission names the tab ceiling in chrome" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);
