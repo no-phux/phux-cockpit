@@ -98,7 +98,7 @@ patch_paths() {
 
 restore() {
     local guard="$1"
-    patch_of "$guard" | git -C "$ROOT" apply -R - 2>/dev/null || true
+    patch_of "$guard" | git -C "$ROOT" apply --unidiff-zero -R - 2>/dev/null || true
     if tracked_dirty; then
         # shellcheck disable=SC2046
         git -C "$ROOT" checkout -- $(patch_paths "$guard") 2>/dev/null || true
@@ -138,7 +138,7 @@ if [[ -n "$RECORD" ]]; then
     } > "$guard"
 
     printf 'captured into %s:\n' "$guard"
-    patch_of "$guard" | git -C "$ROOT" apply --stat - | sed 's/^/  /'
+    patch_of "$guard" | git -C "$ROOT" apply --unidiff-zero --stat - | sed 's/^/  /'
 
     # shellcheck disable=SC2046
     git -C "$ROOT" checkout -- $(patch_paths "$guard")
@@ -202,12 +202,12 @@ for name in "${names[@]}"; do
     printf '=== %s ===\n' "$name"
     printf 'guards: %s\n' "$test_name"
 
-    if ! patch_of "$guard" | git -C "$ROOT" apply --check - 2>/dev/null; then
+    if ! patch_of "$guard" | git -C "$ROOT" apply --unidiff-zero --check - 2>/dev/null; then
         printf 'BREAK NO LONGER APPLIES. The fix moved; re-derive this guard.\n\n' >&2
         failed=1
         continue
     fi
-    patch_of "$guard" | git -C "$ROOT" apply -
+    patch_of "$guard" | git -C "$ROOT" apply --unidiff-zero -
     printf 'removed the fix:\n'
     git -C "$ROOT" diff --stat | sed 's/^/  /'
 

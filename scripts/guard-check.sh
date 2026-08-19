@@ -122,7 +122,7 @@ for guard in "${guard_files[@]}"; do
     # Staleness. The break is stored as a patch against the FIXED tree, so it
     # must still apply forward. When it does not, the fix it removes has moved
     # and the recorded proof is about code that no longer exists.
-    if ! sed -n '/^diff --git /,$p' "$guard" | git -C "$ROOT" apply --check - 2>/dev/null; then
+    if ! sed -n '/^diff --git /,$p' "$guard" | git -C "$ROOT" apply --unidiff-zero --check - 2>/dev/null; then
         complain "$name: its break no longer applies to the tree. The fix moved; re-derive with scripts/guard-red-run.sh --record."
     fi
 done

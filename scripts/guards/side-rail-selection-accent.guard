@@ -9,10 +9,7 @@ diff --git a/src/cockpit/native/view.zig b/src/cockpit/native/view.zig
 index df2feee..7eda500 100644
 --- a/src/cockpit/native/view.zig
 +++ b/src/cockpit/native/view.zig
-@@ -592,42 +592,24 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
-     }, .{body});
- }
- 
+@@ -595,4 +595,4 @@ fn terminalTabTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace
 -/// The side rail's row for one tab. The outer `list_item` remains the native
 -/// hit target and accessibility control; its child row adds the same leading
 -/// accent rail the switcher's vertical list uses to say where selection is.
@@ -21,21 +18,15 @@ index df2feee..7eda500 100644
 +/// register's own `list_item` still fits — it has a leading icon slot and a
 +/// selected state, and the close affordance rides the row beside it.
 +fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tab_index: usize) TerminalUi.Node {
-     const id = ws.tabTerminal(tab_index) orelse return ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
-     const selected = !ws.web_selected and ws.selected_tab == tab_index;
-     const title = terminalTitle(ui, model, id);
+@@ -602 +602,2 @@ fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspac
 -    return ui.el(.list_item, .{
 +    const marker: []const u8 = if (terminalNeedsAttention(model, id)) attention_marker_icon else "";
 +    return ui.listItem(.{
-         .global_key = .{ .index = terminalPaintIndex(model, id) },
-         .size = .sm,
-         .height = side_tab_height,
-         .width = side_rail_width,
+@@ -606,0 +608 @@ fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspac
 +        .icon = marker,
-         .selected = selected,
-         .on_press = .{ .select_position = @intCast(tab_index) },
+@@ -609 +610,0 @@ fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspac
 -        .style = .{ .background = if (selected) tokens.colors.surface_subtle else tokens.colors.surface },
-         .semantics = .{ .role = .tab, .label = tabSemantics(ui, model, ws, tab_index, id, title, selected) },
+@@ -611,20 +612 @@ fn terminalRailTrigger(ui: *TerminalUi, model: *const Model, ws: *const Workspac
 -    }, .{
 -        ui.row(.{ .width = side_rail_width, .height = side_tab_height, .cross = .center }, .{
 -            // Keep the slot in every row: changing selection changes ink, not
@@ -57,13 +48,7 @@ index df2feee..7eda500 100644
 -        }),
 -    });
 +    }, title);
- }
- 
- /// A control plus the name it does not otherwise show.
-@@ -1741,28 +1723,23 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
-     var strip_nodes: [max_tabs + 2]TerminalUi.Node = undefined;
-     var rail_nodes: [max_tabs]TerminalUi.Node = undefined;
-     var strip_written: usize = 0;
+@@ -1744,19 +1726,14 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
 -    var rail_written: usize = 0;
 -    if (model.tab_placement == .top) {
 -        if (window.windowed()) {
@@ -97,10 +82,6 @@ index df2feee..7eda500 100644
 +    }
 +    for (0..ws.tab_count) |index| {
 +        rail_nodes[index] = terminalRailTrigger(ui, model, ws, index);
-     }
-     const strip_slice = strip_nodes[0..strip_written];
+@@ -1765 +1742 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
 -    const rail_slice = rail_nodes[0..rail_written];
 +    const rail_slice = rail_nodes[0..ws.tab_count];
- 
-     const chrome = projection.workspaceChromeIn(model, ws, ws.surface_size);
-     const focused_ref = projection.workspaceTerminalRef(model, ws);
