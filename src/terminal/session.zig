@@ -254,6 +254,21 @@ pub const Session = struct {
     /// pointer moves the underline with the text instead of leaving it on the
     /// cells the link used to occupy.
     hover_point: ?HoverPoint = null,
+    /// Pointer location independent of modifiers. The OSC 8 target preview is
+    /// ordinary hover UI, so pressing Cmd while stationary cannot leave policy
+    /// dependent on whether the platform happens to synthesize a move event.
+    pointer_point: ?HoverPoint = null,
+    /// Receipt for the exact OSC 8 target that completed display-list emission.
+    /// A mismatched visible URL may use its href only while this cell+target
+    /// receipt still matches; hover state by itself is never proof of display.
+    preview_rendered_cell: ?CellPos = null,
+    preview_rendered_buf: [url_module.max_url_bytes]u8 = undefined,
+    preview_rendered_len: usize = 0,
+    /// Separate from `link_buf`: snapshot resolves the underline after the
+    /// preview target is borrowed and may resolve visible-text fallback into
+    /// `link_buf`. Sharing storage silently spliced the two URLs.
+    preview_target_buf: [url_module.max_url_bytes]u8 = undefined,
+    preview_target_len: usize = 0,
 
     pub const CellPos = struct { x: u16 = 0, y: u16 = 0 };
 
@@ -764,6 +779,7 @@ pub const Session = struct {
     /// persists across batches (escape sequences split at a chunk
     /// boundary keep parsing).
     pub fn feed(session: *Session, bytes: []const u8) void {
+        session.invalidateRenderedPreview();
         session.stream.nextSlice(bytes);
         // Output is the overwhelmingly common screen change; marking here
         // (rather than serializing here) is what keeps the semantic text
@@ -1767,18 +1783,15 @@ pub const Session = struct {
     ///     falls back to the heuristic, so a `javascript:` href wrapped around
     ///     visible link text still opens the VISIBLE link and nothing else.
     ///
-    ///  2. When the display text under the pointer is ITSELF a URL and it
-    ///     disagrees with the href, the DISPLAY TEXT WINS. This is the
-    ///     phishing shape OSC 8 makes possible: the sequence chooses both what
-    ///     you read and where you go, so `\x1b]8;;https://evil.example\x1b\\`
-    ///     wrapped around the text `https://bank.example` reads as one
-    ///     destination and navigates to another. Cockpit has no hover preview
-    ///     to show the real target with, so the invariant it can actually keep
-    ///     is that a link which LOOKS like a URL goes where it looks. A
-    ///     mismatch costs the program its indirection; it never costs the user
-    ///     a surprise destination. Where the display text is not a URL
-    ///     (`click here`, a file name, an issue number) there is nothing to
-    ///     disagree with and the href is used as written.
+    ///  2. Hover exposes the REAL
+    ///     href in a pane-local preview and in the terminal's accessibility
+    ///     label. That closes OSC 8's phishing gap before its indirection is
+    ///     honored: `https://bank.example` may display over an href of
+    ///     `https://evil.example`, but the target is visible before the click
+    ///     and is the target the click opens. For URL-shaped display text that
+    ///     disagrees, the exact cell+href must have completed preview emission
+    ///     before the href wins. A quick click, keyboard/accessibility action,
+    ///     failed paint, or stale preview falls back to the visible URL.
     ///
     /// The emulator is read LIVE here rather than through the render state:
     /// this runs on pointer input, arbitrarily long after the last paint, and
@@ -1795,10 +1808,9 @@ pub const Session = struct {
     fn linkAtCell(session: *Session, coordinate: vt.Coordinate) ?Link {
         const shown = session.textLinkAtCell(coordinate);
         if (session.hyperlinkUriAtCell(coordinate)) |href| explicit: {
-            if (!url_module.isAllowedTarget(href)) break :explicit;
-            // The display text claims a different destination — see (2) above.
+            if (url_module.targetIdentity(href) == null) break :explicit;
             if (shown) |text_link| {
-                if (!std.mem.eql(u8, text_link.url, href)) break :explicit;
+                if (!std.mem.eql(u8, text_link.url, href) and !session.previewWasRendered(coordinate, href)) break :explicit;
             }
             return .{
                 .url = session.rememberLink(href) orelse return null,
@@ -1893,6 +1905,60 @@ pub const Session = struct {
             if (point) |new| return old.x != new.x or old.y != new.y;
         }
         return true;
+    }
+
+    /// Track the pane-relative pointer for target preview independently of the
+    /// Cmd underline. Moving it invalidates any receipt from the prior cell.
+    pub fn setPointerPoint(session: *Session, point: ?HoverPoint) bool {
+        const before = session.pointer_point;
+        if (before == null and point == null) return false;
+        if (before) |old| if (point) |new| {
+            if (old.x == new.x and old.y == new.y) return false;
+        };
+        session.pointer_point = point;
+        session.invalidateRenderedPreview();
+        return true;
+    }
+
+    /// The real OSC 8 destination under the pointer.
+    ///
+    /// This deliberately does not return heuristic links: their target is
+    /// already the text on glass. The returned explicit target has passed the
+    /// same allowlist as a click and is copied into session storage, so both
+    /// the visual preview and accessibility surface announce exactly what the
+    /// click path can hand to the OS.
+    pub fn hoveredOsc8Target(session: *Session) ?[]const u8 {
+        const point = session.pointer_point orelse return null;
+        const coordinate = session.pointerViewportCoordinate(point.x, point.y) orelse return null;
+        const href = session.hyperlinkUriAtCell(coordinate) orelse return null;
+        if (url_module.targetIdentity(href) == null) return null;
+        if (href.len > session.preview_target_buf.len) return null;
+        @memcpy(session.preview_target_buf[0..href.len], href);
+        session.preview_target_len = href.len;
+        return session.preview_target_buf[0..session.preview_target_len];
+    }
+
+    pub fn markOsc8PreviewRendered(session: *Session, target: []const u8) void {
+        const identity = url_module.targetIdentity(target) orelse return;
+        if (identity.effective_authority == null) return;
+        const point = session.pointer_point orelse return;
+        const coordinate = session.pointerViewportCoordinate(point.x, point.y) orelse return;
+        const live = session.hyperlinkUriAtCell(coordinate) orelse return;
+        if (!std.mem.eql(u8, live, target) or target.len > session.preview_rendered_buf.len) return;
+        @memcpy(session.preview_rendered_buf[0..target.len], target);
+        session.preview_rendered_len = target.len;
+        session.preview_rendered_cell = .{ .x = @intCast(coordinate.x), .y = @intCast(coordinate.y) };
+    }
+
+    fn previewWasRendered(session: *const Session, coordinate: vt.Coordinate, target: []const u8) bool {
+        const cell = session.preview_rendered_cell orelse return false;
+        return cell.x == coordinate.x and cell.y == coordinate.y and
+            std.mem.eql(u8, session.preview_rendered_buf[0..session.preview_rendered_len], target);
+    }
+
+    fn invalidateRenderedPreview(session: *Session) void {
+        session.preview_rendered_cell = null;
+        session.preview_rendered_len = 0;
     }
 
     /// The link the hover point resolves to right now, or null.

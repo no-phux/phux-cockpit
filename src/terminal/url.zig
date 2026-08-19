@@ -50,11 +50,96 @@ pub fn isAllowedTarget(target: []const u8) bool {
     // well-formed URL. Refusing the class means `https://ok\x00javascript:...`
     // cannot survive as its harmless-looking prefix.
     for (target) |byte| {
-        if (byte <= 0x20 or byte == 0x7f) return false;
+        // OSC 8 has no visual target of its own. Keep its destination in the
+        // same ASCII alphabet as the heuristic so Unicode bidi/formatting
+        // controls cannot make the hover preview read as a different URL.
+        // Internationalized destinations remain representable in their URL
+        // forms (punycode and percent encoding).
+        if (byte <= 0x20 or byte >= 0x7f) return false;
     }
     const scheme = matchScheme(target) orelse return false;
     // A bare scheme names no target.
     return target.len > scheme.len;
+}
+
+pub const TargetIdentity = struct {
+    scheme: []const u8,
+    /// The authority that actually receives an HTTP(S) request, excluding
+    /// userinfo. Null for non-authority schemes such as mailto.
+    effective_authority: ?[]const u8,
+};
+
+/// Security identity for an already-allowlisted target.
+///
+/// HTTP userinfo can be arbitrarily long and can contain host-looking text;
+/// only bytes after the LAST `@` decide where navigation goes. Backslashes
+/// and percent escapes in the authority are refused because URL consumers do
+/// not agree on whether they are separators or decoded host bytes.
+pub fn targetIdentity(target: []const u8) ?TargetIdentity {
+    if (!isAllowedTarget(target)) return null;
+    const scheme = matchScheme(target) orelse return null;
+    if (std.ascii.eqlIgnoreCase(scheme, "mailto:")) {
+        return .{ .scheme = scheme, .effective_authority = null };
+    }
+
+    const rest = target[scheme.len..];
+    const authority_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const authority = rest[0..authority_end];
+    if (authority.len == 0 or std.mem.indexOfScalar(u8, authority, '\\') != null) return null;
+    const effective = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at|
+        authority[at + 1 ..]
+    else
+        authority;
+    if (effective.len == 0 or std.mem.indexOfScalar(u8, effective, '%') != null) return null;
+    if (!validEffectiveAuthority(effective)) return null;
+    return .{ .scheme = scheme, .effective_authority = effective };
+}
+
+fn validEffectiveAuthority(authority: []const u8) bool {
+    if (authority[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return false;
+        const host = authority[1..close];
+        if (host.len == 0) return false;
+        for (host) |byte| if (!std.ascii.isHex(byte) and byte != ':' and byte != '.') return false;
+        const suffix = authority[close + 1 ..];
+        return suffix.len == 0 or (suffix[0] == ':' and validPort(suffix[1..]));
+    }
+
+    const colon = std.mem.lastIndexOfScalar(u8, authority, ':');
+    const host = if (colon) |at| authority[0..at] else authority;
+    if (colon) |at| if (!validPort(authority[at + 1 ..])) return false;
+    if (host.len == 0 or host.len > 253) return false;
+
+    var labels = std.mem.splitScalar(u8, host, '.');
+    var all_numeric = true;
+    var numeric_parts: usize = 0;
+    while (labels.next()) |label| {
+        if (label.len == 0) return false;
+        if (label.len > 63 or label[0] == '-' or label[label.len - 1] == '-') return false;
+        var numeric = true;
+        for (label) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-') return false;
+            if (!std.ascii.isDigit(byte)) numeric = false;
+        }
+        if (numeric) {
+            numeric_parts += 1;
+            if (label.len > 1 and label[0] == '0') return false;
+            const value = std.fmt.parseInt(u8, label, 10) catch return false;
+            _ = value;
+        } else {
+            all_numeric = false;
+        }
+    }
+    // Numeric hosts have several legacy interpretations. Accept only the one
+    // unambiguous form browsers agree on: four decimal octets.
+    return !all_numeric or numeric_parts == 4;
+}
+
+fn validPort(port: []const u8) bool {
+    if (port.len == 0 or port.len > 5) return false;
+    for (port) |byte| if (!std.ascii.isDigit(byte)) return false;
+    const value = std.fmt.parseInt(u16, port, 10) catch return false;
+    return value != 0;
 }
 
 pub const Span = struct {

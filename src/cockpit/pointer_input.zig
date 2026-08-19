@@ -220,8 +220,8 @@ fn validPointerGeometry(event: TerminalPointerEvent) bool {
         event.frame.width > 0 and event.frame.height > 0;
 }
 
-/// Arm the hover underline on the pane under the pointer, and disarm every
-/// other one.
+/// Track target-preview hover and arm the Cmd underline on the pane under the
+/// pointer, disarming every other one.
 ///
 /// The chord is the SAME one that opens a link (Cmd, without Shift), which is
 /// the whole point of the affordance: what underlines is what a click would
@@ -243,7 +243,9 @@ fn updateHoverLink(model: *Model, pane: *Pane, event: TerminalPointerEvent) void
         const other = model.provider.slot(index);
         if (other == pane) continue;
         _ = other.session.setHoverPoint(null);
+        _ = other.session.setPointerPoint(null);
     }
+    _ = pane.session.setPointerPoint(.{ .x = local.x, .y = local.y });
     _ = pane.session.setHoverPoint(if (armed) .{ .x = local.x, .y = local.y } else null);
 }
 
@@ -253,7 +255,9 @@ fn updateHoverLink(model: *Model, pane: *Pane, event: TerminalPointerEvent) void
 pub fn clearHoverLinks(model: *Model) void {
     for (0..model.provider.states.len) |index| {
         if (model.provider.states[index] != .active) continue;
-        _ = model.provider.slot(index).session.setHoverPoint(null);
+        const session = model.provider.slot(index).session;
+        _ = session.setHoverPoint(null);
+        _ = session.setPointerPoint(null);
     }
 }
 
