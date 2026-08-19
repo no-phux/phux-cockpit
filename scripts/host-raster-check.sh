@@ -6,6 +6,7 @@
 #   ./scripts/host-raster-check.sh --min-solid N   # ...and fail below N
 #   ./scripts/host-raster-check.sh --png-prefix P  # keep the rasters
 #   PHUX_COCKPIT_SDK_SRC=<dir> ./scripts/host-raster-check.sh   # a different SDK
+# measures: pinned SDK host/CoreText glyph rasterization
 #
 # WHAT THIS IS FOR
 # ----------------
@@ -39,8 +40,8 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=scripts/lib/zon.sh
-source "${ROOT}/scripts/lib/zon.sh"
+# shellcheck source=scripts/lib/measure.sh
+source "${ROOT}/scripts/lib/measure.sh"
 PIN_CACHE="${PHUX_COCKPIT_SDK_CACHE:-${ROOT}/.zig-cache/pinned-sdk}"
 ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -56,6 +57,7 @@ done
 # scripts/build-automation-cli.sh does, and refuse a checkout at any other
 # commit or with local source changes rather than measuring it quietly.
 SDK_SRC="${PHUX_COCKPIT_SDK_SRC:-}"
+SDK_MODE=pinned
 if [[ -z "$SDK_SRC" ]]; then
     if [[ ! -d "${PIN_CACHE}/.git" ]]; then
         printf 'error: no pinned SDK checkout at %s\n' "$PIN_CACHE" >&2
@@ -88,6 +90,7 @@ if [[ -z "$SDK_SRC" ]]; then
     SDK_SRC="$PIN_CACHE"
     printf 'sdk: %s at %s (pinned)\n' "$PIN_CACHE" "${have:0:9}"
 else
+    SDK_MODE=override
     printf 'sdk: %s (PHUX_COCKPIT_SDK_SRC override - NOT the pin)\n' "$SDK_SRC"
 fi
 
@@ -113,4 +116,13 @@ clang -w -fobjc-arc -fno-sanitize=builtin -ObjC -mmacosx-version-min=11.0 \
     -framework IOKit -framework Carbon -framework Accelerate \
     -framework MediaToolbox
 
+SDK_REF="$(git -C "$SDK_SRC" rev-parse HEAD 2>/dev/null || printf non-git)"
+if [[ "$SDK_MODE" == override ]]; then
+    DERIVE="PHUX_COCKPIT_SDK_SRC=${SDK_SRC} ./scripts/host-raster-check.sh"
+else
+    DERIVE='./scripts/host-raster-check.sh'
+fi
+measure_basis host_raster \
+    "JetBrains Mono NL regular, fixed terminal row, host CoreText rasterizer; sdk_mode=${SDK_MODE}; sdk_source=${SDK_SRC}; sdk_ref=${SDK_REF}" \
+    "$DERIVE"
 "$BIN" "${ROOT}/src/fonts/JetBrainsMonoNLNerdFontMono-Regular.ttf" "${ARGS[@]+"${ARGS[@]}"}"

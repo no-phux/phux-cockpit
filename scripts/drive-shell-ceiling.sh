@@ -6,6 +6,7 @@
 #
 #   ./scripts/drive-shell-ceiling.sh --want 8      # open 8 terminals, or fail
 #   ./scripts/drive-shell-ceiling.sh --want 8 --keep
+# measures: concurrent shell ceiling and per-shell process cost
 #
 # Exit 0 means every one of the N terminals exists AND is running. Exit 1
 # names the terminal that did not appear (the ceiling) or the one that
@@ -38,7 +39,7 @@
 set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-. "${ROOT}/scripts/lib/app-instance.sh"
+. "${ROOT}/scripts/lib/measure.sh"
 WORK="${TMPDIR:-/tmp}/phux-cockpit-ceiling.$$"
 WANT=8
 KEEP=0
@@ -53,13 +54,14 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-app_instance_require_free
-
 mkdir -p "$WORK"
 APP_PID=""
 cleanup() {
     if [[ -n "$APP_PID" && "$KEEP" == "0" ]]; then
         app_instance_stop "$APP_PID"
+    fi
+    if [[ -n "$APP_PID" && "$KEEP" == "1" ]]; then
+        measure_print_retained_run "$APP_PID" "$NATIVE" "$MEASURE_DROPBOX"
     fi
     [[ "$KEEP" == "1" ]] || rm -rf "$WORK"
 }
@@ -92,13 +94,8 @@ HOLD
 chmod +x "${WORK}/hold.sh"
 printf 'command = /bin/sh %s\nfont-size = 13\n' "${WORK}/hold.sh" >"${WORK}/config"
 
-printf 'packaging with automation...\n'
-( cd "$ROOT" && zig build package -Dautomation=true >/dev/null )
-
-PHUX_COCKPIT_CONFIG="${WORK}/config" \
-PHUX_COCKPIT_STATE="${WORK}/workspace.state" \
-    "${ROOT}/zig-out/package/phux-cockpit.app/Contents/MacOS/phux-cockpit" >"${WORK}/app.log" 2>&1 &
-APP_PID=$!
+measure_launch_isolated "$WORK" "${WORK}/config" "${WORK}/app.log"
+APP_PID="$MEASURE_APP_PID"
 
 "$NATIVE" automate wait >/dev/null
 
@@ -148,6 +145,12 @@ printf 'structure: ok (Terminal 1 RUNNING)\n'
 measure() {
     [[ "$MEASURE" == "1" ]] || return 0
     local shells="$1" rss threads fds
+    if [[ -z "${MEASURE_BASIS_PRINTED:-}" ]]; then
+        MEASURE_BASIS_PRINTED=1
+        measure_basis shell_cost \
+            "quiet /bin/sh + cat per tab; rss, threads, and fds read from pid ${APP_PID}" \
+            "./scripts/drive-shell-ceiling.sh --want ${WANT} --measure"
+    fi
     rss="$(ps -o rss= -p "$APP_PID" | tr -d ' ')"
     threads="$(ps -M -p "$APP_PID" | tail -n +2 | wc -l | tr -d ' ')"
     fds="$(lsof -p "$APP_PID" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')"

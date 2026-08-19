@@ -60,9 +60,9 @@
 # Isolating them would take an app.zon change or an SDK option that does not
 # exist.
 #
-# RELATED: scripts/lib/measure.sh grew a `measure_launch_isolated` for the
-# measurement harness. It covers point 3 only. Once both have landed they should
-# share one launcher; see the follow-up bead.
+# RELATED: scripts/lib/measure.sh composes `dev_app_stage` and `dev_app_launch`
+# for driven measurements, so those runs inherit all four guarantees rather
+# than maintaining a second, weaker launcher.
 
 # Suffixes applied to the packaged bundle's own values. One set, here, so a
 # script that ASSERTS the identity and the script that CREATES it cannot drift.
@@ -72,6 +72,7 @@ DEV_APP_NAME_SUFFIX=" (dev)"
 
 # The bundle every non-dev path on this machine means: what the DMG installs,
 # and the thing three days of bug reports were filed against.
+# shellcheck disable=SC2034 # public value consumed by sourcing scripts
 DEV_APP_INSTALLED_BUNDLE="/Applications/Phux Cockpit.app"
 
 dev_app_die() {
@@ -231,6 +232,7 @@ dev_app_launch() {
         PHUX_COCKPIT_STATE="${home}/workspace.state" \
         "$@" \
         "$executable" >"$log" 2>&1 &
+    # shellcheck disable=SC2034 # output variable consumed by the caller
     DEV_APP_PID=$!
 }
 
@@ -248,7 +250,7 @@ dev_app_wait_named() {
         found="$(pgrep -x "$name" | tr '\n' ' ' | sed 's/ $//')"
         [[ "$found" == "$want_pid" ]] && return 0
         if [[ "$SECONDS" -ge "$deadline" ]]; then
-            printf 'dev-app: waited 20s for `pgrep -x %s` to be exactly %s, got: %s\n' \
+            printf "dev-app: waited 20s for \`pgrep -x %s\` to be exactly %s, got: %s\n" \
                 "$name" "$want_pid" "${found:-<nothing>}" >&2
             return 1
         fi
