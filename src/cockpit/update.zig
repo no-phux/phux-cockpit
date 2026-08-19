@@ -1466,7 +1466,6 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
     if (tab_removed) workspace.tab_limit_refused = false;
     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
 }
-
 /// A window whose last tab just closed.
 ///
 /// This is the arm that was wrong the moment a second window existed. It used
