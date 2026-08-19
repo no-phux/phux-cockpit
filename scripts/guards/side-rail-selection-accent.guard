@@ -4,7 +4,7 @@
 # elevation fill. The break restores that leaf row, removing the 2pt accent
 # marker and leaving no non-elevation signal that meets the 3:1 state floor.
 test: the selected side rail tab carries a non-elevation accent marker
-red: 2026-08-18 at 2e2727d
+red: 2026-08-18 at 34ab58f
 diff --git a/src/cockpit/native/view.zig b/src/cockpit/native/view.zig
 index df2feee..7eda500 100644
 --- a/src/cockpit/native/view.zig
