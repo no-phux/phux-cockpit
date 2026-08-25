@@ -58,20 +58,18 @@ jobs:
       # bump and a runner image bump - and those are precisely the two nobody
       # thinks to inspect for glyph weight.
       #
-      # THE FLOOR. Measured on the pin: cell_grid solid=4179. Derived with
+      # THE FLOOR. Measured on the pin: cell_grid solid=4179. Derived locally with
       #     for i in $(seq 1 20); do ./scripts/host-raster-check.sh; done
       # which returned mean_luma=45.7978 solid=4179 lit=5103 on all 20 runs,
       # each one recompiling the harness (macOS 26.5.1, arm64). An x86_64 build
       # of the same harness under Rosetta returned the same three numbers. There
       # is no jitter here to leave room for.
       #
-      # The 4.3% between 4179 and 4000 is therefore not slack for noise. It
-      # covers the one variable that could not be measured from a developer
-      # machine: the runner's CoreText, on a macOS build this repo has never
-      # rasterized against. It costs nothing in power either - the defect class
-      # this exists for lands 4179 -> 3081, a 26.3% loss - so no regression that
-      # a floor of 4179 would catch escapes a floor of 4000. Tighten it only
-      # against numbers this job has actually printed.
+      # Hosted runs then closed the remaining uncertainty. GitHub-hosted macOS
+      # runs 31971072559 and 32092076828 reported solid=4179 on August 16 and 18;
+      # after the Blacksmith migration, runs 32816649797 and 32817202255 again
+      # reported solid=4179 on macOS 26. All four had AppleFontSmoothing unset.
+      # The floor therefore has no guessed runner allowance left in it.
       - name: Check the host rasterizer's glyph weight
         run: |
           # A machine whose user defaults switch font smoothing off measures
@@ -81,7 +79,7 @@ jobs:
           # apart from a real regression by reading the log once.
           defaults -currentHost read -g AppleFontSmoothing 2>/dev/null \
             || echo 'AppleFontSmoothing: unset (the state the floor was derived on)'
-          ./scripts/host-raster-check.sh --min-solid 4000
+          ./scripts/host-raster-check.sh --min-solid 4179
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: phall1/phux
