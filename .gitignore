@@ -2,6 +2,7 @@
 zig-out/
 zig-pkg/
 node_modules/
+.native/
 
 # The worktree's own Zig global cache, created by scripts/zig-build.sh so a
 # stuck build runner in another worktree cannot hold this one's cache lock.
