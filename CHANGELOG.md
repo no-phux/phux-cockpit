@@ -3,6 +3,40 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0](https://github.com/no-phux/phux-cockpit/compare/v0.11.0...v0.12.0) (2026-08-25)
+
+
+### Features
+
+* establish durable work foundation ([#49](https://github.com/no-phux/phux-cockpit/issues/49)) ([8c4e2db](https://github.com/no-phux/phux-cockpit/commit/8c4e2dbc444616de34471b5904f0850849fd62a9))
+* **phux:** switch server-owned sessions ([c47701c](https://github.com/no-phux/phux-cockpit/commit/c47701cbfb50e2f5616b9c34b078a246627419b3))
+* **terminal:** lift shell capacity and polish settings tabs ([e02b018](https://github.com/no-phux/phux-cockpit/commit/e02b018d8751329d066f44c3354cc802540d436f))
+* **terminal:** preview OSC 8 targets before opening ([cd4b271](https://github.com/no-phux/phux-cockpit/commit/cd4b271194b4886f1e5675e6eaeb3729c49e47ac))
+
+
+### Bug Fixes
+
+* **chrome:** mark selected side rail tab ([7e63fde](https://github.com/no-phux/phux-cockpit/commit/7e63fdea845f994161cfeec7fe0d52086cc8eaf2))
+* **ci:** pin compatible Phux client FFI ([#53](https://github.com/no-phux/phux-cockpit/issues/53)) ([1b31b7f](https://github.com/no-phux/phux-cockpit/commit/1b31b7f7cd1daf026901dc83f7f2bf65dd09bb8c))
+* **ci:** refuse dirty SDK raster sources ([f9829b4](https://github.com/no-phux/phux-cockpit/commit/f9829b43cbaaaef211ddaa30959bfd02bee01ff6))
+* clear tab refusal only when capacity returns ([87fe8aa](https://github.com/no-phux/phux-cockpit/commit/87fe8aa49c23feadac0eb40e15a94037f8a55421))
+* **guards:** store side rail proof without trailing space ([34ab58f](https://github.com/no-phux/phux-cockpit/commit/34ab58f5cb06f40b9bf3d2961127cf8385a941d8))
+* keep tab chrome truthful at capacity ([d9c8cd3](https://github.com/no-phux/phux-cockpit/commit/d9c8cd3f983958ba2a7e10e553d1bc32994dd49d))
+* make measurement populations truthful ([ac1b7ed](https://github.com/no-phux/phux-cockpit/commit/ac1b7edb0b2aec3777217f0f184784ff86174f98))
+* make topology retries current and visible ([a06a5c4](https://github.com/no-phux/phux-cockpit/commit/a06a5c4a83b827ebf24ddd5ded17f1a104ceca24))
+* reap forced stops and isolate equal refs ([ec095e2](https://github.com/no-phux/phux-cockpit/commit/ec095e2a22953bd1d0b1c71b2ea82056231ecf11))
+* restore durable work authority boundary ([#51](https://github.com/no-phux/phux-cockpit/issues/51)) ([8083cec](https://github.com/no-phux/phux-cockpit/commit/8083cec734c9710adaa9574016a893e8a1c20868))
+* retry failed topology writes ([163b13a](https://github.com/no-phux/phux-cockpit/commit/163b13a5b34055bf5473f5d9766291156e4b4441))
+* scope tab refusal to its workspace ([43a2f04](https://github.com/no-phux/phux-cockpit/commit/43a2f0410b3545043ed2f5e1250eda858ab30f42))
+* **tabs:** centralize coordinator closeability ([bea1fe4](https://github.com/no-phux/phux-cockpit/commit/bea1fe4c5aa857d2126e46b234421cf3be984d57))
+* **terminal:** canonicalize previewed OSC 8 authority ([ad53063](https://github.com/no-phux/phux-cockpit/commit/ad530630ebdb7fac5514656b9b7273cf5c45f996))
+* **terminal:** require rendered OSC 8 target evidence ([0af605f](https://github.com/no-phux/phux-cockpit/commit/0af605fdf38aa3899d6b724296801675177459dd))
+
+
+### Refactors
+
+* name shared save notice reserve ([315f58c](https://github.com/no-phux/phux-cockpit/commit/315f58c506f40a418ff0609e403247d89695da79))
+
 ## [0.11.0](https://github.com/phall1/phux-cockpit/compare/v0.10.0...v0.11.0) (2026-08-16)
 
 
