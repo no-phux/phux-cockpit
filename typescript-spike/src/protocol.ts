@@ -2,6 +2,7 @@ export const ENGINE_CHANNEL_KEY = 0x434f434b0001;
 export const PROTOCOL_VERSION = 1;
 
 const STATE_INVALIDATED = 1;
+const SNAPSHOT = 2;
 const INVALIDATION_LENGTH = 18;
 
 export interface WireU64 {
@@ -43,6 +44,12 @@ export function nextU64(value: WireU64): WireU64 {
 export function invalidation(bytes: Uint8Array): Invalidation | null {
   if (bytes.length !== INVALIDATION_LENGTH) return null;
   if (bytes[0] !== PROTOCOL_VERSION || bytes[1] !== STATE_INVALIDATED) return null;
+  return { sequence: readU64(bytes, 2), revision: readU64(bytes, 10) };
+}
+
+export function snapshotHeader(bytes: Uint8Array): Invalidation | null {
+  if (bytes.length < INVALIDATION_LENGTH) return null;
+  if (bytes[0] !== PROTOCOL_VERSION || bytes[1] !== SNAPSHOT) return null;
   return { sequence: readU64(bytes, 2), revision: readU64(bytes, 10) };
 }
 

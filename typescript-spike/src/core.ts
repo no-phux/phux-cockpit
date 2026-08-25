@@ -6,6 +6,7 @@ import {
   intent,
   nextU64,
   sameU64,
+  snapshotHeader,
 } from "./protocol.ts";
 
 export interface Tab {
@@ -39,6 +40,8 @@ export type Msg =
   | { readonly kind: "palette_close" }
   | { readonly kind: "settings_open" }
   | { readonly kind: "settings_close" }
+  | { readonly kind: "snapshot_loaded"; readonly body: Uint8Array }
+  | { readonly kind: "snapshot_failed"; readonly error: Uint8Array }
   | {
       readonly kind: "engine_event";
       readonly key: number;
@@ -54,6 +57,8 @@ export const viewUnbound = [
   "engineSequence",
   "engineRevision",
   "engine_event",
+  "snapshot_loaded",
+  "snapshot_failed",
 ] as const;
 
 const ZERO_U64: WireU64 = { hi: 0, lo: 0 };
@@ -71,7 +76,14 @@ export function initialModel(): [Model, Cmd<Msg>] {
       engineRevision: ZERO_U64,
       status: asciiBytes("CONNECTING"),
     },
-    Cmd.channelOpen(ENGINE_CHANNEL_KEY, { event: "engine_event" }),
+    Cmd.batch([
+      Cmd.channelOpen(ENGINE_CHANNEL_KEY, { event: "engine_event" }),
+      Cmd.request("cockpit.snapshot", new Uint8Array(0), {
+        key: "cockpit-snapshot",
+        ok: "snapshot_loaded",
+        err: "snapshot_failed",
+      }),
+    ]),
   ];
 }
 
@@ -105,6 +117,21 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       return { ...model, settingsOpen: true };
     case "settings_close":
       return { ...model, settingsOpen: false };
+    case "snapshot_loaded": {
+      const snapshot = snapshotHeader(msg.body);
+      if (snapshot === null) {
+        return { ...model, engineConnected: false, status: asciiBytes("BAD SNAPSHOT") };
+      }
+      return {
+        ...model,
+        engineConnected: true,
+        engineSequence: snapshot.sequence,
+        engineRevision: snapshot.revision,
+        status: asciiBytes("READY"),
+      };
+    }
+    case "snapshot_failed":
+      return { ...model, engineConnected: false, status: asciiBytes("ENGINE UNAVAILABLE") };
     case "engine_event": {
       if (msg.state !== "data") {
         return {
@@ -116,15 +143,21 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       const event = invalidation(msg.bytes);
       if (event === null) return { ...model, status: asciiBytes("ENGINE PROTOCOL ERROR") };
       const contiguous = sameU64(event.sequence, nextU64(model.engineSequence));
-      return {
+      const next = {
         ...model,
-        engineConnected: true,
         engineSequence: event.sequence,
-        engineRevision: event.revision,
         status: contiguous || sameU64(model.engineSequence, ZERO_U64)
-          ? asciiBytes("READY")
+          ? asciiBytes("SYNCING")
           : asciiBytes("RESYNCING"),
       };
+      return [
+        next,
+        Cmd.request("cockpit.snapshot", new Uint8Array(0), {
+          key: "cockpit-snapshot",
+          ok: "snapshot_loaded",
+          err: "snapshot_failed",
+        }),
+      ];
     }
   }
 }

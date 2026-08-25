@@ -12,6 +12,7 @@ pub const version: u8 = 1;
 
 pub const EventKind = enum(u8) {
     state_invalidated = 1,
+    snapshot = 2,
 };
 
 pub const IntentKind = enum(u8) {
@@ -22,6 +23,7 @@ pub const IntentKind = enum(u8) {
 };
 
 pub const invalidation_len: usize = 18;
+pub const snapshot_header_len: usize = invalidation_len;
 
 pub const Invalidation = struct {
     sequence: u64,
@@ -53,6 +55,12 @@ pub fn decodeInvalidation(bytes: []const u8) ?Invalidation {
         .sequence = std.mem.readInt(u64, bytes[2..10], .little),
         .revision = std.mem.readInt(u64, bytes[10..18], .little),
     };
+}
+
+pub fn encodeSnapshotHeader(sequence: u64, revision: u64) [snapshot_header_len]u8 {
+    var out = encodeInvalidation(sequence, revision);
+    out[1] = @intFromEnum(EventKind.snapshot);
+    return out;
 }
 
 pub fn encodeIntent(value: Intent) [intent_len]u8 {
@@ -100,6 +108,14 @@ test "the TypeScript engine invalidation packet is fixed and versioned" {
 test "the TypeScript channel key stays exactly representable" {
     try std.testing.expect(event_channel_key > 0);
     try std.testing.expect(event_channel_key < 9_007_199_254_740_992);
+}
+
+test "snapshot headers share sequence and revision framing without masquerading as events" {
+    const bytes = encodeSnapshotHeader(21, 34);
+    try std.testing.expectEqual(@as(u8, 2), bytes[1]);
+    try std.testing.expect(decodeInvalidation(&bytes) == null);
+    try std.testing.expectEqual(@as(u64, 21), std.mem.readInt(u64, bytes[2..10], .little));
+    try std.testing.expectEqual(@as(u64, 34), std.mem.readInt(u64, bytes[10..18], .little));
 }
 
 test "TypeScript intents fence positional arguments with the engine revision" {
