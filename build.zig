@@ -512,10 +512,22 @@ fn buildVerdict(
 
 pub fn build(b: *std.Build) void {
     const dependency = b.dependency("native_sdk", .{});
-    const artifacts = native_sdk.addAppArtifacts(b, dependency, .{ .name = "phux-cockpit" });
+    const typescript_spike = b.option(
+        bool,
+        "typescript-spike",
+        "Build the isolated TypeScript + Native markup Cockpit artifact",
+    ) orelse false;
+    const artifacts = if (typescript_spike)
+        native_sdk.addAppArtifacts(b, dependency, .{
+            .name = "phux-cockpit-typescript-spike",
+            .app_root = "typescript-spike",
+        })
+    else
+        native_sdk.addAppArtifacts(b, dependency, .{ .name = "phux-cockpit" });
     const app_module = artifacts.exe.root_module;
     if (app_module.resolved_target.?.result.os.tag != .macos)
         @panic("phux-cockpit supports macOS only");
+    if (typescript_spike) return;
 
     const phux_enabled = b.option(
         bool,

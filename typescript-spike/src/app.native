@@ -1,0 +1,78 @@
+<stack>
+  <if test="{tabPlacement == 'top'}">
+    <column>
+      <row height="50" padding="4" gap="4" cross="center" background="surface" window-drag="true">
+        <spacer width="78" />
+        <tabs grow="1" gap="4" label="Terminal tabs">
+          <for each="tabs" key="index" as="tab">
+            <toggle-button
+              size="sm"
+              icon="terminal"
+              selected="{tab.selected}"
+              on-toggle="select_tab:{tab.index}"
+            >{tab.title}</toggle-button>
+          </for>
+        </tabs>
+        <button size="sm" variant="ghost" icon="search" label="Command palette" on-press="palette_open" />
+        <button size="sm" variant="ghost" icon="plus" label="New terminal" on-press="new_terminal" />
+        <button size="sm" variant="ghost" icon="settings" label="Settings" on-press="settings_open" />
+      </row>
+      <spacer grow="1" />
+      <status-bar>{status}</status-bar>
+    </column>
+  </if>
+  <else>
+    <row>
+      <column width="184" padding="4" gap="8" background="surface" label="Terminal tabs">
+        <row height="40" cross="center">
+          <text grow="1">Cockpit</text>
+          <button size="sm" variant="ghost" icon="plus" label="New terminal" on-press="new_terminal" />
+        </row>
+        <list grow="1" gap="4">
+          <for each="tabs" key="index" as="tab">
+            <list-item
+              icon="terminal"
+              selected="{tab.selected}"
+              on-press="select_tab:{tab.index}"
+            >{tab.title}</list-item>
+          </for>
+        </list>
+        <button size="sm" variant="ghost" icon="search" on-press="palette_open">Commands</button>
+        <button size="sm" variant="ghost" icon="settings" on-press="settings_open">Settings</button>
+        <status-bar>{status}</status-bar>
+      </column>
+      <spacer width="8" />
+      <spacer grow="1" />
+    </row>
+  </else>
+
+  <if test="{paletteOpen}">
+    <row main="center" cross="center">
+      <panel width="480" padding="16">
+        <column gap="12">
+          <row cross="center">
+            <icon name="search" width="16" height="16" />
+            <text grow="1">Command palette</text>
+            <button size="sm" variant="ghost" icon="x" label="Close palette" on-press="palette_close" />
+          </row>
+          <text foreground="text_muted">Type a command to navigate Cockpit.</text>
+        </column>
+      </panel>
+    </row>
+  </if>
+
+  <if test="{settingsOpen}">
+    <row main="end">
+      <panel width="360" padding="16">
+        <column gap="12">
+          <row cross="center">
+            <text grow="1">Settings</text>
+            <button size="sm" variant="ghost" icon="x" label="Close settings" on-press="settings_close" />
+          </row>
+          <button size="sm" variant="outline" on-press="toggle_tab_placement">Move tab strip</button>
+          <button size="sm" variant="destructive" on-press="close_selected_tab">Close selected tab</button>
+        </column>
+      </panel>
+    </row>
+  </if>
+</stack>

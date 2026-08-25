@@ -1,0 +1,8 @@
+.{
+    .name = .phux_cockpit_typescript_spike,
+    .fingerprint = 0x782a655c5a707070,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .native_sdk = .{ .path = "../../../../../.npm/_npx/9a20fe98058af99e/node_modules/@native-sdk/cli" } },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}
