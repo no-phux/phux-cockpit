@@ -85,7 +85,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: phall1/phux
-          ref: 5b5c67a90f9501352bc9b7063c0611480f0fa2a6 # v0.12.0
+          ref: 0372b5802cfefbb5475e79ffd2a9c6a89ba5eaf5 # v0.23.1
           path: .phux
           persist-credentials: false
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
