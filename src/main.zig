@@ -923,6 +923,7 @@ test {
     _ = @import("tests/config_wiring_tests.zig");
     _ = @import("tests/settings_theme_tests.zig");
     _ = @import("tests/tab_strip_tests.zig");
+    _ = @import("tests/tab_identity_tests.zig");
     _ = @import("tests/scrollback_search_tests.zig");
     _ = @import("tests/multi_window_tests.zig");
     _ = @import("tests/sdk_surface_tests.zig");
