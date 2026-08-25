@@ -43,7 +43,7 @@ jobs:
   # never need to cross a job boundary.
   macos:
     name: Package arm64 macOS release
-    runs-on: macos-26
+    runs-on: blacksmith-6vcpu-macos-26
     timeout-minutes: 45
     env:
       RELEASE_TAG: ${{ inputs.tag }}
