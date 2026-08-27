@@ -45,7 +45,7 @@ jobs:
     runs-on: blacksmith-6vcpu-macos-26
     # 45 minutes, matching ci.yml. Measured against the run that is a superset
     # of every step below except packaging:
-    #   gh api repos/phall1/phux-cockpit/actions/runs/31617082301/jobs \
+    #   gh api repos/no-phux/phux-cockpit/actions/runs/31617082301/jobs \
     #     --jq '.jobs[].steps[] | {name, started_at, completed_at}'
     # Cold job total 12m23s: setup 26s, phux-client-ffi 4m23s, null-platform
     # tests 2m28s, phux-provider tests 1m55s, package+soak 2m45s. This job drops
