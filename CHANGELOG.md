@@ -3,6 +3,13 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1](https://github.com/no-phux/phux-cockpit/compare/v0.12.0...v0.12.1) (2026-08-28)
+
+
+### Documentation
+
+* plan the TypeScript authoring migration ([#54](https://github.com/no-phux/phux-cockpit/issues/54)) ([3006060](https://github.com/no-phux/phux-cockpit/commit/300606075a6e896e1ad940b6f41943e8a4865cae))
+
 ## [0.12.0](https://github.com/no-phux/phux-cockpit/compare/v0.11.0...v0.12.0) (2026-08-25)
 
 
