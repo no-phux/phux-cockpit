@@ -147,7 +147,7 @@ exact sha it is pushing, with a token holding `actions: write` on this repo:
 
 ```sh
 gh workflow run sdk-head.yml \
-  --repo phall1/phux-cockpit \
+  --repo no-phux/phux-cockpit \
   --field ref="$GITHUB_SHA"
 ```
 

@@ -37,7 +37,7 @@ All commands are manual, run by an operator when `dsr check` (or direct
 observation of a stuck Actions run) indicates throttling:
 
 ```sh
-dsr check phall1/phux-cockpit
+dsr check no-phux/phux-cockpit
 dsr build phux-cockpit --targets darwin/arm64
 dsr release phux-cockpit --version vX.Y.Z
 dsr fallback phux-cockpit --version vX.Y.Z
