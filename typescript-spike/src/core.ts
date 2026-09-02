@@ -22,6 +22,14 @@ export type ChannelState = "data" | "closed" | "rejected";
 
 export interface Model {
   readonly tabs: readonly Tab[];
+  /// The run the band has room for, always holding the selected tab. The
+  /// toolkit cannot bound a run by itself, and the core cannot measure a
+  /// band; the engine's snapshot carries the shipping projection's answer
+  /// and the core slices to it, with a cue for the rest.
+  readonly visibleTabs: readonly Tab[];
+  readonly tabWidth: number;
+  readonly hasOverflow: boolean;
+  readonly overflowLabel: Uint8Array;
   readonly selectedTab: number;
   readonly tabPlacement: TabPlacement;
   readonly paletteOpen: boolean;
@@ -68,10 +76,56 @@ export const viewUnbound = [
 
 const ZERO_U64: WireU64 = { hi: 0, lo: 0 };
 
+function overflowLabel(hidden: number): Uint8Array {
+  // "+N" for N in 1..255 without string building or division, neither of
+  // which the compiled subset offers on an integer path: peel hundreds and
+  // tens by subtraction.
+  let rest = hidden;
+  let hundreds = 0;
+  while (rest >= 100) {
+    rest -= 100;
+    hundreds += 1;
+  }
+  let tens = 0;
+  while (rest >= 10) {
+    rest -= 10;
+    tens += 1;
+  }
+  const digits = hundreds > 0 ? 3 : tens > 0 ? 2 : 1;
+  const out = new Uint8Array(1 + digits);
+  out[0] = 43;
+  let at = 1;
+  if (hundreds > 0) {
+    out[at] = 48 + hundreds;
+    at += 1;
+  }
+  if (hundreds > 0 || tens > 0) {
+    out[at] = 48 + tens;
+    at += 1;
+  }
+  out[at] = 48 + rest;
+  return out;
+}
+
+/// Slice the tab list to the engine's run. Every index is proven whole from
+/// the wire (protocol.ts fences the bytes), so the slice needs no more.
+function sliceRun(tabs: readonly Tab[], runStart: number, runCount: number): readonly Tab[] {
+  const total = tabs.length;
+  if (!(runStart >= 0 && runStart <= 255) || !(runCount >= 0 && runCount <= 255)) return tabs;
+  const start = Math.trunc(runStart);
+  const count = Math.trunc(runCount);
+  if (start + count > total) return tabs;
+  return tabs.slice(start, start + count);
+}
+
 export function initialModel(): [Model, Cmd<Msg>] {
   return [
     {
       tabs: [{ id: 1, index: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
+      visibleTabs: [{ id: 1, index: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
+      tabWidth: 168,
+      hasOverflow: false,
+      overflowLabel: new Uint8Array(0),
       selectedTab: 0,
       tabPlacement: "top",
       paletteOpen: false,
@@ -100,7 +154,12 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
   switch (msg.kind) {
     case "select_tab":
       return [
-        { ...model, tabs: selectTab(model.tabs, msg.index), selectedTab: msg.index },
+        {
+          ...model,
+          tabs: selectTab(model.tabs, msg.index),
+          visibleTabs: selectTab(model.visibleTabs, msg.index),
+          selectedTab: msg.index,
+        },
         Cmd.host("cockpit.intent", intent(1, model.engineRevision, msg.index)),
       ];
     case "new_terminal":
@@ -137,9 +196,19 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
         return { ...model, engineConnected: false, status: asciiBytes("BAD SNAPSHOT") };
       }
       const selectedTab = Math.trunc(rawSelected);
+      const rawWidth = projected.tabWidth;
+      if (!(rawWidth >= 0 && rawWidth <= 65535)) {
+        return { ...model, engineConnected: false, status: asciiBytes("BAD SNAPSHOT") };
+      }
+      const tabWidth = Math.trunc(rawWidth);
+      const hidden = projected.tabs.length - projected.runCount;
       return {
         ...model,
         tabs: projected.tabs,
+        visibleTabs: sliceRun(projected.tabs, projected.runStart, projected.runCount),
+        tabWidth,
+        hasOverflow: hidden > 0,
+        overflowLabel: hidden > 0 ? overflowLabel(hidden) : new Uint8Array(0),
         selectedTab,
         tabPlacement: projected.tabPlacement === 1 ? "side" : "top",
         engineConnected: true,

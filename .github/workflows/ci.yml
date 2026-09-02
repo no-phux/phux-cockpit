@@ -99,6 +99,14 @@ jobs:
         run: cargo build --locked --profile "${{ steps.phux.outputs.profile }}" -p phux-client-ffi
       - name: Test with the null platform
         run: zig build test -Dplatform=null --summary all
+      # The TypeScript-core graph: its own extension test binary plus the app
+      # tests, compiled through the SDK's ScriptC frontend. Node is the
+      # frontend's runtime; build.zig installs the package's compiler itself.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Test the TypeScript-core spike
+        run: zig build test -Dtypescript-spike=true -Dplatform=null --summary all
       - name: Test the production Phux provider
         run: |
           zig build test \

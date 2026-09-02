@@ -1,17 +1,21 @@
 <stack>
   <if test="{tabPlacement == 'top'}">
     <column>
-      <row height="50" padding="4" gap="4" cross="center" background="surface" window-drag="true">
-        <spacer width="78" />
+      <row height="50" padding="4" gap="4" cross="center" background="surface">
+        <spacer width="78" window-drag="true" />
         <tabs grow="1" gap="4" label="Terminal tabs">
-          <for each="tabs" key="id" as="tab">
+          <for each="visibleTabs" key="id" as="tab">
             <toggle-button
               size="sm"
               icon="terminal"
+              width="{tabWidth}"
               selected="{tab.selected}"
               on-toggle="select_tab:{tab.index}"
             >{tab.title}</toggle-button>
           </for>
+          <if test="{hasOverflow}">
+            <text width="32" label="Tabs not shown">{overflowLabel}</text>
+          </if>
         </tabs>
         <button size="sm" variant="ghost" icon="search" label="Command palette" on-press="palette_open" />
         <button size="sm" variant="ghost" icon="plus" label="New terminal" on-press="new_terminal" />
@@ -29,13 +33,16 @@
           <button size="sm" variant="ghost" icon="plus" label="New terminal" on-press="new_terminal" />
         </row>
         <list grow="1" gap="4">
-          <for each="tabs" key="id" as="tab">
+          <for each="visibleTabs" key="id" as="tab">
             <list-item
               icon="terminal"
               selected="{tab.selected}"
               on-press="select_tab:{tab.index}"
             >{tab.title}</list-item>
           </for>
+          <if test="{hasOverflow}">
+            <text label="Tabs not shown">{overflowLabel}</text>
+          </if>
         </list>
         <button size="sm" variant="ghost" icon="search" on-press="palette_open">Commands</button>
         <button size="sm" variant="ghost" icon="settings" on-press="settings_open">Settings</button>

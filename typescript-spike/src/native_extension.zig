@@ -194,6 +194,10 @@ fn onFrame(_: *const core.Model, frame: native_sdk.platform.GpuFrame) ?core.Msg 
     const fx = bridge.effects orelse return null;
     bridge.spawnShells(engine, fx);
     engine.pumpViewports(fx, frame);
+    // A frame that moved the run (a resize, the first frame after a
+    // placement flip) is announced like an intent: the core's chrome is
+    // wrong until it resyncs, and only the engine knows.
+    if (engine.refreshRun()) bridge.announce(engine);
     return null;
 }
 
@@ -254,6 +258,7 @@ const Rig = struct {
     app_state: *Adapter.App,
     decorated: native_sdk.App,
     harness: *native_sdk.TestHarness(),
+    frame_index: u64 = 1,
 
     fn start() !Rig {
         var core_options: Adapter.CoreOptions = .{};
@@ -327,7 +332,56 @@ const Rig = struct {
     }
 
     fn dispatch(self: *Rig, msg: core.Msg) !void {
-        try self.app_state.dispatch(&self.harness.runtime, 1, msg);
+        self.app_state.dispatch(&self.harness.runtime, 1, msg) catch |err| {
+            std.debug.print("dispatch of {s} failed: {s}\n", .{ @tagName(msg), @errorName(err) });
+            return err;
+        };
+    }
+
+    /// Present a frame at `size`; the engine re-derives the run and, when it
+    /// moved, announces so the core resyncs. Settled either way.
+    fn resize(self: *Rig, size: native_sdk.geometry.SizeF) !void {
+        self.frame_index += 1;
+        const before = self.app_state.model.engineSequence.lo;
+        const engine = bridge.engine.?;
+        const was = engine.currentRun();
+        try self.harness.runtime.dispatchPlatformEvent(self.decorated, .{ .gpu_surface_frame = .{
+            .label = canvas_label,
+            .size = size,
+            .scale_factor = 1,
+            .frame_index = self.frame_index,
+            .timestamp_ns = self.frame_index * 16_000_000,
+        } });
+        const now = engine.currentRun();
+        const moved = was.first != now.first or was.count != now.count or was.extent != now.extent;
+        try self.settle(if (moved) before + 1 else before, "READY");
+    }
+
+    /// Drive the real core and engine into `state`: the tab count through
+    /// intents and resync, the placement and overlays through their Msgs.
+    fn reach(self: *Rig, state: ChromeState) !void {
+        const engine = bridge.engine.?;
+        while (engine.model.wsConst().tab_count < state.tabs) {
+            const before = self.app_state.model.engineSequence.lo;
+            try self.dispatch(.new_terminal);
+            try self.settle(before + 1, "READY");
+        }
+        while (engine.model.wsConst().tab_count > state.tabs) {
+            const before = self.app_state.model.engineSequence.lo;
+            try self.dispatch(.close_selected_tab);
+            try self.settle(before + 1, "READY");
+        }
+        try self.dispatch(.{ .select_tab = 0 });
+        const before_select = self.app_state.model.engineSequence.lo;
+        try self.settle(before_select + 1, "READY");
+        if ((self.app_state.model.tabPlacement == .side) != (state.placement == .side)) {
+            const before = self.app_state.model.engineSequence.lo;
+            try self.dispatch(.toggle_tab_placement);
+            try self.settle(before + 1, "READY");
+        }
+        try self.dispatch(if (state.palette) .palette_open else .palette_close);
+        try self.dispatch(if (state.settings) .settings_open else .settings_close);
+        try std.testing.expectEqual(state.tabs, self.app_state.model.tabs.len);
     }
 };
 
@@ -477,4 +531,143 @@ test "every registered pane gets exactly one shell request and a closed tab kill
     try std.testing.expectEqual(second_key, fx.last_killed);
     engine.spawnShells(&fx, shellEvent);
     try std.testing.expectEqual(@as(usize, 2), fx.spawned);
+}
+
+// MEASURED: the cost of the route docs/DECISIONS.md chose by reuse. A full
+// 80x24 grid of text painted as the chrome prefix, on the engine's model, the
+// way every frame paints it. Print with:
+//
+//   zig build test -Dtypescript-spike=true -Dplatform=null -Dmeasure=true
+//
+// The number a media-surface leaf would have to beat is the per-paint time
+// below plus the display-list decode it saves; the leaf route is not built,
+// so this is the baseline half of that comparison, not the comparison.
+test "MEASURED: the chrome-prefix paint of a full grid on the engine model" {
+    const engine = try Engine.create(std.testing.allocator, std.testing.io);
+    defer engine.destroy();
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    var line: [81]u8 = undefined;
+    for (0..24) |row| {
+        for (0..80) |col| line[col] = @intCast('!' + ((row * 7 + col) % 90));
+        line[80] = '\n';
+        pane.session.feed(&line);
+    }
+    pane.session.refreshScreenText();
+    const size = native_sdk.geometry.SizeF.init(1100, 640);
+    engine.model.ws().surface_size = size;
+    engine.model.ws().surface_scale_factor = 2;
+    const tokens = cockpit.projection.cockpitTokens(engine.model);
+
+    const commands = try std.testing.allocator.alloc(canvas.CanvasCommand, cockpit.projection.chrome_command_envelope);
+    defer std.testing.allocator.free(commands);
+    // One warm paint measures the cell box and primes the painter's caches.
+    var builder = canvas.Builder.init(commands);
+    try engine.paint(&builder, size, tokens);
+    const first = builder.displayList().commands.len;
+    try std.testing.expect(first > 0);
+
+    const iterations: usize = 200;
+    const started = std.Io.Clock.awake.now(std.testing.io);
+    for (0..iterations) |_| {
+        builder.reset();
+        try engine.paint(&builder, size, tokens);
+    }
+    const finished = std.Io.Clock.awake.now(std.testing.io);
+    const total_ns: u64 = @intCast(finished.nanoseconds - started.nanoseconds);
+    cockpit.measured.print(
+        "\nMEASURED chrome_prefix_paint: grid=80x24 size=1100x640 scale=2 commands={d} paints={d} per_paint_us={d}\n",
+        .{ first, iterations, total_ns / iterations / std.time.ns_per_us },
+    );
+}
+
+// ------------------------------------------------------ parity harness
+//
+// What chrome_register_tests.zig is for the Zig chrome, for the markup tree:
+// the compiled app.native is solved at every declared window size and
+// density, in every chrome state the core can be in, and audited with the
+// same toolkit audit the Zig ladder answers to. A finding is a real defect
+// (overlap, a target under the WCAG floor, a widget off its grid), printed
+// the way the Zig audit prints it. The engine's grids are painted beneath
+// this tree and are not widgets; their geometry is the shipping painter's.
+
+const CompiledChrome = canvas.CompiledMarkupView(core.Model, core.Msg, @embedFile("app.native"));
+
+const parity_sizes = [_]native_sdk.geometry.SizeF{
+    native_sdk.geometry.SizeF.init(900, 420),
+    native_sdk.geometry.SizeF.init(1100, 640),
+    native_sdk.geometry.SizeF.init(1680, 1000),
+};
+
+const ChromeState = struct {
+    label: []const u8,
+    placement: core.TabPlacement = .top,
+    tabs: usize = 1,
+    palette: bool = false,
+    settings: bool = false,
+};
+
+const parity_states = [_]ChromeState{
+    .{ .label = "one tab, strip" },
+    .{ .label = "one tab, rail", .placement = .side },
+    .{ .label = "full strip", .tabs = 16 },
+    .{ .label = "full rail", .tabs = 16, .placement = .side },
+    .{ .label = "palette over strip", .palette = true },
+    .{ .label = "settings over rail", .settings = true, .placement = .side },
+    .{ .label = "both overlays, full strip", .tabs = 16, .palette = true, .settings = true },
+};
+
+fn auditChromeAt(model: *const core.Model, size: native_sdk.geometry.SizeF, density: canvas.Density, label: []const u8) !usize {
+    const arena_bytes = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(arena_bytes);
+    var fixed = std.heap.FixedBufferAllocator.init(arena_bytes);
+    var ui = Adapter.Ui.init(fixed.allocator());
+
+    var tokens = cockpit.projection.cockpitTokens(bridge.engine.?.model);
+    tokens.density = density;
+    const node = CompiledChrome.build(&ui, model);
+    const tree = try ui.finalizeWithTokens(node, tokens);
+
+    const nodes = try std.testing.allocator.alloc(canvas.WidgetLayoutNode, canvas.max_layout_audit_nodes);
+    defer std.testing.allocator.free(nodes);
+    const bounds = native_sdk.geometry.RectF.init(0, 0, size.width, size.height);
+    const layout = try canvas.layoutWidgetTreeWithTokens(tree.root, bounds, tokens, nodes);
+
+    var storage: [canvas.max_layout_audit_findings]canvas.LayoutAuditFinding = undefined;
+    const issues = canvas.auditWidgetLayout(layout, bounds, tokens, &storage);
+    if (issues.total == 0) return 0;
+    std.debug.print(
+        "\nmarkup layout audit: {d} finding(s) in \"{s}\" at {d:.0}x{d:.0}, {s} density\n",
+        .{ issues.total, label, size.width, size.height, @tagName(density) },
+    );
+    // The first three findings of a state say what is wrong; the rest of a
+    // sixteen-tab overflow say it again.
+    for (issues.findings, 0..) |finding, index| {
+        if (index == 3) {
+            std.debug.print("  - ... {d} more\n", .{issues.findings.len - 3});
+            break;
+        }
+        var message: [1400]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&message);
+        canvas.formatLayoutAuditFinding(layout, finding, &writer) catch {};
+        std.debug.print("  - {s}\n", .{writer.buffered()});
+    }
+    return issues.total;
+}
+
+// GUARD: ts-chrome-parity
+test "the markup chrome passes the layout audit at every declared size, density and state" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    var total: usize = 0;
+    for (parity_states) |state| {
+        try rig.reach(state);
+        for (parity_sizes) |size| {
+            try rig.resize(size);
+            for ([_]canvas.Density{ .compact, .regular, .spacious }) |density| {
+                total += try auditChromeAt(&rig.app_state.model, size, density, state.label);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), total);
 }

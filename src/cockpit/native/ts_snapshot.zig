@@ -5,15 +5,27 @@ const protocol = @import("ts_protocol.zig");
 
 const Model = model_module.Model;
 
-pub const header_len: usize = protocol.snapshot_header_len + 6;
+/// 18 bytes of framing, then: active window, placement, tab count, selected
+/// tab, flags, a reserved byte, and the RUN the band has room for (first
+/// visible tab, visible count, per-tab extent in points as a u16). The run is
+/// the engine's because only it knows the surface size and the shipping
+/// projection's rule for it (`visibleTabRun`); the core slices its tab list
+/// to the run and shows a cue for the rest.
+pub const header_len: usize = protocol.snapshot_header_len + 10;
 pub const max_title_bytes: usize = 128;
 pub const max_bytes: usize = 4096;
 
 pub const Error = error{BufferTooSmall};
 
+pub const TabRun = struct {
+    first: u8 = 0,
+    count: u8 = 0,
+    extent: u16 = 168,
+};
+
 /// Serialize the active window's chrome projection. Raw cells, process state,
 /// provider slots, and platform window ids deliberately never cross this seam.
-pub fn encode(model: *const Model, sequence: u64, revision: u64, out: []u8) Error![]const u8 {
+pub fn encode(model: *const Model, sequence: u64, revision: u64, run: TabRun, out: []u8) Error![]const u8 {
     if (out.len < header_len) return error.BufferTooSmall;
     const framed = protocol.encodeSnapshotHeader(sequence, revision);
     @memcpy(out[0..framed.len], &framed);
@@ -25,6 +37,9 @@ pub fn encode(model: *const Model, sequence: u64, revision: u64, out: []u8) Erro
     out[21] = @intCast(workspace.selected_tab);
     out[22] = snapshotFlags(model);
     out[23] = 0;
+    out[24] = run.first;
+    out[25] = run.count;
+    std.mem.writeInt(u16, out[26..28], run.extent, .little);
 
     var written: usize = header_len;
     for (0..workspace.tab_count) |index| {
