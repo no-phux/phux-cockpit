@@ -7,7 +7,7 @@ Phux Cockpit includes software from the following projects.
 Native SDK is licensed under the Apache License, Version 2.0. A complete copy
 of that license is distributed as `LICENSE.txt` with the application.
 
-Pinned source: https://github.com/phall1/native/tree/bfb8a4f0a5aa208e4b87b8bbcbd50600416db563
+Pinned source: https://github.com/phall1/native/tree/87917c454432de5dd1eceb52d8a55575d5581289
 
 Upstream: https://github.com/vercel-labs/native
 
@@ -39,15 +39,16 @@ Source: https://github.com/ghostty-org/ghostty
 
 ## Phux Client FFI and Rust Dependencies
 
-Production builds statically link `phux-client-ffi` from Phux v0.23.1 at
-commit `0372b5802cfefbb5475e79ffd2a9c6a89ba5eaf5`. Phux is available under
-MIT OR Apache-2.0.
+Production builds statically link `phux-client-ffi` from Phux workspace
+version `0.23.3` at commit `c477371de4c231cfc0d8902737e6cfb967c0bd7a`,
+with ABI `1`, using Cargo profile `ffi-release`. Phux is available under MIT
+OR Apache-2.0.
 
 The complete generated license inventory and license texts for the Rust
 dependency graph are distributed beside this file as
 `Phux-FFI-THIRD-PARTY.html`.
 
-Source: https://github.com/phall1/phux/tree/v0.23.1
+Source: https://github.com/no-phux/phux/tree/c477371de4c231cfc0d8902737e6cfb967c0bd7a
 
 ## JetBrains Mono Nerd Font
 

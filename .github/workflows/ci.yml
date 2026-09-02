@@ -24,6 +24,9 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Load and check the pinned Phux client FFI provenance
+        id: phux
+        run: ./scripts/verify-phux-ffi.py --github-output "$GITHUB_OUTPUT"
       - name: Check release version synchronization
         run: ./scripts/check-release-version.sh
       # Offline and instant, so it runs before anything is fetched or built.
@@ -82,16 +85,18 @@ jobs:
           ./scripts/host-raster-check.sh --min-solid 4179
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          repository: phall1/phux
-          ref: 0372b5802cfefbb5475e79ffd2a9c6a89ba5eaf5 # v0.23.1
+          repository: ${{ steps.phux.outputs.repository }}
+          ref: ${{ steps.phux.outputs.ref }}
           path: .phux
           persist-credentials: false
+      - name: Verify the pinned Phux client FFI checkout
+        run: ./scripts/verify-phux-ffi.py --phux-tree .phux
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
       - name: Build the pinned Phux client FFI
         working-directory: .phux
-        run: cargo build --locked --profile ffi-release -p phux-client-ffi
+        run: cargo build --locked --profile "${{ steps.phux.outputs.profile }}" -p phux-client-ffi
       - name: Test with the null platform
         run: zig build test -Dplatform=null --summary all
       - name: Test the production Phux provider
