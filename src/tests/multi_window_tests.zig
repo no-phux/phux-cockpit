@@ -89,6 +89,35 @@ test "a terminal belongs to exactly one window and cannot be admitted into anoth
     try testing.expectEqual(@as(usize, 0), located.window);
 }
 
+test "the working-set palette selects and raises a destination in another window" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    const primary_terminal = state.model.primary.focusedTerminalRef() orelse
+        return error.TestExpectedTerminal;
+    app.update(&state.model, .new_window, &state.effects);
+    try testing.expectEqual(@as(usize, 1), state.model.active_window);
+    const second = state.model.wsAt(1) orelse return error.TestExpectedWindow;
+    const second_terminal = second.focusedTerminalRef() orelse return error.TestExpectedTerminal;
+    try testing.expect(!primary_terminal.eql(second_terminal));
+
+    app.update(&state.model, .palette_open, &state.effects);
+    try testing.expect(second.palette.open);
+    const shows_before = state.effects.window_action_state.show_count;
+
+    // OPEN destinations are projected across windows in window/tab order, so
+    // the first unfiltered row is the primary window's terminal.
+    app.update(&state.model, .palette_commit, &state.effects);
+
+    try testing.expect(!second.palette.open);
+    try testing.expectEqual(@as(usize, 0), state.model.active_window);
+    try testing.expect(state.model.selectedTerminalRef().?.eql(primary_terminal));
+    try testing.expectEqual(shows_before + 1, state.effects.window_action_state.show_count);
+    try testing.expectEqualStrings(app.main_window_label, state.effects.window_action_state.lastLabel());
+}
+
 test "each window keeps its own tabs, selection, and surface geometry" {
     const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
     defer harness.destroy(testing.allocator);

@@ -624,11 +624,11 @@ fn paneNeedsAttention(model: *const Model, pane: *const Pane) bool {
 /// off a screen.
 pub const max_terminal_title_bytes: usize = 96;
 
-/// Whether Cockpit owns the lifetime behind a tab's close action. A Phux
-/// terminal belongs to its coordinator, so presenting an enabled local close
-/// verb would be an action that can only silently do nothing.
-pub fn tabCanClose(id: TerminalRef) bool {
-    return provider_contract.isLocal(id);
+/// Closing presentation topology never claims execution ownership. Local
+/// terminals additionally lose their owned process in update; remote terminals
+/// remain in provider inventory and can be admitted again.
+pub fn tabCanClose(_: TerminalRef) bool {
+    return true;
 }
 
 /// Where a terminal LIVES, in the only coordinates anyone can act on: which
@@ -994,8 +994,7 @@ pub fn terminalNeedsAttention(model: *const Model, id: TerminalRef) bool {
 }
 
 pub fn selectedTerminalCanClose(model: *const Model) bool {
-    const terminal_ref = model.selectedTerminalRef() orelse return false;
-    return support.providerKind(terminal_ref) == .local;
+    return model.selectedTerminalRef() != null;
 }
 
 pub fn chromeRevealed(model: *const Model) bool {
@@ -1160,20 +1159,8 @@ pub const WorkspaceChrome = struct {
     content: geometry.RectF,
 };
 
-/// The tab indices the summoned switcher is showing, in tab order.
-///
-/// THE derivation, called by both the view that draws the rows and the commit
-/// that acts on the highlighted one. Two derivations would mean Enter could
-/// select a different tab from the one under the highlight — the same class of
-/// bug `resolvePanes` exists to prevent for pane rects.
-///
-/// Matching is case-insensitive substring against what the tab actually
-/// shows — the shell's own title (OSC 0/2), then its working directory — plus
-/// the tab's 1-based POSITION as digits, because that is the handle the user
-/// already has from `cmd+1`..`cmd+5` and it is the only thing a shell without
-/// title integration offers. A tab whose shell reports neither title nor
-/// directory is therefore findable by its number and by nothing else, which is
-/// the honest answer rather than a fabricated one.
+/// Current-window tab indices retained for the positional cmd+N test surface.
+/// The working-set switcher itself uses `paletteEntriesIn` below.
 pub fn paletteRowsIn(model: *const Model, workspace: *const Workspace, out: []usize) usize {
     const needle = workspace.palette.needle();
     var written: usize = 0;
@@ -1187,36 +1174,129 @@ pub fn paletteRowsIn(model: *const Model, workspace: *const Workspace, out: []us
     return written;
 }
 
-pub const PaletteEntry = union(enum) {
-    tab: usize,
-    session: usize,
+pub const PaletteEntry = model_module.PaletteDestination;
+
+pub const PaletteSection = enum {
+    open,
+    available,
+    sessions,
 };
 
-pub const palette_max_entries: usize = model_module.max_tabs + support.max_remote_sessions;
+pub fn paletteSection(entry: PaletteEntry) PaletteSection {
+    return switch (entry) {
+        .placed_terminal => .open,
+        .available_terminal => .available,
+        .session => .sessions,
+    };
+}
 
-/// All destinations in the summoned switcher. Session rows are copied from the
-/// provider's latest ATTACHED catalog; their indexes are valid only for the
-/// current dispatch/frame, exactly like the borrowed terminal presentations.
-pub fn paletteEntriesIn(model: *const Model, workspace: *const Workspace, out: []PaletteEntry) usize {
-    const needle = workspace.palette.needle();
-    var written: usize = 0;
-    for (0..workspace.tab_count) |index| {
-        if (written >= out.len) return written;
-        if (needle.len == 0 or paletteTabMatches(model, workspace, index, needle)) {
-            out[written] = .{ .tab = index };
-            written += 1;
+const PaletteStage = enum { placed, available, sessions, done };
+
+const PaletteIterator = struct {
+    model: *const Model,
+    needle: []const u8,
+    stage: PaletteStage = .placed,
+    window_index: usize = 0,
+    tab_index: usize = 0,
+    pane_index: usize = 0,
+    remote_index: usize = 0,
+    session_index: usize = 0,
+
+    fn init(model: *const Model, workspace: *const Workspace) PaletteIterator {
+        return .{ .model = model, .needle = workspace.palette.needle() };
+    }
+
+    fn accepts(iterator: *const PaletteIterator, entry: PaletteEntry) bool {
+        return iterator.needle.len == 0 or
+            paletteDestinationMatches(iterator.model, entry, iterator.needle);
+    }
+
+    fn nextPlaced(iterator: *PaletteIterator) ?PaletteEntry {
+        while (iterator.window_index < model_module.max_windows) {
+            if (!iterator.model.windowOpen(iterator.window_index)) {
+                iterator.window_index += 1;
+                continue;
+            }
+            const workspace = iterator.model.wsAtConst(iterator.window_index) orelse {
+                iterator.window_index += 1;
+                continue;
+            };
+            if (iterator.tab_index >= workspace.tab_count) {
+                iterator.window_index += 1;
+                iterator.tab_index = 0;
+                iterator.pane_index = 0;
+                continue;
+            }
+            const tree = workspace.treeConst(iterator.tab_index) orelse {
+                iterator.tab_index += 1;
+                iterator.pane_index = 0;
+                continue;
+            };
+            var refs: [layout.max_panes]TerminalRef = undefined;
+            const count = tree.terminals(&refs);
+            if (iterator.pane_index >= count) {
+                iterator.tab_index += 1;
+                iterator.pane_index = 0;
+                continue;
+            }
+            const terminal_ref = refs[iterator.pane_index];
+            iterator.pane_index += 1;
+            const entry: PaletteEntry = .{ .placed_terminal = .{
+                .window = @intCast(iterator.window_index),
+                .tab = @intCast(iterator.tab_index),
+                .terminal_ref = terminal_ref,
+            } };
+            if (iterator.accepts(entry)) return entry;
+        }
+        return null;
+    }
+
+    fn nextAvailable(iterator: *PaletteIterator) ?PaletteEntry {
+        const refs = iterator.model.remoteTerminalRefs();
+        while (iterator.remote_index < refs.len) {
+            const terminal_ref = refs[iterator.remote_index];
+            iterator.remote_index += 1;
+            if (iterator.model.locateTerminal(terminal_ref) != null) continue;
+            const entry: PaletteEntry = .{ .available_terminal = terminal_ref };
+            if (iterator.accepts(entry)) return entry;
+        }
+        return null;
+    }
+
+    fn nextSession(iterator: *PaletteIterator) ?PaletteEntry {
+        const remote = iterator.model.phuxConst() orelse return null;
+        const sessions = remote.sessionCatalog();
+        while (iterator.session_index < sessions.len) {
+            const entry: PaletteEntry = .{ .session = sessions[iterator.session_index].id };
+            iterator.session_index += 1;
+            if (iterator.accepts(entry)) return entry;
+        }
+        return null;
+    }
+
+    fn next(iterator: *PaletteIterator) ?PaletteEntry {
+        while (true) {
+            switch (iterator.stage) {
+                .placed => if (iterator.nextPlaced()) |entry| return entry else {
+                    iterator.stage = .available;
+                },
+                .available => if (iterator.nextAvailable()) |entry| return entry else {
+                    iterator.stage = .sessions;
+                },
+                .sessions => if (iterator.nextSession()) |entry| return entry else {
+                    iterator.stage = .done;
+                },
+                .done => return null,
+            }
         }
     }
-    const remote = model.phuxConst() orelse return written;
-    for (remote.sessionCatalog(), 0..) |session, index| {
-        if (written >= out.len) break;
-        var digits: [16]u8 = undefined;
-        const id = std.fmt.bufPrint(&digits, "{d}", .{session.id}) catch "";
-        if (needle.len != 0 and !containsIgnoreCase(session.name, needle) and !containsIgnoreCase(id, needle)) continue;
-        out[written] = .{ .session = index };
-        written += 1;
-    }
-    return written;
+};
+
+pub fn paletteEntryCountIn(model: *const Model, workspace: *const Workspace) usize {
+    var iterator = PaletteIterator.init(model, workspace);
+    var count: usize = 0;
+    while (iterator.next() != null) count += 1;
+    return count;
 }
 
 /// The most rows the switcher DRAWS at once.
@@ -1257,6 +1337,83 @@ pub fn paletteWindowFor(match_count: usize, cursor: usize) PaletteWindow {
     const clamped = @min(cursor, match_count - 1);
     const first = if (clamped < shown) 0 else clamped - shown + 1;
     return .{ .first = first, .count = shown };
+}
+
+/// Materialize only the visible selectable rows. The total working set may be
+/// hundreds of large stable identities; caller storage stays capped at eight.
+pub fn paletteEntriesWindowIn(
+    model: *const Model,
+    workspace: *const Workspace,
+    window: PaletteWindow,
+    out: []PaletteEntry,
+) usize {
+    var iterator = PaletteIterator.init(model, workspace);
+    var index: usize = 0;
+    var written: usize = 0;
+    const limit = @min(window.count, out.len);
+    while (iterator.next()) |entry| {
+        if (index < window.first) {
+            index += 1;
+            continue;
+        }
+        if (written >= limit) break;
+        out[written] = entry;
+        written += 1;
+        index += 1;
+    }
+    return written;
+}
+
+fn paletteDestinationMatches(model: *const Model, entry: PaletteEntry, needle: []const u8) bool {
+    return switch (entry) {
+        .placed_terminal => |placed| placedDestinationMatches(model, placed, needle),
+        .available_terminal => |terminal_ref| terminalDestinationMatches(model, terminal_ref, needle),
+        .session => |session_id| sessionDestinationMatches(model, session_id, needle),
+    };
+}
+
+fn placedDestinationMatches(
+    model: *const Model,
+    placed: model_module.PlacedTerminalDestination,
+    needle: []const u8,
+) bool {
+    var address: [32]u8 = undefined;
+    const position = std.fmt.bufPrint(
+        &address,
+        "window {d} tab {d}",
+        .{ placed.window + 1, placed.tab + 1 },
+    ) catch "";
+    return containsIgnoreCase(position, needle) or
+        terminalDestinationMatches(model, placed.terminal_ref, needle);
+}
+
+fn terminalDestinationMatches(model: *const Model, terminal_ref: TerminalRef, needle: []const u8) bool {
+    if (support.providerKind(terminal_ref) == .local) {
+        if (containsIgnoreCase("local native", needle)) return true;
+        const pane = model.provider.terminalConst(terminal_ref) orelse return false;
+        if (containsIgnoreCase(pane.title(), needle)) return true;
+        const cwd = pane.pwd();
+        return cwd.len > 0 and containsIgnoreCase(std.fs.path.basename(cwd), needle);
+    }
+    if (containsIgnoreCase("phux remote", needle)) return true;
+    const presentation = model.remotePresentation(terminal_ref) orelse return false;
+    return containsIgnoreCase(presentation.title, needle) or
+        containsIgnoreCase(@tagName(presentation.phase), needle);
+}
+
+fn sessionDestinationMatches(model: *const Model, session_id: u32, needle: []const u8) bool {
+    const remote = model.phuxConst() orelse return false;
+    for (remote.sessionCatalog()) |session| {
+        if (session.id != session_id) continue;
+        var detail: [64]u8 = undefined;
+        const searchable = std.fmt.bufPrint(
+            &detail,
+            "{d} {d} windows {d} clients",
+            .{ session.id, session.window_count, session.attached_client_count },
+        ) catch "";
+        return containsIgnoreCase(session.name, needle) or containsIgnoreCase(searchable, needle);
+    }
+    return false;
 }
 
 fn paletteTabMatches(model: *const Model, workspace: *const Workspace, index: usize, needle: []const u8) bool {
@@ -1302,10 +1459,15 @@ pub fn paletteSelectedTabIn(model: *const Model, workspace: *const Workspace) ?u
 }
 
 pub fn paletteSelectedEntryIn(model: *const Model, workspace: *const Workspace) ?PaletteEntry {
-    var rows: [palette_max_entries]PaletteEntry = undefined;
-    const count = paletteEntriesIn(model, workspace, &rows);
-    if (count == 0) return null;
-    return rows[@min(workspace.palette.cursor, count - 1)];
+    var iterator = PaletteIterator.init(model, workspace);
+    var index: usize = 0;
+    var last: ?PaletteEntry = null;
+    while (iterator.next()) |entry| {
+        last = entry;
+        if (index >= workspace.palette.cursor) return entry;
+        index += 1;
+    }
+    return last;
 }
 
 /// The band's reveal is a STEP, deliberately, and it must stay one.
