@@ -626,3 +626,81 @@ test "the config path is the app-dirs config directory, and the env override win
     try testing.expect(std.mem.startsWith(u8, resolved, "/Users/alice/"));
     try testing.expect(std.mem.endsWith(u8, resolved, "/config"));
 }
+
+test "Phux startup precedence treats empty environment values as unset" {
+    const parsed = app.parseConfig(
+        "phux-socket = /tmp/from-config.sock\n" ++
+            "phux-session = config-session\n",
+    );
+    const overridden = app.resolvePhuxConfig(parsed, .{
+        .socket = "/tmp/from-environment.sock",
+        .session = "environment-session",
+        .runtime_dir = "/run/user/501",
+        .uid = "501",
+    });
+    try testing.expectEqualStrings("/tmp/from-environment.sock", overridden.phux_socket.slice());
+    try testing.expectEqualStrings("environment-session", overridden.phux_session.slice());
+    try testing.expectEqual(.environment, overridden.phux_socket_source);
+    try testing.expectEqual(.environment, overridden.phux_session_source);
+
+    const empty_environment = app.resolvePhuxConfig(parsed, .{
+        .socket = "",
+        .session = "",
+        .runtime_dir = "/run/user/501",
+        .uid = "501",
+    });
+    try testing.expectEqualStrings("/tmp/from-config.sock", empty_environment.phux_socket.slice());
+    try testing.expectEqualStrings("config-session", empty_environment.phux_session.slice());
+    try testing.expectEqual(.config, empty_environment.phux_socket_source);
+    try testing.expectEqual(.config, empty_environment.phux_session_source);
+
+    // A malformed debug override follows the other environment conventions:
+    // it cannot replace a safe config value.
+    const invalid_environment = app.resolvePhuxConfig(parsed, .{
+        .socket = "relative.sock",
+        .session = "bad\xffname",
+    });
+    try testing.expectEqualStrings("/tmp/from-config.sock", invalid_environment.phux_socket.slice());
+    try testing.expectEqualStrings("config-session", invalid_environment.phux_session.slice());
+}
+
+test "Phux startup resolves a bounded local default without naming a session" {
+    const xdg = app.resolvePhuxConfig(.{}, .{ .runtime_dir = "/run/user/501", .uid = "501" });
+    try testing.expectEqualStrings("/run/user/501/phux/phux.sock", xdg.phux_socket.slice());
+    try testing.expectEqualStrings("", xdg.phux_session.slice());
+    try testing.expectEqual(.default, xdg.phux_socket_source);
+    try testing.expectEqual(.default, xdg.phux_session_source);
+
+    // Empty XDG_RUNTIME_DIR is unset, not the filesystem root.
+    const fallback = app.resolvePhuxConfig(.{}, .{ .runtime_dir = "", .uid = "501" });
+    try testing.expectEqualStrings("/tmp/phux-501/phux.sock", fallback.phux_socket.slice());
+    try testing.expect(!std.mem.eql(u8, "/", fallback.phux_socket.slice()));
+
+    const invalid_config = app.resolvePhuxConfig(
+        app.parseConfig("phux-socket = relative.sock\nphux-session = bad\xffname"),
+        .{ .uid = "501" },
+    );
+    try testing.expectEqualStrings("/tmp/phux-501/phux.sock", invalid_config.phux_socket.slice());
+    try testing.expectEqualStrings("", invalid_config.phux_session.slice());
+    try testing.expectEqual(@as(usize, 2), invalid_config.diagnostic_count);
+}
+
+test "Phux provider construction owns resolved socket and session bytes" {
+    if (comptime !app.phux_enabled) return error.SkipZigTest;
+
+    var resolved = app.resolvePhuxConfig(
+        app.parseConfig(
+            "phux-socket = /tmp/owned-at-construction.sock\n" ++
+                "phux-session = owned-session\n",
+        ),
+        .{},
+    );
+    const provider = (try app.createPhuxProviderFromConfig(testing.allocator, testing.io, &resolved)) orelse
+        return error.TestExpectedPhuxProvider;
+    defer provider.destroy();
+
+    try resolved.phux_socket.set("/tmp/mutated-after-construction.sock");
+    try resolved.phux_session.set("mutated-session");
+    try testing.expectEqualStrings("/tmp/owned-at-construction.sock", app.configuredPhuxSocket(provider));
+    try testing.expectEqualStrings("owned-session", app.configuredPhuxSession(provider).?);
+}

@@ -288,6 +288,7 @@ pub const ConfigFile = model_module.ConfigFile;
 pub const settings_width = view_module.settings_width;
 pub const settings_panel_label = view_module.settings_panel_label;
 pub const settings_sample_label = view_module.settings_sample_label;
+pub const settings_phux_transport_label = view_module.settings_phux_transport_label;
 pub const paneArgvIn = local.paneArgvIn;
 pub const CwdArgv = local.CwdArgv;
 
@@ -359,24 +360,91 @@ pub fn appOptions() TerminalApp.Options {
     };
 }
 
-fn createConfiguredPhuxProvider(init: std.process.Init) !?*PhuxProvider {
+/// Ambient values that can select a local Phux coordinator at startup. Kept
+/// as slices here and copied into `Config` by `resolvePhuxConfig`.
+pub const PhuxEnvironment = struct {
+    socket: ?[]const u8 = null,
+    session: ?[]const u8 = null,
+    runtime_dir: ?[]const u8 = null,
+    uid: ?[]const u8 = null,
+    user: ?[]const u8 = null,
+};
+
+fn nonEmpty(value: ?[]const u8) ?[]const u8 {
+    const candidate = value orelse return null;
+    return if (candidate.len == 0) null else candidate;
+}
+
+fn runtimePhuxSocket(runtime_dir: []const u8, output: []u8) ?[]const u8 {
+    if (runtime_dir.len == 0) return null;
+    const candidate = std.fmt.bufPrint(output, "{s}/phux/phux.sock", .{runtime_dir}) catch return null;
+    if (!config_module.validPhuxSocket(candidate)) return null;
+    return candidate;
+}
+
+fn temporaryPhuxSocket(identity: []const u8, output: []u8) ?[]const u8 {
+    const candidate = std.fmt.bufPrint(output, "/tmp/phux-{s}/phux.sock", .{identity}) catch return null;
+    if (!config_module.validPhuxSocket(candidate)) return null;
+    return candidate;
+}
+
+fn defaultPhuxSocket(env: PhuxEnvironment, output: []u8) []const u8 {
+    if (runtimePhuxSocket(nonEmpty(env.runtime_dir) orelse "", output)) |path| return path;
+    const identity = nonEmpty(env.uid) orelse nonEmpty(env.user) orelse "default";
+    return temporaryPhuxSocket(identity, output) orelse "/tmp/phux-default/phux.sock";
+}
+
+/// Apply startup precedence without borrowing any environment or stack bytes:
+///
+///   non-empty, valid PHUX_* > config file > local default.
+///
+/// Empty environment values are unset by convention. In particular they do
+/// not turn a socket into `/` or a session into a fabricated `default` name.
+pub fn resolvePhuxConfig(parsed: Config, env: PhuxEnvironment) Config {
+    var resolved = parsed;
+    if (nonEmpty(env.socket)) |socket| _ = resolved.setPhuxSocket(socket, .environment);
+    if (resolved.phux_socket.slice().len == 0) {
+        var storage: [config_module.max_phux_socket_bytes]u8 = undefined;
+        _ = resolved.setPhuxSocket(defaultPhuxSocket(env, &storage), .default);
+    }
+    if (nonEmpty(env.session)) |session| _ = resolved.setPhuxSession(session, .environment);
+    return resolved;
+}
+
+/// The provider-construction seam. `PhuxProvider.create` duplicates both
+/// slices, so neither the resolved Config copied into the model nor this
+/// caller's stack is part of the worker's lifetime.
+pub fn createPhuxProviderFromConfig(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    config: *const Config,
+) !?*PhuxProvider {
     if (comptime !phux_enabled) return null;
-    var socket_storage: [std.fs.max_path_bytes]u8 = undefined;
-    const socket_path = init.environ_map.get("PHUX_SOCKET") orelse blk: {
-        if (init.environ_map.get("XDG_RUNTIME_DIR")) |runtime_dir| {
-            break :blk try std.fmt.bufPrint(&socket_storage, "{s}/phux/phux.sock", .{runtime_dir});
-        }
-        const uid_segment = init.environ_map.get("UID") orelse init.environ_map.get("USER") orelse "default";
-        break :blk try std.fmt.bufPrint(&socket_storage, "/tmp/phux-{s}/phux.sock", .{uid_segment});
+    const socket = config.phux_socket.slice();
+    if (!config_module.validPhuxSocket(socket)) return error.InvalidPhuxSocket;
+    const session_name = config.phux_session.slice();
+    if (!config_module.validPhuxSession(session_name)) return error.InvalidPhuxSession;
+    const session: ?[]const u8 = if (session_name.len == 0) null else session_name;
+    return try PhuxProvider.create(gpa, io, .{ .unix = socket }, session, "phux-cockpit");
+}
+
+/// Read-only construction evidence for settings/tests. This returns only the
+/// local-domain location; no TCP endpoint is admitted by this composition.
+pub fn configuredPhuxSocket(provider: *const PhuxProvider) []const u8 {
+    if (comptime !phux_enabled) return "";
+    return switch (provider.endpoint) {
+        .unix => |path| path,
+        else => unreachable,
     };
-    // An absent PHUX_SESSION means "attach the server's current session".
-    // Naming a session means attach-by-name. Creation is never an implicit
-    // launch side effect.
-    const session: ?[]const u8 = if (init.environ_map.get("PHUX_SESSION")) |name|
-        if (name.len == 0) null else name
-    else
-        null;
-    return try PhuxProvider.create(std.heap.page_allocator, init.io, .{ .unix = socket_path }, session, "phux-cockpit");
+}
+
+pub fn configuredPhuxSession(provider: *const PhuxProvider) ?[]const u8 {
+    if (comptime !phux_enabled) return null;
+    return provider.session;
+}
+
+fn createConfiguredPhuxProvider(init: std.process.Init, config: *const Config) !?*PhuxProvider {
+    return createPhuxProviderFromConfig(std.heap.page_allocator, init.io, config);
 }
 
 /// Where the config file lives, resolved through the SDK's `app_dirs`
@@ -758,7 +826,13 @@ pub fn main(init: std.process.Init) !void {
     // Reading it later is exactly how `scrollback-limit` came to parse, store,
     // and do nothing.
     const loaded_config = loadUserConfig(init.io, init);
-    const user_config = loaded_config.config;
+    const user_config = resolvePhuxConfig(loaded_config.config, .{
+        .socket = init.environ_map.get("PHUX_SOCKET"),
+        .session = init.environ_map.get("PHUX_SESSION"),
+        .runtime_dir = init.environ_map.get("XDG_RUNTIME_DIR"),
+        .uid = init.environ_map.get("UID"),
+        .user = init.environ_map.get("USER"),
+    });
     reportConfigDiagnostics(&user_config);
     const max_scrollback_bytes: usize = @intCast(@min(
         user_config.scrollback_bytes,
@@ -783,8 +857,7 @@ pub fn main(init: std.process.Init) !void {
             .{},
         );
     }
-    const remote_provider = createConfiguredPhuxProvider(init) catch |err| {
-        deinitModel(&model);
+    const remote_provider = createConfiguredPhuxProvider(init, &user_config) catch |err| {
         return err;
     };
     initializeStatePersistence(&model, state_path, startup.rejected_state_path);

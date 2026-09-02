@@ -25,25 +25,23 @@ pub const builtin_themes = theme_module.builtins;
 pub const max_font_family_bytes: usize = 128;
 pub const max_shell_bytes: usize = 512;
 pub const max_theme_name_bytes: usize = 64;
+/// One byte is reserved for the terminating NUL in `sockaddr_un.sun_path`.
+/// Accepting anything larger here would defer a deterministic config error
+/// until the connection worker starts.
+pub const max_phux_socket_bytes: usize = @sizeOf(@FieldType(std.posix.sockaddr.un, "path")) - 1;
+/// The Phux protocol's advertised-session admission bound. A configured name
+/// must fit the same envelope as the catalog entry it is expected to match.
+pub const max_phux_session_bytes: usize = 4096;
 pub const max_diagnostics: usize = 16;
 pub const max_config_bytes: usize = 64 * 1024;
 
 /// How much of the offending key or value a diagnostic carries.
 ///
-/// The longest key this parser accepts is 25 bytes, measured with
-///
-///   grep -oE 'eq\(key, "[a-z-]+"\)' src/config/config.zig |
-///     grep -oE '"[a-z-]+"' | awk '{print length($0)-2, $0}' | sort -rn | head -1
-///   => 25 "inherit-working-directory"
-///
-/// so 64 quotes every key whole and still holds the values worth quoting back
-/// (a colour, a size, a cursor style, a short command). It is deliberately not
-/// `max_shell_bytes`: a `too_long` shell is 512 bytes of nobody's business, and
-/// this storage is paid `max_diagnostics` times inside a `Config` that is
-/// copied by value into the model. The cost was measured, not assumed, with a
-/// throwaway `zig run` over this module printing `@sizeOf(Config)`:
-/// 1232 -> 2128 bytes, against a `Model` whose inline workspace is already
-/// ~151 KB.
+/// The longest key this parser accepts fits comfortably inside 64 bytes, as do
+/// the values worth quoting back (a colour, a size, a cursor style, a short
+/// command). It is deliberately not the size of the largest configurable
+/// string: this storage is paid `max_diagnostics` times inside a `Config` that
+/// is copied by value into the model.
 pub const max_diagnostic_text_bytes: usize = 64;
 
 pub const palette_len: usize = 16;
@@ -216,6 +214,25 @@ pub const Shell = Text(max_shell_bytes);
 pub const ThemeName = Text(max_theme_name_bytes);
 pub const DiagnosticText = Text(max_diagnostic_text_bytes);
 
+pub const PhuxSocket = Text(max_phux_socket_bytes);
+pub const PhuxSession = Text(max_phux_session_bytes);
+
+/// Where a resolved Phux startup value came from. Settings uses this as
+/// provenance only: a transport location is not an authority or trust claim.
+pub const PhuxValueSource = enum {
+    default,
+    config,
+    environment,
+
+    pub fn label(source: PhuxValueSource) []const u8 {
+        return switch (source) {
+            .default => "default",
+            .config => "config",
+            .environment => "environment",
+        };
+    }
+};
+
 /// Cut `text` to at most `limit` bytes WITHOUT splitting a UTF-8 sequence.
 ///
 /// A diagnostic's text is quoted straight back into a log line and an
@@ -354,6 +371,15 @@ pub const Config = struct {
     /// Empty means "the user's login shell", resolved at spawn time.
     shell: Shell = Shell.init(""),
 
+    /// Absolute local-domain socket selected by `phux-socket`. Empty only
+    /// before startup resolution supplies the platform default.
+    phux_socket: PhuxSocket = PhuxSocket.init(""),
+    phux_socket_source: PhuxValueSource = .default,
+    /// `phux-session` names an already-existing session. Empty means attach
+    /// the coordinator's current/Last session; it never means create one.
+    phux_session: PhuxSession = PhuxSession.init(""),
+    phux_session_source: PhuxValueSource = .default,
+
     /// A new terminal or split starts in the focused pane's directory, the
     /// way Ghostty does, unless this is turned off.
     inherit_working_directory: bool = true,
@@ -454,6 +480,24 @@ pub const Config = struct {
         return next;
     }
 
+    /// Store an already-validated startup socket together with its provenance.
+    /// False leaves the previous safe value intact.
+    pub fn setPhuxSocket(config: *Config, value: []const u8, source: PhuxValueSource) bool {
+        if (!validPhuxSocket(value)) return false;
+        config.phux_socket.set(value) catch return false;
+        config.phux_socket_source = source;
+        return true;
+    }
+
+    /// Store an already-validated existing-session selection. Empty is the
+    /// explicit representation of current/Last, not a session named "default".
+    pub fn setPhuxSession(config: *Config, value: []const u8, source: PhuxValueSource) bool {
+        if (!validPhuxSession(value)) return false;
+        config.phux_session.set(value) catch return false;
+        config.phux_session_source = if (value.len == 0) .default else source;
+        return true;
+    }
+
     fn note(config: *Config, line: u32, kind: Diagnostic.Kind, text: []const u8) void {
         if (config.diagnostic_count >= max_diagnostics) return;
         var entry: Diagnostic = .{ .line = line, .kind = kind };
@@ -469,6 +513,20 @@ pub const Config = struct {
         return config.diagnostics[0..config.diagnostic_count];
     }
 };
+
+pub fn validPhuxSocket(value: []const u8) bool {
+    return value.len != 0 and
+        value.len <= max_phux_socket_bytes and
+        std.fs.path.isAbsolute(value) and
+        std.mem.indexOfScalar(u8, value, 0) == null and
+        std.unicode.utf8ValidateSlice(value);
+}
+
+pub fn validPhuxSession(value: []const u8) bool {
+    return value.len <= max_phux_session_bytes and
+        std.mem.indexOfScalar(u8, value, 0) == null and
+        std.unicode.utf8ValidateSlice(value);
+}
 
 /// Parse a config file's bytes. Never fails: a malformed line becomes a
 /// diagnostic and the remaining lines still apply. This is deliberate —
@@ -599,6 +657,7 @@ fn applyPair(config: *Config, line: u32, key: []const u8, value: []const u8) voi
     if (eq(key, "cursor-style-blink")) return setBool(config, line, &config.cursor_style_blink, value);
     if (eq(key, "inherit-working-directory")) return setBool(config, line, &config.inherit_working_directory, value);
     if (eq(key, "hide-chrome-when-single")) return setBool(config, line, &config.hide_chrome_when_single, value);
+    if (applyPhuxPair(config, line, key, value)) return;
 
     if (eq(key, "scrollback-limit")) {
         const parsed = std.fmt.parseInt(u64, value, 10) catch {
@@ -676,6 +735,42 @@ fn setBool(config: *Config, line: u32, field: *bool, value: []const u8) void {
         return;
     }
     config.note(line, .bad_value, value);
+}
+
+fn applyPhuxPair(config: *Config, line: u32, key: []const u8, value: []const u8) bool {
+    if (eq(key, "phux-socket")) {
+        setPhuxSocket(config, line, value);
+        return true;
+    }
+    if (eq(key, "phux-session")) {
+        setPhuxSession(config, line, value);
+        return true;
+    }
+    return false;
+}
+
+fn phuxDiagnosticText(key: []const u8, value: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return key;
+    if (!std.unicode.utf8ValidateSlice(value)) return key;
+    return value;
+}
+
+fn setPhuxSocket(config: *Config, line: u32, value: []const u8) void {
+    const detail = phuxDiagnosticText("phux-socket", value);
+    if (value.len > max_phux_socket_bytes) {
+        config.note(line, .too_long, detail);
+        return;
+    }
+    if (!config.setPhuxSocket(value, .config)) config.note(line, .bad_value, detail);
+}
+
+fn setPhuxSession(config: *Config, line: u32, value: []const u8) void {
+    const detail = phuxDiagnosticText("phux-session", value);
+    if (value.len > max_phux_session_bytes) {
+        config.note(line, .too_long, detail);
+        return;
+    }
+    if (!config.setPhuxSession(value, .config)) config.note(line, .bad_value, detail);
 }
 
 /// A `#` starts a comment ONLY at the start of a line (after any leading
