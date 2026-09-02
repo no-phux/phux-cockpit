@@ -363,6 +363,15 @@ libghostty-vt is pinned
 to Ghostty commit `7aa9591746ffa4d2eee458960c76554352832595`, the existing
 Zig 0.16-compatible checkpoint.
 
+## Phux FFI provenance
+
+Production packages link [`no-phux/phux@c477371d`](https://github.com/no-phux/phux/commit/c477371de4c231cfc0d8902737e6cfb967c0bd7a)
+at workspace version `0.23.3`, with `PHUX_CLIENT_ABI_VERSION=1`, using Cargo
+profile `ffi-release`. [`phux-ffi.lock.json`](phux-ffi.lock.json) is the
+canonical source for those values; `./scripts/verify-phux-ffi.py` checks the
+hosted checkouts, documentation, license inventory, and packaged provenance
+against it.
+
 ## Build and test
 
 ```sh
@@ -583,10 +592,11 @@ PHUX_CLIENT_FFI_LIB_DIR="$PWD/../phux/target/ffi-release" \
   ./scripts/package-macos.sh
 ```
 
-Release and CI builds pin that static FFI to Phux `v0.12.0`. Set
-`PHUX_ENABLED=false` only for an explicit local-terminal-only package; production
-packaging requires and verifies the FFI inputs instead of silently omitting the
-coordinator-backed provider.
+Release, CI, and local packaging all require the source and output paths to
+belong to the checkout named by `phux-ffi.lock.json`. The packaging script
+verifies that checkout, its header ABI, workspace version, Cargo profile, and
+artifact directories before building; it does not produce an unattested
+local-terminal-only package.
 
 Verify a packaged or installed bundle and run a process-lifecycle soak with:
 
