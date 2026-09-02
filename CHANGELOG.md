@@ -3,6 +3,20 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0](https://github.com/no-phux/phux-cockpit/compare/v0.13.1...v0.14.0) (2026-09-02)
+
+
+### Features
+
+* **phux:** configure local socket and session ([#67](https://github.com/no-phux/phux-cockpit/issues/67)) ([57076c9](https://github.com/no-phux/phux-cockpit/commit/57076c93f98fced3432a98a970ce9ce663584d27))
+* **phux:** separate inventory from visible tabs ([#63](https://github.com/no-phux/phux-cockpit/issues/63)) ([6724bcc](https://github.com/no-phux/phux-cockpit/commit/6724bccb951c7a769c78485df416935202899b21))
+
+
+### Bug Fixes
+
+* **phux:** pin multi-pane attach support ([#69](https://github.com/no-phux/phux-cockpit/issues/69)) ([b73cae4](https://github.com/no-phux/phux-cockpit/commit/b73cae4bb720d097308bf8f4c5e062efb858f60b))
+* **state:** preserve rejected workspace files ([#66](https://github.com/no-phux/phux-cockpit/issues/66)) ([275ef56](https://github.com/no-phux/phux-cockpit/commit/275ef56949c4bcb518cbb81a461d99dbbbda5d01))
+
 ## [0.13.1](https://github.com/no-phux/phux-cockpit/compare/v0.13.0...v0.13.1) (2026-09-02)
 
 
