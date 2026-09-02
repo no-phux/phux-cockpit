@@ -184,9 +184,13 @@ pub const Host = struct {
         try host.stageOutgoing();
     }
 
-    pub fn attach(host: *Host, session: []const u8, viewport: provider.Viewport) !void {
-        try outboundSize(session.len);
-        try host.queueAttach(c.PHUX_ATTACH_CREATE_IF_MISSING, 0, session, viewport);
+    /// Attach an existing server session without creating anything. A null
+    /// name follows the server's current-session rule; a name selects exactly
+    /// that session. A server with no match must answer with a typed failure.
+    pub fn attachExisting(host: *Host, session: ?[]const u8, viewport: provider.Viewport) !void {
+        if (session) |name| try outboundSize(name.len);
+        const target: u32 = @intCast(if (session == null) c.PHUX_ATTACH_LAST else c.PHUX_ATTACH_BY_NAME);
+        try host.queueAttach(target, 0, if (session) |name| name else &.{}, viewport);
     }
 
     pub fn attachSessionId(host: *Host, session_id: u32, viewport: provider.Viewport) !void {
@@ -252,7 +256,7 @@ pub const Host = struct {
         var delta: SyncDelta = .{};
         while (host.bridge.incoming.take()) |frame| {
             defer host.bridge.incoming.release(frame);
-            try resultError(c.phux_client_feed_frame(host.client, frame.ptr, frame.len));
+            try resultErrorWithContext(host.client, "feed frame", c.phux_client_feed_frame(host.client, frame.ptr, frame.len));
         }
         if (host.state() == .attached and !host.attach_barrier_seen) try host.refreshSessions();
         try host.captureEffects();
@@ -620,7 +624,7 @@ pub const Host = struct {
                 if (terminal.published) terminal.phase = .frozen;
                 continue;
             }
-            try resultError(result);
+            try resultErrorWithContext(host.client, "read terminal grid", result);
             const returned_id = remoteFromC(view.terminal_id) catch |err| {
                 releaseTopAnchor(host.client, &id, view.top_anchor);
                 return err;
@@ -642,7 +646,7 @@ pub const Host = struct {
                 return err;
             };
             if (view.top_anchor.opaque_id != 0)
-                try resultError(c.phux_client_anchor_release(host.client, &id, view.top_anchor));
+                try resultErrorWithContext(host.client, "release terminal top anchor", c.phux_client_anchor_release(host.client, &id, view.top_anchor));
             if (terminal.pending_title_set) {
                 terminal.title.items.len = terminal.pending_title.items.len;
                 if (terminal.pending_title.items.len != 0)
@@ -834,6 +838,17 @@ fn resultError(result: c.PhuxClientResult) Error!void {
         c.PHUX_CLIENT_ENGINE_ERROR => error.Engine,
         c.PHUX_CLIENT_OUT_OF_MEMORY => error.OutOfMemory,
         else => error.Panic,
+    };
+}
+
+fn resultErrorWithContext(client: *c.PhuxClient, operation: []const u8, result: c.PhuxClientResult) Error!void {
+    resultError(result) catch |err| {
+        var raw: c.PhuxBytes = undefined;
+        if (c.phux_client_last_error(client, &raw) == c.PHUX_CLIENT_OK) {
+            const message = effectSlice(raw) catch &.{};
+            if (message.len != 0) std.log.err("Phux client {s}: {s}", .{ operation, message });
+        }
+        return err;
     };
 }
 

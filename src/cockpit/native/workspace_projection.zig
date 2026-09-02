@@ -275,6 +275,7 @@ pub fn visibleTabWindowIn(model: *const Model, workspace: *const Workspace, band
 pub fn tabStripStatusReserveIn(model: *const Model, workspace: *const Workspace) f32 {
     if (model.window_limit_refused or workspace.tab_limit_refused or model.terminal_limit_refused) return tab_strip_notice_reserve;
     if (model.config_write_refused or model.state.write_failed) return tab_strip_save_notice_reserve;
+    if (model.phux_connection_unavailable) return tab_strip_pane_status_reserve;
     const id = workspaceTerminalRef(model, workspace) orelse return 0;
     if (support.providerKind(id) == .phux) return 0;
     const pane = model.provider.terminalConst(id) orelse return 0;
@@ -1024,6 +1025,10 @@ pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     // Exhausted topology retries are equally silent without the band, and can
     // otherwise leave the next unclean launch restoring an older workspace.
     if (model.state.write_failed) return true;
+    // A Phux-enabled launch that cannot attach remains a useful local terminal,
+    // but local means ephemeral. Hiding the only explanation would turn that
+    // intentional fallback into a false durability claim.
+    if (model.phux_connection_unavailable) return true;
     if (workspaceTerminalRef(model, workspace) == null) return true;
     for (0..workspace.tab_count) |index| {
         const current = workspace.treeConst(index) orelse continue;

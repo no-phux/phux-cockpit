@@ -575,6 +575,17 @@ pub const Model = struct {
     /// terminal's first spawn, so no live argv ever aliases a dead one.
     cwd_argv: [max_terminals]local.CwdArgv = [_]local.CwdArgv{.{}} ** max_terminals,
     phux_provider: ?*PhuxProvider = null,
+    /// The configured Phux provider could not reach or attach a server-owned
+    /// session. Local terminals remain usable but are explicitly ephemeral;
+    /// the chrome keeps this difference visible until a complete attach lands.
+    phux_connection_unavailable: bool = false,
+    /// A deliberate session switch waits for the old channel's close event
+    /// before reusing its effect key. Opening immediately races the close and
+    /// the runtime correctly rejects the duplicate key.
+    phux_reconnect_after_close: bool = false,
+    /// Initial attach and an explicit session pick should put the attached
+    /// terminal in front. Ordinary reconnects leave the operator's focus alone.
+    phux_select_on_ready: bool = true,
     remote_ui: [max_remote_terminals]RemoteUiState = [_]RemoteUiState{.{}} ** max_remote_terminals,
     pointer_state: ?*PointerState = null,
     /// Window 0's workspace, INLINE.
@@ -1092,6 +1103,12 @@ pub const Model = struct {
             if (!retained) state.* = .{};
         }
         for (refs[0..count]) |terminal_ref| _ = model.remoteUi(terminal_ref);
+    }
+
+    pub fn selectFirstRemoteTerminal(model: *Model) bool {
+        const remote = model.phuxConst() orelse return false;
+        var refs: [max_remote_terminals]TerminalRef = undefined;
+        return remote.terminalRefs(&refs) != 0 and model.selectTerminal(refs[0]);
     }
 
     /// Whether the config band is up: there is something to say and nobody has

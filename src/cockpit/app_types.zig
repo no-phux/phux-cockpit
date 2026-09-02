@@ -131,6 +131,9 @@ pub const Msg = union(enum) {
     /// Select a server-owned Phux session exposed by the current ATTACHED
     /// catalog. The update loop reconnects by this stable server ID.
     palette_select_session: u32,
+    /// Retry the configured provider after an unavailable launch or disconnect.
+    /// Explicit rather than a hidden reconnect loop: one press, one connection.
+    phux_reconnect,
     /// A typed character reaching the needle rather than the shell.
     palette_input: []const u8,
     palette_backspace,
