@@ -19,6 +19,7 @@ const update_module = @import("cockpit/update.zig");
 const scene = @import("cockpit/native/scene.zig");
 const view_module = @import("cockpit/native/view.zig");
 const host = @import("cockpit/native/host.zig");
+const ts_snapshot = @import("cockpit/native/ts_snapshot.zig");
 const config_module = @import("config/config.zig");
 const theme_module = @import("config/theme.zig");
 
@@ -303,6 +304,8 @@ pub const onFrame = view_module.onFrame;
 pub const tabPlacementFromText = view_module.tabPlacementFromText;
 pub const onTimer = view_module.onTimer;
 pub const CockpitHost = host.CockpitHost;
+pub const encodeTsSnapshot = ts_snapshot.encode;
+pub const ts_snapshot_max_bytes = ts_snapshot.max_bytes;
 
 pub const selection_autoscroll_timer_id = app_types.selection_autoscroll_timer_id;
 pub const terminal_font_id = scene.terminal_font_id;
@@ -924,6 +927,7 @@ test {
     _ = @import("tests/settings_theme_tests.zig");
     _ = @import("tests/tab_strip_tests.zig");
     _ = @import("tests/tab_identity_tests.zig");
+    _ = @import("tests/ts_snapshot_tests.zig");
     _ = @import("tests/scrollback_search_tests.zig");
     _ = @import("tests/multi_window_tests.zig");
     _ = @import("tests/sdk_surface_tests.zig");

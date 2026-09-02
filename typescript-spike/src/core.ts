@@ -6,10 +6,11 @@ import {
   intent,
   nextU64,
   sameU64,
-  snapshotHeader,
+  snapshot,
 } from "./protocol.ts";
 
 export interface Tab {
+  readonly id: number;
   readonly index: number;
   readonly title: Uint8Array;
   readonly selected: boolean;
@@ -66,7 +67,7 @@ const ZERO_U64: WireU64 = { hi: 0, lo: 0 };
 export function initialModel(): [Model, Cmd<Msg>] {
   return [
     {
-      tabs: [{ index: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
+      tabs: [{ id: 1, index: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
       selectedTab: 0,
       tabPlacement: "top",
       paletteOpen: false,
@@ -118,16 +119,25 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
     case "settings_close":
       return { ...model, settingsOpen: false };
     case "snapshot_loaded": {
-      const snapshot = snapshotHeader(msg.body);
-      if (snapshot === null) {
+      const projected = snapshot(msg.body);
+      if (projected === null) {
         return { ...model, engineConnected: false, status: asciiBytes("BAD SNAPSHOT") };
       }
+      const refused = projected.flags & 31;
+      const rawSelected = projected.selectedTab;
+      if (!(rawSelected >= 0 && rawSelected <= 255)) {
+        return { ...model, engineConnected: false, status: asciiBytes("BAD SNAPSHOT") };
+      }
+      const selectedTab = Math.trunc(rawSelected);
       return {
         ...model,
+        tabs: projected.tabs,
+        selectedTab,
+        tabPlacement: projected.tabPlacement === 1 ? "side" : "top",
         engineConnected: true,
-        engineSequence: snapshot.sequence,
-        engineRevision: snapshot.revision,
-        status: asciiBytes("READY"),
+        engineSequence: projected.sequence,
+        engineRevision: projected.revision,
+        status: refused === 0 ? asciiBytes("READY") : asciiBytes("ACTION REFUSED"),
       };
     }
     case "snapshot_failed":

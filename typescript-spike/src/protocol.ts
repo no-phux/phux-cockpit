@@ -15,6 +15,22 @@ export interface Invalidation {
   readonly revision: WireU64;
 }
 
+export interface SnapshotTab {
+  readonly id: number;
+  readonly index: number;
+  readonly title: Uint8Array;
+  readonly selected: boolean;
+  readonly attention: boolean;
+}
+
+export interface EngineSnapshot extends Invalidation {
+  readonly activeWindow: number;
+  readonly tabPlacement: number;
+  readonly selectedTab: number;
+  readonly flags: number;
+  readonly tabs: readonly SnapshotTab[];
+}
+
 function readU32(bytes: Uint8Array, at: number): number {
   const value = bytes[at]
     + bytes[at + 1] * 256
@@ -47,10 +63,48 @@ export function invalidation(bytes: Uint8Array): Invalidation | null {
   return { sequence: readU64(bytes, 2), revision: readU64(bytes, 10) };
 }
 
-export function snapshotHeader(bytes: Uint8Array): Invalidation | null {
-  if (bytes.length < INVALIDATION_LENGTH) return null;
+export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
+  if (bytes.length < 24) return null;
   if (bytes[0] !== PROTOCOL_VERSION || bytes[1] !== SNAPSHOT) return null;
-  return { sequence: readU64(bytes, 2), revision: readU64(bytes, 10) };
+  const count = bytes[20];
+  const selected = bytes[21];
+  // ScriptC proves every integer slot ahead of time: a byte read past the
+  // end is NaN in TypeScript, so each value is fenced with an ordered
+  // comparison before it may enter the model. The bounds are the wire's own
+  // (u8 count, u32 id), not guesses.
+  if (!(count >= 0 && count <= 255)) return null;
+  if (!(selected >= 0 && selected <= 255)) return null;
+  if (selected >= count && count !== 0) return null;
+  const tabs: SnapshotTab[] = [];
+  let at = 24;
+  for (let index = 0; index < count; index += 1) {
+    if (!(index >= 0 && index <= 255)) return null;
+    if (at + 6 > bytes.length) return null;
+    const rawId = readU32(bytes, at);
+    const titleLength = bytes[at + 5];
+    if (!(rawId >= 1 && rawId <= 4294967295)) return null;
+    const id = Math.trunc(rawId);
+    if (!(titleLength >= 0 && titleLength <= 255)) return null;
+    if (at + 6 + titleLength > bytes.length) return null;
+    tabs.push({
+      id,
+      index,
+      title: bytes.subarray(at + 6, at + 6 + titleLength),
+      selected: index === selected,
+      attention: bytes[at + 4] !== 0,
+    });
+    at += 6 + titleLength;
+  }
+  if (at !== bytes.length) return null;
+  return {
+    sequence: readU64(bytes, 2),
+    revision: readU64(bytes, 10),
+    activeWindow: bytes[18],
+    tabPlacement: bytes[19],
+    selectedTab: selected,
+    flags: bytes[22],
+    tabs,
+  };
 }
 
 function writeU32(bytes: Uint8Array, at: number, input: number): void {
