@@ -8,6 +8,7 @@
 # the SDK table to the 4 that pin backed, and the contract test fails at
 # 4 < 32 exactly as it did against the real thing.
 test: the SDK PTY table covers Cockpit's bounded terminal registry
+red: 2026-09-02 at 7a00e4b
 diff --git a/src/providers/local/provider.zig b/src/providers/local/provider.zig
 index 13aa7ba..3503f16 100644
 --- a/src/providers/local/provider.zig
