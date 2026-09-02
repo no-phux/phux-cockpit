@@ -3,6 +3,14 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1](https://github.com/no-phux/phux-cockpit/compare/v0.13.0...v0.13.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **release:** detect release PR head updates ([#64](https://github.com/no-phux/phux-cockpit/issues/64)) ([b81c16f](https://github.com/no-phux/phux-cockpit/commit/b81c16f65adefd72ce117ac070a7cf0be251580d))
+* **release:** validate updated release PRs ([#61](https://github.com/no-phux/phux-cockpit/issues/61)) ([24ff643](https://github.com/no-phux/phux-cockpit/commit/24ff643391a0f1387e2923665a17300834aab125))
+
 ## [0.13.0](https://github.com/no-phux/phux-cockpit/compare/v0.12.1...v0.13.0) (2026-09-02)
 
 
