@@ -9,7 +9,7 @@ diff --git a/src/cockpit/native/workspace_projection.zig b/src/cockpit/native/wo
 index d0e5ebe..b1c28f8 100644
 --- a/src/cockpit/native/workspace_projection.zig
 +++ b/src/cockpit/native/workspace_projection.zig
-@@ -627,8 +627,8 @@ pub const max_terminal_title_bytes: usize = 96;
+@@ -627,6 +627,6 @@ pub const max_terminal_title_bytes: usize = 96;
  /// Closing presentation topology never claims execution ownership. Local
  /// terminals additionally lose their owned process in update; remote terminals
  /// remain in provider inventory and can be admitted again.
@@ -18,5 +18,3 @@ index d0e5ebe..b1c28f8 100644
 +pub fn tabCanClose(id: TerminalRef) bool {
 +    return provider_contract.isLocal(id);
  }
- 
- /// Where a terminal LIVES, in the only coordinates anyone can act on: which
