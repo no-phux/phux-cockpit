@@ -23,21 +23,71 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
-      pr_branch: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).headBranchName || '' }}
+      release_pr_changed: ${{ steps.pr_after.outputs.changed }}
+      pr_branch: ${{ steps.pr_after.outputs.branch }}
     steps:
+      - name: Observe the release PR head before maintenance
+        id: pr_before
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t prs < <(
+            gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+              --json headRefName,headRefOid \
+              --jq '.[] | select(.headRefName | startswith("release-please--branches--")) | [.headRefName,.headRefOid] | @tsv'
+          )
+          if (( ${#prs[@]} > 1 )); then
+            echo "::error::more than one open Release Please PR targets main"
+            exit 1
+          fi
+          head=''
+          if (( ${#prs[@]} == 1 )); then
+            IFS=$'\t' read -r _ head <<<"${prs[0]}"
+          fi
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
-  # `release-please` returns `pr` when it creates OR updates the release PR.
-  # `prs_created` is true only for the first case, which left an updated PR
-  # without the required Zig check and therefore permanently UNSTABLE.
+      - name: Observe whether the release PR head changed
+        id: pr_after
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_HEAD: ${{ steps.pr_before.outputs.head }}
+        run: |
+          set -euo pipefail
+          mapfile -t prs < <(
+            gh pr list --repo "$GITHUB_REPOSITORY" --state open --base main \
+              --json headRefName,headRefOid \
+              --jq '.[] | select(.headRefName | startswith("release-please--branches--")) | [.headRefName,.headRefOid] | @tsv'
+          )
+          if (( ${#prs[@]} > 1 )); then
+            echo "::error::more than one open Release Please PR targets main"
+            exit 1
+          fi
+          branch=''
+          head=''
+          if (( ${#prs[@]} == 1 )); then
+            IFS=$'\t' read -r branch head <<<"${prs[0]}"
+          fi
+          changed=false
+          if [[ -n "$head" && "$head" != "$BEFORE_HEAD" ]]; then
+            changed=true
+          fi
+          {
+            echo "branch=$branch"
+            echo "head=$head"
+            echo "changed=$changed"
+          } >> "$GITHUB_OUTPUT"
+
   validate-release-pr:
     name: Validate release PR
     needs: release-please
-    if: needs.release-please.outputs.pr_branch != ''
+    if: needs.release-please.outputs.release_pr_changed == 'true' && needs.release-please.outputs.pr_branch != ''
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       actions: write
