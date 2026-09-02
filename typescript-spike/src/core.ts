@@ -123,7 +123,9 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       if (projected === null) {
         return { ...model, engineConnected: false, status: asciiBytes("BAD SNAPSHOT") };
       }
-      const refused = projected.flags & 31;
+      // Bits 0..4 are the engine model's own limit and write refusals; bit 7
+      // is the seam's: the last intent named a revision the engine had left.
+      const refused = projected.flags & 159;
       const rawSelected = projected.selectedTab;
       if (!(rawSelected >= 0 && rawSelected <= 255)) {
         return { ...model, engineConnected: false, status: asciiBytes("BAD SNAPSHOT") };

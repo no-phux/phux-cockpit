@@ -50,6 +50,56 @@ fn addProviderContractModules(
     }
 }
 
+/// The TypeScript-core graph: the runner extension under `typescript-spike/`
+/// fronts a real Cockpit engine, and a Zig module may only import files
+/// below its own root, so the engine is handed to each extension instance
+/// (exe, app tests, extension tests) as a module rooted at `src/ts_engine.zig`
+/// carrying the same imports the Zig app root gets — minus the Phux provider,
+/// which this graph never builds.
+fn addTsEngineModules(b: *std.Build, artifacts: native_sdk.AppArtifacts) void {
+    const extension_tests = artifacts.extension_tests orelse
+        @panic("native-sdk app graph did not expose the extension test artifact");
+    const roots = [_]*std.Build.Module{
+        artifacts.extension orelse @panic("native-sdk app graph did not expose the extension module"),
+        artifacts.test_extension orelse @panic("native-sdk app graph did not expose the test extension module"),
+        extension_tests.root_module,
+    };
+    for (roots, 0..) |root, index| {
+        var seen = false;
+        for (roots[0..index]) |earlier| seen = seen or earlier == root;
+        if (seen) continue;
+        const target = root.resolved_target.?;
+        const optimize = root.optimize.?;
+        const sdk_module = root.import_table.get("native_sdk") orelse
+            @panic("native-sdk extension module did not expose the SDK root module");
+        const contract = b.createModule(.{
+            .root_source_file = b.path("src/providers/contract.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        contract.addImport("native_sdk", sdk_module);
+        const phux_options = b.addOptions();
+        phux_options.addOption(bool, "enabled", false);
+        const ghostty = b.dependency("ghostty", .{
+            .target = target,
+            .optimize = optimize,
+            .simd = false,
+            .@"emit-xcframework" = false,
+            .@"emit-macos-app" = false,
+        });
+        const engine = b.createModule(.{
+            .root_source_file = b.path("src/ts_engine.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        engine.addImport("native_sdk", sdk_module);
+        engine.addImport("provider_contract", contract);
+        engine.addImport("phux_options", phux_options.createModule());
+        engine.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
+        root.addImport("cockpit_engine", engine);
+    }
+}
+
 // ---------------------------------------------------------------- phux FFI
 
 /// A validated location for the phux client FFI: a directory holding
@@ -521,13 +571,17 @@ pub fn build(b: *std.Build) void {
         native_sdk.addAppArtifacts(b, dependency, .{
             .name = "phux-cockpit-typescript-spike",
             .app_root = "typescript-spike",
+            .native_extension = "src/native_extension.zig",
         })
     else
         native_sdk.addAppArtifacts(b, dependency, .{ .name = "phux-cockpit" });
     const app_module = artifacts.exe.root_module;
     if (app_module.resolved_target.?.result.os.tag != .macos)
         @panic("phux-cockpit supports macOS only");
-    if (typescript_spike) return;
+    if (typescript_spike) {
+        addTsEngineModules(b, artifacts);
+        return;
+    }
 
     const phux_enabled = b.option(
         bool,

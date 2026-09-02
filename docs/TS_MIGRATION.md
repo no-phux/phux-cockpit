@@ -1,10 +1,30 @@
 # Migrating Cockpit's authoring to TypeScript + `.native` markup
 
-Status: **implementation in progress.** `typescript-spike/` compiles a real
-`core.ts` and `app.native` through ScriptC/corewire on Native SDK 0.9.5, and
-`src/cockpit/native/ts_protocol.zig` pins the first lossless engine/core wire
-records. The shipping graph remains the Zig core until the app-owned runner
-extension and parity gates below are complete.
+Status: **phase 1 seam landed, phase 2 next.** `typescript-spike/` compiles a
+real `core.ts` and `app.native` through ScriptC/corewire on the pinned fork
+(`cockpit/v0.9.5`), and the seam is live end to end under
+`-Dtypescript-spike=true`: `src/cockpit/native/ts_protocol.zig` pins the wire,
+`ts_snapshot.zig` projects chrome state, `ts_engine.zig` owns a real Cockpit
+model behind it, and `typescript-spike/src/native_extension.zig` is the fork's
+`native_extension` hook answering `cockpit.intent`, `cockpit.snapshot` and the
+invalidation channel. Three guards under the extension prove boot, resync and
+the revision fence red-then-green (`zig build test -Dtypescript-spike=true
+-Dplatform=null`). What the engine does NOT yet own is the PTY spawn and the
+terminal pixels: a new tab in the spike mints a real emulator session but no
+shell, and the GPU surface stays empty. That is the phase-2/3 decision below,
+still to be made by measurement. The shipping graph remains the Zig core.
+
+Building the spike needs the SDK package's TypeScript toolchain, which the
+tarball pin does not carry. Once per pin, on the package `zig build` resolved:
+
+```sh
+cd zig-pkg/native_sdk-*/packages/core && npm ci --include=dev
+zig build test -Dtypescript-spike=true -Dplatform=null
+```
+
+Without it the build stops at "the @native-sdk/core frontend cannot resolve
+its TypeScript toolchain" and names the exact directory. The default and Phux
+graphs never touch it.
 
 ## Target
 
