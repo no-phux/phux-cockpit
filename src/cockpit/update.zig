@@ -321,6 +321,57 @@ fn followTabSelection(model: *Model) void {
     }
 }
 
+fn activatePlacedDestination(
+    model: *Model,
+    fx: *Fx,
+    placed: model_module.PlacedTerminalDestination,
+) void {
+    if (!model.containsTerminal(placed.terminal_ref)) return;
+    const current = model.locateTerminal(placed.terminal_ref) orelse return;
+    // The terminal identity survives tab reorder, but not a move to another
+    // window after the row was projected.
+    if (current.window != placed.window) return;
+    const workspace = model.wsAt(current.window) orelse return;
+    if (!workspace.selectTerminal(placed.terminal_ref)) return;
+    const previous_window = model.active_window;
+    model.active_window = current.window;
+    endHiddenCaptures(model, fx);
+    if (previous_window != current.window) fx.showWindow(scene.windowLabelFor(current.window));
+}
+
+fn activateAvailableDestination(model: *Model, fx: *Fx, terminal_ref: TerminalRef) void {
+    if (providerKind(terminal_ref) != .phux or !model.containsTerminal(terminal_ref)) return;
+    if (model.locateTerminal(terminal_ref)) |current| {
+        activatePlacedDestination(model, fx, .{
+            .window = @intCast(current.window),
+            .tab = @intCast(current.tab),
+            .terminal_ref = terminal_ref,
+        });
+        return;
+    }
+    if (!model.admitTab(terminal_ref)) return;
+    _ = model.selectTerminal(terminal_ref);
+    endHiddenCaptures(model, fx);
+}
+
+fn activateSessionDestination(model: *Model, fx: *Fx, session_id: u32) void {
+    const remote = model.phux() orelse return;
+    const changed = remote.selectSession(session_id) catch return;
+    if (!changed) return;
+    model.phux_admit_on_ready = true;
+    model.phux_reconnect_after_close = true;
+    remote.stop();
+    fx.closeChannel(phux_channel_key);
+}
+
+fn activatePaletteDestination(model: *Model, fx: *Fx, destination: app_types.PaletteDestination) void {
+    switch (destination) {
+        .placed_terminal => |placed| activatePlacedDestination(model, fx, placed),
+        .available_terminal => |terminal_ref| activateAvailableDestination(model, fx, terminal_ref),
+        .session => |session_id| activateSessionDestination(model, fx, session_id),
+    }
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const focus_before = remoteFocusTarget(model);
     const owner_before = remoteFocusOwner(model);
@@ -433,9 +484,9 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
                     const terminal_set_changed =
                         delta.ready_published or delta.added_count != 0 or delta.removed_count != 0;
                     if (terminal_set_changed) model.reconcileRemoteTerminals();
-                    if (delta.ready_published and model.phux_select_on_ready) {
-                        model.phux_select_on_ready = false;
-                        _ = model.selectFirstRemoteTerminal();
+                    if (delta.ready_published and model.phux_admit_on_ready) {
+                        model.phux_admit_on_ready = false;
+                        _ = model.admitAndSelectCurrentRemoteTerminal();
                     }
                 },
                 .closed, .rejected => {
@@ -895,10 +946,10 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .tray_opened => {},
         .close_terminal => {
             const id = model.selectedTerminalRef() orelse return;
-            // Close owns LOCAL lifetime only. A Phux terminal exists because
-            // its coordinator says so; cmd+W must not pretend to end it.
-            if (providerKind(id) != .local) return;
-            closePaneForTerminal(model, fx, id, true);
+            // Remote close detaches only this Cockpit leaf. The provider keeps
+            // execution authority and inventory, so the terminal can be
+            // admitted again from the switcher.
+            closePaneForTerminal(model, fx, id, providerKind(id) == .local);
         },
         .move_terminal => |delta| {
             const id = model.selectedTerminalId() orelse return;
@@ -962,8 +1013,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .palette_step => |delta| {
             const workspace = model.ws();
             if (!workspace.palette.open) return;
-            var rows: [projection.palette_max_entries]projection.PaletteEntry = undefined;
-            const count = projection.paletteEntriesIn(model, workspace, &rows);
+            const count = projection.paletteEntryCountIn(model, workspace);
             if (count == 0) return;
             // Wraps, because a switcher you can walk off the end of makes the
             // last row harder to reach than the first.
@@ -979,26 +1029,15 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // A commit with nothing matching still DISMISSES. Leaving the
             // palette up on an Enter that found nothing reads as a stuck
             // keyboard.
-            const entry = target orelse return;
-            switch (entry) {
-                .tab => |index| updateModel(model, .{ .select_position = @intCast(index) }, fx),
-                .session => |index| {
-                    const remote = model.phux() orelse return;
-                    const catalog = remote.sessionCatalog();
-                    if (index >= catalog.len) return;
-                    updateModel(model, .{ .palette_select_session = catalog[index].id }, fx);
-                },
-            }
+            const destination = target orelse return;
+            updateModel(model, .{ .palette_activate = destination }, fx);
         },
-        .palette_select_session => |session_id| {
-            const remote = model.phux() orelse return;
-            const changed = remote.selectSession(session_id) catch return;
+        .palette_activate => |destination| {
+            // Pointer, Enter, and accessibility all arrive here with the same
+            // stable payload. Dismiss the SOURCE workspace before activation
+            // can move `active_window`.
             model.ws().palette.reset();
-            if (!changed) return;
-            model.phux_select_on_ready = true;
-            model.phux_reconnect_after_close = true;
-            remote.stop();
-            fx.closeChannel(phux_channel_key);
+            activatePaletteDestination(model, fx, destination);
         },
         .phux_reconnect => {
             const remote = model.phux() orelse return;
@@ -1381,38 +1420,25 @@ fn moveTabBy(model: *Model, index: u8, delta: i32) ?struct { landed: u8, applied
     return .{ .landed = @intCast(landed), .applied = applied };
 }
 
-/// Close a WHOLE tab — every pane in it — which is what the strip's `x`
-/// means. Panes are closed one at a time through the ordinary path so each
-/// one's pty kill, capture teardown, and clipboard cancellation happen
-/// exactly as cmd+W would do them; the tab drops with its last pane.
-///
-/// A Phux pane cannot be closed locally (its coordinator owns it), so a tab
-/// holding one keeps that pane and survives — the same rule cmd+W follows.
+/// Close a WHOLE tab — every pane in it. Local panes release their owned
+/// process; remote panes lose only their Cockpit topology leaf.
 fn closeTab(model: *Model, fx: *Fx, index: u8) void {
     closeTabIn(model, fx, model.active_window, index);
 }
 
-/// The same, addressed to a specific window — what the whole-window close
-/// walks with, and what keeps a background window's tabs closable at all.
+/// The same, addressed to a specific window — what whole-window close walks.
 fn closeTabIn(model: *Model, fx: *Fx, window_index: usize, index: u8) void {
     const workspace = model.wsAtConst(window_index) orelse return;
     const current = workspace.treeConst(index) orelse return;
     var refs: [layout.max_panes]TerminalRef = undefined;
     const count = current.terminals(&refs);
     for (refs[0..count]) |id| {
-        if (providerKind(id) != .local) continue;
-        closePaneForTerminal(model, fx, id, true);
+        closePaneForTerminal(model, fx, id, providerKind(id) == .local);
     }
 }
 
 /// The focused terminal's LOCAL pane, or null when focus is on the web
 /// surface, on a remote terminal, or on nothing.
-///
-/// Scrollback search is local-only: `vt.search.Screen` matches
-/// case-INSENSITIVELY with no option to change it, while the phux provider's
-/// own `search` takes a `case_sensitive` flag — so one chord driving both
-/// would mean one visible control with two different matching rules. See the
-/// handoff note.
 fn focusedLocalPane(model: *Model) ?*Pane {
     const terminal_ref = model.selectedTerminalRef() orelse return null;
     return model.provider.terminal(terminal_ref);
@@ -1487,12 +1513,13 @@ fn closePaneForTerminal(model: *Model, fx: *Fx, terminal_ref: TerminalRef, kill_
     if (tab_removed) workspace.dropTab(tab_index);
     endHiddenCaptures(model, fx);
 
-    // Every pane close gives a shell slot back. A TAB slot only comes back when
-    // the last pane closes and the tree is dropped.
-    model.terminal_limit_refused = false;
+    // Only a local close gives a process slot back. A TAB slot comes back when
+    // the final topology leaf closes regardless of provider.
+    if (providerKind(terminal_ref) == .local) model.terminal_limit_refused = false;
     if (tab_removed) workspace.tab_limit_refused = false;
     if (workspace.tab_count == 0) retireEmptyWindow(model, fx, where.window);
 }
+
 /// A window whose last tab just closed.
 ///
 /// This is the arm that was wrong the moment a second window existed. It used
@@ -1569,26 +1596,16 @@ fn retireEmptyWindow(model: *Model, fx: *Fx, window_index: usize) void {
     fx.quitApp();
 }
 
-/// Close a WHOLE window: every pane of every tab, through the ordinary
-/// pane-close path so each one's pty kill, capture teardown, and clipboard
-/// cancellation happen exactly as cmd+W would do them. The window itself is
-/// retired by the cascade when its last tab goes.
-///
-/// A Phux pane cannot be closed locally (its coordinator owns it), so a tab
-/// holding one survives — the same rule cmd+W and the tab `x` already follow.
-/// The loop stops the moment a pass fails to shrink the tab list, because a
-/// window made entirely of remote panes would otherwise spin here forever.
+/// Close a WHOLE window: local panes release owned processes and remote panes
+/// detach presentation. The window itself retires when its final tab leaves.
 fn closeWholeWindow(model: *Model, fx: *Fx, window_index: usize) void {
     while (true) {
         const workspace = model.wsAt(window_index) orelse break;
         if (workspace.tab_count == 0) break;
-        const before = workspace.tab_count;
         closeTabIn(model, fx, window_index, 0);
-        const after = if (model.wsAt(window_index)) |current| current.tab_count else 0;
-        if (after >= before) break;
     }
-    // The platform window is already gone, so the slot has to go even when a
-    // remote pane kept a tab alive.
+    // The platform window is already gone. The close cascade normally retires
+    // the slot; this catches an already-empty workspace.
     if (model.windowOpen(window_index)) retireEmptyWindow(model, fx, window_index);
 }
 /// ONE copy in flight: the clipboard write reuses a fixed key, so a second

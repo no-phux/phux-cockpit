@@ -558,8 +558,8 @@ test "closing an earlier tab preserves the selected terminal" {
     try testing.expect(state.model.ws().tabTerminal(state.model.ws().selected_tab).?.eql(selected));
 }
 
-// GUARD: remote-tab-close-affordance
-test "a coordinator-owned tab exposes no enabled close affordance" {
+// GUARD: remote-tab-close-is-presentation-detach
+test "a remote tab detaches presentation and reopens from retained inventory" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
     defer harness.destroy(gpa);
@@ -568,17 +568,85 @@ test "a coordinator-owned tab exposes no enabled close affordance" {
     const iface = state.app();
 
     const remote = try support.remoteTerminalRef(41);
-    try testing.expect(!app.tabCanClose(remote));
-    try testing.expect(app.tabCanClose(state.model.ws().tabTerminal(0).?));
+    const published = [_]app.TerminalRef{remote};
+    app.reconcileRemoteRefs(
+        &state.model.remote_inventory,
+        &state.model.remote_inventory_count,
+        &published,
+    );
+    try testing.expect(app.tabCanClose(remote));
     try testing.expect(state.model.admitTab(remote));
-    try testing.expect(state.model.selectTerminal(remote));
+    const remote_tab = state.model.ws().tabOfTerminal(remote) orelse return error.TestExpectedTab;
+    try state.dispatch(&harness.runtime, 1, .{ .select_position = @intCast(remote_tab) });
     try harness.runtime.dispatchPlatformEvent(iface, .frame_requested);
 
     var closes: usize = 0;
     for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
         if (std.mem.startsWith(u8, node.widget.semantics.label, "Close ")) closes += 1;
     }
-    try testing.expectEqual(@as(usize, 0), closes);
+    try testing.expectEqual(@as(usize, 1), closes);
+
+    try state.dispatch(&harness.runtime, 1, .{ .close_tab = @intCast(remote_tab) });
+    try testing.expect(state.model.locateTerminal(remote) == null);
+    try testing.expectEqual(@as(usize, 1), state.model.remoteTerminalRefs().len);
+    try testing.expect(state.model.remoteTerminalRefs()[0].eql(remote));
+
+    // Reopening is topology admission of the same provider identity.
+    try testing.expect(state.model.admitTab(remote));
+    try testing.expect(state.model.selectTerminal(remote));
+    try testing.expect(state.model.locateTerminal(remote) != null);
+    try testing.expectEqual(@as(usize, 2), state.model.ws().tab_count);
+}
+
+test "remote close preserves provider identity for switcher reopen" {
+    if (comptime app.phux_enabled) {
+        const harness = try native_sdk.TestHarness().create(testing.allocator, .{ .size = surface });
+        defer harness.destroy(testing.allocator);
+        const state = try startCockpit(harness);
+        defer stopCockpit(state);
+
+        const provider = try app.PhuxProvider.create(
+            testing.allocator,
+            testing.io,
+            .{ .unix = "/unused" },
+            "session",
+            "cockpit",
+        );
+        app.attachPhuxProvider(&state.model, provider);
+        const remote_id = try app.RemoteTerminalId.fromPhux(0, 41, "local");
+        try provider.host.terminals.append(testing.allocator, .{
+            .id = remote_id,
+            .phase = .live,
+            .published = true,
+        });
+        const remote: app.TerminalRef = .{
+            .provider_id = .phux,
+            .terminal_id = .{ .phux = remote_id },
+        };
+        state.model.reconcileRemoteTerminals();
+
+        app.update(
+            &state.model,
+            .{ .palette_activate = .{ .available_terminal = remote } },
+            &state.effects,
+        );
+        try testing.expect(state.model.locateTerminal(remote) != null);
+        try state.dispatch(&harness.runtime, 1, .close_terminal);
+        try testing.expect(state.model.locateTerminal(remote) == null);
+        try testing.expect(provider.contains(remote));
+        try testing.expectEqual(app.Phase.live, provider.presentation(remote).?.phase);
+        try testing.expectEqual(@as(usize, 1), state.model.remoteTerminalRefs().len);
+
+        app.update(
+            &state.model,
+            .{ .palette_activate = .{ .available_terminal = remote } },
+            &state.effects,
+        );
+        try testing.expect(state.model.selectedTerminalRef().?.eql(remote));
+        try testing.expect(state.model.locateTerminal(remote) != null);
+    } else {
+        return error.SkipZigTest;
+    }
 }
 
 test "the new-tab button mints a tab through the same path as cmd+T" {

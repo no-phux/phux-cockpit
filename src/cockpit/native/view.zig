@@ -56,6 +56,7 @@ const PaletteRow = struct {
     on_press: Msg,
     semantics: []const u8,
     terminal: ?TerminalRef,
+    placed: bool,
 };
 const paneHasConfirmedLoss = projection.paneHasConfirmedLoss;
 const selectedTerminalCanClose = projection.selectedTerminalCanClose;
@@ -328,6 +329,225 @@ fn remoteLifecycleText(phase: Phase) []const u8 {
         .ended => "ENDED",
         .failed => "FAILED",
     };
+}
+fn placedPaletteRow(
+    ui: *TerminalUi,
+    model: *const Model,
+    placed: model_module.PlacedTerminalDestination,
+    highlighted: bool,
+) PaletteRow {
+    const title = terminalTitle(ui, model, placed.terminal_ref);
+    if (providerKind(placed.terminal_ref) == .local) {
+        const lifecycle = if (model.provider.terminalConst(placed.terminal_ref)) |pane|
+            paneLifecycleText(ui, pane)
+        else
+            "UNAVAILABLE";
+        return .{
+            .label = title,
+            .detail = ui.fmt("WINDOW {d} / TAB {d} / LOCAL", .{ placed.window + 1, placed.tab + 1 }),
+            .on_press = .{ .palette_activate = .{ .placed_terminal = placed } },
+            .semantics = ui.fmt("{s}, open in window {d}, tab {d}, local, {s}{s}", .{
+                title,
+                placed.window + 1,
+                placed.tab + 1,
+                lifecycle,
+                if (highlighted) ", highlighted" else "",
+            }),
+            .terminal = placed.terminal_ref,
+            .placed = true,
+        };
+    }
+    const lifecycle = if (model.remotePresentation(placed.terminal_ref)) |presentation|
+        remoteLifecycleText(presentation.phase)
+    else
+        "UNAVAILABLE";
+    return .{
+        .label = title,
+        .detail = ui.fmt("WINDOW {d} / TAB {d} / PHUX / {s}", .{
+            placed.window + 1,
+            placed.tab + 1,
+            lifecycle,
+        }),
+        .on_press = .{ .palette_activate = .{ .placed_terminal = placed } },
+        .semantics = ui.fmt("{s}, open in window {d}, tab {d}, Phux, {s}{s}", .{
+            title,
+            placed.window + 1,
+            placed.tab + 1,
+            lifecycle,
+            if (highlighted) ", highlighted" else "",
+        }),
+        .terminal = placed.terminal_ref,
+        .placed = true,
+    };
+}
+
+fn availablePaletteRow(
+    ui: *TerminalUi,
+    model: *const Model,
+    terminal_ref: TerminalRef,
+    highlighted: bool,
+) PaletteRow {
+    const title = terminalTitle(ui, model, terminal_ref);
+    const lifecycle = if (model.remotePresentation(terminal_ref)) |presentation|
+        remoteLifecycleText(presentation.phase)
+    else
+        "UNAVAILABLE";
+    return .{
+        .label = title,
+        .detail = ui.fmt("PHUX / {s}", .{lifecycle}),
+        .on_press = .{ .palette_activate = .{ .available_terminal = terminal_ref } },
+        .semantics = ui.fmt("{s}, available in Phux, {s}{s}", .{
+            title,
+            lifecycle,
+            if (highlighted) ", highlighted" else "",
+        }),
+        .terminal = null,
+        .placed = false,
+    };
+}
+
+fn sessionPaletteRow(
+    ui: *TerminalUi,
+    model: *const Model,
+    session_id: u32,
+    highlighted: bool,
+) ?PaletteRow {
+    const remote = model.phuxConst() orelse return null;
+    for (remote.sessionCatalog()) |session| {
+        if (session.id != session_id) continue;
+        const selected = remote.selectedSessionId() == session.id;
+        return .{
+            .label = ui.fmt("{s}", .{session.name}),
+            .detail = ui.fmt("{d} WIN / {d} CLIENT{s}", .{
+                session.window_count,
+                session.attached_client_count,
+                if (selected) " / CURRENT" else "",
+            }),
+            .on_press = .{ .palette_activate = .{ .session = session.id } },
+            .semantics = ui.fmt("{s}, Phux session {d}, {d} windows, {d} attached clients{s}{s}", .{
+                session.name,
+                session.id,
+                session.window_count,
+                session.attached_client_count,
+                if (selected) ", current" else "",
+                if (highlighted) ", highlighted" else "",
+            }),
+            .terminal = null,
+            .placed = false,
+        };
+    }
+    return null;
+}
+
+fn paletteRowFor(
+    ui: *TerminalUi,
+    model: *const Model,
+    entry: projection.PaletteEntry,
+    highlighted: bool,
+) ?PaletteRow {
+    return switch (entry) {
+        .placed_terminal => |placed| placedPaletteRow(ui, model, placed, highlighted),
+        .available_terminal => |terminal_ref| availablePaletteRow(ui, model, terminal_ref, highlighted),
+        .session => |session_id| sessionPaletteRow(ui, model, session_id, highlighted),
+    };
+}
+
+fn paletteSectionLabel(section: projection.PaletteSection) []const u8 {
+    return switch (section) {
+        .open => "OPEN",
+        .available => "AVAILABLE IN PHUX",
+        .sessions => "SESSIONS",
+    };
+}
+fn paletteSectionChanged(previous: ?projection.PaletteSection, current: projection.PaletteSection) bool {
+    return previous == null or previous.? != current;
+}
+
+fn paletteSectionNode(
+    ui: *TerminalUi,
+    section: projection.PaletteSection,
+    tokens: canvas.DesignTokens,
+) TerminalUi.Node {
+    const label = paletteSectionLabel(section);
+    return ui.el(.stack, .{
+        .width = palette_row_width,
+        .height = projection.chrome_icon_extent,
+        .semantics = .{ .label = ui.fmt("{s} destinations", .{label}) },
+    }, .{
+        ui.text(.{
+            .wrap = false,
+            .style = .{ .foreground = tokens.colors.text_muted },
+        }, label),
+    });
+}
+
+fn paletteSelectableNode(
+    ui: *TerminalUi,
+    model: *const Model,
+    row: PaletteRow,
+    highlighted: bool,
+    tokens: canvas.DesignTokens,
+) TerminalUi.Node {
+    return ui.el(.list_item, .{
+        .width = palette_row_width,
+        .height = palette_row_height,
+        .selected = highlighted,
+        .on_press = row.on_press,
+        .style = .{ .background = if (highlighted) tokens.colors.surface_pressed else tokens.colors.surface },
+        .semantics = .{
+            .role = if (row.placed) .tab else .button,
+            .label = row.semantics,
+        },
+    }, .{
+        ui.row(.{ .width = palette_row_width, .height = palette_row_height, .cross = .center }, .{
+            // A 3:1 accent rail carries selection state; the surface wash
+            // alone is intentionally too quiet to do that accessibly.
+            ui.el(.stack, .{
+                .width = projection.tab_indicator_thickness,
+                .height = palette_row_height,
+                .style = .{ .background = if (highlighted) tokens.colors.accent else tokens.colors.surface },
+            }, .{}),
+            ui.row(.{ .grow = 1, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
+                if (row.terminal) |id| tabAttentionMarker(ui, model, id, tokens) else ui.spacer(projection.chrome_icon_extent),
+                ui.text(.{
+                    .grow = 1,
+                    .wrap = false,
+                    .overflow = .ellipsis,
+                    .style = .{ .foreground = if (highlighted) tokens.colors.text else tokens.colors.text_muted },
+                }, row.label),
+                ui.text(.{
+                    .wrap = false,
+                    .style = .{ .foreground = tokens.colors.text_muted },
+                }, row.detail),
+            }),
+        }),
+    });
+}
+
+fn paletteSearchField(
+    ui: *TerminalUi,
+    needle: []const u8,
+    tokens: canvas.DesignTokens,
+) TerminalUi.Node {
+    const empty = needle.len == 0;
+    return ui.row(.{ .width = palette_row_width, .height = palette_row_height, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
+        ui.icon(.{
+            .width = projection.chrome_icon_extent,
+            .height = projection.chrome_icon_extent,
+            .style = .{ .foreground = tokens.colors.text_muted },
+        }, "search"),
+        ui.text(.{
+            .wrap = false,
+            .overflow = .ellipsis,
+            .style = .{ .foreground = if (empty) tokens.colors.text_muted else tokens.colors.text },
+        }, if (empty) "Go to terminal or session…" else needle),
+        ui.el(.stack, .{
+            .width = field_caret_width,
+            .height = field_caret_height,
+            .style = .{ .background = tokens.colors.accent },
+        }, .{}),
+        ui.spacer(1),
+    });
 }
 
 fn emptyStatusNode(ui: *TerminalUi) TerminalUi.Node {
@@ -1176,7 +1396,7 @@ fn configNoticeBand(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignT
     });
 }
 
-/// The summoned tab switcher.
+/// The summoned working-set index.
 ///
 /// It FLOATS. Every other piece of chrome in this app takes its room out of
 /// the content rect, because the painter, the hit-test tree and the PTY sizing
@@ -1187,110 +1407,30 @@ fn configNoticeBand(ui: *TerminalUi, model: *const Model, tokens: canvas.DesignT
 /// churn this round set out to remove. So it is drawn as an overlay in a
 /// `.stack` above the panes, and `workspaceChrome` never hears about it.
 fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, tokens: canvas.DesignTokens) TerminalUi.Node {
-    var rows: [projection.palette_max_entries]projection.PaletteEntry = undefined;
-    const count = projection.paletteEntriesIn(model, ws, &rows);
+    const count = projection.paletteEntryCountIn(model, ws);
     const needle = ws.palette.needle();
     const cursor = if (count == 0) 0 else @min(ws.palette.cursor, count - 1);
-    // Which of the matches this panel is tall enough to DRAW. The match set
-    // above is untouched, so Enter still commits the row under the cursor
-    // whether or not the panel had room for it — the drawing window and the
-    // commit target reading from two different derivations is exactly the class
-    // of bug `resolvePanes` exists to prevent, so this one derives from the same
-    // count and cursor the loop below uses.
     const window = projection.paletteWindowFor(count, cursor);
+    var rows: [projection.palette_max_visible_rows]projection.PaletteEntry = undefined;
+    const visible_count = projection.paletteEntriesWindowIn(model, ws, window, &rows);
 
-    var row_nodes: [projection.palette_max_visible_rows]TerminalUi.Node = undefined;
-    for (rows[window.first..][0..window.count], 0..) |entry, offset| {
+    const max_section_labels = std.meta.fields(projection.PaletteSection).len;
+    var body_nodes: [projection.palette_max_visible_rows + max_section_labels]TerminalUi.Node = undefined;
+    var node_count: usize = 0;
+    var last_section: ?projection.PaletteSection = null;
+
+    for (rows[0..visible_count], 0..) |entry, offset| {
         const highlighted = window.first + offset == cursor;
-        const row: PaletteRow = switch (entry) {
-            .tab => |tab_index| blk: {
-                const id = ws.tabTerminal(tab_index) orelse {
-                    row_nodes[offset] = ui.el(.stack, .{ .semantics = .{ .hidden = true } }, .{});
-                    continue;
-                };
-                const title = terminalTitle(ui, model, id);
-                break :blk .{
-                    .label = title,
-                    .detail = if (tab_index < 5) ui.fmt("CMD+{d}", .{tab_index + 1}) else "TERMINAL",
-                    .on_press = Msg{ .select_position = @intCast(tab_index) },
-                    .semantics = ui.fmt("{s}, terminal {d} of {d}{s}", .{
-                        title,
-                        tab_index + 1,
-                        ws.tab_count,
-                        if (highlighted) ", highlighted" else "",
-                    }),
-                    .terminal = @as(?TerminalRef, id),
-                };
-            },
-            .session => |session_index| blk: {
-                const remote = model.phuxConst() orelse continue;
-                const catalog = remote.sessionCatalog();
-                if (session_index >= catalog.len) continue;
-                const session = catalog[session_index];
-                const selected = remote.selectedSessionId() == session.id;
-                break :blk .{
-                    .label = ui.fmt("{s}", .{session.name}),
-                    .detail = ui.fmt("PHUX / {d} WIN / {d} CLIENT{s}", .{
-                        session.window_count,
-                        session.attached_client_count,
-                        if (selected) " / CURRENT" else "",
-                    }),
-                    .on_press = Msg{ .palette_select_session = session.id },
-                    .semantics = ui.fmt("{s}, Phux session {d}, {d} windows, {d} attached clients{s}{s}", .{
-                        session.name,
-                        session.id,
-                        session.window_count,
-                        session.attached_client_count,
-                        if (selected) ", current" else "",
-                        if (highlighted) ", highlighted" else "",
-                    }),
-                    .terminal = @as(?TerminalRef, null),
-                };
-            },
-        };
-        row_nodes[offset] = ui.el(.list_item, .{
-            // Explicit, and both levels of it. A `grow` inside a container
-            // that was never told how wide it is has nothing to grow against,
-            // which is what left the chord sitting against the title instead
-            // of at the row's trailing edge.
-            .width = palette_row_width,
-            .height = palette_row_height,
-            .selected = highlighted,
-            .on_press = row.on_press,
-            .style = .{ .background = if (highlighted) tokens.colors.surface_pressed else tokens.colors.surface },
-            .semantics = .{
-                .role = if (row.terminal != null) .tab else .button,
-                .label = row.semantics,
-            },
-        }, .{
-            ui.row(.{ .width = palette_row_width, .height = palette_row_height, .cross = .center }, .{
-                // The cursor's accent rail, and it is here for the same
-                // measured reason the selected tab grew one: `surface_pressed`
-                // over `surface` is 1.26:1, and SC 1.4.11 asks 3:1 of anything
-                // that indicates state. A vertical rail rather than the tab's
-                // horizontal bar because this is a vertical list — the accent
-                // marks the edge the rows are read from. Unselected rows paint
-                // it in the row's own ground so the label never shifts.
-                ui.el(.stack, .{
-                    .width = projection.tab_indicator_thickness,
-                    .height = palette_row_height,
-                    .style = .{ .background = if (highlighted) tokens.colors.accent else tokens.colors.surface },
-                }, .{}),
-                ui.row(.{ .grow = 1, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
-                    if (row.terminal) |id| tabAttentionMarker(ui, model, id, tokens) else ui.spacer(projection.chrome_icon_extent),
-                    ui.text(.{
-                        .grow = 1,
-                        .wrap = false,
-                        .overflow = .ellipsis,
-                        .style = .{ .foreground = if (highlighted) tokens.colors.text else tokens.colors.text_muted },
-                    }, row.label),
-                    ui.text(.{
-                        .wrap = false,
-                        .style = .{ .foreground = tokens.colors.text_muted },
-                    }, row.detail),
-                }),
-            }),
-        });
+        const row = paletteRowFor(ui, model, entry, highlighted) orelse continue;
+        const section = projection.paletteSection(entry);
+        if (paletteSectionChanged(last_section, section)) {
+            body_nodes[node_count] = paletteSectionNode(ui, section, tokens);
+            node_count += 1;
+            last_section = section;
+        }
+
+        body_nodes[node_count] = paletteSelectableNode(ui, model, row, highlighted, tokens);
+        node_count += 1;
     }
 
     const body = if (count == 0)
@@ -1298,7 +1438,10 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
             ui.text(.{ .style = .{ .foreground = tokens.colors.warning } }, "No destination matches"),
         })
     else
-        ui.list(.{ .gap = projection.chrome_band_inset, .semantics = .{ .label = "Matching destinations" } }, row_nodes[0..window.count]);
+        ui.list(.{
+            .gap = projection.chrome_band_inset,
+            .semantics = .{ .label = "Working set destinations" },
+        }, body_nodes[0..node_count]);
 
     return ui.column(.{
         .width = palette_width,
@@ -1306,33 +1449,15 @@ fn palettePanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace, toke
         .padding = palette_padding,
         .style = .{ .background = tokens.colors.surface },
         .semantics = .{
-            .label = ui.fmt("Go to terminal or Phux session, {s}, {d} matching", .{
+            .label = ui.fmt("Working set, {s}, {d} matching", .{
                 if (needle.len == 0) "type to filter" else needle,
                 count,
             }),
         },
     }, .{
-        // The needle, drawn rather than hosted — same reasoning as the
-        // scrollback search field two hundred lines up: the app routes the
-        // keys, so the app draws the caret.
-        ui.row(.{ .width = palette_row_width, .height = palette_row_height, .gap = projection.chrome_gap, .cross = .center, .padding = projection.chrome_gap }, .{
-            ui.icon(.{
-                .width = projection.chrome_icon_extent,
-                .height = projection.chrome_icon_extent,
-                .style = .{ .foreground = tokens.colors.text_muted },
-            }, "search"),
-            ui.text(.{
-                .wrap = false,
-                .overflow = .ellipsis,
-                .style = .{ .foreground = if (needle.len == 0) tokens.colors.text_muted else tokens.colors.text },
-            }, if (needle.len == 0) "Go to terminal or Phux session…" else needle),
-            ui.el(.stack, .{
-                .width = field_caret_width,
-                .height = field_caret_height,
-                .style = .{ .background = tokens.colors.accent },
-            }, .{}),
-            ui.spacer(1),
-        }),
+        // The needle is drawn rather than hosted: the app routes every key, so
+        // no keystroke aimed here can leak into a shell.
+        paletteSearchField(ui, needle, tokens),
         body,
     });
 }

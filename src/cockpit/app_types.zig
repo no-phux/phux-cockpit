@@ -13,6 +13,7 @@ pub const TerminalRef = support.TerminalRef;
 pub const BrowserPage = model_module.BrowserPage;
 pub const SurfaceSelection = topology.SurfaceSelection;
 pub const TerminalPointerEvent = model_module.TerminalPointerEvent;
+pub const PaletteDestination = model_module.PaletteDestination;
 
 pub const selection_autoscroll_timer_id: u64 = 1;
 
@@ -114,23 +115,21 @@ pub const Msg = union(enum) {
     /// is where the user already is, so stepping means walking back through
     /// the log.
     search_step: i8,
-    /// cmd+shift+P: the summoned tab switcher.
+    /// cmd+shift+P: the summoned working-set index.
     ///
-    /// It exists because a strip does not scale. The strip windows past what
-    /// fits and shrinks pills before that; the switcher is the path that still
-    /// works at thirty terminals, and it is the seam the product direction's
-    /// "hundreds of agents" eventually arrives through. Idempotent — a second
-    /// chord on an open palette changes nothing.
+    /// The strip does not scale and is window-local. This transient index
+    /// reaches placed terminals across windows, available Phux terminals, and
+    /// server sessions without turning provider inventory into standing tabs.
+    /// Idempotent — a second chord on an open index changes nothing.
     palette_open,
     /// Escape, a click outside, or a committed pick.
     palette_close,
     /// Arrow keys and ctrl+N/P: move the highlight through the FILTERED rows.
     palette_step: i8,
-    /// Enter: select the highlighted tab and dismiss.
+    /// Enter, pointer press, or accessibility activation: commit the same
+    /// stable working-set payload and dismiss.
     palette_commit,
-    /// Select a server-owned Phux session exposed by the current ATTACHED
-    /// catalog. The update loop reconnects by this stable server ID.
-    palette_select_session: u32,
+    palette_activate: PaletteDestination,
     /// Retry the configured provider after an unavailable launch or disconnect.
     /// Explicit rather than a hidden reconnect loop: one press, one connection.
     phux_reconnect,

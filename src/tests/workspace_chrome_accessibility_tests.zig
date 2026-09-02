@@ -120,6 +120,101 @@ test "native tabs and only the selected terminal surface reach accessibility" {
     }
 }
 
+test "working-set sections are static groups around an eight-row selectable viewport" {
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+
+    for (0..9) |_| try state.dispatch(&harness.runtime, 1, .new_terminal);
+    try testing.expectEqual(@as(usize, 10), state.model.ws().tab_count);
+    try pressCanvasKey(harness, state.app(), "p", .{ .primary = true, .shift = true });
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+    var section_count: usize = 0;
+    var selectable_count: usize = 0;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.eql(u8, node.widget.semantics.label, "OPEN destinations")) {
+            section_count += 1;
+            try testing.expect(!node.widget.semantics.focusable);
+        }
+        if (std.mem.indexOf(u8, node.widget.semantics.label, ", open in window ") != null) {
+            selectable_count += 1;
+            try testing.expect(node.widget.semantics.role == .tab);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), section_count);
+    try testing.expectEqual(app.palette_max_visible_rows, selectable_count);
+
+    const buffer = try testing.allocator.alloc(u8, 128 * 1024);
+    defer testing.allocator.free(buffer);
+    var writer = std.Io.Writer.fixed(buffer);
+    try automation.snapshot.writeA11yText(harness.runtime.automationSnapshot("working-set"), &writer);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "Working set destinations") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "OPEN") != null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "AVAILABLE IN PHUX") == null);
+    try testing.expect(std.mem.indexOf(u8, writer.buffered(), "SESSIONS") == null);
+}
+
+test "working-set accessibility groups open available and session destinations" {
+    if (comptime app.phux_enabled) {
+        const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+        defer harness.destroy(testing.allocator);
+        const state = try startCockpit(harness);
+        defer stopCockpit(state);
+
+        const remote = try app.PhuxProvider.create(
+            testing.allocator,
+            testing.io,
+            .{ .unix = "/unused" },
+            "session",
+            "cockpit",
+        );
+        app.attachPhuxProvider(&state.model, remote);
+        const remote_id = try app.RemoteTerminalId.fromPhux(0, 41, "local");
+        try remote.host.terminals.append(testing.allocator, .{
+            .id = remote_id,
+            .phase = .live,
+            .published = true,
+        });
+        try remote.host.sessions.append(testing.allocator, .{
+            .id = 71,
+            .name = try testing.allocator.dupe(u8, "shared-build"),
+            .created_at_unix_secs = 1,
+            .window_count = 2,
+            .attached_client_count = 3,
+            .focused = true,
+        });
+        state.model.reconcileRemoteTerminals();
+
+        try pressCanvasKey(harness, state.app(), "p", .{ .primary = true, .shift = true });
+        try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+
+        var open_group = false;
+        var available_group = false;
+        var sessions_group = false;
+        var available_button = false;
+        var session_button = false;
+        for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+            const label = node.widget.semantics.label;
+            if (std.mem.eql(u8, label, "OPEN destinations")) open_group = true;
+            if (std.mem.eql(u8, label, "AVAILABLE IN PHUX destinations")) available_group = true;
+            if (std.mem.eql(u8, label, "SESSIONS destinations")) sessions_group = true;
+            if (std.mem.indexOf(u8, label, "available in Phux, RUNNING") != null) {
+                available_button = node.widget.semantics.role == .button;
+            }
+            if (std.mem.indexOf(u8, label, "Phux session 71, 2 windows, 3 attached clients") != null) {
+                session_button = node.widget.semantics.role == .button;
+            }
+        }
+        try testing.expect(open_group and available_group and sessions_group);
+        try testing.expect(available_button and session_button);
+        try testing.expectEqual(@as(usize, 1), state.model.ws().tab_count);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "cockpit native-tab proof shot (env-gated)" {
     if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
     if (std.c.getenv("COCKPIT_SHOTS") == null) return error.SkipZigTest;

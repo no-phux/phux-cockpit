@@ -331,12 +331,12 @@ pub const max_windows: usize = 1 + max_secondary_windows;
 /// than a second model: everything below is per-window by construction, and
 /// everything that stayed on `Model` (the provider, the config, the clipboard
 /// latches, the shortcut latch) is genuinely app-wide.
-/// The longest needle the summoned switcher will hold. A tab is found by a
-/// few characters of its name or by its position; nobody types a sentence at
-/// a switcher, and a fixed buffer keeps the workspace allocation-free.
+/// The longest needle the summoned working-set index will hold. A destination
+/// is found by a few characters of its name or position; nobody types a
+/// sentence here, and a fixed buffer keeps the workspace allocation-free.
 pub const max_palette_query_bytes: usize = 64;
 
-/// The summoned tab switcher's state.
+/// The summoned working-set index's state.
 ///
 /// It is a WORKSPACE's, not the model's: each window has its own tabs, so each
 /// window has its own switcher, and a palette open in the window behind must
@@ -393,8 +393,8 @@ pub const Palette = struct {
 
 pub const Workspace = struct {
     tabs: [max_tabs]layout.Tree = [_]layout.Tree{.{}} ** max_tabs,
-    /// The summoned tab switcher. Presentational plus a keyboard mode, and
-    /// deliberately NOT part of `topologySnapshot`: an open switcher is not a
+    /// The summoned working-set index. Presentational plus a keyboard mode,
+    /// and deliberately NOT part of `topologySnapshot`: an open index is not a
     /// workspace shape and must never be restored on launch.
     palette: Palette = .{},
     /// The settings surface. Not part of `topologySnapshot` for the same
@@ -554,6 +554,35 @@ pub const Workspace = struct {
 /// answer once there is more than one window, because a pty event names a
 /// terminal and nothing else.
 pub const TerminalLocation = struct { window: usize, tab: usize };
+/// Stable switcher payload for a terminal that already has presentation
+/// topology. `terminal_ref` is the identity fence; window and tab say where
+/// that identity was projected when the row was built.
+pub const PlacedTerminalDestination = struct {
+    window: u8,
+    tab: u8,
+    terminal_ref: TerminalRef,
+};
+
+/// A working-set destination, carried unchanged by pointer, keyboard, and
+/// accessibility activation. No arm borrows a provider catalog index.
+pub const PaletteDestination = union(enum) {
+    placed_terminal: PlacedTerminalDestination,
+    available_terminal: TerminalRef,
+    session: u32,
+};
+
+/// Replace the bounded remote inventory with the provider's latest complete
+/// publication. The inventory ceiling is independent of every workspace's tab
+/// ceiling: terminals remain discoverable after presentation fills up.
+pub fn reconcileRemoteRefs(
+    inventory: *[max_remote_terminals]TerminalRef,
+    inventory_count: *usize,
+    published: []const TerminalRef,
+) void {
+    const count = @min(inventory.len, published.len);
+    @memcpy(inventory[0..count], published[0..count]);
+    inventory_count.* = count;
+}
 
 pub const Model = struct {
     provider: *LocalProvider,
@@ -583,10 +612,15 @@ pub const Model = struct {
     /// before reusing its effect key. Opening immediately races the close and
     /// the runtime correctly rejects the duplicate key.
     phux_reconnect_after_close: bool = false,
-    /// Initial attach and an explicit session pick should put the attached
-    /// terminal in front. Ordinary reconnects leave the operator's focus alone.
-    phux_select_on_ready: bool = true,
+    /// Initial attach and an explicit session pick admit and select one
+    /// current terminal. Ordinary publications leave presentation and focus
+    /// alone.
+    phux_admit_on_ready: bool = true,
     remote_ui: [max_remote_terminals]RemoteUiState = [_]RemoteUiState{.{}} ** max_remote_terminals,
+    /// The provider's complete bounded terminal publication, independent of
+    /// which terminals currently have Cockpit topology leaves.
+    remote_inventory: [max_remote_terminals]TerminalRef = undefined,
+    remote_inventory_count: usize = 0,
     pointer_state: ?*PointerState = null,
     /// Window 0's workspace, INLINE.
     ///
@@ -933,6 +967,9 @@ pub const Model = struct {
         }
         return null;
     }
+    pub fn remoteTerminalRefs(model: *const Model) []const TerminalRef {
+        return model.remote_inventory[0..model.remote_inventory_count];
+    }
 
     // ------------------------------------------------------------ tabs
     //
@@ -1085,30 +1122,41 @@ pub const Model = struct {
         }
     }
 
+    /// Reconcile provider inventory and presentation state without admitting
+    /// topology. Discovery is not a focus or allocation gesture.
     pub fn reconcileRemoteTerminals(model: *Model) void {
         const remote = model.phuxConst() orelse return;
-        var refs: [max_remote_terminals]TerminalRef = undefined;
-        const count = remote.terminalRefs(&refs);
-        // Remote panes whose terminal the coordinator retired leave the tree;
-        // `normalizeTopology` then collapses tabs that lost every pane.
+        var published: [max_remote_terminals]TerminalRef = undefined;
+        const published_count = remote.terminalRefs(&published);
+        reconcileRemoteRefs(
+            &model.remote_inventory,
+            &model.remote_inventory_count,
+            published[0..published_count],
+        );
+
+        // Remote panes whose terminal the coordinator retired leave every
+        // window; terminals that merely lack a Cockpit leaf stay in inventory.
         model.normalizeTopology();
-        for (refs[0..count]) |candidate| _ = model.admitTab(candidate);
         for (&model.remote_ui) |*state| {
             const known = state.terminal_ref orelse continue;
             var retained = false;
-            for (refs[0..count]) |terminal_ref| if (known.eql(terminal_ref)) {
+            for (model.remoteTerminalRefs()) |terminal_ref| {
+                if (!known.eql(terminal_ref)) continue;
                 retained = true;
                 break;
-            };
+            }
             if (!retained) state.* = .{};
         }
-        for (refs[0..count]) |terminal_ref| _ = model.remoteUi(terminal_ref);
+        for (model.remoteTerminalRefs()) |terminal_ref| _ = model.remoteUi(terminal_ref);
     }
 
-    pub fn selectFirstRemoteTerminal(model: *Model) bool {
-        const remote = model.phuxConst() orelse return false;
-        var refs: [max_remote_terminals]TerminalRef = undefined;
-        return remote.terminalRefs(&refs) != 0 and model.selectTerminal(refs[0]);
+    /// Initial ATTACH_READY and an explicit session switch admit exactly one
+    /// current terminal. Later inventory publications never call this.
+    pub fn admitAndSelectCurrentRemoteTerminal(model: *Model) bool {
+        const refs = model.remoteTerminalRefs();
+        if (refs.len == 0) return false;
+        if (!model.admitTab(refs[0])) return false;
+        return model.selectTerminal(refs[0]);
     }
 
     /// Whether the config band is up: there is something to say and nobody has
