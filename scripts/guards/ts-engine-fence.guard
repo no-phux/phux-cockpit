@@ -1,0 +1,22 @@
+# GUARD ts-engine-fence
+#
+# Positional intents are only meaningful against the revision they were
+# computed from; without the fence a close aimed at "tab 0" lands on whatever
+# is at index 0 now. The break removes the expected-revision comparison. The
+# test holds two tabs, because against one the last-tab rule refuses the close
+# for its own reason and the fence is never exercised.
+test: a stale intent is refused, announced, and surfaced instead of applied
+build: test -Dtypescript-spike=true -Dplatform=null
+diff --git a/src/cockpit/native/ts_engine.zig b/src/cockpit/native/ts_engine.zig
+index 1b5733a..eee041a 100644
+--- a/src/cockpit/native/ts_engine.zig
++++ b/src/cockpit/native/ts_engine.zig
+@@ -62,7 +62,7 @@ pub const Engine = struct {
+     pub fn applyIntent(self: *Engine, bytes: []const u8) bool {
+         self.sequence +%= 1;
+         const intent = protocol.decodeIntent(bytes) orelse return self.refuse();
+-        if (intent.expected_revision != self.revision) return self.refuse();
++        if (false and intent.expected_revision != self.revision) return self.refuse();
+         const changed = switch (intent.kind) {
+             .select_tab => self.model.selectTab(intent.argument),
+             .new_terminal => self.newTerminal(),
