@@ -1692,6 +1692,24 @@ fn topologyWriteNotice(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
         ) },
     }, .{});
 }
+/// A Phux-enabled launch stays useful when no server session can be attached,
+/// but the local shell is ephemeral. Keep that authority boundary visible
+/// instead of silently presenting the fallback as durable work.
+fn phuxUnavailableNotice(ui: *TerminalUi) TerminalUi.Node {
+    return ui.row(.{ .gap = projection.chrome_gap, .cross = .center }, .{
+        ui.el(.badge, .{
+            .variant = .destructive,
+            .text = "PHUX OFFLINE",
+            .semantics = .{ .label = "No Phux session is attached. This local terminal ends with Cockpit." },
+        }, .{}),
+        ui.button(.{
+            .size = .sm,
+            .variant = .secondary,
+            .on_press = .phux_reconnect,
+            .semantics = .{ .label = "Retry attaching the running Phux server" },
+        }, "Retry"),
+    });
+}
 
 fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
     return ui.panel(.{
@@ -1784,6 +1802,8 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
         configWriteNotice(ui, model)
     else if (model.state.write_failed)
         topologyWriteNotice(ui, model)
+    else if (model.phux_connection_unavailable)
+        phuxUnavailableNotice(ui)
     else if (focused_ref) |id| paneStatus(ui, model, id) else emptyStatusNode(ui);
 
     const revealed = projection.chromeRevealedIn(model, ws);

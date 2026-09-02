@@ -112,14 +112,19 @@ fn openPhuxChannel(model: *Model, fx: *Fx, reconnect: bool) void {
         .on_event = Fx.channelMsg(.phux_channel),
         .max_pending = 1,
     });
-    if (!handle.live()) return;
+    if (!handle.live()) {
+        model.phux_connection_unavailable = true;
+        return;
+    }
     if (reconnect) {
         remote.reconnect(handle) catch {
+            model.phux_connection_unavailable = true;
             fx.closeChannel(phux_channel_key);
             return;
         };
     } else {
         remote.open(handle) catch {
+            model.phux_connection_unavailable = true;
             fx.closeChannel(phux_channel_key);
             return;
         };
@@ -411,23 +416,37 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             const remote = model.phux() orelse return;
             switch (event.kind) {
                 .data => {
-                    const delta = remote.drainReadiness() catch {
+                    const delta = remote.drainReadiness() catch |err| {
+                        std.log.err("Phux provider frame failed: {s} (state {t})", .{ @errorName(err), remote.state() });
+                        model.phux_connection_unavailable = true;
                         remote.stop();
                         fx.closeChannel(phux_channel_key);
                         return;
                     };
                     if (delta.detached) {
+                        model.phux_connection_unavailable = true;
                         remote.stop();
                         fx.closeChannel(phux_channel_key);
                         return;
                     }
+                    if (delta.ready_published) model.phux_connection_unavailable = false;
                     const terminal_set_changed =
                         delta.ready_published or delta.added_count != 0 or delta.removed_count != 0;
                     if (terminal_set_changed) model.reconcileRemoteTerminals();
+                    if (delta.ready_published and model.phux_select_on_ready) {
+                        model.phux_select_on_ready = false;
+                        _ = model.selectFirstRemoteTerminal();
+                    }
                 },
                 .closed, .rejected => {
+                    std.log.warn("Phux provider channel {t} (state {t})", .{ event.kind, remote.state() });
                     remote.stop();
-                    openPhuxChannel(model, fx, remote.state() != .new);
+                    if (model.phux_reconnect_after_close) {
+                        model.phux_reconnect_after_close = false;
+                        openPhuxChannel(model, fx, remote.state() != .new);
+                    } else {
+                        model.phux_connection_unavailable = true;
+                    }
                 },
             }
         },
@@ -976,9 +995,15 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             const changed = remote.selectSession(session_id) catch return;
             model.ws().palette.reset();
             if (!changed) return;
+            model.phux_select_on_ready = true;
+            model.phux_reconnect_after_close = true;
             remote.stop();
             fx.closeChannel(phux_channel_key);
-            openPhuxChannel(model, fx, true);
+        },
+        .phux_reconnect => {
+            const remote = model.phux() orelse return;
+            model.phux_reconnect_after_close = false;
+            openPhuxChannel(model, fx, remote.state() != .new);
         },
         .palette_input => |text| {
             const workspace = model.ws();
@@ -1056,10 +1081,12 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
         .settings_commit => {
             const workspace = model.ws();
             if (!workspace.settings.open) return;
-            _ = model.config.setTheme(theme_module.builtins[@min(
-                workspace.settings.cursor,
-                theme_module.builtins.len - 1,
-            )].name);
+            _ = model.config.setTheme(theme_module.builtins[
+                @min(
+                    workspace.settings.cursor,
+                    theme_module.builtins.len - 1,
+                )
+            ].name);
             workspace.settings.reset();
             persistThemeChoice(model);
         },

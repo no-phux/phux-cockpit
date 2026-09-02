@@ -429,6 +429,10 @@ test "the chrome survives the layout audit in every state it has" {
     try sweep(state, "the exhausted layout-save notice");
     state.model.state.write_failed = false;
 
+    state.model.phux_connection_unavailable = true;
+    try sweep(state, "the unavailable Phux notice");
+    state.model.phux_connection_unavailable = false;
+
     state.model.tab_placement = .side;
     try sweep(state, "the side rail");
 }

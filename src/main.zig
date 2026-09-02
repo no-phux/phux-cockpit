@@ -369,7 +369,13 @@ fn createConfiguredPhuxProvider(init: std.process.Init) !?*PhuxProvider {
         const uid_segment = init.environ_map.get("UID") orelse init.environ_map.get("USER") orelse "default";
         break :blk try std.fmt.bufPrint(&socket_storage, "/tmp/phux-{s}/phux.sock", .{uid_segment});
     };
-    const session = init.environ_map.get("PHUX_SESSION") orelse "default";
+    // An absent PHUX_SESSION means "attach the server's current session".
+    // Naming a session means attach-by-name. Creation is never an implicit
+    // launch side effect.
+    const session: ?[]const u8 = if (init.environ_map.get("PHUX_SESSION")) |name|
+        if (name.len == 0) null else name
+    else
+        null;
     return try PhuxProvider.create(std.heap.page_allocator, init.io, .{ .unix = socket_path }, session, "phux-cockpit");
 }
 

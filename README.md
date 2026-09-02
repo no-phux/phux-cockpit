@@ -454,15 +454,22 @@ cargo build --locked --profile ffi-release -p phux-client-ffi \
   --manifest-path ../phux/Cargo.toml
 ```
 
-`-Dphux-enabled=true` is a separate question: it swaps the **app** graph from the
-local terminal provider to the phux provider. It requires the FFI and now fails
-loudly rather than building a local-terminal app under a phux flag:
+`-Dphux-enabled=true` adds the Phux provider to the **app** graph. It requires
+the FFI and fails loudly rather than building an app with no Phux path:
 
 ```sh
 zig build test -Dphux-enabled=true \
   -Dphux-client-ffi-include-dir="$PWD/../phux/crates/phux-client-ffi/include" \
   -Dphux-client-ffi-lib-dir="$PWD/../phux/target/ffi-release"
 ```
+
+At launch, the Phux provider attaches the running server's current session. It
+never creates a server session as a startup side effect. `PHUX_SESSION=name`
+selects an existing session by name; the terminal switcher then exposes the
+server's complete attached-session catalog by stable server ID. If no server
+session can be attached, Cockpit keeps the direct local terminal usable, marks
+it as ephemeral with `PHUX OFFLINE`, and offers one explicit retry after a Phux
+session is started or created.
 
 Tabs start at the top by default. Set `PHUX_COCKPIT_TABS=side` (or `sidebar`)
 to start with the side rail; the in-app placement control switches the current

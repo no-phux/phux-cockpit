@@ -51,13 +51,15 @@ pub const PhuxProvider = struct {
     host: *host_mod.Host,
     worker: ?*extension.Worker = null,
     endpoint: OwnedEndpoint,
-    session: []u8,
+    /// An explicit PHUX_SESSION selects by name. Null means attach the
+    /// server's current session. Neither path has create authority.
+    session: ?[]u8,
     session_id: ?u32 = null,
     client_name: []u8,
     attach_viewport: provider.Viewport = .{ .cols = 80, .rows = 24 },
     attach_queued: bool = false,
 
-    pub fn create(gpa: std.mem.Allocator, io: std.Io, endpoint: Endpoint, session: []const u8, client_name: []const u8) !*PhuxProvider {
+    pub fn create(gpa: std.mem.Allocator, io: std.Io, endpoint: Endpoint, session: ?[]const u8, client_name: []const u8) !*PhuxProvider {
         const self = try gpa.create(PhuxProvider);
         errdefer gpa.destroy(self);
         const bridge = try gpa.create(transport.Bridge);
@@ -68,8 +70,8 @@ pub const PhuxProvider = struct {
         errdefer host.destroy();
         var owned_endpoint = try OwnedEndpoint.init(gpa, endpoint);
         errdefer owned_endpoint.deinit(gpa);
-        const owned_session = try gpa.dupe(u8, session);
-        errdefer gpa.free(owned_session);
+        const owned_session = if (session) |name| try gpa.dupe(u8, name) else null;
+        errdefer if (owned_session) |name| gpa.free(name);
         const owned_client_name = try gpa.dupe(u8, client_name);
         errdefer gpa.free(owned_client_name);
         self.* = .{ .gpa = gpa, .io = io, .bridge = bridge, .host = host, .endpoint = owned_endpoint, .session = owned_session, .client_name = owned_client_name };
@@ -82,7 +84,7 @@ pub const PhuxProvider = struct {
         self.bridge.deinit();
         self.gpa.destroy(self.bridge);
         self.endpoint.deinit(self.gpa);
-        self.gpa.free(self.session);
+        if (self.session) |session| self.gpa.free(session);
         self.gpa.free(self.client_name);
         self.gpa.destroy(self);
     }
@@ -144,7 +146,7 @@ pub const PhuxProvider = struct {
             if (self.session_id) |session_id|
                 try self.host.attachSessionId(session_id, self.attach_viewport)
             else
-                try self.host.attach(self.session, self.attach_viewport);
+                try self.host.attachExisting(self.session, self.attach_viewport);
             self.attach_queued = true;
         }
         if (self.host.state() == .attached and self.session_id == null) {
