@@ -264,6 +264,32 @@ test "cmd+, opens settings and nothing typed into it reaches the pty" {
     try testing.expect(state.effects.ptyWrittenBytes(app.ptyKey(0)).len > reopened);
 }
 
+test "settings discloses Phux transport location session and provenance" {
+    if (comptime !app.phux_enabled) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = geometry.SizeF.init(980, 640) });
+    defer harness.destroy(gpa);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    const iface = state.app();
+
+    state.model.config = app.resolvePhuxConfig(
+        app.parseConfig("phux-socket = /tmp/settings-coordinator.sock"),
+        .{ .session = "shared-build" },
+    );
+    try pressCanvasKey(harness, iface, ",", .{ .primary = true });
+    try releaseCanvasKey(harness, iface, ",", .{ .primary = true });
+
+    const buffer = try gpa.alloc(u8, 128 * 1024);
+    defer gpa.free(buffer);
+    const snapshot = try a11yText(harness, iface, buffer);
+    try testing.expect(hasLabel(
+        snapshot,
+        "Phux transport location: /tmp/settings-coordinator.sock; source: config. Session: shared-build; source: environment.",
+    ));
+}
+
 test "the menu's terminal switcher cannot open underneath the settings panel" {
     // phux-cockpit-1l9. The keyboard cannot reach `palette_open` while the
     // settings panel is up — the settings gate in `handleKey` swallows every

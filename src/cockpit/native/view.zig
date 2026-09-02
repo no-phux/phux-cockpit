@@ -207,6 +207,9 @@ pub const settings_panel_label = "Settings";
 /// colours. They are the only text in the panel exempt from its own legibility
 /// invariant, because showing an unreadable pair is precisely their job.
 pub const settings_sample_label = "colour sample";
+/// Prefix for the read-only transport disclosure in Settings. "Location" is
+/// deliberate: a socket path says where to connect, never who is authoritative.
+pub const settings_phux_transport_label = "Phux transport location";
 
 /// Base for the unfocused-pane scrim, one retained id per resolved pane.
 /// Disjoint from the three above and from `render.paneIdBase` (0x7e21+).
@@ -1621,6 +1624,37 @@ fn settingsThemeRow(ui: *TerminalUi, index: usize, highlighted: bool, active: bo
     });
 }
 
+/// Read-only startup provenance, fitted into the existing Configuration
+/// heading row so the minimum-height panel does not grow. This is disclosure,
+/// not an editor: changing coordinator/session remains config-file territory.
+fn settingsPhuxTransport(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+    const socket = model.config.phux_socket.slice();
+    const location = if (socket.len == 0) "not resolved" else socket;
+    const selected = model.config.phux_session.slice();
+    const session = if (selected.len == 0) "current/Last" else selected;
+    return ui.text(.{
+        .grow = 1,
+        .wrap = false,
+        .overflow = .ellipsis,
+        .style = .{ .foreground = settings_ink_muted },
+        .semantics = .{ .label = ui.fmt(
+            "{s}: {s}; source: {s}. Session: {s}; source: {s}.",
+            .{
+                settings_phux_transport_label,
+                location,
+                model.config.phux_socket_source.label(),
+                session,
+                model.config.phux_session_source.label(),
+            },
+        ) },
+    }, ui.fmt("Phux {s} [{s}] · session {s} [{s}]", .{
+        location,
+        model.config.phux_socket_source.label(),
+        session,
+        model.config.phux_session_source.label(),
+    }));
+}
+
 /// The in-app settings surface.
 ///
 /// It FLOATS, for the same reason the palette does: it is transient, and taking
@@ -1674,7 +1708,7 @@ fn settingsPanel(ui: *TerminalUi, model: *const Model, ws: *const Workspace) Ter
         settingsRule(ui),
         ui.row(.{ .width = settings_row_width, .gap = projection.chrome_gap, .cross = .center }, .{
             ui.text(.{ .wrap = false, .style = .{ .foreground = settings_ink } }, "Configuration"),
-            ui.spacer(1),
+            if (support.phux_enabled) settingsPhuxTransport(ui, model) else ui.spacer(1),
             if (ws.settings.config_exists)
                 settingsAction(ui, "Show in Finder", .settings_reveal_config, false)
             else

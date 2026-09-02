@@ -47,6 +47,89 @@ test "the common settings round-trip" {
     try std.testing.expectEqualStrings("font-family", parsed.diagnosticSlice()[0].text());
 }
 
+test "local Phux socket and existing session parse into owned bounded fields" {
+    var source: [256]u8 = undefined;
+    const text = try std.fmt.bufPrint(
+        &source,
+        "phux-socket = /tmp/phux-alt/phux.sock\nphux-session = shared-build\n",
+        .{},
+    );
+    var parsed = config.parse(text);
+    @memset(&source, '?');
+
+    try std.testing.expectEqualStrings("/tmp/phux-alt/phux.sock", parsed.phux_socket.slice());
+    try std.testing.expectEqualStrings("shared-build", parsed.phux_session.slice());
+    try std.testing.expectEqual(config.PhuxValueSource.config, parsed.phux_socket_source);
+    try std.testing.expectEqual(config.PhuxValueSource.config, parsed.phux_session_source);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostic_count);
+
+    // Empty is the optional "attach current/Last" value. It neither names nor
+    // creates a session, and therefore retains default provenance.
+    parsed = config.parse("phux-session =");
+    try std.testing.expectEqualStrings("", parsed.phux_session.slice());
+    try std.testing.expectEqual(config.PhuxValueSource.default, parsed.phux_session_source);
+    try std.testing.expectEqual(@as(usize, 0), parsed.diagnostic_count);
+}
+
+test "Phux config values enforce path name and encoding boundaries" {
+    const invalid = config.parse(
+        "phux-socket = relative/phux.sock\n" ++
+            "phux-socket = \n" ++
+            "phux-session = bad\x00name\n" ++
+            "phux-session = bad\xffname\n",
+    );
+    try std.testing.expectEqualStrings("", invalid.phux_socket.slice());
+    try std.testing.expectEqualStrings("", invalid.phux_session.slice());
+    try std.testing.expectEqual(@as(usize, 4), invalid.diagnostic_count);
+    for (invalid.diagnosticSlice(), 1..) |diagnostic, line| {
+        try std.testing.expectEqual(@as(u32, @intCast(line)), diagnostic.line);
+        try std.testing.expectEqual(config.Diagnostic.Kind.bad_value, diagnostic.kind);
+    }
+
+    var socket: [config.max_phux_socket_bytes]u8 = undefined;
+    @memset(&socket, 's');
+    socket[0] = '/';
+    var socket_source: [config.max_phux_socket_bytes + 32]u8 = undefined;
+    const exact_socket = try std.fmt.bufPrint(&socket_source, "phux-socket = {s}", .{socket});
+    const socket_boundary = config.parse(exact_socket);
+    try std.testing.expectEqual(config.max_phux_socket_bytes, socket_boundary.phux_socket.slice().len);
+
+    var session: [config.max_phux_session_bytes]u8 = undefined;
+    @memset(&session, 'n');
+    var session_source: [config.max_phux_session_bytes + 32]u8 = undefined;
+    const exact_session = try std.fmt.bufPrint(&session_source, "phux-session = {s}", .{session});
+    const session_boundary = config.parse(exact_session);
+    try std.testing.expectEqual(config.max_phux_session_bytes, session_boundary.phux_session.slice().len);
+
+    var long_socket: [config.max_phux_socket_bytes + 1]u8 = undefined;
+    @memset(&long_socket, 's');
+    long_socket[0] = '/';
+    const long_socket_text = try std.fmt.bufPrint(&socket_source, "phux-socket = {s}", .{long_socket});
+    const socket_rejected = config.parse(long_socket_text);
+    try std.testing.expectEqual(config.Diagnostic.Kind.too_long, socket_rejected.diagnosticSlice()[0].kind);
+
+    var long_session: [config.max_phux_session_bytes + 1]u8 = undefined;
+    @memset(&long_session, 'n');
+    var long_session_source: [config.max_phux_session_bytes + 32]u8 = undefined;
+    const long_session_text = try std.fmt.bufPrint(&long_session_source, "phux-session = {s}", .{long_session});
+    const session_rejected = config.parse(long_session_text);
+    try std.testing.expectEqual(config.Diagnostic.Kind.too_long, session_rejected.diagnosticSlice()[0].kind);
+}
+
+test "Phux keys use the conservative config text writeback" {
+    var out: [256]u8 = undefined;
+    const updated = try config.setKey(
+        "# alternate local coordinator\nphux-socket = /tmp/old.sock\nfont-size = 15\n",
+        "phux-socket",
+        "/tmp/new.sock",
+        &out,
+    );
+    try std.testing.expectEqualStrings(
+        "# alternate local coordinator\nphux-socket = /tmp/new.sock\nfont-size = 15\n",
+        updated,
+    );
+}
+
 test "a key that parses but cannot take effect says so" {
     // The trap this closes: a knob that accepts a value and silently does
     // nothing sends someone hunting for a bug in their terminal instead of
