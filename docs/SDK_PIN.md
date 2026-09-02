@@ -125,11 +125,16 @@ zig build -Dphux-enabled=true \
 ```
 
 **6. Update the documentation, and prove it.** Rewrite the pin paragraph under
-[Requirements](../README.md#requirements) to the new sha, then:
+[Requirements](../README.md#requirements) to the new sha, and the
+`Pinned source:` line under "Native SDK" in `THIRD_PARTY_NOTICES.md`, then:
 
 ```sh
 ./scripts/check-sdk-pin.sh
+./scripts/verify-phux-ffi.py
 ```
+
+The second is the CI provenance step; it fails in seconds on a notices file
+that still names the old sha, before anything compiles.
 
 **7. Describe the change, not the sha.** The `.zon` comment above `.native_sdk`
 is this fork's changelog — it is where a future reader learns why the pin is
