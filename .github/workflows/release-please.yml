@@ -23,7 +23,6 @@ jobs:
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
-      prs_created: ${{ steps.release.outputs.prs_created }}
       pr_branch: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).headBranchName || '' }}
     steps:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
@@ -32,15 +31,18 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  # `release-please` returns `pr` when it creates OR updates the release PR.
+  # `prs_created` is true only for the first case, which left an updated PR
+  # without the required Zig check and therefore permanently UNSTABLE.
   validate-release-pr:
     name: Validate release PR
     needs: release-please
-    if: needs.release-please.outputs.prs_created == 'true' && needs.release-please.outputs.pr_branch != ''
+    if: needs.release-please.outputs.pr_branch != ''
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       actions: write
     steps:
-      - name: Dispatch CI on the generated branch
+      - name: Dispatch CI on the current release PR head
         env:
           GH_TOKEN: ${{ github.token }}
           PR_BRANCH: ${{ needs.release-please.outputs.pr_branch }}
