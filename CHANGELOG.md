@@ -3,6 +3,18 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0](https://github.com/no-phux/phux-cockpit/compare/v0.12.1...v0.13.0) (2026-09-02)
+
+
+### Features
+
+* **phux:** attach running sessions without creating ([#58](https://github.com/no-phux/phux-cockpit/issues/58)) ([60c3e3e](https://github.com/no-phux/phux-cockpit/commit/60c3e3e3489659b5c8bcb5bed8c718d9081bf2cd))
+
+
+### Bug Fixes
+
+* **release:** attest the shipped Phux FFI ([#60](https://github.com/no-phux/phux-cockpit/issues/60)) ([ba90c37](https://github.com/no-phux/phux-cockpit/commit/ba90c37846f4fbff2f00cbd0b690723a8fa7abf0))
+
 ## [0.12.1](https://github.com/no-phux/phux-cockpit/compare/v0.12.0...v0.12.1) (2026-08-28)
 
 
