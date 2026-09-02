@@ -279,3 +279,29 @@ inset a full gap on each side now, which clears a 6pt corner entirely.
 are under 1.5:1, so nobody "fixes" this by lightening a surface, and that the
 accent clears 3:1 on every ground it lands on. Full derivation and sources in
 [docs/DESIGN_SYSTEM.md](DESIGN_SYSTEM.md).
+
+---
+
+## Terminal pixels stay in the native display list beneath markup chrome
+
+**Decided 2026-09-02, by reuse rather than measurement; reopen with a number.**
+
+The TypeScript-core graph paints its grids exactly as the shipping app does:
+`Options.chrome.build` runs the same `view.buildChrome` on the engine's model,
+as a variable-length command prefix under the markup widget tree. The
+alternative in `docs/TS_MIGRATION.md` (a `media-surface` leaf fed by a native
+RGBA producer) was not built.
+
+Why this way first: it costs no painter code, keeps the packed `cell_grid`
+command and its per-row AppKit decoder, keeps the incremental patch path, and
+keeps accessibility where it already is. The media-surface route would lose all
+four and needs a CPU rasterizer on screen, which is the automation renderer that
+`docs/RENDER_FIDELITY.md` says cannot stand in for CoreText. The one thing this
+route cannot do is let markup lay out *around* the grids: the strip is 50pt and
+the rail 184pt on both sides of the seam by construction
+(`workspace_projection.zig`), not by the markup telling the painter.
+
+What would reopen it: a measured frame cost of the chrome prefix under the
+markup tree that a surface leaf would beat, or a chrome layout the fixed
+geometry cannot express.
+

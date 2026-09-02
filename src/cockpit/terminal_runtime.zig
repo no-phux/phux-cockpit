@@ -11,7 +11,12 @@ const canvas = native_sdk.canvas;
 const Model = model_module.Model;
 pub const Pane = local.Pane;
 pub const Fx = app_types.Fx;
-pub fn spawnPane(pane: *Pane, fx: *Fx) void {
+/// `fx` is any effects instance with the pty verbs (`ptySpawn`, `ptyWrite`,
+/// `ptyResize`, `ptyKill`), not only this app's own: the TypeScript-core
+/// graph drives the same runtime from its adapter's effects, whose Msg type
+/// is the compiled core's. `on_event` is that graph's own event constructor
+/// for the same reason.
+pub fn spawnPane(pane: *Pane, fx: anytype, on_event: anytype) void {
     const model = pane;
     model.session_generation +%= 1;
     if (model.session_generation == 0) model.session_generation = 1;
@@ -56,7 +61,7 @@ pub fn spawnPane(pane: *Pane, fx: *Fx) void {
         .argv = model.argv,
         .cols = model.cols,
         .rows = model.rows,
-        .on_event = Fx.ptyMsg(.shell),
+        .on_event = on_event,
     });
 }
 
@@ -77,7 +82,7 @@ pub fn paneForKey(model: *Model, key: u64) ?*Pane {
 /// impossible — larger than the ring itself — and counted as dropped);
 /// `false` means it merely does not fit RIGHT NOW, is untouched and
 /// uncounted, and the caller retains it to retry as the ring drains.
-pub fn enqueueOutbound(model: *Pane, fx: *Fx, bytes: []const u8) bool {
+pub fn enqueueOutbound(model: *Pane, fx: anytype, bytes: []const u8) bool {
     const cap = model.outbound_buffer.len;
     if (bytes.len > cap) {
         model.outbound_dropped += bytes.len;
@@ -109,7 +114,7 @@ pub fn enqueueOutbound(model: *Pane, fx: *Fx, bytes: []const u8) bool {
 /// retained reply gets its retry now; if it still cannot enter the ring,
 /// the keystroke must not jump the queue — it drops counted rather than
 /// arrive before an answer the child may be parsing toward.
-pub fn enqueueTransient(model: *Pane, fx: *Fx, bytes: []const u8) void {
+pub fn enqueueTransient(model: *Pane, fx: anytype, bytes: []const u8) void {
     moveResponsesToOutbound(model, fx);
     if (model.session.response_len > 0) {
         model.outbound_dropped += bytes.len;
@@ -126,7 +131,7 @@ pub fn enqueueTransient(model: *Pane, fx: *Fx, bytes: []const u8) void {
 /// ring and is retried on the next output, resize, or frame: a
 /// non-reading child pauses the stream instead of losing its tail, and a
 /// reply is never removed before it actually lands.
-pub fn flushOutbound(model: *Pane, fx: *Fx) void {
+pub fn flushOutbound(model: *Pane, fx: anytype) void {
     const cap = model.outbound_buffer.len;
     while (model.outbound_len > 0) {
         const run_to_end = cap - model.outbound_head;
@@ -155,7 +160,7 @@ pub fn flushOutbound(model: *Pane, fx: *Fx) void {
 /// query's reply is well under a slice's worth of input, so the buffer
 /// never overflows and no reply is dropped. This keeps the write-back
 /// lossless: a child that blocks on a DSR answer never hangs.
-pub fn feedOutput(model: *Pane, fx: *Fx, bytes: []const u8) void {
+pub fn feedOutput(model: *Pane, fx: anytype, bytes: []const u8) void {
     const slice_bytes = grid.Session.feed_slice_bytes;
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -180,7 +185,7 @@ pub fn feedOutput(model: *Pane, fx: *Fx, bytes: []const u8) void {
 /// retried on the next output, resize, or frame — instead of discarding
 /// an answer the child may be blocked on. Only a queued (or impossible,
 /// counted) batch clears; never a torn escape sequence either way.
-pub fn moveResponsesToOutbound(model: *Pane, fx: *Fx) void {
+pub fn moveResponsesToOutbound(model: *Pane, fx: anytype) void {
     const pending = model.session.pendingResponses();
     if (pending.len > 0) {
         if (!enqueueOutbound(model, fx, pending)) return;
@@ -195,7 +200,7 @@ pub fn moveResponsesToOutbound(model: *Pane, fx: *Fx) void {
 /// legacy modes. (Key REPEAT is the one event type the hosts do not
 /// distinguish from a fresh press, so a TUI that enabled event reporting
 /// sees repeats as presses.)
-pub fn encodeKeyEvent(model: *Pane, fx: *Fx, event: canvas.WidgetKeyboardEvent, action: vt.input.KeyAction) void {
+pub fn encodeKeyEvent(model: *Pane, fx: anytype, event: canvas.WidgetKeyboardEvent, action: vt.input.KeyAction) void {
     const session = model.session;
     const natural_key_mask = macosNaturalTextKeyMask(event.key);
     if (action == .release and natural_key_mask != 0 and
@@ -296,7 +301,7 @@ fn macosNaturalTextSequence(event: canvas.WidgetKeyboardEvent) ?[]const u8 {
 /// protocol's report-all mode — raw bytes there would desynchronize the
 /// application's key decoding. Multi-scalar commits (IME words, paste)
 /// stay raw text, the protocol's rule for composed input.
-pub fn sendCommittedText(model: *Pane, fx: *Fx, text: []const u8) void {
+pub fn sendCommittedText(model: *Pane, fx: anytype, text: []const u8) void {
     single: {
         const len = std.unicode.utf8ByteSequenceLength(text[0]) catch break :single;
         if (text.len != len) break :single;
