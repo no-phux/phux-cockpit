@@ -134,9 +134,26 @@
         //   `theme = auto` can follow the system without polling anything.
         // - A 32-slot PTY effect table, matching Cockpit's bounded terminal
         //   registry instead of silently binding the whole app at four shells.
+        //
+        // cockpit/v0.9.5 (2026-09-02): the same Cockpit commits rebased onto
+        // upstream v0.9.5, plus the seam the TypeScript migration needs:
+        //
+        // - `AppOptions.native_extension`, an app-owned Zig module the
+        //   generated core.ts runner calls to compose `host_calls`, the
+        //   view/markup options and the final `native_sdk.App`. Cockpit's
+        //   `typescript-spike/src/native_extension.zig` reserves the
+        //   `cockpit.` command namespace through the generalized
+        //   `HostCallMux` and keeps a real engine behind it.
+        // - `AppArtifacts.extension`, `.test_extension` and
+        //   `.extension_tests`: Zig collects tests from the root module only,
+        //   so an extension's guards need their own test artifact, and a Zig
+        //   module can only import below its own root, so the app's build
+        //   hands the engine to each instance as a module.
+        // - Comptime markup diagnostics name the markup again instead of
+        //   failing on Zig 0.16's refusal to discard an error value.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/87917c454432de5dd1eceb52d8a55575d5581289.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQl8_nQJvRq6oKl08e3elKNFRg_jLv0vUbst1XOal",
+            .url = "https://github.com/phall1/native/archive/7e783da8df366aa3a89de72287d2c6c81121355c.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQvwwsgLU5tfq3ymTRoyx9vSyB6vHqHRqeihyppxJ",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream
