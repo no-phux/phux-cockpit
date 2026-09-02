@@ -5,18 +5,17 @@
 # intent was then refused for a move it never heard about. The break applies
 # the intent and never posts the invalidation.
 test: an intent moves the engine and the core resyncs to the new revision
-red: 2026-09-02 at 7a00e4b
 build: test -Dtypescript-spike=true -Dplatform=null
 diff --git a/typescript-spike/src/native_extension.zig b/typescript-spike/src/native_extension.zig
-index b094b92..2913653 100644
+index 51ebe28..e93832b 100644
 --- a/typescript-spike/src/native_extension.zig
 +++ b/typescript-spike/src/native_extension.zig
-@@ -60,7 +60,7 @@ const Bridge = struct {
-         if (!std.mem.eql(u8, name, protocol.intent_command)) return;
-         const engine = self.engine orelse return;
-         _ = engine.applyIntent(payload);
+@@ -73,7 +73,7 @@ const Bridge = struct {
+         } else {
+             _ = engine.applyIntent(payload, &cockpit.NoShells{});
+         }
 -        self.announce(engine);
 +        if (false) self.announce(engine);
      }
  
-     /// Tell the core that state moved. Silence when the channel is not open
+     fn spawnShells(self: *Bridge, engine: *Engine, fx: *Effects) void {
