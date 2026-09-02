@@ -41,6 +41,9 @@ export type Msg =
   | { readonly kind: "palette_close" }
   | { readonly kind: "settings_open" }
   | { readonly kind: "settings_close" }
+  // Posted by the native engine for every shell event it consumed: no bytes
+  // ride along, the core only learns that the grids beneath it moved.
+  | { readonly kind: "engine_wake" }
   | { readonly kind: "snapshot_loaded"; readonly body: Uint8Array }
   | { readonly kind: "snapshot_failed"; readonly error: Uint8Array }
   | {
@@ -58,6 +61,7 @@ export const viewUnbound = [
   "engineSequence",
   "engineRevision",
   "engine_event",
+  "engine_wake",
   "snapshot_loaded",
   "snapshot_failed",
 ] as const;
@@ -118,6 +122,8 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       return { ...model, settingsOpen: true };
     case "settings_close":
       return { ...model, settingsOpen: false };
+    case "engine_wake":
+      return { ...model };
     case "snapshot_loaded": {
       const projected = snapshot(msg.body);
       if (projected === null) {

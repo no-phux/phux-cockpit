@@ -75,7 +75,7 @@ const selectedTerminalCanClose = projection.selectedTerminalCanClose;
 /// through here so no terminal can end up with the default palette because
 /// its entry point forgot.
 fn spawnConfiguredPane(model: *Model, pane: *Pane, fx: *Fx) void {
-    spawnPane(pane, fx);
+    spawnPane(pane, fx, Fx.ptyMsg(.shell));
     model_module.applySessionConfig(&model.config, pane.session);
 }
 

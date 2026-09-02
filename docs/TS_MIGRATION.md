@@ -1,18 +1,21 @@
 # Migrating Cockpit's authoring to TypeScript + `.native` markup
 
-Status: **phase 1 seam landed, phase 2 next.** `typescript-spike/` compiles a
-real `core.ts` and `app.native` through ScriptC/corewire on the pinned fork
-(`cockpit/v0.9.5`), and the seam is live end to end under
-`-Dtypescript-spike=true`: `src/cockpit/native/ts_protocol.zig` pins the wire,
-`ts_snapshot.zig` projects chrome state, `ts_engine.zig` owns a real Cockpit
-model behind it, and `typescript-spike/src/native_extension.zig` is the fork's
-`native_extension` hook answering `cockpit.intent`, `cockpit.snapshot` and the
-invalidation channel. Three guards under the extension prove boot, resync and
-the revision fence red-then-green (`zig build test -Dtypescript-spike=true
--Dplatform=null`). What the engine does NOT yet own is the PTY spawn and the
-terminal pixels: a new tab in the spike mints a real emulator session but no
-shell, and the GPU surface stays empty. That is the phase-2/3 decision below,
-still to be made by measurement. The shipping graph remains the Zig core.
+Status: **phase 3 first cut running under `-Dtypescript-spike=true`.**
+`typescript-spike/` is a real cockpit: markup chrome from `app.native` over a
+`core.ts` model, and beneath it the shipping Zig painter drawing real shells.
+The seam (`ts_protocol.zig`, `ts_snapshot.zig`, `ts_engine.zig`, the fork's
+`native_extension` hook in `typescript-spike/src/native_extension.zig`) carries
+intents, snapshots and invalidations; the engine now also owns the PTY spawn,
+output, key encoding, committed text and the resize pump, through the same
+`terminal_runtime.zig` the shipping app uses (made generic over the effects
+type). No terminal byte enters the compiled core: shell events are consumed in
+the pty event constructor and the core receives a void `engine_wake`. Guards
+under the extension prove boot, resync, the revision fence, key routing and
+shell ownership red-then-green (`zig build test -Dtypescript-spike=true
+-Dplatform=null`). Not yet moved: scrollback search, selection, mouse
+protocols, bells, secondary windows, settings/palette contents (the spike's
+overlays are placeholders), and the parity harness of phase 2. The shipping
+graph remains the Zig core.
 
 Building the spike needs the SDK package's TypeScript toolchain, which the
 tarball pin does not carry. Once per pin, on the package `zig build` resolved:

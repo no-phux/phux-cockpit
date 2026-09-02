@@ -8,7 +8,9 @@ const std = @import("std");
 pub const engine = @import("cockpit/native/ts_engine.zig");
 pub const protocol = @import("cockpit/native/ts_protocol.zig");
 pub const snapshot = @import("cockpit/native/ts_snapshot.zig");
+pub const projection = @import("cockpit/native/workspace_projection.zig");
 pub const Engine = engine.Engine;
+pub const NoShells = engine.NoShells;
 
 test {
     std.testing.refAllDecls(@This());

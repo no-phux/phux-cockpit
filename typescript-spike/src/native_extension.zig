@@ -20,6 +20,8 @@ const cockpit = @import("cockpit_engine");
 const Engine = cockpit.Engine;
 const protocol = cockpit.protocol;
 const Adapter = native_sdk.TsUiApp(core);
+const Effects = Adapter.Effects;
+const canvas = native_sdk.canvas;
 
 const HostChannelBinding = channelBindingType();
 
@@ -32,6 +34,12 @@ fn channelBindingType() type {
 const Bridge = struct {
     engine: ?*Engine = null,
     channels: ?HostChannelBinding = null,
+    /// The adapter's effects, known once the runner has built the app. Until
+    /// then there is nothing to spawn shells through, and `spawnShells` is
+    /// idempotent so the first frame catches up.
+    effects: ?*Effects = null,
+    /// Tests that want no child processes clear this before starting.
+    shells: bool = true,
     /// The one snapshot completion in flight. A newer request overwrites an
     /// unpolled older one; the runtime cancels the replaced key itself.
     pending: bool = false,
@@ -59,8 +67,18 @@ const Bridge = struct {
         const self: *Bridge = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, name, protocol.intent_command)) return;
         const engine = self.engine orelse return;
-        _ = engine.applyIntent(payload);
+        if (self.effects) |fx| {
+            _ = engine.applyIntent(payload, fx);
+            self.spawnShells(engine, fx);
+        } else {
+            _ = engine.applyIntent(payload, &cockpit.NoShells{});
+        }
         self.announce(engine);
+    }
+
+    fn spawnShells(self: *Bridge, engine: *Engine, fx: *Effects) void {
+        if (!self.shells) return;
+        engine.spawnShells(fx, shellEvent);
     }
 
     /// Tell the core that state moved. Silence when the channel is not open
@@ -135,6 +153,57 @@ const Bridge = struct {
 
 var bridge = Bridge{};
 
+// ------------------------------------------------- native seams (no TS)
+
+/// The pty event constructor the adapter's effects call for every shell
+/// event. The bytes are consumed here, into the pane's emulator, and the
+/// core receives only a void wake so it re-renders; no terminal byte enters
+/// the compiled core.
+fn shellEvent(event: native_sdk.EffectPtyEvent) core.Msg {
+    if (bridge.engine) |engine| {
+        if (bridge.effects) |fx| engine.onShellEvent(fx, event);
+    }
+    return .engine_wake;
+}
+
+/// Keys no markup widget claimed. The palette and settings surfaces are the
+/// core's, so while either is open the shell must not see typing meant for
+/// them; the core's model says which, and the view fn below reads it.
+fn onKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
+    if (overlay_open) return null;
+    const engine = bridge.engine orelse return null;
+    const fx = bridge.effects orelse return null;
+    engine.onKey(fx, event);
+    return null;
+}
+
+fn onText(event: canvas.WidgetKeyboardEvent) ?core.Msg {
+    if (overlay_open) return null;
+    const engine = bridge.engine orelse return null;
+    const fx = bridge.effects orelse return null;
+    engine.onText(fx, event);
+    return null;
+}
+
+/// Set by the paint pass, which sees the committed core model: the only
+/// place the extension learns whether an overlay owns the keyboard.
+var overlay_open: bool = false;
+
+fn onFrame(_: *const core.Model, frame: native_sdk.platform.GpuFrame) ?core.Msg {
+    const engine = bridge.engine orelse return null;
+    const fx = bridge.effects orelse return null;
+    bridge.spawnShells(engine, fx);
+    engine.pumpViewports(fx, frame);
+    return null;
+}
+
+fn paintChrome(model: *const core.Model, builder: *canvas.Builder, size: native_sdk.geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
+    overlay_open = model.paletteOpen or model.settingsOpen;
+    const engine = bridge.engine orelse return;
+    engine.model.tab_placement = if (model.tabPlacement == .side) .side else .top;
+    return engine.paint(builder, size, tokens);
+}
+
 fn installEngine(options: *Adapter.CoreOptions, gpa: std.mem.Allocator, io: std.Io) void {
     bridge = .{};
     bridge.engine = Engine.create(gpa, io) catch null;
@@ -145,9 +214,24 @@ pub fn configureCoreOptions(options: *Adapter.CoreOptions, init: std.process.Ini
     installEngine(options, std.heap.page_allocator, init.io);
 }
 
-pub fn configureOptions(_: *Adapter.Options, _: std.process.Init) void {}
+fn configureOptionsValue(options: *Adapter.Options) void {
+    options.chrome = .{
+        .prefix_commands = cockpit.projection.chrome_command_envelope,
+        .variable_prefix = true,
+        .build = paintChrome,
+    };
+    options.on_key = onKey;
+    options.key_release_events = true;
+    options.on_text = onText;
+    options.on_frame = onFrame;
+}
+
+pub fn configureOptions(options: *Adapter.Options, _: std.process.Init) void {
+    configureOptionsValue(options);
+}
 
 pub fn app(app_state: *Adapter.App) native_sdk.App {
+    bridge.effects = &app_state.effects;
     return app_state.app();
 }
 
@@ -175,12 +259,14 @@ const Rig = struct {
         var core_options: Adapter.CoreOptions = .{};
         installEngine(&core_options, std.testing.allocator, std.testing.io);
         try std.testing.expect(bridge.engine != null);
-        const options: Adapter.Options = .{
+        bridge.shells = false;
+        var options: Adapter.Options = .{
             .name = "phux-cockpit-typescript-spike",
             .scene = test_scene,
             .canvas_label = canvas_label,
             .markup = .{ .source = @embedFile("app.native") },
         };
+        configureOptionsValue(&options);
         const app_state = try Adapter.create(std.heap.page_allocator, core_options, options);
         errdefer app_state.destroy();
         const decorated = app(app_state);
@@ -196,6 +282,18 @@ const Rig = struct {
             .scale_factor = 1,
             .frame_index = 1,
             .timestamp_ns = 1,
+        } });
+        // The frame request is what commits the widget tree; input routed
+        // before it has no tree to fall through and reaches nothing.
+        try harness.runtime.dispatchPlatformEvent(decorated, .frame_requested);
+        // A press on the grid gives the surface keyboard focus, as a person's
+        // first click does; unfocused input routes nowhere.
+        try harness.runtime.dispatchPlatformEvent(decorated, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = canvas_label,
+            .kind = .pointer_down,
+            .x = 400,
+            .y = 300,
         } });
         return .{ .app_state = app_state, .decorated = decorated, .harness = harness };
     }
@@ -297,4 +395,86 @@ test "a stale intent is refused, announced, and surfaced instead of applied" {
     try std.testing.expect(!engine.intent_refused);
     try rig.settle(3, "READY");
     try std.testing.expectEqual(core.TabPlacement.side, rig.app_state.model.tabPlacement);
+}
+
+// GUARD: ts-engine-keys
+test "unclaimed keys and text reach the focused pane's outbound ring and never the core" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    try std.testing.expectEqual(@as(usize, 0), pane.outbound_len);
+
+    // Through the platform, so the SDK's own widget-precedence routing is
+    // what hands the input to the extension: nothing in the markup claims
+    // typing, so committed text and a bare Enter fall through. No shell is
+    // live in the rig, so the encoded bytes stay queued in the ring, which
+    // is exactly where the shipping app parks them too.
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .text_input,
+        .text = "ls",
+    } });
+    try std.testing.expectEqual(@as(usize, 2), pane.outbound_len);
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .key_down,
+        .key = "Enter",
+    } });
+    try std.testing.expectEqual(@as(usize, 3), pane.outbound_len);
+
+    // With an overlay open the same input is the core's, not the shell's.
+    overlay_open = true;
+    defer overlay_open = false;
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{
+        .window_id = 1,
+        .label = canvas_label,
+        .kind = .text_input,
+        .text = "x",
+    } });
+    try std.testing.expectEqual(@as(usize, 3), pane.outbound_len);
+}
+
+// GUARD: ts-engine-shells
+test "every registered pane gets exactly one shell request and a closed tab kills its own" {
+    const Recorder = struct {
+        spawned: usize = 0,
+        killed: usize = 0,
+        last_killed: u64 = 0,
+        pub fn ptySpawn(self: *@This(), _: anytype) void {
+            self.spawned += 1;
+        }
+        pub fn ptyWrite(_: *@This(), _: u64, _: []const u8) bool {
+            return false;
+        }
+        pub fn ptyResize(_: *@This(), _: u64, _: u16, _: u16) void {}
+        pub fn ptyKill(self: *@This(), key: u64) void {
+            self.killed += 1;
+            self.last_killed = key;
+        }
+    };
+    const engine = try Engine.create(std.testing.allocator, std.testing.io);
+    defer engine.destroy();
+    var fx = Recorder{};
+
+    engine.spawnShells(&fx, shellEvent);
+    engine.spawnShells(&fx, shellEvent);
+    try std.testing.expectEqual(@as(usize, 1), fx.spawned);
+
+    const open = protocol.encodeIntent(.{ .kind = .new_terminal, .expected_revision = 1, .argument = 0 });
+    try std.testing.expect(engine.applyIntent(&open, &fx));
+    engine.spawnShells(&fx, shellEvent);
+    try std.testing.expectEqual(@as(usize, 2), fx.spawned);
+
+    const second = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    const second_key = second.pty_key;
+    const close = protocol.encodeIntent(.{ .kind = .close_tab, .expected_revision = 2, .argument = 1 });
+    try std.testing.expect(engine.applyIntent(&close, &fx));
+    try std.testing.expectEqual(@as(usize, 1), fx.killed);
+    try std.testing.expectEqual(second_key, fx.last_killed);
+    engine.spawnShells(&fx, shellEvent);
+    try std.testing.expectEqual(@as(usize, 2), fx.spawned);
 }
