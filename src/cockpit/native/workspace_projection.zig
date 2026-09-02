@@ -147,7 +147,8 @@ pub const tab_indicator_thickness: f32 = 2;
 ///   "LAYOUT UNSAVED"               re-derived against that slot by the audit
 ///   "FAILED" + Restart             124 / 128 / 131
 ///   "SPAWN FAILED" + Restart       171 / 175 / 178
-///   "SPAWN REJECTED" + Restart     191 / 195 / 198   <- the pane floor
+///   "SPAWN REJECTED" + Restart     191 / 195 / 198
+///   "LAYOUT NOT RESTORED"          re-derived against the 200pt pane slot
 ///
 /// TWO numbers rather than one because the pane status is 84pt wider than the
 /// refusal notices and it is the RARE one: holding its room unconditionally
@@ -262,6 +263,14 @@ pub fn visibleTabWindowIn(model: *const Model, workspace: *const Workspace, band
     return visibleTabRun(workspace, tabRunWidthIn(model, workspace, band_width));
 }
 
+fn limitNoticeVisible(model: *const Model, workspace: *const Workspace) bool {
+    return model.window_limit_refused or workspace.tab_limit_refused or model.terminal_limit_refused;
+}
+
+fn saveFailureNoticeVisible(model: *const Model) bool {
+    return model.config_write_refused or model.state.write_failed;
+}
+
 /// The width of the status the band's trailing slot will carry — zero when
 /// there is none.
 ///
@@ -273,8 +282,9 @@ pub fn visibleTabWindowIn(model: *const Model, workspace: *const Workspace, band
 /// leading reserve entirely) and too much at the wide end (it held that room
 /// for a status node that was 0x0).
 pub fn tabStripStatusReserveIn(model: *const Model, workspace: *const Workspace) f32 {
-    if (model.window_limit_refused or workspace.tab_limit_refused or model.terminal_limit_refused) return tab_strip_notice_reserve;
-    if (model.config_write_refused or model.state.write_failed) return tab_strip_save_notice_reserve;
+    if (limitNoticeVisible(model, workspace)) return tab_strip_notice_reserve;
+    if (model.state.rejectedExisting()) return tab_strip_pane_status_reserve;
+    if (saveFailureNoticeVisible(model)) return tab_strip_save_notice_reserve;
     if (model.phux_connection_unavailable) return tab_strip_pane_status_reserve;
     const id = workspaceTerminalRef(model, workspace) orelse return 0;
     if (support.providerKind(id) == .phux) return 0;
@@ -1001,33 +1011,22 @@ pub fn chromeRevealed(model: *const Model) bool {
     return chromeRevealedIn(model, model.wsConst());
 }
 
+/// Whether the trailing chrome status has something app-wide or
+/// workspace-wide to say. Each latch needs the band even at one terminal:
+/// otherwise its user action or preservation boundary would be silent.
+fn chromeNoticeVisible(model: *const Model, workspace: *const Workspace) bool {
+    if (limitNoticeVisible(model, workspace)) return true;
+    if (model.state.rejectedExisting()) return true;
+    if (saveFailureNoticeVisible(model)) return true;
+    return model.phux_connection_unavailable;
+}
+
 pub fn chromeRevealedIn(model: *const Model, workspace: *const Workspace) bool {
     // `hide-chrome-when-single = false` means "I want my tab strip", full
     // stop — the at-rest hide is a default, not a law.
     if (!model.config.hide_chrome_when_single) return true;
     if (workspace.tab_count > 1) return true;
-    // A refusal has to be visible somewhere, and the band is the only chrome
-    // this app has: a cmd+N at the window ceiling reveals it rather than
-    // doing nothing at all.
-    if (model.window_limit_refused) return true;
-    // Reaching the workspace's tab ceiling is just as visible as reaching the
-    // process's shell ceiling, but names the resource the gesture exhausted.
-    if (workspace.tab_limit_refused) return true;
-    // Same rule for the shell ceiling, and it matters more at ONE tab: that is
-    // exactly the state a refused cmd+D leaves behind, and with the band
-    // hidden the chord would look unbound rather than refused.
-    if (model.terminal_limit_refused) return true;
-    // And for a save the config file refused. At one tab with the chrome
-    // hidden there is nowhere else for it to appear, and the whole defect this
-    // latch exists for is a theme change that reported nothing at all.
-    if (model.config_write_refused) return true;
-    // Exhausted topology retries are equally silent without the band, and can
-    // otherwise leave the next unclean launch restoring an older workspace.
-    if (model.state.write_failed) return true;
-    // A Phux-enabled launch that cannot attach remains a useful local terminal,
-    // but local means ephemeral. Hiding the only explanation would turn that
-    // intentional fallback into a false durability claim.
-    if (model.phux_connection_unavailable) return true;
+    if (chromeNoticeVisible(model, workspace)) return true;
     if (workspaceTerminalRef(model, workspace) == null) return true;
     for (0..workspace.tab_count) |index| {
         const current = workspace.treeConst(index) orelse continue;

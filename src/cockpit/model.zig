@@ -86,6 +86,10 @@ pub const StatePersistence = struct {
     path_storage: [max_state_path_bytes]u8 = undefined,
     path_len: usize = 0,
     fingerprint: u64 = 0,
+    /// An existing state file was present but could not be accepted. Its path
+    /// remains available for the startup notice, while this latch makes the
+    /// entire persistence pipeline read-only for the lifetime of the launch.
+    preserve_rejected_existing: bool = false,
     /// A write effect is outstanding on the state-file key. A second write on
     /// a live key is rejected by the SDK, so one waits rather than racing.
     inflight: bool = false,
@@ -107,13 +111,21 @@ pub const StatePersistence = struct {
         return state.path_storage[0..state.path_len];
     }
 
+    /// The one persistence invariant: a destination exists and this launch is
+    /// allowed to replace it. Every asynchronous and synchronous write path
+    /// asks this before doing any work.
     pub fn enabled(state: *const StatePersistence) bool {
-        return state.path_len != 0;
+        return state.path_len != 0 and !state.preserve_rejected_existing;
+    }
+
+    pub fn rejectedExisting(state: *const StatePersistence) bool {
+        return state.path_len != 0 and state.preserve_rejected_existing;
     }
 
     /// Adopt a resolved path, or disable persistence when there is none to
     /// adopt. A window that cannot find a state directory still runs.
     pub fn setPath(state: *StatePersistence, value: ?[]const u8) void {
+        state.preserve_rejected_existing = false;
         const resolved = value orelse "";
         if (resolved.len == 0 or resolved.len > max_state_path_bytes) {
             state.path_len = 0;
@@ -121,6 +133,18 @@ pub const StatePersistence = struct {
         }
         @memcpy(state.path_storage[0..resolved.len], resolved);
         state.path_len = resolved.len;
+    }
+
+    /// Keep the rejected source path for explanation, but retire every route
+    /// that could rename, truncate, replace, or retry a write against it.
+    pub fn preserveRejectedExisting(state: *StatePersistence, source_path: []const u8) void {
+        state.setPath(source_path);
+        if (state.path_len == 0) return;
+        state.preserve_rejected_existing = true;
+        state.inflight = false;
+        state.pending = false;
+        state.retry_count = 0;
+        state.write_failed = false;
     }
 };
 
@@ -1658,13 +1682,10 @@ pub fn restoreModelWithScrollback(
                 // applies to cmd+T (see `local.max_live_shells`): `initFx`
                 // spawns every pane this loop mints, so a snapshot with more
                 // leaves than the effects layer has ptys would reopen with the
-                // surplus panes permanently blank — which is the bug the
-                // ceiling exists to stop, arriving at launch instead of at a
-                // chord. Refusing the whole restore is deliberate: the caller
-                // (`main.restoreWorkspace`) already falls back to a fresh
-                // single-terminal workspace, and only SHAPE is persisted, so
-                // an over-capacity snapshot written by an older build costs a
-                // layout once rather than dead panes every launch.
+                // surplus panes permanently blank. This is a runtime resource
+                // failure, not malformed state: `main.restoreWorkspace`
+                // propagates it so startup fails visibly and the valid source
+                // remains untouched.
                 if (provider.liveShellCount() >= local.max_live_shells) return error.TerminalCapacityReached;
                 const session = try grid.Session.createWithScrollback(gpa, io, 80, 24, provider.max_scrollback_bytes);
                 errdefer session.destroy();

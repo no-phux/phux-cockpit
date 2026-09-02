@@ -562,43 +562,145 @@ pub fn resolveStatePath(
     return session_state.joinPath(dir, path_storage) catch null;
 }
 
-/// Read and parse the state file. False means "there is no usable workspace
-/// here" — no file, an unreadable one, an empty one, a truncated one, one from
-/// a future version, or one byte of noise — and it is never an error, because
-/// every one of those cases has exactly one correct behaviour: open a fresh
-/// window.
-fn readPersistedState(io: std.Io, path: []const u8, out: *PersistedTopologySnapshot) bool {
-    var bytes: [session_state.max_state_bytes]u8 = undefined;
-    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+/// Provenance for one state-file read. A missing file is the ordinary first
+/// launch. A rejected file definitely existed and carries the exact path whose
+/// bytes must be preserved. Every other I/O failure is returned to startup.
+pub const PersistedStateLoad = union(enum) {
+    missing,
+    restored,
+    rejected_existing: []const u8,
+};
+
+/// Read and parse the state file without collapsing "missing", "rejected", and
+/// a real I/O failure into one false value.
+pub fn readPersistedState(
+    io: std.Io,
+    path: []const u8,
+    out: *PersistedTopologySnapshot,
+) !PersistedStateLoad {
+    var bytes: [session_state.max_state_bytes + 1]u8 = undefined;
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return .missing,
+        else => return err,
+    };
     defer file.close(io);
-    // A file past the ceiling fills the buffer and loses its terminator, so
-    // it fails the parse rather than reading back as a shorter workspace.
-    const read = file.readPositionalAll(io, &bytes, 0) catch return false;
-    return session_state.parse(bytes[0..read], out);
+    // The extra byte distinguishes an exactly bounded valid file from a file
+    // whose valid-looking prefix was truncated at the read ceiling.
+    const read = try file.readPositionalAll(io, &bytes, 0);
+    if (read > session_state.max_state_bytes) return .{ .rejected_existing = path };
+    if (!session_state.parse(bytes[0..read], out)) return .{ .rejected_existing = path };
+    return .restored;
 }
+
+/// Startup provenance after parsing, migration, and model reconstruction.
+///
+/// `.restored = null` is valid state containing no terminal tabs. It follows
+/// the established fresh-terminal behavior without mislabeling the file as
+/// missing or rejected.
+pub const WorkspaceRestore = union(enum) {
+    missing,
+    restored: ?Model,
+    rejected_existing: []const u8,
+};
 
 /// Rebuild the saved workspace before anything else exists, so the window
 /// opens INTO the restored layout instead of being seen to assemble it.
 /// `restored` receives the migrated snapshot, which still holds the working
 /// directories the panes have to be put in once the model reaches its final
 /// storage.
-fn restoreWorkspace(
+pub fn restoreWorkspace(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
     restored: *TopologySnapshot,
     max_scrollback_bytes: usize,
-) ?Model {
+) !WorkspaceRestore {
     var persisted: PersistedTopologySnapshot = undefined;
-    if (!readPersistedState(io, path, &persisted)) return null;
-    const snapshot = migrateTopologySnapshot(persisted) catch return null;
-    // A snapshot with no tabs describes a session with nothing in it. That is
-    // valid state (the web surface was selected when the last tab closed) but
-    // it is not a workspace to reopen, so it takes the fresh path.
-    if (snapshot.tab_count == 0) return null;
-    const model = model_module.restoreModelWithScrollback(gpa, io, .{ .v4 = snapshot }, max_scrollback_bytes) catch return null;
+    switch (try readPersistedState(io, path, &persisted)) {
+        .missing => return .missing,
+        .rejected_existing => |rejected_path| return .{ .rejected_existing = rejected_path },
+        .restored => {},
+    }
+    const snapshot = migrateTopologySnapshot(persisted) catch
+        return .{ .rejected_existing = path };
     restored.* = snapshot;
-    return model;
+    if (snapshot.tab_count == 0) return .{ .restored = null };
+    const model = try model_module.restoreModelWithScrollback(
+        gpa,
+        io,
+        .{ .v4 = snapshot },
+        max_scrollback_bytes,
+    );
+    return .{ .restored = model };
+}
+
+fn freshWorkspace(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    max_scrollback_bytes: usize,
+) !Model {
+    const session = try grid.Session.createWithScrollback(gpa, io, 80, 24, max_scrollback_bytes);
+    return initialProductionModelWithIo(gpa, io, session) catch |err| {
+        session.destroy();
+        return err;
+    };
+}
+
+pub const WorkspaceStateProvenance = enum {
+    missing,
+    restored,
+    rejected_existing,
+};
+
+const InitialWorkspace = struct {
+    model: Model,
+    provenance: WorkspaceStateProvenance,
+    rejected_state_path: ?[]const u8 = null,
+};
+
+fn loadInitialWorkspace(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    state_path: ?[]const u8,
+    restored_snapshot: *TopologySnapshot,
+    max_scrollback_bytes: usize,
+) !InitialWorkspace {
+    const outcome: WorkspaceRestore = if (state_path) |path|
+        try restoreWorkspace(gpa, io, path, restored_snapshot, max_scrollback_bytes)
+    else
+        .missing;
+    return switch (outcome) {
+        .missing => .{
+            .model = try freshWorkspace(gpa, io, max_scrollback_bytes),
+            .provenance = .missing,
+        },
+        .rejected_existing => |path| .{
+            .model = try freshWorkspace(gpa, io, max_scrollback_bytes),
+            .provenance = .rejected_existing,
+            .rejected_state_path = path,
+        },
+        .restored => |saved| restored: {
+            if (saved) |model| {
+                break :restored .{ .model = model, .provenance = .restored };
+            }
+            break :restored .{
+                .model = try freshWorkspace(gpa, io, max_scrollback_bytes),
+                .provenance = .restored,
+            };
+        },
+    };
+}
+
+fn initializeStatePersistence(
+    model: *Model,
+    state_path: ?[]const u8,
+    rejected_state_path: ?[]const u8,
+) void {
+    model.state.setPath(state_path);
+    if (rejected_state_path) |path| model.state.preserveRejectedExisting(path);
+    // Seed the shape hash with what is already live, so a launch that changes
+    // nothing writes nothing.
+    model.state.fingerprint = model.topologyFingerprint();
 }
 
 /// Say out loud what the config file did not do.
@@ -664,20 +766,14 @@ pub fn main(init: std.process.Init) !void {
     ));
 
     var restored_snapshot: TopologySnapshot = .{};
-    var restored = false;
-    var model = restore: {
-        if (state_path) |path| {
-            if (restoreWorkspace(std.heap.page_allocator, init.io, path, &restored_snapshot, max_scrollback_bytes)) |saved| {
-                restored = true;
-                break :restore saved;
-            }
-        }
-        const session = try grid.Session.createWithScrollback(std.heap.page_allocator, init.io, 80, 24, max_scrollback_bytes);
-        break :restore initialProductionModelWithIo(std.heap.page_allocator, init.io, session) catch |err| {
-            session.destroy();
-            return err;
-        };
-    };
+    const startup = try loadInitialWorkspace(
+        std.heap.page_allocator,
+        init.io,
+        state_path,
+        &restored_snapshot,
+        max_scrollback_bytes,
+    );
+    var model = startup.model;
     // Terminals are minted lazily, so the provider carries the ceiling for
     // every pane opened after this point.
     model.provider.max_scrollback_bytes = max_scrollback_bytes;
@@ -691,10 +787,7 @@ pub fn main(init: std.process.Init) !void {
         deinitModel(&model);
         return err;
     };
-    model.state.setPath(state_path);
-    // Seed the shape hash with what is already on disk, so a launch that
-    // changes nothing writes nothing.
-    model.state.fingerprint = model.topologyFingerprint();
+    initializeStatePersistence(&model, state_path, startup.rejected_state_path);
     model.config = user_config;
     // Where a theme chosen in the settings surface gets written back. Resolved
     // ONCE here, because `update` has no environment to resolve it from later.
@@ -707,7 +800,7 @@ pub fn main(init: std.process.Init) !void {
     // setting one act later: the config value was already in effect when the
     // user toggled the strip, so replaying the config would undo them on every
     // launch. It does not outrank the env knob below.
-    if (restored) model.tab_placement = restored_snapshot.tab_placement;
+    if (startup.provenance == .restored) model.tab_placement = restored_snapshot.tab_placement;
     // The env override stays and stays LAST: it is the debugging knob, and a
     // knob that a config file could silently disable would not be one.
     if (init.environ_map.get("PHUX_COCKPIT_TABS")) |value| {
@@ -721,7 +814,7 @@ pub fn main(init: std.process.Init) !void {
     defer app_state.deinit();
     // The argv can only be written once the model is in the storage it will
     // live in: it holds SLICES into that model's own `cwd_argv`.
-    if (restored) applyRestoredWorkingDirectories(&app_state.inner.model, &restored_snapshot);
+    if (startup.provenance == .restored) applyRestoredWorkingDirectories(&app_state.inner.model, &restored_snapshot);
     // The runtime's own `.stop` lifecycle already flushes the layout, which is
     // the path that actually fires on a macOS quit. This is the belt to that
     // pair of braces, for a host whose run loop returns without a shutdown
