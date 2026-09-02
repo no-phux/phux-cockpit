@@ -558,7 +558,6 @@ test "closing an earlier tab preserves the selected terminal" {
     try testing.expect(state.model.ws().tabTerminal(state.model.ws().selected_tab).?.eql(selected));
 }
 
-// GUARD: remote-tab-close-is-presentation-detach
 test "a remote tab detaches presentation and reopens from retained inventory" {
     const gpa = testing.allocator;
     const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
