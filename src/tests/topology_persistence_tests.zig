@@ -7,6 +7,7 @@ const testing = std.testing;
 
 const createDefaultSession = support.createDefaultSession;
 const startCockpit = support.startCockpit;
+const startFocusedTerminal = support.startFocusedTerminal;
 const stopCockpit = support.stopCockpit;
 const remoteRef = support.remoteTerminalRef;
 
@@ -310,6 +311,212 @@ test "a corrupt, truncated, empty, or future state file falls back to a fresh la
         @memcpy(seeded[header.len..][0..len], noise[0..len]);
         _ = app.parseWorkspaceState(seeded[0 .. header.len + len], &parsed);
     }
+}
+
+// GUARD: preserve-rejected-workspace-state
+test "a rejected existing state stays byte-exact through fresh interaction and shutdown" {
+    const root = ".zig-cache/phux-cockpit-rejected-state-tests";
+    const path = root ++ "/workspace.state";
+    const original =
+        "phux-cockpit-state 99\n" ++
+        "placement side\n" ++
+        "future-field must-survive-byte-for-byte\n" ++
+        "end\n";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing.io, root) catch {};
+    defer cwd.deleteTree(testing.io, root) catch {};
+    try cwd.createDirPath(testing.io, root);
+    try cwd.writeFile(testing.io, .{ .sub_path = path, .data = original });
+
+    var snapshot: app.TopologySnapshot = .{};
+    const rejected_path = switch (try app.restoreWorkspace(
+        testing.allocator,
+        testing.io,
+        path,
+        &snapshot,
+        1024 * 1024,
+    )) {
+        .rejected_existing => |preserved_path| preserved_path,
+        .missing => return error.TestExpectedRejectedState,
+        .restored => |maybe_model| {
+            var unexpected = maybe_model orelse return error.TestExpectedRejectedState;
+            defer app.deinitModel(&unexpected);
+            return error.TestExpectedRejectedState;
+        },
+    };
+    try testing.expectEqualStrings(path, rejected_path);
+
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startFocusedTerminal(testing.allocator, harness);
+    defer stopCockpit(state);
+    state.model.state.preserveRejectedExisting(rejected_path);
+    try testing.expect(state.model.state.rejectedExisting());
+    try testing.expect(!state.model.state.enabled());
+
+    // The fallback remains a real terminal: keyboard and topology interaction
+    // proceed, while the persistence invariant arms no debounce and posts no
+    // write.
+    const selected = state.model.selectedTerminalId() orelse return error.TestExpectedTerminal;
+    const pane = state.model.provider.terminal(selected) orelse return error.TestExpectedTerminal;
+    try support.typeCanvasText(harness, state.app(), "still usable");
+    try testing.expectEqualStrings("still usable", state.effects.ptyWrittenBytes(pane.pty_key));
+    app.update(&state.model, .new_terminal, &state.effects);
+    app.update(&state.model, .split_right, &state.effects);
+    try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+    app.update(&state.model, debounceFired(), &state.effects);
+    try testing.expectEqual(@as(usize, 0), state.effects.pendingFileCount());
+    state.model.state.inflight_fingerprint = state.model.state.fingerprint;
+    app.update(&state.model, writeCompleted(.io_failed), &state.effects);
+    try testing.expectError(error.EffectNotFound, state.effects.fireTimer(app.topology_persist_timer_key));
+
+    // The sole notice is ordinary chrome, not a modal surface. Its accessible
+    // name carries both the exact path and the preservation guarantee.
+    try testing.expect(app.chromeRevealed(&state.model));
+    try harness.runtime.dispatchPlatformEvent(state.app(), .frame_requested);
+    var saw_badge = false;
+    var saw_accessible_path = false;
+    var said_preserved = false;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (std.mem.eql(u8, node.widget.text, "LAYOUT NOT RESTORED")) saw_badge = true;
+        const label = node.widget.semantics.label;
+        if (std.mem.indexOf(u8, label, path) != null) saw_accessible_path = true;
+        if (std.mem.indexOf(u8, label, "file was preserved") != null) said_preserved = true;
+    }
+    try testing.expect(saw_badge);
+    try testing.expect(saw_accessible_path);
+    try testing.expect(said_preserved);
+
+    // Exercise both exit routes: `.shutdown` and the same synchronous method
+    // main's defer calls. Neither may touch the rejected source.
+    app.update(&state.model, .shutdown, &state.effects);
+    state.model.writeWorkspaceState(testing.io);
+    var preserved: [original.len + 1]u8 = undefined;
+    var file = try cwd.openFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    const read = try file.readPositionalAll(testing.io, &preserved, 0);
+    try testing.expectEqual(original.len, read);
+    try testing.expectEqualStrings(original, preserved[0..read]);
+}
+
+test "migration-invalid state is rejected without changing its source" {
+    const root = ".zig-cache/phux-cockpit-invalid-migration-tests";
+    const path = root ++ "/workspace.state";
+    const original =
+        "phux-cockpit-state 3\n" ++
+        "placement top\n" ++
+        "selection tab 0\n" ++
+        "tab 2 1\n" ++
+        "node 0 leaf 2 0\n" ++
+        "node 1 leaf 2 1\n" ++
+        "node 2 branch - horizontal 0.99 0 1\n" ++
+        "end\n";
+    var parsed: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(original, &parsed));
+    try testing.expectError(error.InvalidTopology, app.migrateTopologySnapshot(parsed));
+
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing.io, root) catch {};
+    defer cwd.deleteTree(testing.io, root) catch {};
+    try cwd.createDirPath(testing.io, root);
+    try cwd.writeFile(testing.io, .{ .sub_path = path, .data = original });
+
+    var snapshot: app.TopologySnapshot = .{};
+    switch (try app.restoreWorkspace(
+        testing.allocator,
+        testing.io,
+        path,
+        &snapshot,
+        1024 * 1024,
+    )) {
+        .rejected_existing => |preserved_path| try testing.expectEqualStrings(path, preserved_path),
+        .missing => return error.TestExpectedRejectedState,
+        .restored => |maybe_model| {
+            var unexpected = maybe_model orelse return error.TestExpectedRejectedState;
+            defer app.deinitModel(&unexpected);
+            return error.TestExpectedRejectedState;
+        },
+    }
+
+    var preserved: [original.len + 1]u8 = undefined;
+    var file = try cwd.openFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    const read = try file.readPositionalAll(testing.io, &preserved, 0);
+    try testing.expectEqual(original.len, read);
+    try testing.expectEqualStrings(original, preserved[0..read]);
+}
+
+test "missing state saves and valid state restores then remains writable" {
+    const root = ".zig-cache/phux-cockpit-state-provenance-tests";
+    const path = root ++ "/workspace.state";
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(testing.io, root) catch {};
+    defer cwd.deleteTree(testing.io, root) catch {};
+
+    var snapshot: app.TopologySnapshot = .{};
+    switch (try app.restoreWorkspace(
+        testing.allocator,
+        testing.io,
+        path,
+        &snapshot,
+        1024 * 1024,
+    )) {
+        .missing => {},
+        .rejected_existing => return error.TestExpectedMissingState,
+        .restored => |maybe_model| {
+            var unexpected = maybe_model orelse return error.TestExpectedMissingState;
+            defer app.deinitModel(&unexpected);
+            return error.TestExpectedMissingState;
+        },
+    }
+
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{});
+    defer harness.destroy(testing.allocator);
+    const state = try startCockpit(harness);
+    defer stopCockpit(state);
+    try testing.expect(!app.chromeRevealed(&state.model));
+    state.model.state.setPath(path);
+    app.update(&state.model, .split_right, &state.effects);
+    app.update(&state.model, .shutdown, &state.effects);
+
+    // A valid file must not turn an allocation failure into "rejected" and a
+    // fresh fallback. Startup sees the resource failure.
+    try testing.expectError(error.OutOfMemory, app.restoreWorkspace(
+        std.testing.failing_allocator,
+        testing.io,
+        path,
+        &snapshot,
+        1024 * 1024,
+    ));
+
+    var restored_snapshot: app.TopologySnapshot = .{};
+    var restored = switch (try app.restoreWorkspace(
+        testing.allocator,
+        testing.io,
+        path,
+        &restored_snapshot,
+        1024 * 1024,
+    )) {
+        .restored => |maybe_model| maybe_model orelse return error.TestExpectedRestoredState,
+        .missing => return error.TestExpectedRestoredState,
+        .rejected_existing => return error.TestExpectedRestoredState,
+    };
+    defer app.deinitModel(&restored);
+    try testing.expectEqualDeep(try state.model.topologySnapshot(), restored_snapshot);
+    try testing.expect(!app.chromeRevealed(&restored));
+
+    // The restored provenance remains writable. Change it, synchronously save
+    // it, and inspect the actual file rather than only the model.
+    restored.state.setPath(path);
+    restored.tab_placement = .side;
+    restored.writeWorkspaceState(testing.io);
+    var bytes: [app.max_state_bytes]u8 = undefined;
+    var file = try cwd.openFile(testing.io, path, .{});
+    defer file.close(testing.io);
+    const read = try file.readPositionalAll(testing.io, &bytes, 0);
+    var persisted: app.PersistedTopologySnapshot = undefined;
+    try testing.expect(app.parseWorkspaceState(bytes[0..read], &persisted));
+    try testing.expectEqual(app.TabPlacement.side, (try app.migrateTopologySnapshot(persisted)).tab_placement);
 }
 
 test "a version 2 state file migrates into the current schema with no working directories" {

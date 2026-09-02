@@ -428,6 +428,9 @@ test "the chrome survives the layout audit in every state it has" {
     state.model.state.write_failed = true;
     try sweep(state, "the exhausted layout-save notice");
     state.model.state.write_failed = false;
+    state.model.state.preserveRejectedExisting("/tmp/preserved-workspace.state");
+    try sweep(state, "the rejected layout notice");
+    state.model.state.setPath(null);
 
     state.model.phux_connection_unavailable = true;
     try sweep(state, "the unavailable Phux notice");
@@ -631,6 +634,7 @@ test "the trailing status fits the room the strip holds back" {
         .{ .label = "shell limit", .prefix = "Shell limit reached", .reserve = app.tab_strip_notice_reserve },
         .{ .label = "window limit", .prefix = "Window limit reached", .reserve = app.tab_strip_notice_reserve },
         .{ .label = "tab limit", .prefix = "Tab limit reached", .reserve = app.tab_strip_notice_reserve },
+        .{ .label = "layout restore rejection", .prefix = "Workspace layout was not restored", .reserve = app.tab_strip_pane_status_reserve },
         .{ .label = "theme save failure", .prefix = "Theme could not be saved", .reserve = app.tab_strip_save_notice_reserve },
         .{ .label = "layout save failure", .prefix = "Workspace layout could not be saved", .reserve = app.tab_strip_save_notice_reserve },
     };
@@ -639,12 +643,15 @@ test "the trailing status fits the room the strip holds back" {
         state.model.terminal_limit_refused = index == 0;
         state.model.window_limit_refused = index == 1;
         state.model.ws().tab_limit_refused = index == 2;
-        state.model.config_write_refused = index == 3;
-        state.model.state.write_failed = index == 4;
+        state.model.state.setPath(null);
+        if (index == 3) state.model.state.preserveRejectedExisting("/tmp/preserved-workspace.state");
+        state.model.config_write_refused = index == 4;
+        state.model.state.write_failed = index == 5;
         defer {
             state.model.terminal_limit_refused = false;
             state.model.window_limit_refused = false;
             state.model.ws().tab_limit_refused = false;
+            state.model.state.setPath(null);
             state.model.config_write_refused = false;
             state.model.state.write_failed = false;
         }

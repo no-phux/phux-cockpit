@@ -1805,6 +1805,21 @@ fn configWriteNotice(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
     }, .{});
 }
 
+/// A state file that exists but cannot be restored remains untouched. This is
+/// deliberately a calm, persistent status rather than a modal error: the fresh
+/// terminal is usable, while the spoken label names the preserved source and
+/// the launch-scoped persistence boundary.
+fn topologyRestoreNotice(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
+    return ui.el(.badge, .{
+        .variant = .secondary,
+        .text = "LAYOUT NOT RESTORED",
+        .semantics = .{ .label = ui.fmt(
+            "Workspace layout was not restored from {s}. The file was preserved, and layout saving is disabled for this launch.",
+            .{model.state.path()},
+        ) },
+    }, .{});
+}
+
 /// What an exhausted workspace-state write says. It shares the existing save
 /// notice slot: both are destructive badges about a file that did not land.
 fn topologyWriteNotice(ui: *TerminalUi, model: *const Model) TerminalUi.Node {
@@ -1834,6 +1849,27 @@ fn phuxUnavailableNotice(ui: *TerminalUi) TerminalUi.Node {
             .semantics = .{ .label = "Retry attaching the running Phux server" },
         }, "Retry"),
     });
+}
+
+/// KEEP IN STEP with `projection.tabStripStatusReserveIn`, which decides how
+/// much room the tab run gives up for this node. Immediate gesture refusals
+/// outrank persistent file notices; each lower status gets the row back when
+/// the higher one clears.
+fn trailingStatus(
+    ui: *TerminalUi,
+    model: *const Model,
+    ws: *const Workspace,
+    focused_ref: ?TerminalRef,
+) TerminalUi.Node {
+    if (model.window_limit_refused) return windowLimitNotice(ui);
+    if (ws.tab_limit_refused) return tabLimitNotice(ui);
+    if (model.terminal_limit_refused) return terminalLimitNotice(ui);
+    if (model.state.rejectedExisting()) return topologyRestoreNotice(ui, model);
+    if (model.config_write_refused) return configWriteNotice(ui, model);
+    if (model.state.write_failed) return topologyWriteNotice(ui, model);
+    if (model.phux_connection_unavailable) return phuxUnavailableNotice(ui);
+    if (focused_ref) |id| return paneStatus(ui, model, id);
+    return emptyStatusNode(ui);
 }
 
 fn parkedWebKitAnchor(ui: *TerminalUi) TerminalUi.Node {
@@ -1909,27 +1945,7 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
 
     const chrome = projection.workspaceChromeIn(model, ws, ws.surface_size);
     const focused_ref = projection.workspaceTerminalRef(model, ws);
-    // KEEP IN STEP with `projection.tabStripStatusReserveIn`, which decides how
-    // much room the tab run above gives up for this node. A disagreement puts
-    // the `+` button underneath the badge.
-    //
-    // The two ceilings outrank this one only because they are answers to a
-    // gesture the user made a moment ago and is still waiting on. A refused
-    // save is latched until the next save lands, so it loses nothing by
-    // yielding the row for as long as one of those is up.
-    const status = if (model.window_limit_refused)
-        windowLimitNotice(ui)
-    else if (ws.tab_limit_refused)
-        tabLimitNotice(ui)
-    else if (model.terminal_limit_refused)
-        terminalLimitNotice(ui)
-    else if (model.config_write_refused)
-        configWriteNotice(ui, model)
-    else if (model.state.write_failed)
-        topologyWriteNotice(ui, model)
-    else if (model.phux_connection_unavailable)
-        phuxUnavailableNotice(ui)
-    else if (focused_ref) |id| paneStatus(ui, model, id) else emptyStatusNode(ui);
+    const status = trailingStatus(ui, model, ws, focused_ref);
 
     const revealed = projection.chromeRevealedIn(model, ws);
     // The strip is TERMINALS ONLY. The web surface kept its pane, its scene

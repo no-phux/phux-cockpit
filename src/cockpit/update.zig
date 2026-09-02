@@ -226,6 +226,7 @@ const topology_persist_retry_limit: u8 = 3;
 /// stack, and the SDK copies it at the call, so it must exist here and nowhere
 /// up the already-deep dispatch frame.
 fn writeTopologySnapshot(model: *Model, fx: *Fx) void {
+    if (!model.state.enabled()) return;
     var bytes: [session_state.max_state_bytes]u8 = undefined;
     const snapshot = model.topologySnapshot() catch return;
     const encoded = session_state.serialize(&snapshot, &bytes) catch return;
@@ -386,9 +387,11 @@ pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const fingerprint = model.topologyFingerprint();
     if (fingerprint != model.state.fingerprint) {
         model.state.fingerprint = fingerprint;
-        model.state.pending = true;
-        model.state.retry_count = 0;
-        armTopologyPersist(model, fx);
+        if (model.state.enabled()) {
+            model.state.pending = true;
+            model.state.retry_count = 0;
+            armTopologyPersist(model, fx);
+        }
     }
     const focus_after = remoteFocusTarget(model);
     const owner_after = remoteFocusOwner(model);
