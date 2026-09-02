@@ -417,6 +417,10 @@ pub const Palette = struct {
 
 pub const Workspace = struct {
     tabs: [max_tabs]layout.Tree = [_]layout.Tree{.{}} ** max_tabs,
+    /// Process-local projection identities. Positions move and focused panes
+    /// change, so neither can safely key the TypeScript tab list.
+    tab_ids: [max_tabs]u32 = [_]u32{0} ** max_tabs,
+    next_tab_id: u32 = 1,
     /// The summoned working-set index. Presentational plus a keyboard mode,
     /// and deliberately NOT part of `topologySnapshot`: an open index is not a
     /// workspace shape and must never be restored on launch.
@@ -514,12 +518,41 @@ pub const Workspace = struct {
         return current.focusedTerminal();
     }
 
+    pub fn tabId(workspace: *const Workspace, index: usize) ?u32 {
+        if (index >= workspace.tab_count) return null;
+        const id = workspace.tab_ids[index];
+        return if (id == 0) null else id;
+    }
+
+    fn mintTabId(workspace: *Workspace) u32 {
+        while (true) {
+            const candidate = workspace.next_tab_id;
+            workspace.next_tab_id +%= 1;
+            if (workspace.next_tab_id == 0) workspace.next_tab_id = 1;
+            if (candidate == 0) continue;
+            var used = false;
+            for (workspace.tab_ids[0..workspace.tab_count]) |existing| {
+                if (existing == candidate) {
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) return candidate;
+        }
+    }
+
+    pub fn assignRestoredTabId(workspace: *Workspace, index: usize) void {
+        if (index >= workspace.tab_count or workspace.tab_ids[index] != 0) return;
+        workspace.tab_ids[index] = workspace.mintTabId();
+    }
+
     /// Give `id` a tab of its own. Idempotent: a terminal already living in
     /// some pane keeps the tab it is in.
     pub fn admitTab(workspace: *Workspace, id: TerminalRef) bool {
         if (workspace.tabOfTerminal(id) != null) return true;
         if (workspace.tab_count >= max_tabs) return false;
         workspace.tabs[workspace.tab_count] = layout.Tree.initLeaf(id);
+        workspace.tab_ids[workspace.tab_count] = workspace.mintTabId();
         workspace.tab_count += 1;
         return true;
     }
@@ -528,9 +561,13 @@ pub const Workspace = struct {
         if (index >= workspace.tab_count) return;
         if (index < workspace.selected_tab) workspace.selected_tab -= 1;
         var cursor = index;
-        while (cursor + 1 < workspace.tab_count) : (cursor += 1) workspace.tabs[cursor] = workspace.tabs[cursor + 1];
+        while (cursor + 1 < workspace.tab_count) : (cursor += 1) {
+            workspace.tabs[cursor] = workspace.tabs[cursor + 1];
+            workspace.tab_ids[cursor] = workspace.tab_ids[cursor + 1];
+        }
         workspace.tab_count -= 1;
         workspace.tabs[workspace.tab_count] = .{};
+        workspace.tab_ids[workspace.tab_count] = 0;
         if (workspace.tab_count == 0) {
             workspace.selected_tab = 0;
             return;
@@ -565,6 +602,7 @@ pub const Workspace = struct {
         if (target_signed < 0 or target_signed >= workspace.tab_count) return false;
         const target: usize = @intCast(target_signed);
         std.mem.swap(layout.Tree, &workspace.tabs[current], &workspace.tabs[target]);
+        std.mem.swap(u32, &workspace.tab_ids[current], &workspace.tab_ids[target]);
         if (workspace.selected_tab == current) {
             workspace.selected_tab = target;
         } else if (workspace.selected_tab == target) {
@@ -1676,6 +1714,7 @@ pub fn restoreModelWithScrollback(
         };
         for (tabs, 0..) |tab, tab_index| {
             workspace.tabs[tab_index] = decodeTab(tab);
+            workspace.assignRestoredTabId(tab_index);
             for (tab.nodes) |node| {
                 if (node.kind != .leaf or !node.has_terminal) continue;
                 // The SHELL ceiling applies to a restored layout exactly as it

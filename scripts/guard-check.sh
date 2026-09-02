@@ -36,6 +36,9 @@ set -euo pipefail
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 GUARD_DIR="$ROOT/scripts/guards"
+# Every source root that may carry a `// GUARD:` marker. The TypeScript-core
+# spike's extension keeps its own guards beside the module they prove.
+SCAN_ROOTS=("$ROOT/src" "$ROOT/typescript-spike/src")
 
 # The guard currently being re-derived, if any, named by guard-red-run.sh.
 #
@@ -90,9 +93,9 @@ for guard in "${guard_files[@]}"; do
     fi
 
     # -F: Zig test names are prose and contain regex metacharacters.
-    hit="$(grep -rFn "test \"$test_name\" {" "$ROOT/src" || true)"
+    hit="$(grep -rFn "test \"$test_name\" {" "${SCAN_ROOTS[@]}" || true)"
     if [[ -z "$hit" ]]; then
-        complain "$name: names test \"$test_name\", which no longer exists in src/."
+        complain "$name: names test \"$test_name\", which no longer exists under src/ or typescript-spike/src/."
         continue
     fi
     if [[ "$(printf '%s\n' "$hit" | wc -l)" -ne 1 ]]; then
@@ -139,6 +142,6 @@ while IFS= read -r marker_line; do
     if [[ "$known_guards" != *" $name "* ]]; then
         complain "$name: marked in ${marker_line%%:*} but scripts/guards/$name.guard does not exist."
     fi
-done < <(grep -rn '// GUARD: ' "$ROOT/src" || true)
+done < <(grep -rn '// GUARD: ' "${SCAN_ROOTS[@]}" || true)
 
 exit "$status"

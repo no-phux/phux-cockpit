@@ -21,6 +21,9 @@
 #       --test "the zig test name" [PATH...]        capture the break sitting
 #                                                   in the working tree, then
 #                                                   prove it
+#   ... --build "test -Dtypescript-spike=true -Dplatform=null"
+#                                                   for a test that only exists
+#                                                   in another build graph
 #
 # PATH narrows what is captured, and giving it is the safe habit: without it
 # the capture is the whole `git diff`, which on a shared checkout has already
@@ -63,11 +66,13 @@ mkdir -p "$LOG_DIR" "$GUARD_DIR"
 
 RECORD=""
 RECORD_TEST=""
+RECORD_BUILD=""
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --record) RECORD="${2:?--record needs a guard name}"; shift 2 ;;
         --test) RECORD_TEST="${2:?--test needs a zig test name}"; shift 2 ;;
+        --build) RECORD_BUILD="${2:?--build needs zig build arguments}"; shift 2 ;;
         -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
         -*) printf 'unknown argument: %s\n' "$1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
@@ -88,6 +93,16 @@ require_clean() {
 }
 
 patch_of() { sed -n '/^diff --git /,$p' "$1"; }
+
+# The `zig build` arguments a guard's test runs under. The default gate is
+# `test`; a guard whose test only exists in another graph (the TypeScript-core
+# spike, say) names that graph on a `build:` line, because a red run in the
+# wrong graph cannot even find the test and would be reported as WRONG RED.
+build_args_of() {
+    local value
+    value="$(sed -n 's/^build: //p' "$1" | head -1)"
+    printf '%s' "${value:-test}"
+}
 
 # The paths a guard's patch touches, so every restore is narrowed to them.
 # `git checkout -- .` is not an acceptable fallback: this working directory has
@@ -134,6 +149,7 @@ if [[ -n "$RECORD" ]]; then
         printf '# Describe the defect this test exists to catch, and what removing the\n'
         printf '# fix below puts back. Prose here is preserved across re-runs.\n'
         printf 'test: %s\n' "$RECORD_TEST"
+        [[ -n "$RECORD_BUILD" ]] && printf 'build: %s\n' "$RECORD_BUILD"
         printf '%s\n' "$diff_text"
     } > "$guard"
 
@@ -192,6 +208,7 @@ failed=0
 # guard tool that only works under a Homebrew bash is a guard tool somebody
 # will one day run under /bin/bash.
 proved=()
+baselined_graphs=()
 
 for name in "${names[@]}"; do
     guard="$GUARD_DIR/$name.guard"
@@ -201,6 +218,21 @@ for name in "${names[@]}"; do
 
     printf '=== %s ===\n' "$name"
     printf 'guards: %s\n' "$test_name"
+    build_args="$(build_args_of "$guard")"
+
+    # A guard in another graph needs that graph's own green baseline: the
+    # default gate above never compiled its test, so it has proved nothing
+    # about it yet. Once per graph per run.
+    if [[ "$build_args" != "test" && " ${baselined_graphs[*]:-} " != *" $build_args "* ]]; then
+        graph_log="$LOG_DIR/baseline-$(printf '%s' "$build_args" | tr -c 'A-Za-z0-9' '_').log"
+        set +e
+        (cd "$ROOT" && zig build $build_args) > "$graph_log" 2>&1
+        graph_exit=$?
+        set -e
+        printf 'zig build %s exit=%d  (%s)\n' "$build_args" "$graph_exit" "$graph_log"
+        [[ $graph_exit -eq 0 ]] || die "the '$build_args' baseline is not green. Nothing proved here would mean anything."
+        baselined_graphs+=("$build_args")
+    fi
 
     if ! patch_of "$guard" | git -C "$ROOT" apply --unidiff-zero --check - 2>/dev/null; then
         printf 'BREAK NO LONGER APPLIES. The fix moved; re-derive this guard.\n\n' >&2
@@ -213,13 +245,13 @@ for name in "${names[@]}"; do
 
     log="$LOG_DIR/$name.red.log"
     set +e
-    (cd "$ROOT" && zig build test) > "$log" 2>&1
+    (cd "$ROOT" && zig build $build_args) > "$log" 2>&1
     red_exit=$?
     set -e
 
     restore "$guard"
 
-    printf 'zig build test exit=%d  (%s)\n' "$red_exit" "$log"
+    printf 'zig build %s exit=%d  (%s)\n' "$build_args" "$red_exit" "$log"
 
     if [[ $red_exit -eq 0 ]]; then
         printf 'NOT A GUARD: the suite stayed GREEN with the fix removed. This test\n' >&2

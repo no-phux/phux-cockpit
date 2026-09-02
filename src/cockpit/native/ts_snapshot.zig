@@ -1,0 +1,58 @@
+const std = @import("std");
+const model_module = @import("../model.zig");
+const projection = @import("workspace_projection.zig");
+const protocol = @import("ts_protocol.zig");
+
+const Model = model_module.Model;
+
+pub const header_len: usize = protocol.snapshot_header_len + 6;
+pub const max_title_bytes: usize = 128;
+pub const max_bytes: usize = 4096;
+
+pub const Error = error{BufferTooSmall};
+
+/// Serialize the active window's chrome projection. Raw cells, process state,
+/// provider slots, and platform window ids deliberately never cross this seam.
+pub fn encode(model: *const Model, sequence: u64, revision: u64, out: []u8) Error![]const u8 {
+    if (out.len < header_len) return error.BufferTooSmall;
+    const framed = protocol.encodeSnapshotHeader(sequence, revision);
+    @memcpy(out[0..framed.len], &framed);
+
+    const workspace = model.wsConst();
+    out[18] = @intCast(model.active_window);
+    out[19] = @intFromEnum(model.tab_placement);
+    out[20] = @intCast(workspace.tab_count);
+    out[21] = @intCast(workspace.selected_tab);
+    out[22] = snapshotFlags(model);
+    out[23] = 0;
+
+    var written: usize = header_len;
+    for (0..workspace.tab_count) |index| {
+        const terminal = workspace.tabTerminal(index) orelse continue;
+        var title_buffer: [max_title_bytes]u8 = undefined;
+        const title = projection.terminalTitleInto(model, terminal, &title_buffer);
+        const bounded = title[0..@min(title.len, max_title_bytes)];
+        const needed = 6 + bounded.len;
+        if (written + needed > out.len) return error.BufferTooSmall;
+
+        std.mem.writeInt(u32, out[written..][0..4], workspace.tabId(index) orelse 0, .little);
+        out[written + 4] = if (projection.terminalNeedsAttention(model, terminal)) 1 else 0;
+        out[written + 5] = @intCast(bounded.len);
+        @memcpy(out[written + 6 ..][0..bounded.len], bounded);
+        written += needed;
+    }
+    return out[0..written];
+}
+
+fn snapshotFlags(model: *const Model) u8 {
+    const workspace = model.wsConst();
+    var flags: u8 = 0;
+    if (model.window_limit_refused) flags |= 1 << 0;
+    if (workspace.tab_limit_refused) flags |= 1 << 1;
+    if (model.terminal_limit_refused) flags |= 1 << 2;
+    if (model.config_write_refused) flags |= 1 << 3;
+    if (model.state.write_failed) flags |= 1 << 4;
+    if (workspace.palette.open) flags |= 1 << 5;
+    if (workspace.settings.open) flags |= 1 << 6;
+    return flags;
+}

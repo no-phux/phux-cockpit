@@ -1,7 +1,30 @@
 # Migrating Cockpit's authoring to TypeScript + `.native` markup
 
-Status: **plan, not yet started.** This document exists so the first PR that
-starts the migration lands against a written contract instead of a vibe.
+Status: **phase 1 seam landed, phase 2 next.** `typescript-spike/` compiles a
+real `core.ts` and `app.native` through ScriptC/corewire on the pinned fork
+(`cockpit/v0.9.5`), and the seam is live end to end under
+`-Dtypescript-spike=true`: `src/cockpit/native/ts_protocol.zig` pins the wire,
+`ts_snapshot.zig` projects chrome state, `ts_engine.zig` owns a real Cockpit
+model behind it, and `typescript-spike/src/native_extension.zig` is the fork's
+`native_extension` hook answering `cockpit.intent`, `cockpit.snapshot` and the
+invalidation channel. Three guards under the extension prove boot, resync and
+the revision fence red-then-green (`zig build test -Dtypescript-spike=true
+-Dplatform=null`). What the engine does NOT yet own is the PTY spawn and the
+terminal pixels: a new tab in the spike mints a real emulator session but no
+shell, and the GPU surface stays empty. That is the phase-2/3 decision below,
+still to be made by measurement. The shipping graph remains the Zig core.
+
+Building the spike needs the SDK package's TypeScript toolchain, which the
+tarball pin does not carry. Once per pin, on the package `zig build` resolved:
+
+```sh
+cd zig-pkg/native_sdk-*/packages/core && npm ci --include=dev
+zig build test -Dtypescript-spike=true -Dplatform=null
+```
+
+Without it the build stops at "the @native-sdk/core frontend cannot resolve
+its TypeScript toolchain" and names the exact directory. The default and Phux
+graphs never touch it.
 
 ## Target
 
@@ -17,8 +40,11 @@ The goal is to move what the SDK's TS tier is good at (declarative chrome,
 bindings, derived values, the automation-checked markup contract) onto that
 path, and keep everything that must sit next to libghostty-vt native. The SDK
 tier split is binary: an app graph is EITHER a Zig core OR a TS core. There is
-no per-widget mixing, so this is a swap of the app loop, staged behind proven
-seams — not a file-by-file port.
+no second app loop, so this is a swap of the core staged behind proven seams —
+not a file-by-file port. Rendering CAN compose: a custom Zig view may call
+`canvas.CompiledMarkupView(...).build` and place the native terminal subtree
+beside/under that node. That is the intended final shape: one TS model/update
+loop, `.native` chrome, and one app-owned Zig terminal module.
 
 ## What moves, what stays
 
@@ -59,11 +85,15 @@ emulator state):
    (`FINDINGS.md:258`), so payloads are chunked or summarized, never raw
    scrollback.
 2. **Core → engine:** how a TS core issues commands (pty spawn/write/resize/
-   kill, tab ops) to a native extension is the open spike question. The fixed
-   routed-op vocabulary (`files/fetch/spawn/store/...`) cannot express PTY
-   lifecycle. Candidate answers live in the fork's bridge/extension layers
-   (`src/extensions/`, `src/runtime/builtin_bridge.zig`); if none reaches a TS
-   core, this requires a fork contribution — same review bar as `cell_grid`.
+   kill, tab ops) to a native extension is now settled: `Cmd.host` /
+   `Cmd.request` ride `TsUiApp.CoreOptions.host_calls`, whose public
+   `HostCallBinding` is synchronous-or-async and answers requests through the
+   ordinary effect result path. Cockpit exposes one versioned intent command
+   and one snapshot request rather than mirroring every native operation into
+   the interface. The SDK-generated runner does not expose that option to an
+   app, so the fork needs one narrow native-extension hook to configure
+   `CoreOptions`, configure the composed view/chrome options, and decorate the
+   resulting `native_sdk.App` with Cockpit's event/focus host.
 3. **Terminal pixels:** two candidates, decide by measurement not taste:
    - Keep native painting of grids into the chrome display list (today's path)
      and let markup own only the interactive chrome around it.
