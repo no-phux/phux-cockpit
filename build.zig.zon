@@ -151,9 +151,12 @@
         //   hands the engine to each instance as a module.
         // - Comptime markup diagnostics name the markup again instead of
         //   failing on Zig 0.16's refusal to discard an error value.
+        // - Split widgets carry an axis through layout, pointer drag, keyboard
+        //   steps, resize cursor, paint, and accessibility while preserving
+        //   horizontal as the source-compatible default.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/7e783da8df366aa3a89de72287d2c6c81121355c.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQvwwsgLU5tfq3ymTRoyx9vSyB6vHqHRqeihyppxJ",
+            .url = "https://github.com/phall1/native/archive/4ab1ad084a38ba1d6e6ee3a8ed5e96177dcb59fd.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQgtjsgJho9BSrIbo_BevDDmDAVuMOTardBRCXlEE",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream

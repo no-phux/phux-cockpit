@@ -46,7 +46,6 @@ const cockpitTokens = projection.cockpitTokens;
 const terminalTokens = projection.terminalTokens;
 const chromeRevealed = projection.chromeRevealed;
 const workspaceChrome = projection.workspaceChrome;
-const resolvePanes = projection.resolvePanes;
 const terminalNeedsAttention = projection.terminalNeedsAttention;
 const paneLifecycleFailed = projection.paneLifecycleFailed;
 
@@ -1089,7 +1088,7 @@ fn paintLinkTargetPreview(
 /// A single pane's interaction surface. No pane header: Ghostty has none,
 /// and the 24pt `TERMINAL 2 / PHUX / RUNNING` strip cost every split pane a
 /// row of grid for information the tab strip already carries.
-fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, node: layout.NodeId, terminal_ref: TerminalRef, rect: geometry.RectF) TerminalUi.Node {
+fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, node: layout.NodeId, terminal_ref: TerminalRef) TerminalUi.Node {
     const pane = model.provider.terminalConst(terminal_ref);
     const screen = if (pane) |local|
         local.session.screenText()
@@ -1103,7 +1102,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, n
             .global_key = .{ .index = terminalPaintIndex(model, terminal_ref) },
             .grow = 1,
             .min_width = split_pane_min_width,
-            .height = rect.height,
+            .min_height = split_pane_min_height,
             .opacity = 0,
             .text = screen,
             .on_press = .{ .focus_pane = node },
@@ -1126,7 +1125,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, n
         .global_key = .{ .index = @intCast(@intFromEnum(local_id.?)) },
         .grow = 1,
         .min_width = split_pane_min_width,
-        .height = rect.height,
+        .min_height = split_pane_min_height,
         .opacity = 0,
         .text = screen,
         .on_press = .{ .focus_pane = node },
@@ -1149,7 +1148,7 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, n
     return ui.el(.stack, .{
         .grow = 1,
         .min_width = split_pane_min_width,
-        .height = rect.height,
+        .min_height = split_pane_min_height,
     }, .{
         surface,
         ui.column(.{ .grow = 1, .main = .center, .cross = .center, .gap = projection.chrome_gap }, .{
@@ -1168,49 +1167,44 @@ fn terminalSurface(ui: *TerminalUi, model: *const Model, ws: *const Workspace, n
     });
 }
 
-/// The widget tree for a subtree, laid out on EXACTLY the rects
-/// `layout.splitRect` resolves — the same primitive `resolvePanes` walks.
-///
-/// A horizontal branch becomes an SDK `.split`, whose own fraction clamp is
-/// the same formula (`splitFractionBounds` == `layout.effectiveFraction` for
-/// equal minimums), so it keeps a real draggable divider. A vertical branch
-/// becomes a column with explicit child heights, because the SDK's splitter
-/// is horizontal-only.
-fn paneSubtree(ui: *TerminalUi, model: *const Model, ws: *const Workspace, node: layout.NodeId, rect: geometry.RectF) TerminalUi.Node {
+/// Build the interaction tree from the leaves already selected by
+/// `layout.resolve()`. The SDK splitter consumes the same model fraction and
+/// minimums for either axis; the view does not call `splitRect` or introduce
+/// another geometry derivation.
+fn paneSubtree(
+    ui: *TerminalUi,
+    model: *const Model,
+    ws: *const Workspace,
+    node: layout.NodeId,
+    resolved: []const layout.Pane,
+) TerminalUi.Node {
     const current = ws.selectedTreeConst() orelse return emptyStatusNode(ui);
     const entry = current.node(node);
     switch (entry.kind) {
         .free => return emptyStatusNode(ui),
         .leaf => {
             const terminal_ref = entry.terminal orelse return emptyStatusNode(ui);
-            return terminalSurface(ui, model, ws, node, terminal_ref, rect);
+            for (resolved) |pane| {
+                if (pane.node == node) return terminalSurface(ui, model, ws, node, terminal_ref);
+            }
+            return emptyStatusNode(ui);
         },
         .branch => {
-            const halves = layout.splitRect(
-                rect,
-                entry.orientation,
-                entry.fraction,
-                split_divider_width,
-                split_pane_min_width,
-                split_pane_min_height,
-            );
-            const first = paneSubtree(ui, model, ws, entry.first, halves[0]);
-            const second = paneSubtree(ui, model, ws, entry.second, halves[1]);
-            return switch (entry.orientation) {
-                .horizontal => ui.split(.{
-                    .grow = 1,
-                    .height = rect.height,
-                    .gap = split_divider_width,
-                    .value = entry.fraction,
-                    .on_resize = split_resize_handlers[node],
-                    .semantics = .{ .label = "Terminal split" },
-                }, .{ first, second }),
-                .vertical => ui.column(.{
-                    .grow = 1,
-                    .height = rect.height,
-                    .gap = split_divider_width,
-                }, .{ first, second }),
-            };
+            const first = paneSubtree(ui, model, ws, entry.first, resolved);
+            const second = paneSubtree(ui, model, ws, entry.second, resolved);
+            return ui.split(.{
+                .split_axis = switch (entry.orientation) {
+                    .horizontal => .horizontal,
+                    .vertical => .vertical,
+                },
+                .grow = 1,
+                .min_width = split_pane_min_width,
+                .min_height = split_pane_min_height,
+                .gap = split_divider_width,
+                .value = entry.fraction,
+                .on_resize = split_resize_handlers[node],
+                .semantics = .{ .label = "Terminal split" },
+            }, .{ first, second });
         },
     }
 }
@@ -2025,7 +2019,9 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
     // would have the last window rebuilt win the argument about where the one
     // webview lives.
     const content = if (ws.selectedTreeConst()) |current| blk: {
-        const panes = paneSubtree(ui, model, ws, current.root, chrome.content);
+        var resolved: [layout.max_panes]layout.Pane = undefined;
+        const resolved_count = projection.resolvePanesIn(model, ws, ws.surface_size, &resolved);
+        const panes = paneSubtree(ui, model, ws, current.root, resolved[0..resolved_count]);
         if (!is_main) break :blk panes;
         // Parking the webview at a one-point anchor preserves its native
         // page state without allowing it to cover or receive input over a

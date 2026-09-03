@@ -411,6 +411,99 @@ test "split divider drag and keyboard resize stay in lockstep with the painted r
         try testing.expectApproxEqAbs(pane.rect.width, laid_out.width, 0.25);
     }
 }
+// GUARD: vertical-divider-parity
+test "vertical divider drag keyboard accessibility and child rectangles share resolved geometry" {
+    const gpa = testing.allocator;
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = surface });
+    defer harness.destroy(gpa);
+    const app_state = try startFocusedTerminal(gpa, harness);
+    defer gpa.destroy(app_state);
+    defer destroyModelSessions(&app_state.model);
+    defer app_state.deinit();
+    const app_iface = app_state.app();
+
+    try app_state.dispatch(&harness.runtime, 1, .split_down);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+    const branch = app_state.model.ws().tabs[0].root;
+
+    var divider: ?native_sdk.canvas.WidgetLayoutNode = null;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind == .split_divider) divider = node;
+    }
+    const initial_divider = divider orelse return error.TestExpectedSplitDivider;
+    try testing.expectEqual(native_sdk.canvas.SplitAxis.vertical, initial_divider.widget.runtime_flags.split_axis);
+    const content = app.workspaceChrome(&app_state.model, surface).content;
+    try testing.expectApproxEqAbs(content.x, initial_divider.frame.x, 0.25);
+    try testing.expectApproxEqAbs(content.width, initial_divider.frame.width, 0.25);
+    try testing.expectApproxEqAbs(app.split_divider_width, initial_divider.frame.height, 0.25);
+
+    const target = rectCenter(initial_divider.frame);
+    try clickCanvas(harness, app_iface, target.x, target.y);
+    try testing.expectEqual(initial_divider.widget.id, harness.runtime.views[0].canvas_widget_focused_id);
+    const before_key = app_state.model.ws().tabs[0].node(branch).fraction;
+    try pressCanvasKey(harness, app_iface, "arrowdown", .{});
+    try testing.expect(app_state.model.ws().tabs[0].node(branch).fraction > before_key);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    divider = null;
+    for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+        if (node.widget.kind == .split_divider) divider = node;
+    }
+    const drag_start = rectCenter((divider orelse return error.TestExpectedSplitDivider).frame);
+    const before_drag = app_state.model.ws().tabs[0].node(branch).fraction;
+    for ([_]native_sdk.platform.GpuSurfaceInputKind{ .pointer_down, .pointer_drag, .pointer_up }, [_]f32{ 0, 60, 60 }) |kind, dy| {
+        try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
+            .window_id = 1,
+            .label = app.canvas_label,
+            .kind = kind,
+            .x = drag_start.x,
+            .y = drag_start.y + dy,
+        } });
+    }
+    try testing.expect(app_state.model.ws().tabs[0].node(branch).fraction > before_drag);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    const before_accessibility = app_state.model.ws().tabs[0].node(branch).fraction;
+    _ = try harness.runtime.dispatchCanvasWidgetAccessibilityAction(app_iface, 1, app.canvas_label, .{
+        .id = initial_divider.widget.id,
+        .action = .decrement,
+    });
+    try testing.expect(app_state.model.ws().tabs[0].node(branch).fraction < before_accessibility);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
+
+    const snapshot = harness.runtime.automationSnapshot("Vertical split");
+    var saw_adjustable_separator = false;
+    for (snapshot.widgets) |widget| {
+        if (widget.id != initial_divider.widget.id) continue;
+        try testing.expectEqualStrings("separator", widget.role);
+        try testing.expect(widget.actions.focus);
+        try testing.expect(widget.actions.increment);
+        try testing.expect(widget.actions.decrement);
+        try testing.expectApproxEqAbs(app_state.model.ws().tabs[0].node(branch).fraction, widget.value.?, 0.0001);
+        saw_adjustable_separator = true;
+    }
+    try testing.expect(saw_adjustable_separator);
+
+    // Painter/input leaves are built from the same `layout.resolve()` result.
+    var panes: [app.max_panes_per_tab]app.LayoutPane = undefined;
+    const count = app.resolvePanes(&app_state.model, surface, &panes);
+    try testing.expectEqual(@as(usize, 2), count);
+    for (panes[0..count]) |pane| {
+        const widget_id = native_sdk.canvas.globalWidgetId(.terminal, .{
+            .index = @intCast(@intFromEnum(app.localId(pane.terminal).?)),
+        });
+        var laid_out: ?geometry.RectF = null;
+        for (harness.runtime.views[0].widgetLayoutTree().nodes) |node| {
+            if (node.widget.id == widget_id) laid_out = node.frame;
+        }
+        const rect = laid_out orelse return error.TestExpectedTerminalInteractionSurface;
+        try testing.expectApproxEqAbs(pane.rect.x, rect.x, 0.25);
+        try testing.expectApproxEqAbs(pane.rect.y, rect.y, 0.25);
+        try testing.expectApproxEqAbs(pane.rect.width, rect.width, 0.25);
+        try testing.expectApproxEqAbs(pane.rect.height, rect.height, 0.25);
+    }
+}
+
 
 test "split PTY grids preserve each pane's full bounded viewport" {
     const gpa = testing.allocator;
