@@ -11,7 +11,7 @@ on:
         type: string
     secrets:
       HOMEBREW_TAP_DEPLOY_KEY:
-        required: true
+        required: false
       MACOS_CERTIFICATE:
         required: false
       MACOS_CERTIFICATE_PASSWORD:
@@ -185,15 +185,6 @@ jobs:
             --cycles 10 \
             --artifacts zig-out/soak-release
 
-      - name: Require Homebrew tap deploy key
-        env:
-          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-        run: |
-          if [[ -z "$DEPLOY_KEY" ]]; then
-            echo "::error::HOMEBREW_TAP_DEPLOY_KEY must target phall1/homebrew-tap with write access."
-            exit 1
-          fi
-
       - name: Attach and verify release assets
         id: assets
         env:
@@ -208,21 +199,20 @@ jobs:
           existing_assets="$(gh release view "${RELEASE_TAG}" \
             --json assets --jq '.assets[].name' | LC_ALL=C sort)"
           release_was_draft="$(gh release view "${RELEASE_TAG}" --json isDraft --jq .isDraft)"
+          uploaded_this_run=false
 
           if [[ "${release_was_draft}" == "true" ]]; then
-            while IFS= read -r asset; do
-              [[ -z "${asset}" ]] && continue
-              if ! grep -Fxq "${asset}" <<< "${expected_assets}"; then
-                printf 'error: draft release %s has unexpected asset %s\n' \
-                  "${RELEASE_TAG}" "${asset}" >&2
-                exit 1
-              fi
-            done <<< "${existing_assets}"
-            gh release upload "${RELEASE_TAG}" \
-              "zig-out/release/${archive}" \
-              "zig-out/release/${image}" \
-              zig-out/release/SHA256SUMS \
-              --clobber
+            if [[ -z "${existing_assets}" ]]; then
+              gh release upload "${RELEASE_TAG}" \
+                "zig-out/release/${archive}" \
+                "zig-out/release/${image}" \
+                zig-out/release/SHA256SUMS
+              uploaded_this_run=true
+            elif [[ "${existing_assets}" != "${expected_assets}" ]]; then
+              printf 'error: draft release %s has a partial or unexpected asset set; refusing to mutate it\n' "${RELEASE_TAG}" >&2
+              printf 'expected:\n%s\nfound:\n%s\n' "${expected_assets}" "${existing_assets}" >&2
+              exit 1
+            fi
           elif [[ "${existing_assets}" != "${expected_assets}" ]]; then
             printf 'error: published release %s has a partial or unexpected asset set\n' "${RELEASE_TAG}" >&2
             printf 'expected:\n%s\nfound:\n%s\n' "${expected_assets}" "${existing_assets}" >&2
@@ -242,7 +232,7 @@ jobs:
             --pattern "${archive}" \
             --pattern "${image}" \
             --pattern SHA256SUMS
-          if [[ "${release_was_draft}" == "true" ]]; then
+          if [[ "${uploaded_this_run}" == "true" ]]; then
             cmp "zig-out/release/${archive}" "${existing}/${archive}"
             cmp "zig-out/release/${image}" "${existing}/${image}"
             cmp zig-out/release/SHA256SUMS "${existing}/SHA256SUMS"
@@ -299,6 +289,51 @@ jobs:
             echo "draft=${release_was_draft}"
           } >> "${GITHUB_OUTPUT}"
 
+      # A keyless replay deliberately reaches this gate only after the draft
+      # owns the exact, re-downloaded, verified asset set. Keep publication
+      # after the gate so the expected fallback failure cannot expose a release
+      # whose tap update cannot run.
+      - name: Require Homebrew tap deploy key before publication
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DEPLOY_KEY}" ]]; then
+            echo "::error::KEYLESS_RELEASE_STOP: verified assets remain attached to draft ${RELEASE_TAG}; HOMEBREW_TAP_DEPLOY_KEY is required before publication and the Homebrew update."
+            exit 1
+          fi
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: phall1/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Update Homebrew tap before publication
+        env:
+          NOTARIZED: ${{ steps.assets.outputs.notarized }}
+        run: |
+          set -euo pipefail
+          TAG="$RELEASE_TAG"
+          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
+          version="${BASH_REMATCH[1]}"
+          archive="phux-cockpit-$version-macos-arm64.zip"
+          expected="$(awk -v file="$archive" '$2 == file { print $1 }' zig-out/release/SHA256SUMS)"
+          actual="$(shasum -a 256 "zig-out/release/$archive" | cut -d ' ' -f 1)"
+          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$actual" == "$expected" ]]
+          cd tap
+          bash .github/scripts/gen-phux-cockpit-cask.sh "$TAG" "$actual" "$NOTARIZED" Casks/phux-cockpit.rb
+          ruby -c Casks/phux-cockpit.rb
+          intended_cask_blob="$(git hash-object Casks/phux-cockpit.rb)"
+          bash .github/scripts/commit-update.sh Casks/phux-cockpit.rb "Brew cask update for Phux Cockpit $TAG"
+          git fetch origin main
+          remote_cask_blob="$(git rev-parse origin/main:Casks/phux-cockpit.rb)"
+          if ! [[ "${remote_cask_blob}" == "${intended_cask_blob}" ]]; then
+            printf 'error: pushed Homebrew cask does not match origin/main; refusing to publish release\n' >&2
+            exit 1
+          fi
+
       - name: Record signing status and publish verified draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -339,30 +374,6 @@ jobs:
           if [[ "${WAS_DRAFT}" == "true" ]]; then
             gh release edit "${RELEASE_TAG}" --draft=false
           fi
-
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          repository: phall1/homebrew-tap
-          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
-          path: tap
-
-      - name: Update Homebrew tap
-        env:
-          NOTARIZED: ${{ steps.assets.outputs.notarized }}
-        run: |
-          set -euo pipefail
-          TAG="$RELEASE_TAG"
-          [[ "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]
-          version="${BASH_REMATCH[1]}"
-          archive="phux-cockpit-$version-macos-arm64.zip"
-          expected="$(awk -v file="$archive" '$2 == file { print $1 }' zig-out/release/SHA256SUMS)"
-          actual="$(shasum -a 256 "zig-out/release/$archive" | cut -d ' ' -f 1)"
-          [[ "$expected" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$actual" == "$expected" ]]
-          cd tap
-          bash .github/scripts/gen-phux-cockpit-cask.sh "$TAG" "$actual" "$NOTARIZED" Casks/phux-cockpit.rb
-          ruby -c Casks/phux-cockpit.rb
-          bash .github/scripts/commit-update.sh Casks/phux-cockpit.rb "Brew cask update for Phux Cockpit $TAG"
 
       - name: Remove temporary signing credentials
         if: always()
