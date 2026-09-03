@@ -21,6 +21,10 @@ const layout = @import("../layout.zig");
 const grid = @import("../../terminal/grid.zig");
 const vt = @import("ghostty-vt");
 const terminal_runtime = @import("../terminal_runtime.zig");
+const pointer_input = @import("../pointer_input.zig");
+const update_module = @import("../update.zig");
+const provider_contract = @import("provider_contract");
+const local = @import("../../providers/local/provider.zig");
 const projection = @import("workspace_projection.zig");
 const view = @import("view.zig");
 const protocol = @import("ts_protocol.zig");
@@ -29,6 +33,8 @@ const theme_module = @import("../../config/theme.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
+const platform = native_sdk.platform;
+const keyIs = terminal_runtime.keyIs;
 const Model = model_module.Model;
 const TerminalRef = support.TerminalRef;
 const max_terminals = model_module.max_terminals;
@@ -44,7 +50,16 @@ pub const NoShells = struct {
     }
     pub fn ptyResize(_: *const NoShells, _: u64, _: u16, _: u16) void {}
     pub fn ptyKill(_: *const NoShells, _: u64) void {}
+    pub fn showNotification(_: *const NoShells, _: anytype) void {}
+    pub fn writeClipboard(_: *const NoShells, _: anytype) void {}
+    pub fn readClipboard(_: *const NoShells, _: anytype) void {}
+    pub fn openUrl(_: *const NoShells, _: []const u8) void {}
 };
+
+/// Where a clipboard read is going once it lands, mirroring update.zig's
+/// `paste_target`: into the focused pane as a bracketed paste, or into the
+/// open search needle.
+const PasteTarget = enum { pane, search_needle };
 
 /// Snapshot flag bit reserved for the engine: the last intent was refused
 /// because it named a revision the engine had already moved past (or could
@@ -65,6 +80,17 @@ pub const Engine = struct {
     last_run: ts_snapshot.TabRun = .{},
     /// The config file's state as of the last `probe_config` intent.
     config_probe: ts_snapshot.ConfigProbe = .{},
+    /// The pane a clipboard read was requested for, resolved when the result
+    /// lands; the model's own paste flags carry the rest.
+    paste_ref: ?TerminalRef = null,
+    paste_target: PasteTarget = .pane,
+    /// Click coalescing for raw surface input, which carries no click count
+    /// of its own: a down within the double-click window and radius of the
+    /// last one counts up, the way the routed widget path counts for the
+    /// Zig chrome.
+    last_down_ns: u64 = 0,
+    last_down_point: geometry.PointF = .{},
+    last_click_count: u8 = 0,
 
     /// The model is multi-MB and lives on the heap for the process lifetime;
     /// `gpa` sizes the emulator sessions the provider mints, `io` is what the
@@ -220,8 +246,19 @@ pub const Engine = struct {
                 pane.phase = .live;
                 pane.output_batches += 1;
                 pane.output_bytes += event.bytes.len;
+                const protocol_before = pane.mouse_protocol_fingerprint;
+                // Read BEFORE the feed: the notification fires on the latch's
+                // rising edge, and after the feed a fresh bell and a standing
+                // one look the same.
+                const bell_before = pane.bellRung();
                 terminal_runtime.feedOutput(pane, fx, event.bytes);
+                pointer_input.syncMouseProtocol(pane);
+                if (protocol_before != 0 and protocol_before != pane.mouse_protocol_fingerprint) {
+                    pointer_input.endMismatchedMouseCaptures(self.model, fx, pane);
+                }
                 pane.session.refreshScreenText();
+                self.notifyBackgroundBell(fx, pane, bell_before);
+                if (pane.selecting and !pane.session.rebaseSelection()) pane.selecting = false;
                 terminal_runtime.flushOutbound(pane, fx);
                 terminal_runtime.moveResponsesToOutbound(pane, fx);
             },
@@ -239,19 +276,293 @@ pub const Engine = struct {
 
     // ------------------------------------------------------------- input
 
-    /// A key that no chrome widget claimed goes to the focused pane's
-    /// emulator encoder, which is the only thing that knows the live modes
-    /// (kitty event reporting, application cursor keys) the bytes depend on.
+    /// A key that no chrome widget claimed, the way update.zig's handleKey
+    /// treats the terminal block: the search field first, then the app's own
+    /// chords (find, select, copy, paste, select all), and everything else to
+    /// the focused pane's emulator encoder, which alone knows the live modes
+    /// the bytes depend on. Releases only ever reach the encoder.
     pub fn onKey(self: *Engine, fx: anytype, event: canvas.WidgetKeyboardEvent) void {
         const pane = self.focusedPane() orelse return;
-        const action: vt.input.KeyAction = if (event.phase == .key_up) .release else .press;
-        terminal_runtime.encodeKeyEvent(pane, fx, event, action);
+        if (event.phase == .key_up) {
+            terminal_runtime.encodeKeyEvent(pane, fx, event, .release);
+            return;
+        }
+        const mods = event.modifiers;
+        const primary = mods.hasCommandModifier();
+        if (pane.session.search.open) {
+            self.searchKey(fx, pane, event);
+            return;
+        }
+        if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "f")) {
+            if (pane.selecting) {
+                pane.selecting = false;
+                pane.session.clearSelection();
+            }
+            pane.session.searchOpen();
+            return;
+        }
+        if (primary and !mods.alt and !mods.control and keyIs(event.key, "g")) {
+            _ = pane.session.searchStep(!mods.shift);
+            return;
+        }
+        if (primary and mods.shift and keyIs(event.key, "space")) {
+            if (pane.selecting) {
+                pane.selecting = false;
+                pane.session.clearSelection();
+            } else {
+                pane.selecting = true;
+                pane.session.beginSelection(false);
+            }
+            return;
+        }
+        if (primary and keyIs(event.key, "c") and (pane.selecting or pane.session.selectionActive())) {
+            self.copySelection(fx, pane);
+            return;
+        }
+        if (primary and keyIs(event.key, "v")) {
+            self.requestPaste(fx, pane, .pane);
+            return;
+        }
+        if (primary and !mods.shift and !mods.alt and !mods.control and keyIs(event.key, "a")) {
+            if (pane.session.selectAllHistory()) pane.selecting = false;
+            return;
+        }
+        terminal_runtime.encodeKeyEvent(pane, fx, event, .press);
     }
 
+    /// update.zig's handleSearchKey: the field owns Escape, Enter and
+    /// Backspace; paste goes into the needle; copy still copies.
+    fn searchKey(self: *Engine, fx: anytype, pane: *model_module.Pane, event: canvas.WidgetKeyboardEvent) void {
+        const primary = event.modifiers.hasCommandModifier();
+        if (primary and keyIs(event.key, "v")) {
+            self.requestPaste(fx, pane, .search_needle);
+            return;
+        }
+        if (primary and keyIs(event.key, "c") and (pane.selecting or pane.session.selectionActive())) {
+            self.copySelection(fx, pane);
+            return;
+        }
+        if (keyIs(event.key, "escape")) {
+            pane.session.searchClose();
+            return;
+        }
+        if (keyIs(event.key, "enter") or keyIs(event.key, "return")) {
+            _ = pane.session.searchStep(!event.modifiers.shift);
+            return;
+        }
+        if (keyIs(event.key, "backspace") or keyIs(event.key, "delete")) {
+            _ = pane.session.searchBackspace();
+            return;
+        }
+    }
+
+    /// Committed text: into an open search needle, else into the shell the
+    /// way update.zig's .text arm sends it (never over a keyboard selection,
+    /// never into an ended shell, always after scrolling to the bottom).
     pub fn onText(self: *Engine, fx: anytype, event: canvas.WidgetKeyboardEvent) void {
         const pane = self.focusedPane() orelse return;
         if (event.text.len == 0) return;
+        if (pane.session.search.open) {
+            _ = pane.session.searchInput(event.text);
+            return;
+        }
+        if (pane.selecting or !pane.acceptsInput()) return;
+        if (pane.session.selectionActive()) pane.session.clearSelection();
+        pane.session.scrollToBottom();
         terminal_runtime.sendCommittedText(pane, fx, event.text);
+    }
+
+    // -------------------------------------------------------- clipboard
+
+    /// update.zig's copySelection for a local pane. The effects wrapper the
+    /// graph hands in supplies the result constructor; the answer lands in
+    /// `onClipboardWritten`.
+    fn copySelection(self: *Engine, fx: anytype, pane: *model_module.Pane) void {
+        const model = self.model;
+        if (model.copy_inflight) return;
+        pane.copy_failed = false;
+        const text = (pane.session.selectionText(pane.session.gpa) catch {
+            pane.copy_failed = true;
+            pane.copied_bytes = 0;
+            return;
+        }) orelse {
+            if (pane.session.selectionActive()) {
+                pane.copy_failed = true;
+                pane.copied_bytes = 0;
+            }
+            return;
+        };
+        defer pane.session.gpa.free(text);
+        pane.copied_bytes = text.len;
+        model.copy_inflight = true;
+        fx.writeClipboard(.{ .key = local.clipboard_key, .text = text });
+    }
+
+    /// The clipboard write's answer (update.zig's .clipboard arm): a
+    /// successful copy keeps the range highlighted and ends keyboard
+    /// selection; a failed one says so on the pane.
+    pub fn onClipboardWritten(self: *Engine, ok: bool) void {
+        const model = self.model;
+        if (!model.copy_inflight) return;
+        model.copy_inflight = false;
+        const pane = self.focusedPane() orelse return;
+        if (ok) {
+            pane.selecting = false;
+        } else {
+            pane.copied_bytes = 0;
+            pane.copy_failed = true;
+        }
+    }
+
+    fn requestPaste(self: *Engine, fx: anytype, pane: *model_module.Pane, target: PasteTarget) void {
+        const model = self.model;
+        if (model.paste_inflight) return;
+        if (target == .pane and !pane.acceptsInput()) {
+            model.paste_failed = true;
+            return;
+        }
+        model.paste_inflight = true;
+        self.paste_ref = pane.id;
+        self.paste_target = target;
+        fx.readClipboard(.{ .key = local.paste_clipboard_key });
+    }
+
+    /// The clipboard read's answer (update.zig's .paste_clipboard arm): into
+    /// the needle if that is where it was aimed, else a bracketed paste into
+    /// the pane it was requested for, never a different one.
+    pub fn onClipboardRead(self: *Engine, fx: anytype, ok: bool, text: []const u8) void {
+        const model = self.model;
+        if (!model.paste_inflight) return;
+        model.paste_inflight = false;
+        const ref = self.paste_ref orelse return;
+        self.paste_ref = null;
+        if (!ok) {
+            model.paste_failed = true;
+            return;
+        }
+        const pane = model.provider.terminal(ref) orelse return;
+        if (self.paste_target == .search_needle) {
+            model.paste_failed = !pane.session.searchPaste(text);
+            return;
+        }
+        if (!pane.acceptsInput()) {
+            model.paste_failed = true;
+            return;
+        }
+        model.paste_failed = false;
+        update_module.pasteClipboardText(model, pane, fx, text);
+    }
+
+    // ---------------------------------------------------------- pointer
+
+    /// Route one raw surface pointer event into the pane under it, the way
+    /// CockpitHost routes the widget-routed one: a new down supersedes this
+    /// pointer's old capture, a move/up/cancel follows its capture wherever
+    /// the pointer went, a hover or wheel goes to the pane under the point.
+    /// Returns whether a terminal took it; chrome is never under a pane's
+    /// frame, and the caller keeps overlays out.
+    pub fn onPointer(self: *Engine, fx: anytype, raw: platform.GpuSurfaceInputEvent) bool {
+        const model = self.model;
+        const phase: canvas.WidgetPointerPhase = switch (raw.kind) {
+            .pointer_down => .down,
+            .pointer_up => .up,
+            .pointer_cancel => .cancel,
+            .pointer_move => .hover,
+            .pointer_drag => .move,
+            .scroll => .wheel,
+            else => return false,
+        };
+        const point = geometry.PointF.init(raw.x, raw.y);
+        if (phase == .down) {
+            if (pointer_input.pointerCaptureFor(model, raw.window_id, raw.pointer_id)) |previous| {
+                pointer_input.handleTerminalPointer(model, fx, .{
+                    .window_id = previous.window_id,
+                    .terminal_id = previous.terminal_id,
+                    .generation = previous.generation,
+                    .phase = .cancel,
+                    .pointer_id = previous.pointer_id,
+                    .button = previous.button,
+                    .point = previous.last_point,
+                    .frame = previous.frame,
+                    .modifiers = previous.modifiers,
+                });
+            }
+        }
+        const capture = switch (phase) {
+            .move, .up, .cancel => pointer_input.pointerCaptureFor(model, raw.window_id, raw.pointer_id),
+            .hover, .down, .wheel => null,
+        };
+        var terminal_id: support.LocalTerminalId = undefined;
+        var generation: u64 = 0;
+        var frame: geometry.RectF = .{};
+        if (capture) |owned| {
+            terminal_id = owned.terminal_id;
+            generation = owned.generation;
+            frame = pointer_input.paneFrameForTerminal(model, support.localRef(owned.terminal_id)) orelse owned.frame;
+        } else {
+            if (phase == .move or phase == .up or phase == .cancel) return false;
+            const ref = pointer_input.terminalRefAtPoint(model, raw.x, raw.y) orelse return false;
+            const pane = model.provider.terminal(ref) orelse return false;
+            terminal_id = provider_contract.localId(ref) orelse return false;
+            generation = pane.session_generation;
+            frame = pointer_input.paneFrameForTerminal(model, ref) orelse return false;
+        }
+        pointer_input.handleTerminalPointer(model, fx, .{
+            .window_id = raw.window_id,
+            .terminal_id = terminal_id,
+            .generation = generation,
+            .phase = phase,
+            .pointer_id = raw.pointer_id,
+            .button = raw.button,
+            .click_count = self.clickCount(phase, point, raw.timestamp_ns),
+            .point = point,
+            .frame = frame,
+            .delta = geometry.OffsetF.init(raw.delta_x, raw.delta_y),
+            .modifiers = .{
+                .shift = raw.modifiers.shift,
+                .control = raw.modifiers.control,
+                .alt = raw.modifiers.option,
+                .super = raw.modifiers.command,
+            },
+        });
+        return true;
+    }
+
+    const double_click_window_ns: u64 = 400 * std.time.ns_per_ms;
+    const double_click_radius: f32 = 4;
+
+    fn clickCount(self: *Engine, phase: canvas.WidgetPointerPhase, point: geometry.PointF, now_ns: u64) u8 {
+        if (phase != .down) return @max(1, self.last_click_count);
+        const near = @abs(point.x - self.last_down_point.x) <= double_click_radius and
+            @abs(point.y - self.last_down_point.y) <= double_click_radius;
+        const soon = now_ns >= self.last_down_ns and now_ns - self.last_down_ns <= double_click_window_ns;
+        self.last_click_count = if (near and soon and self.last_click_count < 3) self.last_click_count + 1 else 1;
+        self.last_down_ns = now_ns;
+        self.last_down_point = point;
+        return self.last_click_count;
+    }
+
+    // ------------------------------------------------------------ focus
+
+    /// update.zig's .focus_changed arm: blur strands every held key and
+    /// pointer capture, and a bell that rings while unfocused notifies.
+    pub fn setFocused(self: *Engine, fx: anytype, focused: bool) void {
+        const model = self.model;
+        if (model.focused == focused) return;
+        model.focused = focused;
+        if (!focused) pointer_input.endAllCaptures(model, fx);
+    }
+
+    /// update.zig's notifyBackgroundBell: the rising edge of a bell while
+    /// the app is in the background reaches the person who is not looking.
+    fn notifyBackgroundBell(self: *Engine, fx: anytype, pane: *const model_module.Pane, rang_before: bool) void {
+        const model = self.model;
+        if (model.focused) return;
+        if (rang_before or !pane.bellRung()) return;
+        var title_storage: [projection.max_terminal_title_bytes]u8 = undefined;
+        const title = projection.terminalTitleInto(model, pane.id, &title_storage);
+        if (!model.recordNotification(title)) return;
+        fx.showNotification(.{ .title = title, .subtitle = "Phux Cockpit", .body = "Terminal bell" });
     }
 
     fn focusedPane(self: *Engine) ?*model_module.Pane {
@@ -355,3 +666,10 @@ pub const Engine = struct {
         return protocol.encodeInvalidation(self.sequence, self.revision);
     }
 };
+
+/// The focused pane's frame in surface points, for tests that aim raw input
+/// at the grid; null before a frame has sized the surface.
+pub fn pointerFrame(engine: *const Engine) ?geometry.RectF {
+    const ref = engine.model.focusedTerminalRef() orelse return null;
+    return pointer_input.paneFrameForTerminal(engine.model, ref);
+}

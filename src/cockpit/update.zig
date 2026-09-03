@@ -1746,7 +1746,9 @@ fn requestPaste(model: *Model, fx: *Fx, terminal_ref: TerminalRef) void {
 /// clipboard result is dispatch scratch, so the mutable staging buffer
 /// also gives `encodePaste` room to normalize newlines and replace unsafe
 /// control bytes before the result returns.
-fn pasteClipboardText(model: *Model, pane: *Pane, fx: *Fx, text: []const u8) void {
+/// Generic over the effects type for the same reason terminal_runtime.zig is:
+/// the TypeScript-core graph delivers a paste through its adapter's effects.
+pub fn pasteClipboardText(model: *Model, pane: *Pane, fx: anytype, text: []const u8) void {
     const fence_bytes = "\x1b[200~".len;
     const staging = pane.session.gpa.alloc(u8, text.len + fence_bytes * 2) catch {
         model.paste_failed = true;

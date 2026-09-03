@@ -27,8 +27,18 @@ through a `set_theme` intent (the engine writes the config and reports a
 refusal), reveals the config file, and probes the file once on opening
 (`probe_config`), never per frame. Escape, the arrows and Enter reach the
 overlays through the extension's key fallback while they own the keyboard.
-Not yet moved: scrollback search, selection, mouse protocols, bells, and
-secondary windows. The shipping graph remains the Zig core.
+The native behaviours are the engine's too: raw surface pointer input over
+a pane's frame routes through the shipping `pointer_input.handleTerminalPointer`
+(selection, mouse reporting, wheel scrollback, link hover and open), with the
+same capture rules CockpitHost applies; cmd+F search, cmd+C copy, cmd+V
+paste (bracketed, or into the needle), cmd+A and the keyboard-selection
+chord mirror `update.zig`'s terminal block; a bell while the app is
+deactivated notifies on its rising edge; a mouse-protocol flip ends
+mismatched captures. `pointer_input.zig` and `pasteClipboardText` are generic
+over the effects type for the same reason `terminal_runtime.zig` is. Not yet
+moved: secondary windows, the selection autoscroll timer, Finder drops, and
+the working directory in the switcher. The shipping graph remains the Zig
+core.
 
 Building the spike needs the SDK package's TypeScript toolchain, which the
 tarball pin does not carry. Once per pin, on the package `zig build` resolved:

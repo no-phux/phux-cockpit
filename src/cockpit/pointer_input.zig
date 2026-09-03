@@ -261,7 +261,7 @@ pub fn clearHoverLinks(model: *Model) void {
     }
 }
 
-pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent) void {
+pub fn handleTerminalPointer(model: *Model, fx: anytype, event: TerminalPointerEvent) void {
     switch (event.phase) {
         .down => {
             // A second down for the same physical pointer terminates its old
@@ -467,7 +467,7 @@ pub fn handleTerminalPointer(model: *Model, fx: *Fx, event: TerminalPointerEvent
     }
 }
 
-fn endPointerCapture(model: *Model, fx: *Fx, index: usize, cancelled: bool) void {
+fn endPointerCapture(model: *Model, fx: anytype, index: usize, cancelled: bool) void {
     if (index >= model.pointer_captures.len or !model.pointer_captures[index].active) return;
     const capture = model.pointer_captures[index];
     model.pointer_captures[index].active = false;
@@ -488,7 +488,7 @@ fn endPointerCapture(model: *Model, fx: *Fx, index: usize, cancelled: bool) void
     }
 }
 
-pub fn endCapturesForTerminal(model: *Model, fx: *Fx, id: TerminalRef) void {
+pub fn endCapturesForTerminal(model: *Model, fx: anytype, id: TerminalRef) void {
     const local = provider_contract.localId(id) orelse return;
     for (0..model.pointer_captures.len) |index| {
         if (model.pointer_captures[index].active and model.pointer_captures[index].terminal_id == local) {
@@ -497,7 +497,7 @@ pub fn endCapturesForTerminal(model: *Model, fx: *Fx, id: TerminalRef) void {
     }
 }
 
-pub fn endMismatchedMouseCaptures(model: *Model, fx: *Fx, pane: *Pane) void {
+pub fn endMismatchedMouseCaptures(model: *Model, fx: anytype, pane: *Pane) void {
     for (0..model.pointer_captures.len) |index| {
         const capture = model.pointer_captures[index];
         if (capture.active and capture.mode == .mouse_report and
@@ -509,11 +509,11 @@ pub fn endMismatchedMouseCaptures(model: *Model, fx: *Fx, pane: *Pane) void {
     }
 }
 
-pub fn endAllCaptures(model: *Model, fx: *Fx) void {
+pub fn endAllCaptures(model: *Model, fx: anytype) void {
     for (0..model.pointer_captures.len) |index| endPointerCapture(model, fx, index, true);
 }
 
-pub fn endHiddenCaptures(model: *Model, fx: *Fx) void {
+pub fn endHiddenCaptures(model: *Model, fx: anytype) void {
     for (0..model.pointer_captures.len) |index| {
         if (model.pointer_captures[index].active and !terminalVisible(model, localRef(model.pointer_captures[index].terminal_id))) {
             endPointerCapture(model, fx, index, true);
@@ -531,7 +531,7 @@ pub fn modelHasSelectionAutoscroll(model: *const Model) bool {
     return false;
 }
 
-pub fn handleSelectionAutoscroll(model: *Model, fx: *Fx) void {
+pub fn handleSelectionAutoscroll(model: *Model, fx: anytype) void {
     for (0..model.pointer_captures.len) |index| {
         const capture = model.pointer_captures[index];
         if (!capture.active or capture.mode != .local_selection) continue;
@@ -570,7 +570,7 @@ fn terminalMouseButton(button: i32) ?vt.input.MouseButton {
 fn encodeMouseReport(
     model: *const Model,
     pane: *Pane,
-    fx: *Fx,
+    fx: anytype,
     action: vt.input.MouseAction,
     button: ?vt.input.MouseButton,
     local: geometry.PointF,
@@ -690,7 +690,7 @@ fn accumulateWheel(accum: *f32, delta: f32, quantum_value: f32) void {
 fn flushMouseWheelOnce(
     model: *const Model,
     pane: *Pane,
-    fx: *Fx,
+    fx: anytype,
     accum: *f32,
     positive: vt.input.MouseButton,
     negative: vt.input.MouseButton,
@@ -713,7 +713,7 @@ fn flushMouseWheelOnce(
 fn flushMouseWheels(
     model: *const Model,
     pane: *Pane,
-    fx: *Fx,
+    fx: anytype,
     cell: grid.CellBox,
     local: geometry.PointF,
     frame: geometry.RectF,
