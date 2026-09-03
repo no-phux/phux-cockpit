@@ -2170,6 +2170,12 @@ pub fn buildChromeWindow(model: *const Model, builder: *canvas.Builder, context:
     return paintWindow(model, builder, window_index, context.size, context.tokens);
 }
 
+/// The same, addressed by index for a host whose ChromeContext is another
+/// app type's (the TypeScript-core graph paints through its adapter's).
+pub fn paintWindowIndex(model: *const Model, builder: *canvas.Builder, window_index: usize, size: geometry.SizeF, tokens: canvas.DesignTokens, _: native_sdk.platform.WindowId) anyerror!void {
+    return paintWindow(model, builder, window_index, size, tokens);
+}
+
 /// The main window's chrome through the legacy single-window seam. Kept so
 /// the tests that paint one window directly keep a stable entry point, and so
 /// an `Options.chrome.build` fallback still produces the right pixels.

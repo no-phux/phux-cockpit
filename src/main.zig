@@ -306,6 +306,7 @@ pub const tabPlacementFromText = view_module.tabPlacementFromText;
 pub const onTimer = view_module.onTimer;
 pub const CockpitHost = host.CockpitHost;
 pub const encodeTsSnapshot = ts_snapshot.encode;
+pub const TsTabRun = ts_snapshot.TabRun;
 pub const ts_snapshot_max_bytes = ts_snapshot.max_bytes;
 
 pub const selection_autoscroll_timer_id = app_types.selection_autoscroll_timer_id;

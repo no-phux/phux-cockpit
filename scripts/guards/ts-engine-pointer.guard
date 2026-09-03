@@ -4,18 +4,18 @@
 # can be selected with the mouse in this graph. The break stops the wrapping
 # host from routing it.
 test: a drag across the grid through the raw surface input selects text
-red: 2026-09-02 at 7ddd450
+red: 2026-09-02 at d7dc724
 build: test -Dtypescript-spike=true -Dplatform=null
 diff --git a/typescript-spike/src/native_extension.zig b/typescript-spike/src/native_extension.zig
-index e974fe2..f1d20ed 100644
+index 1d58c65..19a490e 100644
 --- a/typescript-spike/src/native_extension.zig
 +++ b/typescript-spike/src/native_extension.zig
-@@ -387,7 +387,7 @@ fn routePointer(value: native_sdk.Event) void {
-     if (!std.mem.eql(u8, raw.label, canvas_label)) return;
-     const engine = bridge.engine orelse return;
-     const fx = engineFx() orelse return;
--    _ = engine.onPointer(fx, raw);
-+    if (false) _ = engine.onPointer(fx, raw);
- }
- 
- var pointer_host = PointerHost{};
+@@ -409,7 +409,7 @@ fn routePointer(value: native_sdk.Event) void {
+             // before the pane under it is resolved, as CockpitHost adopts
+             // the routed event's window.
+             engine.model.active_window = index;
+-            _ = engine.onPointer(fx, raw);
++            if (false) _ = engine.onPointer(fx, raw);
+         },
+         else => {},
+     }

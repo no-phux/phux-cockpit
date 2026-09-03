@@ -28,6 +28,13 @@ pub const IntentKind = enum(u8) {
     /// once, when the settings surface opens: a probe touches the disk, and
     /// a snapshot must not.
     probe_config = 7,
+    /// A new window with one shell, as cmd+N; `window` is ignored.
+    new_window = 8,
+    /// Close window `window` whole, as the OS close button; every tab's
+    /// shells go with it.
+    close_window = 9,
+    /// Make window `window` the active one, as the OS focus did.
+    focus_window = 10,
 };
 
 pub const invalidation_len: usize = 18;
@@ -38,12 +45,16 @@ pub const Invalidation = struct {
     revision: u64,
 };
 
-pub const intent_len: usize = 11;
+pub const intent_len: usize = 12;
 
+/// `window` addresses the window an intent means (0 is the main window);
+/// a tab intent from a secondary window's chrome names that window so it
+/// cannot land on whichever window happened to be active.
 pub const Intent = struct {
     kind: IntentKind,
     expected_revision: u64,
     argument: u8,
+    window: u8 = 0,
 };
 
 pub fn encodeInvalidation(sequence: u64, revision: u64) [invalidation_len]u8 {
@@ -77,6 +88,7 @@ pub fn encodeIntent(value: Intent) [intent_len]u8 {
     out[1] = @intFromEnum(value.kind);
     std.mem.writeInt(u64, out[2..10], value.expected_revision, .little);
     out[10] = value.argument;
+    out[11] = value.window;
     return out;
 }
 
@@ -90,12 +102,16 @@ pub fn decodeIntent(bytes: []const u8) ?Intent {
         5 => .set_theme,
         6 => .reveal_config,
         7 => .probe_config,
+        8 => .new_window,
+        9 => .close_window,
+        10 => .focus_window,
         else => return null,
     };
     return .{
         .kind = kind,
         .expected_revision = std.mem.readInt(u64, bytes[2..10], .little),
         .argument = bytes[10],
+        .window = bytes[11],
     };
 }
 
@@ -134,17 +150,19 @@ test "TypeScript intents fence positional arguments with the engine revision" {
         .kind = .close_tab,
         .expected_revision = 0x8877_6655_4433_2211,
         .argument = 14,
+        .window = 2,
     };
     const bytes = encodeIntent(value);
     try std.testing.expectEqualSlices(u8, &.{
         version, 3,
         0x11,    0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-        14,
+        14,      2,
     }, &bytes);
     const decoded = decodeIntent(&bytes).?;
     try std.testing.expectEqual(value.kind, decoded.kind);
     try std.testing.expectEqual(value.expected_revision, decoded.expected_revision);
     try std.testing.expectEqual(value.argument, decoded.argument);
+    try std.testing.expectEqual(value.window, decoded.window);
 
     var unknown = bytes;
     unknown[1] = 255;

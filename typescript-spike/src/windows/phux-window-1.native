@@ -1,0 +1,2 @@
+<import src="components/cockpit-window.native"/>
+<use template="cockpit-window" tabs="{window1Tabs}" width="{window1TabWidth}" more="{window1HasOverflow}" cue="{window1OverflowLabel}" />

@@ -19,6 +19,7 @@
         </tabs>
         <button size="sm" variant="ghost" icon="search" label="Command palette" on-press="palette_open" />
         <button size="sm" variant="ghost" icon="plus" label="New terminal" on-press="new_terminal" />
+        <button size="sm" variant="ghost" icon="external-link" label="New window" on-press="new_window" />
         <button size="sm" variant="ghost" icon="settings" label="Settings" on-press="settings_open" />
       </row>
       <spacer grow="1" />

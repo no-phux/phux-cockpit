@@ -281,6 +281,7 @@ fn onFrame(_: *const core.Model, frame: native_sdk.platform.GpuFrame) ?core.Msg 
     const engine = bridge.engine orelse return null;
     const fx = engineFx() orelse return null;
     bridge.spawnShells(engine, fx);
+    // Every window's frame pumps its own workspace; the label says which.
     engine.pumpViewports(fx, frame);
     // A frame that moved the run (a resize, the first frame after a
     // placement flip) is announced like an intent: the core's chrome is
@@ -295,6 +296,16 @@ fn paintChrome(model: *const core.Model, builder: *canvas.Builder, size: native_
     const engine = bridge.engine orelse return;
     engine.model.tab_placement = if (model.tabPlacement == .side) .side else .top;
     return engine.paint(builder, size, tokens);
+}
+
+/// The per-window painter the runtime prefers when it is set: it alone says
+/// WHICH window is being painted, and for an app whose terminals are chrome
+/// commands the difference is a second window full of live cells versus a
+/// tab strip over an empty canvas (the same note as the Zig app's).
+fn paintChromeWindow(model: *const core.Model, builder: *canvas.Builder, context: Adapter.App.ChromeContext) anyerror!void {
+    if (context.is_main) return paintChrome(model, builder, context.size, context.tokens);
+    const engine = bridge.engine orelse return;
+    return engine.paintWindow(builder, context.canvas_label, context.window_id, context.size, context.tokens);
 }
 
 fn installEngine(options: *Adapter.CoreOptions, gpa: std.mem.Allocator, io: std.Io) void {
@@ -312,6 +323,7 @@ fn configureOptionsValue(options: *Adapter.Options) void {
         .prefix_commands = cockpit.projection.chrome_command_envelope,
         .variable_prefix = true,
         .build = paintChrome,
+        .build_window = paintChromeWindow,
     };
     options.on_key = onKey;
     options.key_release_events = true;
@@ -375,19 +387,32 @@ const PointerHost = struct {
 };
 
 fn routePointer(value: native_sdk.Event) void {
-    const raw = switch (value) {
-        .gpu_surface_input => |raw| raw,
-        else => return,
-    };
-    switch (raw.kind) {
-        .pointer_down, .pointer_up, .pointer_cancel, .pointer_move, .pointer_drag, .scroll => {},
-        else => return,
-    }
-    if (overlay_open) return;
-    if (!std.mem.eql(u8, raw.label, canvas_label)) return;
     const engine = bridge.engine orelse return;
     const fx = engineFx() orelse return;
-    _ = engine.onPointer(fx, raw);
+    switch (value) {
+        // A routed key names the window it was typed in: adopt it before the
+        // key fallback resolves the focused pane, as CockpitHost adopts a
+        // routed event's window. The raw echo is left to the pointer kinds.
+        .canvas_widget_keyboard => |routed| {
+            const index = Engine.windowIndexForCanvas(routed.view_label) orelse return;
+            if (engine.model.windowOpen(index)) engine.model.active_window = index;
+        },
+        .gpu_surface_input => |raw| {
+            switch (raw.kind) {
+                .pointer_down, .pointer_up, .pointer_cancel, .pointer_move, .pointer_drag, .scroll => {},
+                else => return,
+            }
+            const index = Engine.windowIndexForCanvas(raw.label) orelse return;
+            if (index == 0 and overlay_open) return;
+            if (!engine.model.windowOpen(index)) return;
+            // A press in any window's grid makes that window the active one
+            // before the pane under it is resolved, as CockpitHost adopts
+            // the routed event's window.
+            engine.model.active_window = index;
+            _ = engine.onPointer(fx, raw);
+        },
+        else => {},
+    }
 }
 
 var pointer_host = PointerHost{};
@@ -411,6 +436,27 @@ const test_windows = [_]native_sdk.ShellWindow{.{
 }};
 const test_scene: native_sdk.ShellConfig = .{ .windows = &test_windows };
 
+/// What the generated runner's src/windows registry does, for the rig: each
+/// declared window label builds its own compiled markup over the core model.
+const window_sources = [_]canvas.ui_markup.SourceFile{
+    .{ .path = "components/cockpit-window.native", .source = @embedFile("windows/components/cockpit-window.native") },
+    .{ .path = "phux-window-1.native", .source = @embedFile("windows/phux-window-1.native") },
+    .{ .path = "phux-window-2.native", .source = @embedFile("windows/phux-window-2.native") },
+    .{ .path = "phux-window-3.native", .source = @embedFile("windows/phux-window-3.native") },
+    .{ .path = "phux-window-4.native", .source = @embedFile("windows/phux-window-4.native") },
+};
+const WindowView1 = canvas.CompiledMarkupImports(core.Model, core.Msg, "phux-window-1.native", &window_sources);
+const WindowView2 = canvas.CompiledMarkupImports(core.Model, core.Msg, "phux-window-2.native", &window_sources);
+const WindowView3 = canvas.CompiledMarkupImports(core.Model, core.Msg, "phux-window-3.native", &window_sources);
+const WindowView4 = canvas.CompiledMarkupImports(core.Model, core.Msg, "phux-window-4.native", &window_sources);
+
+fn testWindowView(ui: *Adapter.Ui, model: *const core.Model, label: []const u8) Adapter.Ui.Node {
+    if (std.mem.eql(u8, label, "phux-window-1")) return WindowView1.build(ui, model);
+    if (std.mem.eql(u8, label, "phux-window-2")) return WindowView2.build(ui, model);
+    if (std.mem.eql(u8, label, "phux-window-3")) return WindowView3.build(ui, model);
+    return WindowView4.build(ui, model);
+}
+
 const Rig = struct {
     app_state: *Adapter.App,
     decorated: native_sdk.App,
@@ -427,6 +473,10 @@ const Rig = struct {
             .scene = test_scene,
             .canvas_label = canvas_label,
             .markup = .{ .source = @embedFile("app.native") },
+            .window_view = testWindowView,
+            // The generated runner wires the core's exported commandMsg; a
+            // quit-close window command must map through it.
+            .on_command = core.commandMsg,
         };
         configureOptionsValue(&options);
         const app_state = try Adapter.create(std.heap.page_allocator, core_options, options);
@@ -1008,4 +1058,39 @@ test "a drag across the grid through the raw surface input selects text" {
     try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{ .window_id = 1, .label = canvas_label, .kind = .pointer_drag, .x = frame.x + 160, .y = y, .timestamp_ns = 2 } });
     try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{ .window_id = 1, .label = canvas_label, .kind = .pointer_up, .x = frame.x + 160, .y = y, .timestamp_ns = 3 } });
     try std.testing.expect(pane.session.selectionActive());
+}
+
+// GUARD: ts-engine-windows
+test "a new window opens a second workspace with its own shell and closes whole through the seam" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+    // windows(model) builds its descriptors in the frame arena it is handed.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const frame = arena.allocator();
+
+    var before = rig.app_state.model.engineSequence.lo;
+    try rig.dispatch(.new_window);
+    try rig.settle(before + 1, "READY");
+    try std.testing.expect(engine.model.windowOpen(1));
+    try std.testing.expectEqual(@as(usize, 1), engine.model.wsAtConst(1).?.tab_count);
+    try std.testing.expect(rig.app_state.model.window1Open);
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.model.window1Tabs.len);
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.model.windows(frame).len);
+    // The main window's own list is untouched by the second window's tab.
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.model.tabs.len);
+
+    // A tab intent from the second window's chrome names that window.
+    try std.testing.expectEqual(@as(i64, 32), rig.app_state.model.window1Tabs[0].slot);
+
+    // The OS close button arrives as the declared command; the engine
+    // retires the slot and its shell, and the descriptor goes with it.
+    before = rig.app_state.model.engineSequence.lo;
+    try rig.dispatch(.{ .window_closed = 1 });
+    try rig.settle(before + 1, "READY");
+    try std.testing.expect(!engine.model.windowOpen(1));
+    try std.testing.expect(!rig.app_state.model.window1Open);
+    try std.testing.expectEqual(@as(usize, 0), rig.app_state.model.windows(frame).len);
 }

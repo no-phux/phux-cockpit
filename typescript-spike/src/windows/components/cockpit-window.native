@@ -1,0 +1,25 @@
+<template name="cockpit-window" args="tabs width more cue">
+  <stack>
+    <column>
+      <row height="50" padding="4" gap="4" cross="center" background="surface">
+        <spacer width="78" window-drag="true" />
+        <tabs grow="1" gap="4" label="Terminal tabs">
+          <for each="tabs" key="id" as="tab">
+            <toggle-button
+              size="sm"
+              icon="terminal"
+              width="{width}"
+              selected="{tab.selected}"
+              on-toggle="select_slot:{tab.slot}"
+            >{tab.title}</toggle-button>
+          </for>
+          <if test="{more}">
+            <text width="32" label="Tabs not shown">{cue}</text>
+          </if>
+        </tabs>
+        <button size="sm" variant="ghost" icon="plus" label="New window" on-press="new_window" />
+      </row>
+      <spacer grow="1" />
+    </column>
+  </stack>
+</template>

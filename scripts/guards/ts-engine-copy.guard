@@ -4,7 +4,7 @@
 # drops the copy chord from the key block, so the keystroke falls through to
 # the encoder and the selection never leaves the pane.
 test: select all and cmd+C put the scrollback on the clipboard through the seam
-red: 2026-09-02 at 7ddd450
+red: 2026-09-02 at d7dc724
 build: test -Dtypescript-spike=true -Dplatform=null
 diff --git a/src/cockpit/native/ts_engine.zig b/src/cockpit/native/ts_engine.zig
 index c5489f5..496fd8f 100644

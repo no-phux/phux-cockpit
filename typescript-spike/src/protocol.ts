@@ -28,6 +28,17 @@ export interface ThemeEntry {
   readonly name: Uint8Array;
 }
 
+/// One open secondary window's section: which slot, its tabs, selection
+/// and run. Presence is liveness.
+export interface SecondaryWindow {
+  readonly index: number;
+  readonly selectedTab: number;
+  readonly runStart: number;
+  readonly runCount: number;
+  readonly tabWidth: number;
+  readonly tabs: readonly SnapshotTab[];
+}
+
 export interface EngineSnapshot extends Invalidation {
   readonly activeWindow: number;
   readonly tabPlacement: number;
@@ -48,6 +59,7 @@ export interface EngineSnapshot extends Invalidation {
   readonly configWritable: boolean;
   readonly configProbed: boolean;
   readonly configPath: Uint8Array;
+  readonly secondary: readonly SecondaryWindow[];
 }
 
 function readU32(bytes: Uint8Array, at: number): number {
@@ -82,26 +94,16 @@ export function invalidation(bytes: Uint8Array): Invalidation | null {
   return { sequence: readU64(bytes, 2), revision: readU64(bytes, 10) };
 }
 
-export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
-  if (bytes.length < 28) return null;
-  if (bytes[0] !== PROTOCOL_VERSION || bytes[1] !== SNAPSHOT) return null;
-  const count = bytes[20];
-  const selected = bytes[21];
-  // ScriptC proves every integer slot ahead of time: a byte read past the
-  // end is NaN in TypeScript, so each value is fenced with an ordered
-  // comparison before it may enter the model. The bounds are the wire's own
-  // (u8 count, u32 id), not guesses.
-  if (!(count >= 0 && count <= 255)) return null;
-  if (!(selected >= 0 && selected <= 255)) return null;
-  if (selected >= count && count !== 0) return null;
-  const runStart = bytes[24];
-  const runCount = bytes[25];
-  const tabWidth = bytes[26] + bytes[27] * 256;
-  if (!(runStart >= 0 && runStart <= 255) || !(runCount >= 0 && runCount <= 255)) return null;
-  if (!(tabWidth >= 0 && tabWidth <= 65535)) return null;
-  if (runStart + runCount > count) return null;
+interface TabRecords {
+  readonly tabs: readonly SnapshotTab[];
+  readonly at: number;
+}
+
+/// `count` tab records from `start`: id, attention, bounded title. Shared by
+/// the main section and every secondary window's.
+function readTabs(bytes: Uint8Array, start: number, count: number, selected: number): TabRecords | null {
   const tabs: SnapshotTab[] = [];
-  let at = 28;
+  let at = start;
   for (let index = 0; index < count; index += 1) {
     if (!(index >= 0 && index <= 255)) return null;
     if (at + 6 > bytes.length) return null;
@@ -120,6 +122,31 @@ export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
     });
     at += 6 + titleLength;
   }
+  return { tabs, at };
+}
+
+export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
+  if (bytes.length < 28) return null;
+  if (bytes[0] !== PROTOCOL_VERSION || bytes[1] !== SNAPSHOT) return null;
+  const count = bytes[20];
+  const selected = bytes[21];
+  // ScriptC proves every integer slot ahead of time: a byte read past the
+  // end is NaN in TypeScript, so each value is fenced with an ordered
+  // comparison before it may enter the model. The bounds are the wire's own
+  // (u8 count, u32 id), not guesses.
+  if (!(count >= 0 && count <= 255)) return null;
+  if (!(selected >= 0 && selected <= 255)) return null;
+  if (selected >= count && count !== 0) return null;
+  const runStart = bytes[24];
+  const runCount = bytes[25];
+  const tabWidth = bytes[26] + bytes[27] * 256;
+  if (!(runStart >= 0 && runStart <= 255) || !(runCount >= 0 && runCount <= 255)) return null;
+  if (!(tabWidth >= 0 && tabWidth <= 65535)) return null;
+  if (runStart + runCount > count) return null;
+  const main = readTabs(bytes, 28, count, selected);
+  if (main === null) return null;
+  const tabs = main.tabs;
+  let at = main.at;
   // The settings trailer.
   if (at + 1 > bytes.length) return null;
   const themeCount = bytes[at];
@@ -144,8 +171,32 @@ export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
   if (!(pathLength >= 0 && pathLength <= 255) || at + 1 + pathLength > bytes.length) return null;
   const configPath = bytes.subarray(at + 1, at + 1 + pathLength);
   at += 1 + pathLength;
+  // The secondary window sections.
+  if (at + 1 > bytes.length) return null;
+  const secondaryCount = bytes[at];
+  if (!(secondaryCount >= 0 && secondaryCount <= 4)) return null;
+  at += 1;
+  const secondary: SecondaryWindow[] = [];
+  for (let slot = 0; slot < secondaryCount; slot += 1) {
+    if (at + 7 > bytes.length) return null;
+    const index = bytes[at];
+    const tabCount = bytes[at + 1];
+    const selectedIn = bytes[at + 2];
+    const runStart = bytes[at + 3];
+    const runCount = bytes[at + 4];
+    const tabWidth = bytes[at + 5] + bytes[at + 6] * 256;
+    if (!(index >= 1 && index <= 4) || !(tabCount >= 0 && tabCount <= 255) || !(selectedIn >= 0 && selectedIn <= 255)) return null;
+    if (!(runStart >= 0 && runStart <= 255) || !(runCount >= 0 && runCount <= 255) || !(tabWidth >= 0 && tabWidth <= 65535)) return null;
+    if (selectedIn >= tabCount && tabCount !== 0) return null;
+    if (runStart + runCount > tabCount) return null;
+    const section = readTabs(bytes, at + 7, tabCount, selectedIn);
+    if (section === null) return null;
+    secondary.push({ index, selectedTab: selectedIn, runStart, runCount, tabWidth, tabs: section.tabs });
+    at = section.at;
+  }
   if (at !== bytes.length) return null;
   return {
+    secondary,
     themes,
     activeTheme,
     configEnabled: (configFlags & 1) !== 0,
@@ -174,12 +225,13 @@ function writeU32(bytes: Uint8Array, at: number, input: number): void {
   bytes[at + 3] = Math.floor(value / 16777216) % 256;
 }
 
-export function intent(kind: number, expectedRevision: WireU64, argument: number): Uint8Array {
-  const bytes = new Uint8Array(11);
-  bytes[0] = PROTOCOL_VERSION;
-  bytes[1] = kind;
-  writeU32(bytes, 2, expectedRevision.lo);
-  writeU32(bytes, 6, expectedRevision.hi);
-  bytes[10] = argument;
-  return bytes;
+export function intent(kind: number, revision: WireU64, argument: number, window: number): Uint8Array {
+  const out = new Uint8Array(12);
+  out[0] = PROTOCOL_VERSION;
+  out[1] = kind;
+  writeU32(out, 2, revision.lo);
+  writeU32(out, 6, revision.hi);
+  out[10] = argument;
+  out[11] = window;
+  return out;
 }
