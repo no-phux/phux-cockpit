@@ -379,6 +379,9 @@ pub const Palette = struct {
     /// what row 0 means on every keystroke, and an index into the unfiltered
     /// list would silently point at a row the user cannot see.
     cursor: usize = 0,
+    /// The stable identity carried by the row currently highlighted. `cursor`
+    /// is only navigation geometry; activation never resolves through it.
+    highlighted: ?PaletteDestination = null,
 
     pub fn needle(palette: *const Palette) []const u8 {
         return palette.query[0..palette.query_len];
@@ -388,6 +391,7 @@ pub const Palette = struct {
         palette.open = false;
         palette.query_len = 0;
         palette.cursor = 0;
+        palette.highlighted = null;
     }
 
     /// Append typed text, dropping anything past the buffer rather than

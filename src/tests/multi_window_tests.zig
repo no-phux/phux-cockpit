@@ -108,8 +108,10 @@ test "the working-set palette selects and raises a destination in another window
     const shows_before = state.effects.window_action_state.show_count;
 
     // OPEN destinations are projected across windows in window/tab order, so
-    // the first unfiltered row is the primary window's terminal.
-    app.update(&state.model, .palette_commit, &state.effects);
+    // the first unfiltered row is the primary window's terminal. Activation
+    // carries the row's identity rather than resolving its position again.
+    const highlighted = second.palette.highlighted orelse return error.TestExpectedTerminal;
+    app.update(&state.model, .{ .palette_activate = highlighted }, &state.effects);
 
     try testing.expect(!second.palette.open);
     try testing.expectEqual(@as(usize, 0), state.model.active_window);
