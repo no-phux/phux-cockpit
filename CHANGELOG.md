@@ -3,6 +3,20 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0](https://github.com/no-phux/phux-cockpit/compare/v0.15.0...v0.16.0) (2026-09-03)
+
+
+### Features
+
+* **native:** add vertical divider parity ([#81](https://github.com/no-phux/phux-cockpit/issues/81)) ([0701685](https://github.com/no-phux/phux-cockpit/commit/0701685a416907459c5bd767e76a56430e43f99b))
+
+
+### Bug Fixes
+
+* **native:** schedule useful first frame before deferred work ([#82](https://github.com/no-phux/phux-cockpit/issues/82)) ([f182236](https://github.com/no-phux/phux-cockpit/commit/f182236e309e4510640a8193b23d2d0cf6427a37))
+* **release:** make keyless fallback preserve draft assets ([#80](https://github.com/no-phux/phux-cockpit/issues/80)) ([47d7c4e](https://github.com/no-phux/phux-cockpit/commit/47d7c4e64b55e0ed75b904617c41eec7c601c16d))
+* **switcher:** fence keyboard activation by stable id ([#78](https://github.com/no-phux/phux-cockpit/issues/78)) ([0fcad32](https://github.com/no-phux/phux-cockpit/commit/0fcad323e7414d4f0eba80a777b9b969d339b1b4))
+
 ## [0.15.0](https://github.com/no-phux/phux-cockpit/compare/v0.14.0...v0.15.0) (2026-09-03)
 
 
