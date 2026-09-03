@@ -3,6 +3,24 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0](https://github.com/no-phux/phux-cockpit/compare/v0.14.0...v0.15.0) (2026-09-03)
+
+
+### Features
+
+* **native:** give the TypeScript-core spike real shells and native pixels ([#71](https://github.com/no-phux/phux-cockpit/issues/71)) ([417dfa9](https://github.com/no-phux/phux-cockpit/commit/417dfa9128f464c6f47ff725c21a2f50c0d5d03c))
+* **native:** land the TypeScript core seam with a real engine behind it ([#68](https://github.com/no-phux/phux-cockpit/issues/68)) ([38e957a](https://github.com/no-phux/phux-cockpit/commit/38e957a1364511f1ae887e8f6dbc53f9fe86ba6b))
+* **native:** markup parity harness, engine-owned tab run, toolchain and paint baseline ([#72](https://github.com/no-phux/phux-cockpit/issues/72)) ([ff96a05](https://github.com/no-phux/phux-cockpit/commit/ff96a052985879f55263cdf6fea8e6c1702e85fd))
+* **native:** pointer, search, copy, paste and bells behind the TypeScript seam ([#75](https://github.com/no-phux/phux-cockpit/issues/75)) ([c2767bc](https://github.com/no-phux/phux-cockpit/commit/c2767bce9377028c20d8eb1d501714f270adaf90))
+* **native:** real switcher and settings surfaces in the TypeScript spike ([#74](https://github.com/no-phux/phux-cockpit/issues/74)) ([14f2978](https://github.com/no-phux/phux-cockpit/commit/14f297869349aaee10b0c241be53fb8364e64725))
+* **native:** secondary windows in the TypeScript-core spike ([#76](https://github.com/no-phux/phux-cockpit/issues/76)) ([09ddf91](https://github.com/no-phux/phux-cockpit/commit/09ddf916a0a6c86e71ed23f1fa14cefbed21d2d6))
+
+
+### Bug Fixes
+
+* **build:** install the TypeScript toolchain before the SDK's own check ([#73](https://github.com/no-phux/phux-cockpit/issues/73)) ([09fe43c](https://github.com/no-phux/phux-cockpit/commit/09fe43cf5fd0e9eb02ec3fb65905e793351bcaaf))
+* **phux:** pin durable late-server retry ([#77](https://github.com/no-phux/phux-cockpit/issues/77)) ([92be8e5](https://github.com/no-phux/phux-cockpit/commit/92be8e5f6fa1230dcf46f6456b3013fbbd60e323))
+
 ## [0.14.0](https://github.com/no-phux/phux-cockpit/compare/v0.13.1...v0.14.0) (2026-09-02)
 
 
