@@ -12,10 +12,16 @@ type). No terminal byte enters the compiled core: shell events are consumed in
 the pty event constructor and the core receives a void `engine_wake`. Guards
 under the extension prove boot, resync, the revision fence, key routing and
 shell ownership red-then-green (`zig build test -Dtypescript-spike=true
--Dplatform=null`). Not yet moved: scrollback search, selection, mouse
-protocols, bells, secondary windows, settings/palette contents (the spike's
-overlays are placeholders), and the parity harness of phase 2. The shipping
-graph remains the Zig core.
+-Dplatform=null`). The phase 2 parity harness exists: `ts-chrome-parity` solves the
+compiled `app.native` at every declared window size and density, in every
+chrome state the core can reach, and runs the toolkit's layout audit on it,
+driving the real core through the rig so there is one rule. It found two
+defects on its first run (an unbounded sixteen-tab run, and a drag row that
+pushed twenty drag regions at a sixteen-region platform table); the engine now
+owns the tab run through the shipping `visibleTabRun` projection and the
+snapshot carries it. Not yet moved: scrollback search, selection, mouse
+protocols, bells, secondary windows, and the settings/palette contents (the
+spike's overlays are placeholders). The shipping graph remains the Zig core.
 
 Building the spike needs the SDK package's TypeScript toolchain, which the
 tarball pin does not carry. Once per pin, on the package `zig build` resolved:

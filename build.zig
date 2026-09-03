@@ -56,7 +56,35 @@ fn addProviderContractModules(
 /// (exe, app tests, extension tests) as a module rooted at `src/ts_engine.zig`
 /// carrying the same imports the Zig app root gets — minus the Phux provider,
 /// which this graph never builds.
-fn addTsEngineModules(b: *std.Build, artifacts: native_sdk.AppArtifacts) void {
+/// The SDK package's TypeScript frontend needs its compiler (`scriptc`) under
+/// packages/core/node_modules, and the tarball pin does not carry it: every
+/// pin bump used to stop at "cannot resolve its TypeScript toolchain" until
+/// someone ran `npm ci` in a cache directory by hand. Install it once, at
+/// configure time, for the package this build actually resolved. The default
+/// and Phux graphs never reach this.
+fn ensureTsToolchain(b: *std.Build, dependency: *std.Build.Dependency) void {
+    const root = dependency.builder.build_root.path orelse return;
+    const core_dir = b.pathJoin(&.{ root, "packages", "core" });
+    const probe = b.pathJoin(&.{ core_dir, "node_modules", "scriptc", "dist", "main.js" });
+    if (std.Io.Dir.cwd().access(b.graph.io, probe, .{})) |_| {
+        return;
+    } else |_| {}
+    std.log.warn("typescript-spike: installing the SDK package's TypeScript toolchain once in {s}", .{core_dir});
+    const result = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ "npm", "ci", "--include=dev" },
+        .cwd = .{ .path = core_dir },
+    }) catch |err| {
+        std.log.err("typescript-spike: could not run npm ci in {s}: {s}. Install Node 24+ and run it by hand.", .{ core_dir, @errorName(err) });
+        return;
+    };
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.log.err("typescript-spike: npm ci failed in {s}:\n{s}", .{ core_dir, result.stderr });
+}
+
+fn addTsEngineModules(b: *std.Build, artifacts: native_sdk.AppArtifacts, measure: bool) void {
     const extension_tests = artifacts.extension_tests orelse
         @panic("native-sdk app graph did not expose the extension test artifact");
     const roots = [_]*std.Build.Module{
@@ -80,6 +108,8 @@ fn addTsEngineModules(b: *std.Build, artifacts: native_sdk.AppArtifacts) void {
         contract.addImport("native_sdk", sdk_module);
         const phux_options = b.addOptions();
         phux_options.addOption(bool, "enabled", false);
+        const test_options = b.addOptions();
+        test_options.addOption(bool, "measure", measure);
         const ghostty = b.dependency("ghostty", .{
             .target = target,
             .optimize = optimize,
@@ -95,6 +125,7 @@ fn addTsEngineModules(b: *std.Build, artifacts: native_sdk.AppArtifacts) void {
         engine.addImport("native_sdk", sdk_module);
         engine.addImport("provider_contract", contract);
         engine.addImport("phux_options", phux_options.createModule());
+        engine.addImport("test_options", test_options.createModule());
         engine.addImport("ghostty-vt", ghostty.module("ghostty-vt"));
         root.addImport("cockpit_engine", engine);
     }
@@ -579,7 +610,13 @@ pub fn build(b: *std.Build) void {
     if (app_module.resolved_target.?.result.os.tag != .macos)
         @panic("phux-cockpit supports macOS only");
     if (typescript_spike) {
-        addTsEngineModules(b, artifacts);
+        ensureTsToolchain(b, dependency);
+        const measure_spike = b.option(
+            bool,
+            "measure",
+            "Print MEASURED diagnostics from tests (see src/tests/measured.zig)",
+        ) orelse false;
+        addTsEngineModules(b, artifacts, measure_spike);
         return;
     }
 

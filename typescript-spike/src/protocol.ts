@@ -28,6 +28,11 @@ export interface EngineSnapshot extends Invalidation {
   readonly tabPlacement: number;
   readonly selectedTab: number;
   readonly flags: number;
+  /// The run the band has room for, by the engine's projection: the first
+  /// visible tab, how many, and the per-tab extent in points.
+  readonly runStart: number;
+  readonly runCount: number;
+  readonly tabWidth: number;
   readonly tabs: readonly SnapshotTab[];
 }
 
@@ -64,7 +69,7 @@ export function invalidation(bytes: Uint8Array): Invalidation | null {
 }
 
 export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
-  if (bytes.length < 24) return null;
+  if (bytes.length < 28) return null;
   if (bytes[0] !== PROTOCOL_VERSION || bytes[1] !== SNAPSHOT) return null;
   const count = bytes[20];
   const selected = bytes[21];
@@ -75,8 +80,14 @@ export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
   if (!(count >= 0 && count <= 255)) return null;
   if (!(selected >= 0 && selected <= 255)) return null;
   if (selected >= count && count !== 0) return null;
+  const runStart = bytes[24];
+  const runCount = bytes[25];
+  const tabWidth = bytes[26] + bytes[27] * 256;
+  if (!(runStart >= 0 && runStart <= 255) || !(runCount >= 0 && runCount <= 255)) return null;
+  if (!(tabWidth >= 0 && tabWidth <= 65535)) return null;
+  if (runStart + runCount > count) return null;
   const tabs: SnapshotTab[] = [];
-  let at = 24;
+  let at = 28;
   for (let index = 0; index < count; index += 1) {
     if (!(index >= 0 && index <= 255)) return null;
     if (at + 6 > bytes.length) return null;
@@ -103,6 +114,9 @@ export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
     tabPlacement: bytes[19],
     selectedTab: selected,
     flags: bytes[22],
+    runStart,
+    runCount,
+    tabWidth,
     tabs,
   };
 }

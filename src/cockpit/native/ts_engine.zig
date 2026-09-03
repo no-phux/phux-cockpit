@@ -57,6 +57,10 @@ pub const Engine = struct {
     /// The pty key each registry slot was last spawned for, so `spawnShells`
     /// is idempotent across frames and a reused slot spawns again.
     spawned_keys: [max_terminals]u64 = [_]u64{0} ** max_terminals,
+    /// The run the last snapshot carried. A frame that changes it (a resize,
+    /// a placement flip) is announced like an intent, because the core's
+    /// chrome is wrong until it resyncs.
+    last_run: ts_snapshot.TabRun = .{},
 
     /// The model is multi-MB and lives on the heap for the process lifetime;
     /// `gpa` sizes the emulator sessions the provider mints, `io` is what the
@@ -251,10 +255,58 @@ pub const Engine = struct {
         return true;
     }
 
-    pub fn snapshot(self: *const Engine, out: []u8) ts_snapshot.Error![]const u8 {
-        const bytes = ts_snapshot.encode(self.model, self.sequence, self.revision, out);
+    pub fn snapshot(self: *Engine, out: []u8) ts_snapshot.Error![]const u8 {
+        self.last_run = self.currentRun();
+        const bytes = ts_snapshot.encode(self.model, self.sequence, self.revision, self.last_run, out);
         if (self.intent_refused) out[22] |= intent_refused_flag;
         return bytes;
+    }
+
+    /// The tabs the band has room for, by the shipping projection's rule. The
+    /// strip hands `visibleTabRun` the width the markup leaves it: the surface
+    /// minus the traffic-light spacer and the row padding (app.native's own
+    /// numbers). The rail is rows of 32pt in the height its own furniture
+    /// leaves (an 8pt padding, a 40pt header, four 8pt gaps, three 28pt
+    /// rows), with a 40pt cue reserved once anything is hidden. Before the
+    /// first frame the surface is unknown and every tab is in the run.
+    pub fn currentRun(self: *const Engine) ts_snapshot.TabRun {
+        const workspace = self.model.wsConst();
+        const total = workspace.tab_count;
+        if (total == 0) return .{};
+        const size = workspace.surface_size;
+        if (size.width <= 0 or size.height <= 0) return .{ .first = 0, .count = @intCast(total), .extent = 168 };
+        if (self.model.tab_placement == .top) {
+            const run_width = projection.tabRunWidthIn(self.model, workspace, size.width - 78 - 8);
+            const window = projection.visibleTabRun(workspace, run_width);
+            return .{
+                .first = @intCast(window.first),
+                .count = @intCast(window.count),
+                .extent = @intFromFloat(@max(0, @min(65535, window.extent))),
+            };
+        }
+        const row: f32 = 32;
+        const furniture: f32 = 8 + 40 + 32 + 84;
+        const usable = @max(row, size.height - furniture);
+        var count: usize = @max(1, @as(usize, @intFromFloat(@floor(usable / row))));
+        if (count < total) {
+            const cued = @max(row, usable - 40);
+            count = @max(1, @as(usize, @intFromFloat(@floor(cued / row))));
+        }
+        count = @min(count, total);
+        const selected = @min(workspace.selected_tab, total - 1);
+        const first: usize = if (selected >= count) selected - count + 1 else 0;
+        return .{ .first = @intCast(first), .count = @intCast(count), .extent = 168 };
+    }
+
+    /// Re-derive the run after a frame; true when it moved, in which case
+    /// the caller announces so the core resyncs. Sequence advances then too:
+    /// it counts announcements, and this is one.
+    pub fn refreshRun(self: *Engine) bool {
+        const run = self.currentRun();
+        if (run.first == self.last_run.first and run.count == self.last_run.count and run.extent == self.last_run.extent) return false;
+        self.last_run = run;
+        self.sequence +%= 1;
+        return true;
     }
 
     pub fn invalidation(self: *const Engine) [protocol.invalidation_len]u8 {

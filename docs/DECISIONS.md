@@ -301,7 +301,15 @@ route cannot do is let markup lay out *around* the grids: the strip is 50pt and
 the rail 184pt on both sides of the seam by construction
 (`workspace_projection.zig`), not by the markup telling the painter.
 
-What would reopen it: a measured frame cost of the chrome prefix under the
-markup tree that a surface leaf would beat, or a chrome layout the fixed
-geometry cannot express.
+The baseline, measured 2026-09-02 on this machine by the extension's
+`MEASURED: the chrome-prefix paint of a full grid on the engine model` test
+(`zig build test -Dtypescript-spike=true -Dplatform=null -Dmeasure=true
+-Doptimize=ReleaseFast`): a full 80x24 grid at 1100x640, scale 2, paints as
+29 commands in 42 us per paint (472 us in the Debug test build). A surface leaf
+would have to rasterize the same grid, upload it, and composite it in less
+than that plus the display-list decode it saves, and it would do so without
+the incremental cell-patch path. That is the number to beat.
+
+What would reopen it: a measured leaf route under that figure, or a chrome
+layout the fixed geometry cannot express.
 
