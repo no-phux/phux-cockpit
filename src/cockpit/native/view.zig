@@ -2013,11 +2013,11 @@ pub fn viewWindow(ui: *TerminalUi, model: *const Model, window_index: usize) Ter
         // are cmd+1..cmd+N — the band is presentation, never the only path.
         else ui.el(.stack, .{ .height = 0, .semantics = .{ .hidden = true } }, .{});
 
-    // The WebKit surface is a scene-declared view of the MAIN window, so only
-    // the main window's tree carries its anchor. A secondary window paints its
-    // panes and nothing else — the alternative, an anchor in every window,
-    // would have the last window rebuilt win the argument about where the one
-    // webview lives.
+    // The WebKit surface is a dynamic child of the MAIN window's canvas, so
+    // only the main window's tree carries its anchor. A secondary window
+    // paints its panes and nothing else — the alternative, an anchor in every
+    // window, would have the last window rebuilt win the argument about where
+    // the one webview lives.
     const content = if (ws.selectedTreeConst()) |current| blk: {
         var resolved: [layout.max_panes]layout.Pane = undefined;
         const resolved_count = projection.resolvePanesIn(model, ws, ws.surface_size, &resolved);
@@ -2469,13 +2469,14 @@ pub fn onFrame(model: *const Model, frame: native_sdk.platform.GpuFrame) ?Msg {
 /// built into the scene's own canvas. Answering with it for every window made
 /// every secondary window's rebuild resolve the anchor against a widget tree
 /// that does not contain it, logging "no canvas widget carries semantics
-/// label ..." on every rebuild of every other window. The behaviour was always
-/// correct — the pane is found and snapped in the window that owns it — but
-/// the noise buried real warnings.
+/// label ..." on every rebuild of every other window.
 ///
-/// Zero is the right answer for a window that hosts no webview.
+/// It also answers zero until the host has materialized the parked child after
+/// the first nonblank canvas present. That keeps the initial UiApp rebuild from
+/// logging a missing scene WebView while, more importantly, keeping WebKit
+/// process startup off the launch-to-glass path.
 pub fn webPanes(model: *const Model, context: TerminalApp.ChromeContext, out: []TerminalApp.WebViewPane) usize {
-    if (!context.is_main) return 0;
+    if (!context.is_main or !model.webview_materialized) return 0;
     out[0] = .{
         .label = webview_label,
         .anchor = webview_anchor,

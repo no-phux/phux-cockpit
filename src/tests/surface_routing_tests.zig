@@ -199,6 +199,49 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
     host.inner.effects.executor = .fake;
     const app_iface = host.app();
     try harness.start(app_iface);
+    // Scene loading must not start WebKit ahead of the first useful canvas
+    // frame. The request event installs and presents the canvas; only its
+    // nonblank completion materializes the parked child view.
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.webview_count);
+    // The command can arrive before the first frame (global menu/shortcut
+    // delivery is already live). It selects Web without trying to focus a
+    // child that does not exist, so the callback remains healthy.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "surface.web",
+        .key = "b",
+        .window_id = 1,
+        .modifiers = .{ .primary = true, .shift = true },
+    } });
+    try testing.expect(host.inner.model.selectedSurface().eql(.web));
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.webview_count);
+    try releaseCanvasKey(harness, app_iface, "b", .{ .primary = true, .shift = true });
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = geometry.SizeF.init(980, 640),
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+    } });
+    try testing.expectEqual(@as(usize, 0), harness.null_platform.webview_count);
+    try testing.expectEqual(@as(usize, 1), harness.runtime.registeredCanvasFontCount());
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = geometry.SizeF.init(980, 640),
+        .scale_factor = 2,
+        .frame_index = 2,
+        .timestamp_ns = 2_000_000,
+        .nonblank = true,
+    } });
+    try testing.expectEqual(@as(usize, 1), harness.null_platform.webview_count);
+    try testing.expect(host.inner.model.webview_materialized);
+    try testing.expectEqual(@as(u8, 3), host.inner.model.deferred_font_count);
+    try testing.expectEqual(@as(usize, 4), harness.runtime.registeredCanvasFontCount());
+    var early_views_buffer: [4]native_sdk.ViewInfo = undefined;
+    var early_web_focused = false;
+    for (harness.runtime.listViews(1, &early_views_buffer)) |item| {
+        if (std.mem.eql(u8, item.label, app.webview_label)) early_web_focused = item.focused;
+    }
+    try testing.expect(early_web_focused);
     try host.inner.dispatch(&harness.runtime, 1, .new_terminal);
     try host.inner.dispatch(&harness.runtime, 1, .{ .select_position = 0 });
 
@@ -255,6 +298,87 @@ test "native tab shortcuts transfer first responder between canvas and WebKit" {
     try testing.expect(host.inner.model.selectedTerminalRef().?.eql(app.initialTerminalRef(1)));
 }
 
+test "post-present resource failure keeps the terminal alive and retries only on demand" {
+    const gpa = testing.allocator;
+    const size = geometry.SizeF.init(980, 640);
+    const harness = try native_sdk.TestHarness().create(gpa, .{ .size = size });
+    defer harness.destroy(gpa);
+    harness.null_platform.gpu_surfaces = true;
+    harness.runtime.options.security.navigation.allowed_origins = &app.web_origins;
+    harness.runtime.options.shortcuts = &app.cockpit_shortcuts;
+
+    const session = try createSession(80, 24);
+    const host = try gpa.create(app.CockpitHost);
+    defer gpa.destroy(host);
+    host.init(std.heap.page_allocator, app.initialModel(session), app.appOptions());
+    defer destroyModelSessions(&host.inner.model);
+    defer host.deinit();
+    host.inner.effects.executor = .fake;
+    const app_iface = host.app();
+    try harness.start(app_iface);
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = size,
+        .scale_factor = 2,
+        .frame_index = 1,
+        .timestamp_ns = 1_000_000,
+    } });
+
+    // Fill the bounded WebView table so Cockpit's dynamic create receives the
+    // real runtime refusal. The first post-present attempt must consume no
+    // future frame retries and must not escape the app callback.
+    var labels: [native_sdk.platform.max_webviews][32]u8 = undefined;
+    for (0..native_sdk.platform.max_webviews) |index| {
+        const label = try std.fmt.bufPrint(&labels[index], "occupied-{d}", .{index});
+        _ = try harness.runtime.createView(.{
+            .window_id = 1,
+            .label = label,
+            .kind = .webview,
+            .parent = app.canvas_label,
+            .frame = geometry.RectF.init(0, 0, 1, 1),
+            .layer = 20,
+            .url = app.BrowserPage.github.url(),
+        });
+    }
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = size,
+        .scale_factor = 2,
+        .frame_index = 2,
+        .timestamp_ns = 2_000_000,
+        .nonblank = true,
+    } });
+    try testing.expect(host.inner.model.post_present_resources_attempted);
+    try testing.expect(!host.inner.model.webview_materialized);
+    try testing.expect(host.inner.model.containsTerminal(app.initialTerminalRef(0)));
+
+    // Free capacity, then deliver another ordinary frame. Automatic retry
+    // would create immediately and become frame-spam; the view stays absent.
+    try harness.runtime.closeView(1, "occupied-0");
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
+        .label = app.canvas_label,
+        .size = size,
+        .scale_factor = 2,
+        .frame_index = 3,
+        .timestamp_ns = 3_000_000,
+        .nonblank = true,
+    } });
+    try testing.expect(!host.inner.model.webview_materialized);
+    try testing.expectEqual(native_sdk.platform.max_webviews - 1, harness.null_platform.webview_count);
+
+    // A later explicit Web request is the one bounded retry. It consumes the
+    // newly available slot and transfers focus without restarting the app.
+    try harness.runtime.dispatchPlatformEvent(app_iface, .{ .shortcut = .{
+        .id = "surface.web",
+        .key = "b",
+        .window_id = 1,
+        .modifiers = .{ .primary = true, .shift = true },
+    } });
+    try testing.expect(host.inner.model.selectedSurface().eql(.web));
+    try testing.expect(host.inner.model.webview_materialized);
+    try testing.expectEqual(native_sdk.platform.max_webviews, harness.null_platform.webview_count);
+}
+
 test "pointer tab actions return focus to terminal content and hand off WebKit" {
     const gpa = testing.allocator;
     const size = geometry.SizeF.init(980, 640);
@@ -280,6 +404,7 @@ test "pointer tab actions return focus to terminal content and hand off WebKit" 
         .frame_index = 1,
         .timestamp_ns = 1_000_000,
     } });
+    try app.installPostPresentResources(&harness.runtime, &host.inner.model, 1);
     // A second TAB is what makes the band appear at all. The band carries no
     // New/Close/Split/Side-tabs buttons any more — those are cmd+T, cmd+W,
     // cmd+D and a placement setting — so the strip is all there is to click.

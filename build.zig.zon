@@ -154,9 +154,14 @@
         // - Split widgets carry an axis through layout, pointer drag, keyboard
         //   steps, resize cursor, paint, and accessibility while preserving
         //   horizontal as the source-compatible default.
+        // - The runtime's existing scoped display-list refresh batch is public.
+        //   Cockpit uses `beginCanvasWidgetDisplayListRefreshBatch`/`end...`
+        //   only around the installing main-canvas event: display-list work and
+        //   presentation stay synchronous, while AppKit accessibility
+        //   publication moves to the responding frame's post-present flush.
         .native_sdk = .{
-            .url = "https://github.com/phall1/native/archive/4ab1ad084a38ba1d6e6ee3a8ed5e96177dcb59fd.tar.gz",
-            .hash = "native_sdk-0.1.0-hzDzQgtjsgJho9BSrIbo_BevDDmDAVuMOTardBRCXlEE",
+            .url = "https://github.com/phall1/native/archive/df0c15cbd15fe30af923001468fb61f99ee22264.tar.gz",
+            .hash = "native_sdk-0.1.0-hzDzQk1ysgKPZuZ_NZe_37dNOpfYCqlAj2qQ7atEav3o",
         },
         // libghostty-vt: Ghostty's extracted terminal-state core, consumed
         // as the `ghostty-vt` Zig module. Pinned to the first upstream
