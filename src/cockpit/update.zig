@@ -372,6 +372,13 @@ fn activatePaletteDestination(model: *Model, fx: *Fx, destination: app_types.Pal
         .session => |session_id| activateSessionDestination(model, fx, session_id),
     }
 }
+/// Convert the presentational cursor to a durable payload at the moment the
+/// user moves or filters the highlight. Provider publications may rebuild
+/// after this point; Enter must retain this identity rather than re-resolve the
+/// same numeric row against new catalog contents.
+fn syncPaletteHighlight(model: *const Model, workspace: *model_module.Workspace) void {
+    workspace.palette.highlighted = projection.paletteEntryAtCursorIn(model, workspace);
+}
 
 pub fn update(model: *Model, msg: Msg, fx: *Fx) void {
     const focus_before = remoteFocusTarget(model);
@@ -527,7 +534,9 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             // it must still be typeable over the web surface and over a
             // workspace whose focused terminal has gone away.
             if (model.ws().palette.open) {
-                model.ws().palette.append(event.text);
+                const workspace = model.ws();
+                workspace.palette.append(event.text);
+                syncPaletteHighlight(model, workspace);
                 return;
             }
             // The settings surface has no text field, and that is precisely
@@ -1011,6 +1020,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             if (workspace.settings.open) updateModel(model, .settings_close, fx);
             workspace.palette.reset();
             workspace.palette.open = true;
+            syncPaletteHighlight(model, workspace);
         },
         .palette_close => model.ws().palette.reset(),
         .palette_step => |delta| {
@@ -1023,17 +1033,7 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             const signed: i32 = @intCast(count);
             const current: i32 = @intCast(@min(workspace.palette.cursor, count - 1));
             workspace.palette.cursor = @intCast(@mod(current + delta, signed));
-        },
-        .palette_commit => {
-            const workspace = model.ws();
-            if (!workspace.palette.open) return;
-            const target = projection.paletteSelectedEntryIn(model, workspace);
-            workspace.palette.reset();
-            // A commit with nothing matching still DISMISSES. Leaving the
-            // palette up on an Enter that found nothing reads as a stuck
-            // keyboard.
-            const destination = target orelse return;
-            updateModel(model, .{ .palette_activate = destination }, fx);
+            syncPaletteHighlight(model, workspace);
         },
         .palette_activate => |destination| {
             // Pointer, Enter, and accessibility all arrive here with the same
@@ -1051,11 +1051,13 @@ fn updateModel(model: *Model, msg: Msg, fx: *Fx) void {
             const workspace = model.ws();
             if (!workspace.palette.open) return;
             workspace.palette.append(text);
+            syncPaletteHighlight(model, workspace);
         },
         .palette_backspace => {
             const workspace = model.ws();
             if (!workspace.palette.open) return;
             workspace.palette.backspace();
+            syncPaletteHighlight(model, workspace);
         },
         // One-way, and for this launch only. The band is the app's single
         // chance to say a setting did not apply; re-raising it on the next
@@ -1908,7 +1910,14 @@ fn handleKey(model: *Model, fx: *Fx, event: canvas.WidgetKeyboardEvent) void {
             return;
         }
         if (keyIs(event.key, "enter") or keyIs(event.key, "return")) {
-            updateModel(model, .palette_commit, fx);
+            // The identity was fenced when this row became highlighted. A
+            // provider catalog rebuild between paint and Enter must not make
+            // this cursor select whatever moved into the old numeric slot.
+            const destination = model.ws().palette.highlighted orelse {
+                updateModel(model, .palette_close, fx);
+                return;
+            };
+            updateModel(model, .{ .palette_activate = destination }, fx);
             return;
         }
         if (keyIs(event.key, "backspace") or keyIs(event.key, "delete")) {

@@ -107,7 +107,8 @@ test "provider dispatch refuses a provider-qualified remote identity at the loca
     try testing.expect(!model.selectTerminal(remote));
 }
 
-test "session activation remains fenced by stable id after catalog reorder" {
+// GUARD: switcher-stable-id
+test "keyboard session activation keeps the highlighted id across catalog rebuilds" {
     if (comptime app.phux_enabled) {
         const remote = try app.PhuxProvider.create(
             testing.allocator,
@@ -132,7 +133,7 @@ test "session activation remains fenced by stable id after catalog reorder" {
             .created_at_unix_secs = 1,
             .window_count = 2,
             .attached_client_count = 1,
-            .focused = true,
+            .focused = false,
         });
         try remote.host.sessions.append(testing.allocator, .{
             .id = 72,
@@ -143,14 +144,40 @@ test "session activation remains fenced by stable id after catalog reorder" {
             .focused = false,
         });
 
-        // The row was built for 72 before the provider reordered its catalog.
-        const activation = app.Msg{ .palette_activate = .{ .session = 72 } };
+        // One placed local terminal precedes the two sessions, so two steps
+        // highlight session 72. This is the identity the painted row carries.
+        app.update(&state.model, .palette_open, &state.effects);
+        app.update(&state.model, .{ .palette_step = 2 }, &state.effects);
+        switch (state.model.ws().palette.highlighted orelse return error.TestExpectedSession) {
+            .session => |id| try testing.expectEqual(@as(u32, 72), id),
+            else => return error.TestExpectedSession,
+        }
+
+        // Removal leaves session 71 occupying the last live catalog slot. An
+        // index-based Enter clamps to that row and switches to the wrong ID;
+        // the fenced payload instead reports 72 unavailable by selecting none.
+        const removed = remote.host.sessions.orderedRemove(1);
+        app.update(&state.model, .{ .key = .{
+            .key = "enter",
+            .phase = .key_down,
+        } }, &state.effects);
+        try testing.expectEqual(@as(?u32, null), remote.session_id);
+
+        // Restore the catalog, highlight 72 again, then reorder after the
+        // highlight was projected. Enter must still activate 72, not the 71
+        // that moved into its old index.
+        try remote.host.sessions.append(testing.allocator, removed);
+        app.update(&state.model, .palette_open, &state.effects);
+        app.update(&state.model, .{ .palette_step = 2 }, &state.effects);
         std.mem.swap(
             @TypeOf(remote.host.sessions.items[0]),
             &remote.host.sessions.items[0],
             &remote.host.sessions.items[1],
         );
-        app.update(&state.model, activation, &state.effects);
+        app.update(&state.model, .{ .key = .{
+            .key = "enter",
+            .phase = .key_down,
+        } }, &state.effects);
         try testing.expectEqual(@as(?u32, 72), remote.session_id);
     } else {
         return error.SkipZigTest;

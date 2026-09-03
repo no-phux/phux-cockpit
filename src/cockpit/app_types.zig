@@ -126,9 +126,8 @@ pub const Msg = union(enum) {
     palette_close,
     /// Arrow keys and ctrl+N/P: move the highlight through the FILTERED rows.
     palette_step: i8,
-    /// Enter, pointer press, or accessibility activation: commit the same
-    /// stable working-set payload and dismiss.
-    palette_commit,
+    /// Enter, pointer press, or accessibility activation: commit one stable
+    /// working-set identity and dismiss.
     palette_activate: PaletteDestination,
     /// Retry the configured provider after an unavailable launch or disconnect.
     /// Explicit rather than a hidden reconnect loop: one press, one connection.

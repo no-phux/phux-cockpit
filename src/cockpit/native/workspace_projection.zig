@@ -1457,7 +1457,10 @@ pub fn paletteSelectedTabIn(model: *const Model, workspace: *const Workspace) ?u
     return rows[@min(workspace.palette.cursor, count - 1)];
 }
 
-pub fn paletteSelectedEntryIn(model: *const Model, workspace: *const Workspace) ?PaletteEntry {
+/// Resolve navigation geometry to an identity only when the highlight moves.
+/// Enter consumes the identity cached on `Palette`; it never calls this after
+/// a provider catalog may have rebuilt.
+pub fn paletteEntryAtCursorIn(model: *const Model, workspace: *const Workspace) ?PaletteEntry {
     var iterator = PaletteIterator.init(model, workspace);
     var index: usize = 0;
     var last: ?PaletteEntry = null;
