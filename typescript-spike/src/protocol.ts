@@ -23,6 +23,11 @@ export interface SnapshotTab {
   readonly attention: boolean;
 }
 
+export interface ThemeEntry {
+  readonly index: number;
+  readonly name: Uint8Array;
+}
+
 export interface EngineSnapshot extends Invalidation {
   readonly activeWindow: number;
   readonly tabPlacement: number;
@@ -34,6 +39,15 @@ export interface EngineSnapshot extends Invalidation {
   readonly runCount: number;
   readonly tabWidth: number;
   readonly tabs: readonly SnapshotTab[];
+  /// The settings trailer: the builtin theme catalog, the theme in effect
+  /// (255 when none is named), the config file's probed state, its path.
+  readonly themes: readonly ThemeEntry[];
+  readonly activeTheme: number;
+  readonly configEnabled: boolean;
+  readonly configExists: boolean;
+  readonly configWritable: boolean;
+  readonly configProbed: boolean;
+  readonly configPath: Uint8Array;
 }
 
 function readU32(bytes: Uint8Array, at: number): number {
@@ -106,8 +120,39 @@ export function snapshot(bytes: Uint8Array): EngineSnapshot | null {
     });
     at += 6 + titleLength;
   }
+  // The settings trailer.
+  if (at + 1 > bytes.length) return null;
+  const themeCount = bytes[at];
+  if (!(themeCount >= 0 && themeCount <= 32)) return null;
+  at += 1;
+  const themes: ThemeEntry[] = [];
+  for (let index = 0; index < themeCount; index += 1) {
+    if (!(index >= 0 && index <= 32)) return null;
+    if (at + 1 > bytes.length) return null;
+    const nameLength = bytes[at];
+    if (!(nameLength >= 1 && nameLength <= 32) || at + 1 + nameLength > bytes.length) return null;
+    themes.push({ index, name: bytes.subarray(at + 1, at + 1 + nameLength) });
+    at += 1 + nameLength;
+  }
+  if (at + 2 > bytes.length) return null;
+  const activeTheme = bytes[at];
+  const configFlags = bytes[at + 1];
+  if (!(activeTheme >= 0 && activeTheme <= 255) || !(configFlags >= 0 && configFlags <= 255)) return null;
+  at += 2;
+  if (at + 1 > bytes.length) return null;
+  const pathLength = bytes[at];
+  if (!(pathLength >= 0 && pathLength <= 255) || at + 1 + pathLength > bytes.length) return null;
+  const configPath = bytes.subarray(at + 1, at + 1 + pathLength);
+  at += 1 + pathLength;
   if (at !== bytes.length) return null;
   return {
+    themes,
+    activeTheme,
+    configEnabled: (configFlags & 1) !== 0,
+    configExists: (configFlags & 2) !== 0,
+    configWritable: (configFlags & 4) !== 0,
+    configProbed: (configFlags & 8) !== 0,
+    configPath,
     sequence: readU64(bytes, 2),
     revision: readU64(bytes, 10),
     activeWindow: bytes[18],

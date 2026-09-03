@@ -169,8 +169,23 @@ fn shellEvent(event: native_sdk.EffectPtyEvent) core.Msg {
 /// Keys no markup widget claimed. The palette and settings surfaces are the
 /// core's, so while either is open the shell must not see typing meant for
 /// them; the core's model says which, and the view fn below reads it.
+/// Keys the overlays answer to that no widget of theirs claims: Escape
+/// dismisses, the arrows move the highlight, Enter commits the settings
+/// surface (the switcher's Enter is its input's own on-submit). Delivered
+/// as core Msgs, because the overlays are the core's; the shell never sees
+/// them while an overlay owns the keyboard.
+fn overlayKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
+    if (event.phase == .key_up) return null;
+    const key = event.key;
+    if (std.mem.eql(u8, key, "Escape")) return if (palette_open) .palette_close else .settings_close;
+    if (std.mem.eql(u8, key, "ArrowDown")) return if (palette_open) .{ .palette_move = 1 } else .{ .settings_move = 1 };
+    if (std.mem.eql(u8, key, "ArrowUp")) return if (palette_open) .{ .palette_move = -1 } else .{ .settings_move = -1 };
+    if (std.mem.eql(u8, key, "Enter") and !palette_open) return .settings_commit;
+    return null;
+}
+
 fn onKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
-    if (overlay_open) return null;
+    if (overlay_open) return overlayKey(event);
     const engine = bridge.engine orelse return null;
     const fx = bridge.effects orelse return null;
     engine.onKey(fx, event);
@@ -188,6 +203,7 @@ fn onText(event: canvas.WidgetKeyboardEvent) ?core.Msg {
 /// Set by the paint pass, which sees the committed core model: the only
 /// place the extension learns whether an overlay owns the keyboard.
 var overlay_open: bool = false;
+var palette_open: bool = false;
 
 fn onFrame(_: *const core.Model, frame: native_sdk.platform.GpuFrame) ?core.Msg {
     const engine = bridge.engine orelse return null;
@@ -203,6 +219,7 @@ fn onFrame(_: *const core.Model, frame: native_sdk.platform.GpuFrame) ?core.Msg 
 
 fn paintChrome(model: *const core.Model, builder: *canvas.Builder, size: native_sdk.geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
     overlay_open = model.paletteOpen or model.settingsOpen;
+    palette_open = model.paletteOpen;
     const engine = bridge.engine orelse return;
     engine.model.tab_placement = if (model.tabPlacement == .side) .side else .top;
     return engine.paint(builder, size, tokens);
@@ -379,8 +396,16 @@ const Rig = struct {
             try self.dispatch(.toggle_tab_placement);
             try self.settle(before + 1, "READY");
         }
+        // The overlays are mutually exclusive in the core as in the shipping
+        // app; settings is asked for last so a "both" state ends on it.
+        // Opening settings probes the config file through the seam, which
+        // is one announcement to wait for.
         try self.dispatch(if (state.palette) .palette_open else .palette_close);
-        try self.dispatch(if (state.settings) .settings_open else .settings_close);
+        if (state.settings != self.app_state.model.settingsOpen) {
+            const before = self.app_state.model.engineSequence.lo;
+            try self.dispatch(if (state.settings) .settings_open else .settings_close);
+            if (state.settings) try self.settle(before + 1, "READY");
+        }
         try std.testing.expectEqual(state.tabs, self.app_state.model.tabs.len);
     }
 };
@@ -498,6 +523,7 @@ test "every registered pane gets exactly one shell request and a closed tab kill
         spawned: usize = 0,
         killed: usize = 0,
         last_killed: u64 = 0,
+        pub fn hostSend(_: *@This(), _: []const u8, _: []const u8) void {}
         pub fn ptySpawn(self: *@This(), _: anytype) void {
             self.spawned += 1;
         }
@@ -670,4 +696,54 @@ test "the markup chrome passes the layout audit at every declared size, density 
         }
     }
     try std.testing.expectEqual(@as(usize, 0), total);
+}
+
+// GUARD: ts-overlay-switcher
+test "the switcher filters the engine's tabs by position or title and selects through the seam" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    try rig.reach(.{ .label = "three tabs", .tabs = 3 });
+    const engine = bridge.engine.?;
+
+    try rig.dispatch(.palette_open);
+    try std.testing.expectEqual(@as(usize, 3), rig.app_state.model.paletteRows.len);
+    try rig.dispatch(.{ .palette_edit = .{ .insert_text = "3" } });
+    try std.testing.expectEqual(@as(usize, 1), rig.app_state.model.paletteRows.len);
+    try std.testing.expectEqual(@as(i64, 2), rig.app_state.model.paletteRows[0].index);
+
+    // Enter on the input is its own on-submit; the core sends a fenced
+    // select intent and the engine's selection moves.
+    const before = rig.app_state.model.engineSequence.lo;
+    try rig.dispatch(.palette_submit);
+    try std.testing.expect(!rig.app_state.model.paletteOpen);
+    try rig.settle(before + 1, "READY");
+    try std.testing.expectEqual(@as(usize, 2), engine.model.wsConst().selected_tab);
+    try std.testing.expectEqual(@as(i64, 2), rig.app_state.model.selectedTab);
+}
+
+// GUARD: ts-overlay-settings
+test "the settings surface shows the engine's theme catalog and saves through the seam" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+
+    // Opening probes the config file once, through the seam; the catalog
+    // rides every snapshot.
+    const before = rig.app_state.model.engineSequence.lo;
+    try rig.dispatch(.settings_open);
+    try rig.settle(before + 1, "READY");
+    try std.testing.expect(engine.config_probe.probed);
+    try std.testing.expectEqual(@as(usize, 6), rig.app_state.model.themes.len);
+    try std.testing.expect(rig.app_state.model.configNotice.len > 0);
+
+    try rig.dispatch(.{ .settings_pick = 3 });
+    try std.testing.expect(rig.app_state.model.themes[3].highlighted);
+    const before_save = rig.app_state.model.engineSequence.lo;
+    try rig.dispatch(.settings_commit);
+    try std.testing.expect(!rig.app_state.model.settingsOpen);
+    try rig.settle(before_save + 1, "READY");
+    try std.testing.expectEqualStrings("nord", engine.model.config.theme.slice());
+    try std.testing.expect(rig.app_state.model.themes[3].active);
 }
