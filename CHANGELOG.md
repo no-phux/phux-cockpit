@@ -3,6 +3,13 @@
 All notable changes to Phux Cockpit are documented in this file. The project
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1](https://github.com/no-phux/phux-cockpit/compare/v0.16.0...v0.16.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **dev:** admit isolated workspace state writes ([#83](https://github.com/no-phux/phux-cockpit/issues/83)) ([d940a08](https://github.com/no-phux/phux-cockpit/commit/d940a08dabfae62271e12fc139e2b8a0355abf45))
+
 ## [0.16.0](https://github.com/no-phux/phux-cockpit/compare/v0.15.0...v0.16.0) (2026-09-03)
 
 
