@@ -1,0 +1,20 @@
+# GUARD ts-engine-pointer
+#
+# Raw surface pointer input over the grid must reach the engine, or nothing
+# can be selected with the mouse in this graph. The break stops the wrapping
+# host from routing it.
+test: a drag across the grid through the raw surface input selects text
+build: test -Dtypescript-spike=true -Dplatform=null
+diff --git a/typescript-spike/src/native_extension.zig b/typescript-spike/src/native_extension.zig
+index e974fe2..f1d20ed 100644
+--- a/typescript-spike/src/native_extension.zig
++++ b/typescript-spike/src/native_extension.zig
+@@ -387,7 +387,7 @@ fn routePointer(value: native_sdk.Event) void {
+     if (!std.mem.eql(u8, raw.label, canvas_label)) return;
+     const engine = bridge.engine orelse return;
+     const fx = engineFx() orelse return;
+-    _ = engine.onPointer(fx, raw);
++    if (false) _ = engine.onPointer(fx, raw);
+ }
+ 
+ var pointer_host = PointerHost{};
