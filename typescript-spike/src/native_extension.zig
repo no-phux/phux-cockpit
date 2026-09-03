@@ -22,6 +22,53 @@ const protocol = cockpit.protocol;
 const Adapter = native_sdk.TsUiApp(core);
 const Effects = Adapter.Effects;
 const canvas = native_sdk.canvas;
+const canvas_label = "phux-cockpit-canvas";
+
+/// The effects the engine drives, with this graph's own result constructors
+/// filled in: the engine names a clipboard verb and a key, and the answer
+/// comes back as a core Msg this file builds. Everything else forwards.
+const EngineFx = struct {
+    effects: *Effects,
+
+    pub fn hostSend(self: EngineFx, name: []const u8, payload: []const u8) void {
+        self.effects.hostSend(name, payload);
+    }
+    pub fn ptySpawn(self: EngineFx, options: anytype) void {
+        self.effects.ptySpawn(.{
+            .key = options.key,
+            .argv = options.argv,
+            .cols = options.cols,
+            .rows = options.rows,
+            .on_event = options.on_event,
+        });
+    }
+    pub fn ptyWrite(self: EngineFx, key: u64, bytes: []const u8) bool {
+        return self.effects.ptyWrite(key, bytes);
+    }
+    pub fn ptyResize(self: EngineFx, key: u64, cols: u16, rows: u16) void {
+        self.effects.ptyResize(key, cols, rows);
+    }
+    pub fn ptyKill(self: EngineFx, key: u64) void {
+        self.effects.ptyKill(key);
+    }
+    pub fn showNotification(self: EngineFx, options: native_sdk.platform.NotificationOptions) void {
+        self.effects.showNotification(options);
+    }
+    pub fn openUrl(self: EngineFx, url: []const u8) void {
+        self.effects.openUrl(url);
+    }
+    pub fn writeClipboard(self: EngineFx, options: struct { key: u64, text: []const u8 }) void {
+        self.effects.writeClipboard(.{ .key = options.key, .text = options.text, .on_result = clipboardWritten });
+    }
+    pub fn readClipboard(self: EngineFx, options: struct { key: u64 }) void {
+        self.effects.readClipboard(.{ .key = options.key, .on_result = clipboardRead });
+    }
+};
+
+fn engineFx() ?EngineFx {
+    const effects = bridge.effects orelse return null;
+    return .{ .effects = effects };
+}
 
 const HostChannelBinding = channelBindingType();
 
@@ -67,7 +114,7 @@ const Bridge = struct {
         const self: *Bridge = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, name, protocol.intent_command)) return;
         const engine = self.engine orelse return;
-        if (self.effects) |fx| {
+        if (engineFx()) |fx| {
             _ = engine.applyIntent(payload, fx);
             self.spawnShells(engine, fx);
         } else {
@@ -76,7 +123,7 @@ const Bridge = struct {
         self.announce(engine);
     }
 
-    fn spawnShells(self: *Bridge, engine: *Engine, fx: *Effects) void {
+    fn spawnShells(self: *Bridge, engine: *Engine, fx: EngineFx) void {
         if (!self.shells) return;
         engine.spawnShells(fx, shellEvent);
     }
@@ -161,9 +208,34 @@ var bridge = Bridge{};
 /// the compiled core.
 fn shellEvent(event: native_sdk.EffectPtyEvent) core.Msg {
     if (bridge.engine) |engine| {
-        if (bridge.effects) |fx| engine.onShellEvent(fx, event);
+        if (engineFx()) |fx| engine.onShellEvent(fx, event);
     }
     return .engine_wake;
+}
+
+fn clipboardWritten(event: native_sdk.EffectClipboardResult) core.Msg {
+    if (bridge.engine) |engine| engine.onClipboardWritten(event.outcome == .ok);
+    return .engine_wake;
+}
+
+fn clipboardRead(event: native_sdk.EffectClipboardResult) core.Msg {
+    if (bridge.engine) |engine| {
+        if (engineFx()) |fx| engine.onClipboardRead(fx, event.outcome == .ok, event.text);
+    }
+    return .engine_wake;
+}
+
+/// The app's activation is the terminal's focus: a bell that rings while
+/// deactivated notifies, and deactivation strands every capture.
+fn onLifecycle(event: native_sdk.LifecycleEvent) ?core.Msg {
+    const engine = bridge.engine orelse return null;
+    const fx = engineFx() orelse return null;
+    switch (event) {
+        .activate => engine.setFocused(fx, true),
+        .deactivate => engine.setFocused(fx, false),
+        else => {},
+    }
+    return null;
 }
 
 /// Keys no markup widget claimed. The palette and settings surfaces are the
@@ -187,7 +259,7 @@ fn overlayKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
 fn onKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
     if (overlay_open) return overlayKey(event);
     const engine = bridge.engine orelse return null;
-    const fx = bridge.effects orelse return null;
+    const fx = engineFx() orelse return null;
     engine.onKey(fx, event);
     return null;
 }
@@ -195,7 +267,7 @@ fn onKey(event: canvas.WidgetKeyboardEvent) ?core.Msg {
 fn onText(event: canvas.WidgetKeyboardEvent) ?core.Msg {
     if (overlay_open) return null;
     const engine = bridge.engine orelse return null;
-    const fx = bridge.effects orelse return null;
+    const fx = engineFx() orelse return null;
     engine.onText(fx, event);
     return null;
 }
@@ -207,7 +279,7 @@ var palette_open: bool = false;
 
 fn onFrame(_: *const core.Model, frame: native_sdk.platform.GpuFrame) ?core.Msg {
     const engine = bridge.engine orelse return null;
-    const fx = bridge.effects orelse return null;
+    const fx = engineFx() orelse return null;
     bridge.spawnShells(engine, fx);
     engine.pumpViewports(fx, frame);
     // A frame that moved the run (a resize, the first frame after a
@@ -245,20 +317,88 @@ fn configureOptionsValue(options: *Adapter.Options) void {
     options.key_release_events = true;
     options.on_text = onText;
     options.on_frame = onFrame;
+    options.on_lifecycle = onLifecycle;
 }
 
 pub fn configureOptions(options: *Adapter.Options, _: std.process.Init) void {
     configureOptionsValue(options);
 }
 
+/// Wraps the adapter's app to see the raw surface input before it: the
+/// pointer kinds over a pane's frame are the engine's (selection, mouse
+/// reporting, wheel scrollback, link hover), the way CockpitHost routes the
+/// widget-routed ones. Chrome never lies under a pane frame, and an open
+/// overlay keeps the pointer for the core. Every event still reaches the
+/// inner app afterwards.
+const PointerHost = struct {
+    inner: native_sdk.App = undefined,
+
+    fn wrap(self: *PointerHost, inner: native_sdk.App) native_sdk.App {
+        self.inner = inner;
+        return .{
+            .context = self,
+            .name = inner.name,
+            .source = inner.source,
+            .source_fn = if (inner.source_fn != null) source else null,
+            .scene_fn = if (inner.scene_fn != null) scene else null,
+            .start_fn = if (inner.start_fn != null) start else null,
+            .event_fn = if (inner.event_fn != null) event else null,
+            .stop_fn = if (inner.stop_fn != null) stop else null,
+            .replay_fn = if (inner.replay_fn != null) replay else null,
+        };
+    }
+    fn source(context: *anyopaque) anyerror!native_sdk.WebViewSource {
+        const self: *PointerHost = @ptrCast(@alignCast(context));
+        return self.inner.webViewSource();
+    }
+    fn scene(context: *anyopaque) anyerror!native_sdk.ShellConfig {
+        const self: *PointerHost = @ptrCast(@alignCast(context));
+        return (try self.inner.scene()) orelse error.SceneUnavailable;
+    }
+    fn start(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const self: *PointerHost = @ptrCast(@alignCast(context));
+        try self.inner.start(runtime);
+    }
+    fn event(context: *anyopaque, runtime: *native_sdk.Runtime, value: native_sdk.Event) anyerror!void {
+        const self: *PointerHost = @ptrCast(@alignCast(context));
+        routePointer(value);
+        try self.inner.event(runtime, value);
+    }
+    fn stop(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
+        const self: *PointerHost = @ptrCast(@alignCast(context));
+        try self.inner.stop(runtime);
+    }
+    fn replay(context: *anyopaque, control: native_sdk.runtime.ReplayControl) anyerror!void {
+        const self: *PointerHost = @ptrCast(@alignCast(context));
+        try self.inner.replayControl(control);
+    }
+};
+
+fn routePointer(value: native_sdk.Event) void {
+    const raw = switch (value) {
+        .gpu_surface_input => |raw| raw,
+        else => return,
+    };
+    switch (raw.kind) {
+        .pointer_down, .pointer_up, .pointer_cancel, .pointer_move, .pointer_drag, .scroll => {},
+        else => return,
+    }
+    if (overlay_open) return;
+    if (!std.mem.eql(u8, raw.label, canvas_label)) return;
+    const engine = bridge.engine orelse return;
+    const fx = engineFx() orelse return;
+    _ = engine.onPointer(fx, raw);
+}
+
+var pointer_host = PointerHost{};
+
 pub fn app(app_state: *Adapter.App) native_sdk.App {
     bridge.effects = &app_state.effects;
-    return app_state.app();
+    return pointer_host.wrap(app_state.app());
 }
 
 // ------------------------------------------------------------------ tests
 
-const canvas_label = "phux-cockpit-canvas";
 const test_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .gpu_backend = .metal },
 };
@@ -519,11 +659,15 @@ test "unclaimed keys and text reach the focused pane's outbound ring and never t
 
 // GUARD: ts-engine-shells
 test "every registered pane gets exactly one shell request and a closed tab kills its own" {
-    const Recorder = struct {
+    const SpawnRecorder = struct {
         spawned: usize = 0,
         killed: usize = 0,
         last_killed: u64 = 0,
         pub fn hostSend(_: *@This(), _: []const u8, _: []const u8) void {}
+        pub fn showNotification(_: *@This(), _: anytype) void {}
+        pub fn writeClipboard(_: *@This(), _: anytype) void {}
+        pub fn readClipboard(_: *@This(), _: anytype) void {}
+        pub fn openUrl(_: *@This(), _: []const u8) void {}
         pub fn ptySpawn(self: *@This(), _: anytype) void {
             self.spawned += 1;
         }
@@ -538,7 +682,7 @@ test "every registered pane gets exactly one shell request and a closed tab kill
     };
     const engine = try Engine.create(std.testing.allocator, std.testing.io);
     defer engine.destroy();
-    var fx = Recorder{};
+    var fx = SpawnRecorder{};
 
     engine.spawnShells(&fx, shellEvent);
     engine.spawnShells(&fx, shellEvent);
@@ -746,4 +890,122 @@ test "the settings surface shows the engine's theme catalog and saves through th
     try rig.settle(before_save + 1, "READY");
     try std.testing.expectEqualStrings("nord", engine.model.config.theme.slice());
     try std.testing.expect(rig.app_state.model.themes[3].active);
+}
+
+/// An effects recorder for the native-behaviour guards: counts what the
+/// engine asked for and keeps the last clipboard text, no processes.
+const Recorder = struct {
+    notifications: usize = 0,
+    clipboard_writes: usize = 0,
+    clipboard_reads: usize = 0,
+    last_text: [256]u8 = undefined,
+    last_text_len: usize = 0,
+    pub fn hostSend(_: *Recorder, _: []const u8, _: []const u8) void {}
+    pub fn ptySpawn(_: *Recorder, _: anytype) void {}
+    pub fn ptyWrite(_: *Recorder, _: u64, _: []const u8) bool {
+        return false;
+    }
+    pub fn ptyResize(_: *Recorder, _: u64, _: u16, _: u16) void {}
+    pub fn ptyKill(_: *Recorder, _: u64) void {}
+    pub fn openUrl(_: *Recorder, _: []const u8) void {}
+    pub fn showNotification(self: *Recorder, _: anytype) void {
+        self.notifications += 1;
+    }
+    pub fn writeClipboard(self: *Recorder, options: anytype) void {
+        self.clipboard_writes += 1;
+        self.last_text_len = @min(options.text.len, self.last_text.len);
+        @memcpy(self.last_text[0..self.last_text_len], options.text[0..self.last_text_len]);
+    }
+    pub fn readClipboard(self: *Recorder, _: anytype) void {
+        self.clipboard_reads += 1;
+    }
+    fn text(self: *const Recorder) []const u8 {
+        return self.last_text[0..self.last_text_len];
+    }
+};
+
+fn engineWithText(text: []const u8) !*Engine {
+    const engine = try Engine.create(std.testing.allocator, std.testing.io);
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    pane.session.feed(text);
+    pane.session.refreshScreenText();
+    return engine;
+}
+
+// GUARD: ts-engine-bell
+test "a bell while the app is deactivated notifies once, on its rising edge" {
+    const engine = try engineWithText("prompt$ ");
+    defer engine.destroy();
+    var fx = Recorder{};
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    const key = pane.pty_key;
+
+    engine.setFocused(&fx, false);
+    engine.onShellEvent(&fx, .{ .key = key, .kind = .output, .bytes = "more\x07" });
+    try std.testing.expectEqual(@as(usize, 1), fx.notifications);
+    // A standing bell does not ring again until it is acknowledged.
+    engine.onShellEvent(&fx, .{ .key = key, .kind = .output, .bytes = "\x07" });
+    try std.testing.expectEqual(@as(usize, 1), fx.notifications);
+
+    // A focused app hears its own bell and is not notified.
+    const attended = try engineWithText("prompt$ ");
+    defer attended.destroy();
+    var quiet = Recorder{};
+    const front = attended.model.provider.terminal(attended.model.focusedTerminalRef().?).?;
+    attended.setFocused(&quiet, true);
+    attended.onShellEvent(&quiet, .{ .key = front.pty_key, .kind = .output, .bytes = "\x07" });
+    try std.testing.expectEqual(@as(usize, 0), quiet.notifications);
+}
+
+// GUARD: ts-engine-copy
+test "select all and cmd+C put the scrollback on the clipboard through the seam" {
+    const engine = try engineWithText("hello world\r\n");
+    defer engine.destroy();
+    var fx = Recorder{};
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+
+    engine.onKey(&fx, .{ .key = "a", .text = "", .phase = .key_down, .modifiers = .{ .super = true } });
+    try std.testing.expect(pane.session.selectionActive());
+    engine.onKey(&fx, .{ .key = "c", .text = "", .phase = .key_down, .modifiers = .{ .super = true } });
+    try std.testing.expectEqual(@as(usize, 1), fx.clipboard_writes);
+    try std.testing.expect(std.mem.indexOf(u8, fx.text(), "hello world") != null);
+    try std.testing.expect(engine.model.copy_inflight);
+    engine.onClipboardWritten(true);
+    try std.testing.expect(!engine.model.copy_inflight);
+}
+
+// GUARD: ts-engine-search
+test "cmd+F opens the scrollback search, typing feeds the needle, Escape closes it" {
+    const engine = try engineWithText("alpha\r\nbeta\r\n");
+    defer engine.destroy();
+    var fx = Recorder{};
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+
+    engine.onKey(&fx, .{ .key = "f", .text = "", .phase = .key_down, .modifiers = .{ .super = true } });
+    try std.testing.expect(pane.session.search.open);
+    engine.onText(&fx, .{ .key = "", .text = "bet", .phase = .text_input });
+    try std.testing.expectEqualStrings("bet", pane.session.searchNeedle());
+    try std.testing.expectEqual(@as(usize, 0), pane.outbound_len);
+    engine.onKey(&fx, .{ .key = "Escape", .text = "", .phase = .key_down });
+    try std.testing.expect(!pane.session.search.open);
+}
+
+// GUARD: ts-engine-pointer
+test "a drag across the grid through the raw surface input selects text" {
+    var rig = try Rig.start();
+    defer rig.stop();
+    try rig.settle(0, "READY");
+    const engine = bridge.engine.?;
+    const pane = engine.model.provider.terminal(engine.model.focusedTerminalRef().?).?;
+    pane.session.feed("the quick brown fox jumps over the lazy dog\r\n");
+    pane.session.refreshScreenText();
+    try rig.resize(native_sdk.geometry.SizeF.init(1100, 640));
+    const frame = cockpit.engine.pointerFrame(engine) orelse return error.TestExpectedFrame;
+    try std.testing.expect(!pane.session.selectionActive());
+
+    const y = frame.y + 12;
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{ .window_id = 1, .label = canvas_label, .kind = .pointer_down, .x = frame.x + 8, .y = y, .timestamp_ns = 1 } });
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{ .window_id = 1, .label = canvas_label, .kind = .pointer_drag, .x = frame.x + 160, .y = y, .timestamp_ns = 2 } });
+    try rig.harness.runtime.dispatchPlatformEvent(rig.decorated, .{ .gpu_surface_input = .{ .window_id = 1, .label = canvas_label, .kind = .pointer_up, .x = frame.x + 160, .y = y, .timestamp_ns = 3 } });
+    try std.testing.expect(pane.session.selectionActive());
 }
