@@ -367,8 +367,8 @@ Zig 0.16-compatible checkpoint.
 
 ## Phux FFI provenance
 
-Production packages link [`no-phux/phux@0531189b`](https://github.com/no-phux/phux/commit/0531189bf77db5a93f98e897219d6d7ced2cd491)
-at workspace version `0.23.3`, with `PHUX_CLIENT_ABI_VERSION=1`, using Cargo
+Production packages link [`no-phux/phux@7ac821ad`](https://github.com/no-phux/phux/commit/7ac821ad8c430289ad689a9756d498ad72f6034e)
+at workspace version `0.24.0`, with `PHUX_CLIENT_ABI_VERSION=1`, using Cargo
 profile `ffi-release`. [`phux-ffi.lock.json`](phux-ffi.lock.json) is the
 canonical source for those values; `./scripts/verify-phux-ffi.py` checks the
 hosted checkouts, documentation, license inventory, and packaged provenance
