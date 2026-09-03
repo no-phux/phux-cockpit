@@ -13,7 +13,7 @@ test "TypeScript snapshot contains stable tab identities and bounded titles" {
     model.primary.palette.open = true;
 
     var bytes: [app.ts_snapshot_max_bytes]u8 = undefined;
-    const snapshot = try app.encodeTsSnapshot(&model, 7, 11, .{ .first = 0, .count = 2, .extent = 168 }, .{}, &bytes);
+    const snapshot = try app.encodeTsSnapshot(&model, 7, 11, .{.{ .first = 0, .count = 2, .extent = 168 }} ++ [_]app.TsTabRun{.{}} ** 4, .{}, &bytes);
     try testing.expectEqual(@as(u8, 1), snapshot[0]);
     try testing.expectEqual(@as(u8, 2), snapshot[1]);
     try testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, snapshot[2..10], .little));
@@ -40,5 +40,5 @@ test "TypeScript snapshot refuses truncation instead of emitting a partial recor
     defer app.deinitModel(&model);
 
     var bytes: [27]u8 = undefined;
-    try testing.expectError(error.BufferTooSmall, app.encodeTsSnapshot(&model, 0, 0, .{}, .{}, &bytes));
+    try testing.expectError(error.BufferTooSmall, app.encodeTsSnapshot(&model, 0, 0, [_]app.TsTabRun{.{}} ** 5, .{}, &bytes));
 }

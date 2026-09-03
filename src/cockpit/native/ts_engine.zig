@@ -25,6 +25,7 @@ const pointer_input = @import("../pointer_input.zig");
 const update_module = @import("../update.zig");
 const provider_contract = @import("provider_contract");
 const local = @import("../../providers/local/provider.zig");
+const scene = @import("scene.zig");
 const projection = @import("workspace_projection.zig");
 const view = @import("view.zig");
 const protocol = @import("ts_protocol.zig");
@@ -77,7 +78,7 @@ pub const Engine = struct {
     /// The run the last snapshot carried. A frame that changes it (a resize,
     /// a placement flip) is announced like an intent, because the core's
     /// chrome is wrong until it resyncs.
-    last_run: ts_snapshot.TabRun = .{},
+    last_runs: ts_snapshot.WindowRuns = [_]ts_snapshot.TabRun{.{}} ** (1 + model_module.max_secondary_windows),
     /// The config file's state as of the last `probe_config` intent.
     config_probe: ts_snapshot.ConfigProbe = .{},
     /// The pane a clipboard read was requested for, resolved when the result
@@ -121,6 +122,10 @@ pub const Engine = struct {
         self.sequence +%= 1;
         const intent = protocol.decodeIntent(bytes) orelse return self.refuse();
         if (intent.expected_revision != self.revision) return self.refuse();
+        // A tab intent means the window whose chrome sent it. Adopting it as
+        // active first is what CockpitHost does with a routed event's window.
+        if (intent.window != 0 and !self.model.windowOpen(intent.window)) return self.refuse();
+        self.model.active_window = if (intent.window == 0) 0 else intent.window;
         const changed = switch (intent.kind) {
             .select_tab => self.model.selectTab(intent.argument),
             .new_terminal => self.newTerminal(),
@@ -129,6 +134,9 @@ pub const Engine = struct {
             .set_theme => self.setTheme(intent.argument),
             .reveal_config => self.revealConfig(fx),
             .probe_config => self.probeConfig(),
+            .new_window => self.newWindow(),
+            .close_window => self.closeWindow(intent.window, fx),
+            .focus_window => self.focusWindow(intent.window),
         };
         if (!changed) return self.refuse();
         self.intent_refused = false;
@@ -213,6 +221,89 @@ pub const Engine = struct {
             .probed = true,
         };
         return true;
+    }
+
+    // ----------------------------------------------------------- windows
+
+    /// update.zig's .new_window: a window slot, a workspace, one shell in
+    /// it, selected. Refusals put everything back and stay visible.
+    fn newWindow(self: *Engine) bool {
+        const model = self.model;
+        const index = model.freeWindowIndex() orelse {
+            model.window_limit_refused = true;
+            return false;
+        };
+        const workspace = model.openWindow(index) orelse {
+            model.window_limit_refused = true;
+            return false;
+        };
+        const previous = model.active_window;
+        model.active_window = index;
+        const pane = model.provider.createTerminal() catch {
+            model.terminal_limit_refused = true;
+            model.closeWindow(index);
+            model.active_window = previous;
+            return false;
+        };
+        if (!workspace.admitTab(pane.id)) {
+            _ = model.provider.destroyTerminal(pane.id);
+            model.closeWindow(index);
+            model.active_window = previous;
+            return false;
+        }
+        _ = workspace.selectTerminal(pane.id);
+        model.window_limit_refused = false;
+        return true;
+    }
+
+    /// update.zig's closeWholeWindow for a secondary window: every tab's
+    /// shells are killed and its panes destroyed, then the slot retires. The
+    /// main window is not this seam's to close; that is the app's quit.
+    fn closeWindow(self: *Engine, index: u8, fx: anytype) bool {
+        const model = self.model;
+        if (index == 0 or !model.windowOpen(index)) return false;
+        while (model.wsAt(index)) |workspace| {
+            if (workspace.tab_count == 0) break;
+            const tree = workspace.treeConst(0) orelse break;
+            var refs: [layout.max_panes]TerminalRef = undefined;
+            const count = tree.terminals(&refs);
+            workspace.dropTab(0);
+            for (refs[0..count]) |id| {
+                if (model.provider.terminal(id)) |pane| fx.ptyKill(pane.pty_key);
+                _ = model.provider.destroyTerminal(id);
+            }
+        }
+        model.closeWindow(index);
+        if (model.active_window == index) model.active_window = 0;
+        return true;
+    }
+
+    fn focusWindow(self: *Engine, index: u8) bool {
+        const model = self.model;
+        if (!model.windowOpen(index)) return false;
+        if (model.active_window == index) return false;
+        model.active_window = index;
+        return true;
+    }
+
+    /// The window index a canvas label names, by the shipping scene's own
+    /// table: the spike declares the same labels, so per-window painting,
+    /// frames and input resolve through one function.
+    pub fn windowIndexForCanvas(label: []const u8) ?usize {
+        return scene.windowIndexForCanvas(label);
+    }
+
+    /// Adopt the platform's focused window as the active one, the way
+    /// CockpitHost adopts a routed event's window; a window this engine has
+    /// not painted yet has no id to match.
+    pub fn adoptFocusedWindow(self: *Engine, window_id: platform.WindowId) void {
+        const model = self.model;
+        for (0..model_module.max_windows) |index| {
+            const workspace = model.wsAtConst(index) orelse continue;
+            if (workspace.window_id != window_id) continue;
+            if (model.windowOpen(index)) model.active_window = index;
+            return;
+        }
     }
 
     // ------------------------------------------------------------ shells
@@ -579,8 +670,10 @@ pub const Engine = struct {
     pub fn pumpViewports(self: *Engine, fx: anytype, frame: native_sdk.platform.GpuFrame) void {
         if (frame.size.width <= 0 or frame.size.height <= 0) return;
         const model = self.model;
-        const workspace = model.ws();
+        const index = windowIndexForCanvas(frame.label) orelse return;
+        const workspace = model.wsAt(index) orelse return;
         workspace.surface_size = frame.size;
+        workspace.window_id = frame.window_id;
         if (frame.scale_factor > 0) workspace.surface_scale_factor = frame.scale_factor;
         const proposals = projection.proposedViewportsIn(model, workspace, frame.size);
         for (proposals.slice()) |proposal| {
@@ -601,6 +694,13 @@ pub const Engine = struct {
         return view.buildChrome(self.model, builder, size, tokens);
     }
 
+    /// One window's grids, by its canvas label: the shipping painter's own
+    /// per-window entry, unchanged.
+    pub fn paintWindow(self: *const Engine, builder: *canvas.Builder, canvas_label: []const u8, window_id: platform.WindowId, size: geometry.SizeF, tokens: canvas.DesignTokens) anyerror!void {
+        const index = windowIndexForCanvas(canvas_label) orelse return;
+        return view.paintWindowIndex(self.model, builder, index, size, tokens, window_id);
+    }
+
     fn setPlacement(self: *Engine, argument: u8) bool {
         const placement: model_module.TabPlacement = if (argument == 1) .side else .top;
         if (self.model.tab_placement == placement) return false;
@@ -609,8 +709,8 @@ pub const Engine = struct {
     }
 
     pub fn snapshot(self: *Engine, out: []u8) ts_snapshot.Error![]const u8 {
-        self.last_run = self.currentRun();
-        const bytes = ts_snapshot.encode(self.model, self.sequence, self.revision, self.last_run, self.config_probe, out);
+        self.last_runs = self.currentRuns();
+        const bytes = ts_snapshot.encode(self.model, self.sequence, self.revision, self.last_runs, self.config_probe, out);
         if (self.intent_refused) out[22] |= intent_refused_flag;
         return bytes;
     }
@@ -623,7 +723,19 @@ pub const Engine = struct {
     /// rows), with a 40pt cue reserved once anything is hidden. Before the
     /// first frame the surface is unknown and every tab is in the run.
     pub fn currentRun(self: *const Engine) ts_snapshot.TabRun {
-        const workspace = self.model.wsConst();
+        return self.runFor(self.model.active_window);
+    }
+
+    pub fn currentRuns(self: *const Engine) ts_snapshot.WindowRuns {
+        var runs: ts_snapshot.WindowRuns = [_]ts_snapshot.TabRun{.{}} ** (1 + model_module.max_secondary_windows);
+        for (0..runs.len) |index| {
+            if (self.model.windowOpen(index)) runs[index] = self.runFor(index);
+        }
+        return runs;
+    }
+
+    fn runFor(self: *const Engine, index: usize) ts_snapshot.TabRun {
+        const workspace = self.model.wsAtConst(index) orelse return .{};
         const total = workspace.tab_count;
         if (total == 0) return .{};
         const size = workspace.surface_size;
@@ -655,9 +767,13 @@ pub const Engine = struct {
     /// the caller announces so the core resyncs. Sequence advances then too:
     /// it counts announcements, and this is one.
     pub fn refreshRun(self: *Engine) bool {
-        const run = self.currentRun();
-        if (run.first == self.last_run.first and run.count == self.last_run.count and run.extent == self.last_run.extent) return false;
-        self.last_run = run;
+        const runs = self.currentRuns();
+        var moved = false;
+        for (runs, self.last_runs) |run, last| {
+            if (run.first != last.first or run.count != last.count or run.extent != last.extent) moved = true;
+        }
+        if (!moved) return false;
+        self.last_runs = runs;
         self.sequence +%= 1;
         return true;
     }

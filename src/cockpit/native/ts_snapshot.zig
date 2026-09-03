@@ -36,7 +36,12 @@ pub const max_config_path_bytes: usize = 200;
 
 /// Serialize the active window's chrome projection. Raw cells, process state,
 /// provider slots, and platform window ids deliberately never cross this seam.
-pub fn encode(model: *const Model, sequence: u64, revision: u64, run: TabRun, probe: ConfigProbe, out: []u8) Error![]const u8 {
+/// The run of every window, main first; a closed secondary slot's run is
+/// unused. The engine derives them from each window's own surface size.
+pub const WindowRuns = [1 + model_module.max_secondary_windows]TabRun;
+
+pub fn encode(model: *const Model, sequence: u64, revision: u64, runs: WindowRuns, probe: ConfigProbe, out: []u8) Error![]const u8 {
+    const run = runs[0];
     if (out.len < header_len) return error.BufferTooSmall;
     const framed = protocol.encodeSnapshotHeader(sequence, revision);
     @memcpy(out[0..framed.len], &framed);
@@ -53,6 +58,41 @@ pub fn encode(model: *const Model, sequence: u64, revision: u64, run: TabRun, pr
     std.mem.writeInt(u16, out[26..28], run.extent, .little);
 
     var written: usize = header_len;
+    written = try encodeTabs(model, workspace, out, written);
+    written = try encodeSettings(model, probe, out, written);
+    written = try encodeSecondaryWindows(model, runs, out, written);
+    return out[0..written];
+}
+
+/// The open secondary windows, each as its own section: index, tab count,
+/// selection, run, then the same tab records the main section carries. A
+/// closed slot is absent; presence is liveness, as it is for the platform
+/// windows the core declares from this.
+fn encodeSecondaryWindows(model: *const Model, runs: WindowRuns, out: []u8, start: usize) Error!usize {
+    var written = start;
+    if (written + 1 > out.len) return error.BufferTooSmall;
+    const count_at = written;
+    out[count_at] = 0;
+    written += 1;
+    for (1..1 + model_module.max_secondary_windows) |index| {
+        if (!model.windowOpen(index)) continue;
+        const workspace = model.wsAtConst(index) orelse continue;
+        if (written + 7 > out.len) return error.BufferTooSmall;
+        out[written] = @intCast(index);
+        out[written + 1] = @intCast(workspace.tab_count);
+        out[written + 2] = @intCast(workspace.selected_tab);
+        out[written + 3] = runs[index].first;
+        out[written + 4] = runs[index].count;
+        std.mem.writeInt(u16, out[written + 5 ..][0..2], runs[index].extent, .little);
+        written += 7;
+        written = try encodeTabs(model, workspace, out, written);
+        out[count_at] += 1;
+    }
+    return written;
+}
+
+fn encodeTabs(model: *const Model, workspace: *const model_module.Workspace, out: []u8, start: usize) Error!usize {
+    var written = start;
     for (0..workspace.tab_count) |index| {
         const terminal = workspace.tabTerminal(index) orelse continue;
         var title_buffer: [max_title_bytes]u8 = undefined;
@@ -67,8 +107,7 @@ pub fn encode(model: *const Model, sequence: u64, revision: u64, run: TabRun, pr
         @memcpy(out[written + 6 ..][0..bounded.len], bounded);
         written += needed;
     }
-    written = try encodeSettings(model, probe, out, written);
-    return out[0..written];
+    return written;
 }
 
 /// The trailer after the tab records: the builtin theme catalog by name (the

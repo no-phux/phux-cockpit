@@ -1,4 +1,5 @@
-import { Cmd, asciiBytes } from "@native-sdk/core";
+import { Cmd, asciiBytes, windowDescriptor } from "@native-sdk/core";
+import { type WindowDescriptor } from "@native-sdk/core/events";
 import { applyTextInputEvent, type TextEditState, type TextInputEvent } from "@native-sdk/core/text";
 import {
   ENGINE_CHANNEL_KEY,
@@ -13,6 +14,7 @@ import {
 export interface Tab {
   readonly id: number;
   readonly index: number;
+  readonly slot: number;
   readonly title: Uint8Array;
   readonly selected: boolean;
   readonly attention: boolean;
@@ -32,6 +34,22 @@ export interface ThemeRow {
   readonly label: Uint8Array;
   readonly active: boolean;
   readonly highlighted: boolean;
+}
+
+/// One secondary window slot, as the engine's snapshot reports it. `open`
+/// is presence in the snapshot; a closed slot keeps empty lists so the
+/// slot's markup always has something to bind. `slot` on a tab packs the
+/// window and the index into one number for the markup's single-value
+/// handlers (window * 32 + index; a workspace holds at most sixteen tabs).
+export interface WindowState {
+  readonly index: number;
+  readonly open: boolean;
+  readonly tabs: readonly Tab[];
+  readonly visibleTabs: readonly Tab[];
+  readonly tabWidth: number;
+  readonly hasOverflow: boolean;
+  readonly overflowLabel: Uint8Array;
+  readonly selectedTab: number;
 }
 
 export type TabPlacement = "top" | "side";
@@ -60,6 +78,28 @@ export interface Model {
   readonly settingsCursor: number;
   readonly configExists: boolean;
   readonly configNotice: Uint8Array;
+  // Each secondary slot flattened: a markup template takes scalars and
+  // slices as arguments, not records, so the slot's markup binds these.
+  readonly window1Open: boolean;
+  readonly window1Tabs: readonly Tab[];
+  readonly window1TabWidth: number;
+  readonly window1HasOverflow: boolean;
+  readonly window1OverflowLabel: Uint8Array;
+  readonly window2Open: boolean;
+  readonly window2Tabs: readonly Tab[];
+  readonly window2TabWidth: number;
+  readonly window2HasOverflow: boolean;
+  readonly window2OverflowLabel: Uint8Array;
+  readonly window3Open: boolean;
+  readonly window3Tabs: readonly Tab[];
+  readonly window3TabWidth: number;
+  readonly window3HasOverflow: boolean;
+  readonly window3OverflowLabel: Uint8Array;
+  readonly window4Open: boolean;
+  readonly window4Tabs: readonly Tab[];
+  readonly window4TabWidth: number;
+  readonly window4HasOverflow: boolean;
+  readonly window4OverflowLabel: Uint8Array;
   readonly engineConnected: boolean;
   readonly engineSequence: WireU64;
   readonly engineRevision: WireU64;
@@ -68,7 +108,10 @@ export interface Model {
 
 export type Msg =
   | { readonly kind: "select_tab"; readonly index: number }
+  | { readonly kind: "select_slot"; readonly slot: number }
   | { readonly kind: "new_terminal" }
+  | { readonly kind: "new_window" }
+  | { readonly kind: "window_closed"; readonly window: number }
   | { readonly kind: "close_selected_tab" }
   | { readonly kind: "toggle_tab_placement" }
   | { readonly kind: "palette_open" }
@@ -99,6 +142,7 @@ export type Msg =
 
 export const viewUnbound = [
   "selectedTab",
+  "window_closed",
   "paletteAnchor",
   "paletteFocus",
   "paletteCursor",
@@ -196,6 +240,7 @@ const NO_BYTES = new Uint8Array(0);
 // Typed empties: a bare `[]` in a record literal is inferred as number[] and
 // the record then fails to be a Model at the union boundary, at runtime.
 const NO_ROWS: readonly SwitcherRow[] = [];
+const NO_TABS: readonly Tab[] = [];
 const NO_THEMES: readonly ThemeRow[] = [];
 
 /// The switcher rows for a needle: every tab whose strip position or title
@@ -271,6 +316,163 @@ function configNotice(enabled: boolean, probed: boolean, exists: boolean, writab
   return joinBytes(asciiBytes("Active configuration file: "), path, NO_BYTES);
 }
 
+function stampSlots(tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly selected: boolean; readonly attention: boolean }[], window: number): readonly Tab[] {
+  const out: Tab[] = [];
+  const w = window >= 0 && window <= 4 ? Math.trunc(window) : 0;
+  for (let i = 0; i < tabs.length; i += 1) {
+    const t = tabs[i];
+    const rawIndex = t.index;
+    const rawId = t.id;
+    if (!(rawIndex >= 0 && rawIndex <= 31) || !(rawId >= 1 && rawId <= 4294967295)) continue;
+    const index = Math.trunc(rawIndex);
+    const id = Math.trunc(rawId);
+    out.push({ id, index, slot: w * 32 + index, title: t.title, selected: t.selected, attention: t.attention });
+  }
+  return out;
+}
+
+const CLOSED_WINDOW: WindowState = {
+  index: 0,
+  open: false,
+  tabs: [],
+  visibleTabs: [],
+  tabWidth: 168,
+  hasOverflow: false,
+  overflowLabel: new Uint8Array(0),
+  selectedTab: 0,
+};
+
+function closedWindow(index: number): WindowState {
+  const at = index >= 0 && index <= 4 ? Math.trunc(index) : 0;
+  return { ...CLOSED_WINDOW, index: at };
+}
+
+function windowState(index: number, section: { readonly selectedTab: number; readonly runStart: number; readonly runCount: number; readonly tabWidth: number; readonly tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly selected: boolean; readonly attention: boolean }[] } | null): WindowState {
+  if (section === null) return closedWindow(index);
+  const at = index >= 0 && index <= 4 ? Math.trunc(index) : 0;
+  const tabs = stampSlots(section.tabs, at);
+  const hidden = tabs.length - section.runCount;
+  const selected = section.selectedTab >= 0 && section.selectedTab <= 255 ? Math.trunc(section.selectedTab) : 0;
+  const width = section.tabWidth >= 0 && section.tabWidth <= 65535 ? Math.trunc(section.tabWidth) : 168;
+  return {
+    index: at,
+    open: true,
+    tabs,
+    visibleTabs: sliceRun(tabs, section.runStart, section.runCount),
+    tabWidth: width,
+    hasOverflow: hidden > 0,
+    overflowLabel: hidden > 0 ? overflowLabel(hidden) : new Uint8Array(0),
+    selectedTab: selected,
+  };
+}
+
+// Each slot's descriptor spells its labels literally: the compiled subset
+// binds `src/windows/<label>.native` to the literal at build time.
+function describeWindow1(): WindowDescriptor {
+  return windowDescriptor({
+    label: asciiBytes("phux-window-1"),
+    canvasLabel: asciiBytes("phux-cockpit-canvas-1"),
+    title: asciiBytes("Phux Cockpit TS"),
+    width: 1100,
+    height: 640,
+    minWidth: 900,
+    minHeight: 420,
+    titlebar: "hidden_inset_tall",
+    closePolicy: "quit",
+    onCloseCommand: asciiBytes("cockpit.window.closed.1"),
+  });
+}
+
+function describeWindow2(): WindowDescriptor {
+  return windowDescriptor({
+    label: asciiBytes("phux-window-2"),
+    canvasLabel: asciiBytes("phux-cockpit-canvas-2"),
+    title: asciiBytes("Phux Cockpit TS"),
+    width: 1100,
+    height: 640,
+    minWidth: 900,
+    minHeight: 420,
+    titlebar: "hidden_inset_tall",
+    closePolicy: "quit",
+    onCloseCommand: asciiBytes("cockpit.window.closed.2"),
+  });
+}
+
+function describeWindow3(): WindowDescriptor {
+  return windowDescriptor({
+    label: asciiBytes("phux-window-3"),
+    canvasLabel: asciiBytes("phux-cockpit-canvas-3"),
+    title: asciiBytes("Phux Cockpit TS"),
+    width: 1100,
+    height: 640,
+    minWidth: 900,
+    minHeight: 420,
+    titlebar: "hidden_inset_tall",
+    closePolicy: "quit",
+    onCloseCommand: asciiBytes("cockpit.window.closed.3"),
+  });
+}
+
+function describeWindow4(): WindowDescriptor {
+  return windowDescriptor({
+    label: asciiBytes("phux-window-4"),
+    canvasLabel: asciiBytes("phux-cockpit-canvas-4"),
+    title: asciiBytes("Phux Cockpit TS"),
+    width: 1100,
+    height: 640,
+    minWidth: 900,
+    minHeight: 420,
+    titlebar: "hidden_inset_tall",
+    closePolicy: "quit",
+    onCloseCommand: asciiBytes("cockpit.window.closed.4"),
+  });
+}
+
+/// The secondary windows the engine has open, as platform windows: the same
+/// labels the shipping scene declares, so the engine paints, sizes and routes
+/// each one through its own table. Presence is liveness. The compiled subset
+/// requires an array literal of descriptor calls per return, so every
+/// combination of open slots is spelled out.
+export function windows(model: Model): readonly WindowDescriptor[] {
+  const a = model.window1Open;
+  const b = model.window2Open;
+  const c = model.window3Open;
+  const d = model.window4Open;
+  if (a && b && c && d) return [describeWindow1(), describeWindow2(), describeWindow3(), describeWindow4()];
+  if (a && b && c && !d) return [describeWindow1(), describeWindow2(), describeWindow3()];
+  if (a && b && !c && d) return [describeWindow1(), describeWindow2(), describeWindow4()];
+  if (a && b && !c && !d) return [describeWindow1(), describeWindow2()];
+  if (a && !b && c && d) return [describeWindow1(), describeWindow3(), describeWindow4()];
+  if (a && !b && c && !d) return [describeWindow1(), describeWindow3()];
+  if (a && !b && !c && d) return [describeWindow1(), describeWindow4()];
+  if (a && !b && !c && !d) return [describeWindow1()];
+  if (!a && b && c && d) return [describeWindow2(), describeWindow3(), describeWindow4()];
+  if (!a && b && c && !d) return [describeWindow2(), describeWindow3()];
+  if (!a && b && !c && d) return [describeWindow2(), describeWindow4()];
+  if (!a && b && !c && !d) return [describeWindow2()];
+  if (!a && !b && c && d) return [describeWindow3(), describeWindow4()];
+  if (!a && !b && c && !d) return [describeWindow3()];
+  if (!a && !b && !c && d) return [describeWindow4()];
+  return [];
+}
+
+/// The OS closed a window: tell the engine, which retires the slot and its
+/// shells; the next snapshot drops the window from `windows(model)`.
+export function commandMsg(name: string): Msg | null {
+  if (name === "cockpit.window.closed.1") return { kind: "window_closed", window: 1 };
+  if (name === "cockpit.window.closed.2") return { kind: "window_closed", window: 2 };
+  if (name === "cockpit.window.closed.3") return { kind: "window_closed", window: 3 };
+  if (name === "cockpit.window.closed.4") return { kind: "window_closed", window: 4 };
+  return null;
+}
+
+function findSection(sections: readonly { readonly index: number; readonly selectedTab: number; readonly runStart: number; readonly runCount: number; readonly tabWidth: number; readonly tabs: readonly { readonly id: number; readonly index: number; readonly title: Uint8Array; readonly selected: boolean; readonly attention: boolean }[] }[], index: number) {
+  for (let i = 0; i < sections.length; i += 1) {
+    if (sections[i].index === index) return sections[i];
+  }
+  return null;
+}
+
 /// Slice the tab list to the engine's run. Every index is proven whole from
 /// the wire (protocol.ts fences the bytes), so the slice needs no more.
 function sliceRun(tabs: readonly Tab[], runStart: number, runCount: number): readonly Tab[] {
@@ -285,8 +487,8 @@ function sliceRun(tabs: readonly Tab[], runStart: number, runCount: number): rea
 export function initialModel(): [Model, Cmd<Msg>] {
   return [
     {
-      tabs: [{ id: 1, index: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
-      visibleTabs: [{ id: 1, index: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
+      tabs: [{ id: 1, index: 0, slot: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
+      visibleTabs: [{ id: 1, index: 0, slot: 0, title: asciiBytes("Terminal 1"), selected: true, attention: false }],
       tabWidth: 168,
       hasOverflow: false,
       overflowLabel: new Uint8Array(0),
@@ -303,6 +505,26 @@ export function initialModel(): [Model, Cmd<Msg>] {
       settingsCursor: 0,
       configExists: false,
       configNotice: new Uint8Array(0),
+      window1Open: false,
+      window1Tabs: NO_TABS,
+      window1TabWidth: 168,
+      window1HasOverflow: false,
+      window1OverflowLabel: new Uint8Array(0),
+      window2Open: false,
+      window2Tabs: NO_TABS,
+      window2TabWidth: 168,
+      window2HasOverflow: false,
+      window2OverflowLabel: new Uint8Array(0),
+      window3Open: false,
+      window3Tabs: NO_TABS,
+      window3TabWidth: 168,
+      window3HasOverflow: false,
+      window3OverflowLabel: new Uint8Array(0),
+      window4Open: false,
+      window4Tabs: NO_TABS,
+      window4TabWidth: 168,
+      window4HasOverflow: false,
+      window4OverflowLabel: new Uint8Array(0),
       engineConnected: false,
       engineSequence: ZERO_U64,
       engineRevision: ZERO_U64,
@@ -333,17 +555,37 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
           visibleTabs: selectTab(model.visibleTabs, msg.index),
           selectedTab: msg.index,
         },
-        Cmd.host("cockpit.intent", intent(1, model.engineRevision, msg.index)),
+        Cmd.host("cockpit.intent", intent(1, model.engineRevision, msg.index, 0)),
       ];
+    case "select_slot": {
+      // A tab pressed in a secondary window's chrome: the intent names that
+      // window so it cannot land on whichever window is active.
+      const slot = msg.slot;
+      if (!(slot >= 0 && slot <= 159)) return model;
+      let window = 0;
+      let index = Math.trunc(slot);
+      while (index >= 32) {
+        index -= 32;
+        window += 1;
+      }
+      return [model, Cmd.host("cockpit.intent", intent(1, model.engineRevision, index, window))];
+    }
     case "new_terminal":
-      return [model, Cmd.host("cockpit.intent", intent(2, model.engineRevision, 0))];
+      return [model, Cmd.host("cockpit.intent", intent(2, model.engineRevision, 0, 0))];
+    case "new_window":
+      return [model, Cmd.host("cockpit.intent", intent(8, model.engineRevision, 0, 0))];
+    case "window_closed": {
+      const window = msg.window;
+      if (!(window >= 1 && window <= 4)) return model;
+      return [model, Cmd.host("cockpit.intent", intent(9, model.engineRevision, 0, Math.trunc(window)))];
+    }
     case "close_selected_tab":
-      return [model, Cmd.host("cockpit.intent", intent(3, model.engineRevision, model.selectedTab))];
+      return [model, Cmd.host("cockpit.intent", intent(3, model.engineRevision, model.selectedTab, 0))];
     case "toggle_tab_placement": {
       const placement: TabPlacement = model.tabPlacement === "top" ? "side" : "top";
       return [
         { ...model, tabPlacement: placement },
-        Cmd.host("cockpit.intent", intent(4, model.engineRevision, placement === "side" ? 1 : 0)),
+        Cmd.host("cockpit.intent", intent(4, model.engineRevision, placement === "side" ? 1 : 0, 0)),
       ];
     }
     case "palette_open":
@@ -375,7 +617,7 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       const row = model.paletteRows[model.paletteCursor];
       const picked = row.index;
       const selected: Model = { ...closed, tabs: selectTab(model.tabs, picked), visibleTabs: selectTab(model.visibleTabs, picked), selectedTab: picked };
-      return [selected, Cmd.host("cockpit.intent", intent(1, model.engineRevision, picked))];
+      return [selected, Cmd.host("cockpit.intent", intent(1, model.engineRevision, picked, 0))];
     }
     case "palette_pick": {
       if (!model.paletteOpen) return model;
@@ -392,7 +634,7 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
         visibleTabs: selectTab(model.visibleTabs, picked),
         selectedTab: picked,
       };
-      return [chosen, Cmd.host("cockpit.intent", intent(1, model.engineRevision, picked))];
+      return [chosen, Cmd.host("cockpit.intent", intent(1, model.engineRevision, picked, 0))];
     }
     case "settings_open": {
       if (model.settingsOpen) return model;
@@ -400,7 +642,7 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       // app asks the disk once when the panel opens and never per frame.
       return [
         { ...model, settingsOpen: true, paletteOpen: false },
-        Cmd.host("cockpit.intent", intent(7, model.engineRevision, 0)),
+        Cmd.host("cockpit.intent", intent(7, model.engineRevision, 0, 0)),
       ];
     }
     case "settings_close":
@@ -424,12 +666,12 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       if (!model.settingsOpen) return model;
       return [
         { ...model, settingsOpen: false },
-        Cmd.host("cockpit.intent", intent(5, model.engineRevision, model.settingsCursor)),
+        Cmd.host("cockpit.intent", intent(5, model.engineRevision, model.settingsCursor, 0)),
       ];
     }
     case "settings_reveal":
       if (!model.settingsOpen || !model.configExists) return model;
-      return [model, Cmd.host("cockpit.intent", intent(6, model.engineRevision, 0))];
+      return [model, Cmd.host("cockpit.intent", intent(6, model.engineRevision, 0, 0))];
     case "engine_wake":
       return { ...model };
     case "snapshot_loaded": {
@@ -454,14 +696,45 @@ export function update(model: Model, msg: Msg): Model | [Model, Cmd<Msg>] {
       const active = projected.activeTheme;
       const cursor = model.settingsOpen ? model.settingsCursor : active >= 0 && active <= 32 && active < projected.themes.length ? Math.trunc(active) : 0;
       const refused = (projected.flags & 8) !== 0;
+      const mainTabs = stampSlots(projected.tabs, 0);
+      const w1 = windowState(1, findSection(projected.secondary, 1));
+      const w2 = windowState(2, findSection(projected.secondary, 2));
+      const w3 = windowState(3, findSection(projected.secondary, 3));
+      const w4 = windowState(4, findSection(projected.secondary, 4));
+      // The width crosses a record into an integer slot; the proof is
+      // restated at the boundary, once per slot.
+      const width1 = w1.tabWidth >= 0 && w1.tabWidth <= 65535 ? Math.trunc(w1.tabWidth) : 168;
+      const width2 = w2.tabWidth >= 0 && w2.tabWidth <= 65535 ? Math.trunc(w2.tabWidth) : 168;
+      const width3 = w3.tabWidth >= 0 && w3.tabWidth <= 65535 ? Math.trunc(w3.tabWidth) : 168;
+      const width4 = w4.tabWidth >= 0 && w4.tabWidth <= 65535 ? Math.trunc(w4.tabWidth) : 168;
       const synced: Model = {
         ...model,
+        window1Open: w1.open,
+        window1Tabs: w1.visibleTabs,
+        window1TabWidth: width1,
+        window1HasOverflow: w1.hasOverflow,
+        window1OverflowLabel: w1.overflowLabel,
+        window2Open: w2.open,
+        window2Tabs: w2.visibleTabs,
+        window2TabWidth: width2,
+        window2HasOverflow: w2.hasOverflow,
+        window2OverflowLabel: w2.overflowLabel,
+        window3Open: w3.open,
+        window3Tabs: w3.visibleTabs,
+        window3TabWidth: width3,
+        window3HasOverflow: w3.hasOverflow,
+        window3OverflowLabel: w3.overflowLabel,
+        window4Open: w4.open,
+        window4Tabs: w4.visibleTabs,
+        window4TabWidth: width4,
+        window4HasOverflow: w4.hasOverflow,
+        window4OverflowLabel: w4.overflowLabel,
         themes: themeRows(projected.themes, active, cursor),
         settingsCursor: cursor,
         configExists: projected.configExists,
         configNotice: configNotice(projected.configEnabled, projected.configProbed, projected.configExists, projected.configWritable, refused, projected.configPath),
-        tabs: projected.tabs,
-        visibleTabs: sliceRun(projected.tabs, projected.runStart, projected.runCount),
+        tabs: mainTabs,
+        visibleTabs: sliceRun(mainTabs, projected.runStart, projected.runCount),
         tabWidth,
         hasOverflow: hidden > 0,
         overflowLabel: hidden > 0 ? overflowLabel(hidden) : new Uint8Array(0),

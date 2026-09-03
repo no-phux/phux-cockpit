@@ -35,10 +35,16 @@ paste (bracketed, or into the needle), cmd+A and the keyboard-selection
 chord mirror `update.zig`'s terminal block; a bell while the app is
 deactivated notifies on its rising edge; a mouse-protocol flip ends
 mismatched captures. `pointer_input.zig` and `pasteClipboardText` are generic
-over the effects type for the same reason `terminal_runtime.zig` is. Not yet
-moved: secondary windows, the selection autoscroll timer, Finder drops, and
-the working directory in the switcher. The shipping graph remains the Zig
-core.
+over the effects type for the same reason `terminal_runtime.zig` is. Secondary
+windows are model-declared: the snapshot carries a section per open window,
+the core exports `windows(model)` with the shipping scene's own labels, each
+slot binds one shared markup template (`src/windows/`), and the engine
+paints, pumps and routes every window through the scene's canvas table; the
+platform's focused window is the active one, and a tab intent from a window's
+chrome names that window. Not yet moved: the selection autoscroll timer,
+Finder drops, the working directory in the switcher, and overlays in
+secondary windows (the switcher and settings live in the main window). The
+shipping graph remains the Zig core.
 
 Building the spike needs the SDK package's TypeScript toolchain, which the
 tarball pin does not carry. Once per pin, on the package `zig build` resolved:
