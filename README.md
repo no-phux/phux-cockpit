@@ -513,7 +513,7 @@ The dev run differs in four ways, each closing a different hole:
 | process name | `phux-cockpit` | `phux-cockpit-dev` |
 | Dock and menu | Phux Cockpit | Phux Cockpit (dev) |
 | config | `~/.config/phux-cockpit/config` | `.dev-run/config` |
-| workspace layout | `~/Library/Application Support/…/workspace.state` | `.dev-run/workspace.state` |
+| workspace layout | `~/Library/Application Support/…/workspace.state` | `.dev-run/dev.phux.cockpit/workspace.state` |
 | automation dropbox | the CWD you launched from | `.dev-run/.zig-cache/…` |
 
 The process name is the one that matters to tooling rather than to you.

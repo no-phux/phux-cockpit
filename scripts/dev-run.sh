@@ -215,7 +215,7 @@ printf '  bundle id:  %s\n' "$staged_id"
 printf '  process:    %s      (pgrep -x %s)\n' "$staged_executable" "$staged_executable"
 printf '  menu name:  %s\n' "$staged_name"
 printf '  config:     %s\n' "$CONFIG"
-printf '  state:      %s/workspace.state\n' "$DEV_HOME"
+printf '  state:      %s\n' "$(dev_app_state_path "$DEV_HOME")"
 if [[ -d "$DEV_APP_INSTALLED_BUNDLE" ]]; then
     read -r installed_id installed_executable _ <<<"$(dev_app_identity "$DEV_APP_INSTALLED_BUNDLE")"
     printf '  not:        %s (%s, %s, v%s)\n' \

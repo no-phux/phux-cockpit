@@ -319,8 +319,9 @@ mkdir -p -- "${FAKE_HOME}/.config/phux-cockpit"
 REAL_MARKER="${WORK}/marker-real"
 DEV_MARKER="${WORK}/marker-dev"
 write_marker_config "${FAKE_HOME}/.config/phux-cockpit/config" "${WORK}/real-shell.sh" "$REAL_MARKER"
-mkdir -p -- "${WORK}/devhome"
+mkdir -p -- "${WORK}/devhome/${DEV_APP_RUNTIME_ID}"
 write_marker_config "${WORK}/devhome/config" "${WORK}/dev-shell.sh" "$DEV_MARKER"
+DEV_STATE="$(dev_app_state_path "${WORK}/devhome")"
 FAKE_PLATFORM_STATE="${FAKE_HOME}/Library/Application Support/Phux Cockpit/State/workspace.state"
 
 if [[ -e "$REAL_MARKER" || -e "$DEV_MARKER" || -e "$FAKE_PLATFORM_STATE" ]]; then
@@ -330,9 +331,9 @@ fi
 
 printf '  arm A: launched the way scripts/dev-run.sh launches\n'
 env -C "${WORK}/devhome" \
-    HOME="$FAKE_HOME" XDG_CONFIG_HOME="${FAKE_HOME}/.config" \
+    HOME="$FAKE_HOME" XDG_CONFIG_HOME="${FAKE_HOME}/.config" TMPDIR="${WORK}/devhome" \
     PHUX_COCKPIT_CONFIG="${WORK}/devhome/config" \
-    PHUX_COCKPIT_STATE="${WORK}/devhome/workspace.state" \
+    PHUX_COCKPIT_STATE="$DEV_STATE" \
     "$EXECUTABLE" >"${WORK}/arm-a.log" 2>&1 &
 ARM_A_PID=$!
 PIDS+=("$ARM_A_PID")
@@ -356,7 +357,7 @@ fi
 sleep 3
 kill "$ARM_A_PID" 2>/dev/null || true
 PIDS=()
-if wait_for_file "${WORK}/devhome/workspace.state" 20; then
+if wait_for_file "$DEV_STATE" 20; then
     ok 'workspace layout was written into the dev home'
 else
     bad 'no workspace state in the dev home; the state seam did not take'
