@@ -5,7 +5,7 @@
 # break answers every snapshot request as an unknown command, which is what
 # an engine that does not serialize state looks like from the core.
 test: the core boots from the engine's snapshot, not from its own defaults
-red: 2026-09-02 at 7a00e4b
+red: 2026-09-02 at 30012da
 build: test -Dtypescript-spike=true -Dplatform=null
 diff --git a/typescript-spike/src/native_extension.zig b/typescript-spike/src/native_extension.zig
 index b094b92..b6c0665 100644
