@@ -29,6 +29,8 @@ jobs:
         run: ./scripts/verify-phux-ffi.py --github-output "$GITHUB_OUTPUT"
       - name: Check release version synchronization
         run: ./scripts/check-release-version.sh
+      - name: Check release fallback ordering
+        run: ./scripts/check-release-fallback.sh
       # Offline and instant, so it runs before anything is fetched or built.
       # A pin bump that leaves README describing the previous sha has already
       # shipped once; the sha a reader trusts has to be the sha that is built.

@@ -75,31 +75,65 @@ outside GitHub's managed secret store, is the point. (This mirrors the
 reasoning behind ADR-0084 in the operator's home-ops repo, made for a
 different, now-retired self-hosted-runner approach, for the same reason.)
 
-If a real release needs to go out during an outage and Developer ID
-signing matters for that release, the fallback is not a substitute for
-waiting on or escalating hosted Actions — it's a way to get *an* artifact
-published, ad-hoc signed, when that's an acceptable tradeoff.
+If a real release needs to go out during an outage and Developer ID signing
+matters for that release, the fallback is not a substitute for waiting on or
+escalating hosted Actions. Without the tap credential it prepares a verified,
+ad-hoc-signed draft; a credentialed recovery is still required to publish it.
 
-## The Homebrew tap caveat
+## The Homebrew tap stop point
 
-`HOMEBREW_TAP_DEPLOY_KEY` is `required: true` at the `workflow_call` level
-and gates a later step in `release.yml` that hard-fails if the secret is
-unset. `dsr`'s local config does not configure this secret either.
+`HOMEBREW_TAP_DEPLOY_KEY` is optional at the `workflow_call` boundary so a
+keyless local replay can build and preserve its result. The workflow itself
+has one explicit keyless stop:
+`Require Homebrew tap deploy key before publication`.
 
-This means a full local replay of `release.yml` via `dsr` will get through
-build, asset upload, and ad-hoc-signature verification, but will fail at the
-Homebrew-tap-update gate. That failure is expected, not a sign that the
-fallback release is broken — the assets are already uploaded by the time it
-happens.
+The order is deliberate:
 
-If you actually use the fallback to ship a real release, the Homebrew tap
-does not get updated automatically. Either:
+1. build and package the app;
+2. upload the exact asset set only when the draft has no assets; an exact
+   existing set is preserved, while a partial or unexpected set fails before
+   any mutation;
+3. download the assets; compare them byte-for-byte with the local package only
+   when this run uploaded them, then intrinsically verify the remote checksums,
+   signature mode, archive, and disk image;
+4. fail with `KEYLESS_RELEASE_STOP` when the tap deploy key is absent;
+5. when the key is present, check out `phall1/homebrew-tap`, generate and
+   validate the cask, hash that generated working-tree file, push the real tap
+   update, fetch `origin/main`, and prove its cask blob equals the pre-push hash;
+6. only after that remote equality proof, annotate and publish the draft.
 
-- run `bash scripts/gen-formula.sh` and push the result to the tap manually
-  afterward, or
-- accept that the tap stays stale until a real hosted-Actions release runs
-  and updates it normally.
+Consequently, `dsr fallback phux-cockpit --version vX.Y.Z` without the deploy
+key is expected to exit nonzero at `KEYLESS_RELEASE_STOP`. The verified assets
+remain attached to the **draft** Release for a credentialed rerun, but the
+Release is not published and the tap is not changed. Do not describe this
+state as a published or partially published release.
 
-State this plainly to whoever consumes the release: a `dsr fallback` run
-that stops at the Homebrew gate is a partial success (artifacts are up),
-not a failure that needs debugging.
+After `HOMEBREW_TAP_DEPLOY_KEY` is restored in the repository secrets, rerun
+the release workflow for the same tag:
+
+```sh
+gh workflow run release.yml --repo no-phux/phux-cockpit --field tag=vX.Y.Z
+```
+
+The rerun preserves an exact existing asset set and rejects a partial or
+unexpected set before mutation. Because fresh ZIP, DMG, and signing output is
+not byte-reproducible, it does not compare regenerated local bytes with those
+pre-existing assets; it verifies the downloaded remote assets intrinsically.
+The workflow hashes the generated working-tree cask before invoking the tap's
+commit helper, performs the real tap update, fetches `origin/main`, and requires
+its cask blob to equal that pre-helper hash. The draft is published only after
+that proof succeeds.
+
+If a Release was published by some other recovery path but its tap entry is
+stale, delegate formula recovery to the tap's real `Update packages` workflow:
+
+```sh
+gh workflow run update-packages.yml --repo phall1/homebrew-tap --field tool=phux-cockpit
+```
+
+That external workflow resolves the published Release, recomputes the archive
+digest, and invokes its checked-in
+`.github/scripts/gen-phux-cockpit-cask.sh`; there is no Cockpit-local
+`scripts/gen-formula.sh`. It also runs every fifteen minutes, so waiting for
+its next scheduled run is the credential-free alternative to the explicit
+dispatch.
