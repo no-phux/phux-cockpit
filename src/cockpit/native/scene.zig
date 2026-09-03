@@ -202,9 +202,12 @@ pub const cockpit_status_item: TerminalApp.StatusItemOptions = .{
 /// for, and "Phux Cockpit 3" would be the widest thing up there.
 pub const status_item_prefix = "PX";
 
+// WebKit is deliberately absent from the startup scene. The host materializes
+// its parked child view only after the first nonblank canvas present; creating
+// WKWebView behind this surface used to hold the synchronous startup-frame
+// flush behind WebKit process startup and consume the whole 150 ms budget.
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Phux Cockpit canvas", .accessibility_label = "Phux Cockpit", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
-    .{ .label = webview_label, .kind = .webview, .parent = canvas_label, .url = model_module.BrowserPage.github.url(), .x = 0, .y = 0, .width = webkit_parking_extent, .height = webkit_parking_extent, .layer = 20 },
 };
 /// The window's declared label. `fx.closeWindow` addresses a window by this
 /// name.

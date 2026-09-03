@@ -305,10 +305,10 @@ pub const onFrame = view_module.onFrame;
 pub const tabPlacementFromText = view_module.tabPlacementFromText;
 pub const onTimer = view_module.onTimer;
 pub const CockpitHost = host.CockpitHost;
+pub const installPostPresentResources = host.installPostPresentResources;
 pub const encodeTsSnapshot = ts_snapshot.encode;
 pub const TsTabRun = ts_snapshot.TabRun;
 pub const ts_snapshot_max_bytes = ts_snapshot.max_bytes;
-
 pub const selection_autoscroll_timer_id = app_types.selection_autoscroll_timer_id;
 pub const terminal_font_id = scene.terminal_font_id;
 const terminal_bold_font_id = scene.terminal_bold_font_id;
@@ -322,7 +322,11 @@ pub fn appOptions() TerminalApp.Options {
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .tokens_fn = cockpitTokens,
-        .fonts = &scene.cockpit_fonts,
+        // Register the regular face for the first useful frame. The host adds
+        // the three weighted companions after that present, using the pin's
+        // late-font seam so the next rebuild replaces transient synthesis
+        // without charging four 2.3 MB parses to launch.
+        .fonts = scene.cockpit_fonts[0..1],
         .init_fx = update_module.initFx,
         .update_fx = update,
         .view = view,
@@ -924,25 +928,29 @@ test "tab placement configuration accepts only documented values" {
     try std.testing.expectEqual(@as(?TabPlacement, null), tabPlacementFromText("left"));
 }
 
-test "the terminal family is bundled whole and selected by the design tokens" {
+// GUARD: first-frame-deferred-fonts
+test "the terminal family is bundled whole while startup registers only regular" {
     const options = appOptions();
-    // Four faces, not one: SGR bold and italic select a real face now, and a
-    // missing companion silently downgrades to synthesis rather than failing,
-    // so the count is worth asserting.
-    try std.testing.expectEqual(@as(usize, 4), options.fonts.len);
+    // The regular face is enough for a useful first frame; missing companions
+    // render through the SDK's synthesis until CockpitHost registers the real
+    // faces immediately after that present.
+    try std.testing.expectEqual(@as(usize, 1), options.fonts.len);
+    try std.testing.expectEqual(terminal_font_id, options.fonts[0].id);
     const expected = [_]struct { id: @TypeOf(terminal_font_id), name: []const u8 }{
         .{ .id = terminal_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Regular" },
         .{ .id = terminal_bold_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Bold" },
         .{ .id = terminal_italic_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Italic" },
         .{ .id = terminal_bold_italic_font_id, .name = "JetBrainsMonoNL Nerd Font Mono Bold Italic" },
     };
+    try std.testing.expectEqual(expected.len, scene.cockpit_fonts.len);
     for (expected, 0..) |want, index| {
-        try std.testing.expectEqual(want.id, options.fonts[index].id);
-        try std.testing.expectEqualStrings(want.name, options.fonts[index].name);
+        const registration = scene.cockpit_fonts[index];
+        try std.testing.expectEqual(want.id, registration.id);
+        try std.testing.expectEqualStrings(want.name, registration.name);
         // Every one is a real TrueType file, not an empty embed that would
         // register and then render nothing.
-        try std.testing.expect(options.fonts[index].ttf.len > 4);
-        try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, options.fonts[index].ttf[0..4]);
+        try std.testing.expect(registration.ttf.len > 4);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0, 0 }, registration.ttf[0..4]);
     }
     // Ids must be distinct, or a later registration overwrites an earlier one
     // and a whole weight vanishes.

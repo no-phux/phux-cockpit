@@ -433,8 +433,8 @@ test "the strip shows terminals only and still reaches the web surface" {
         try testing.expect(std.mem.indexOf(u8, label, "Web") == null);
     }
 
-    // Kept, not deleted: the surface, its pane declaration and its scene
-    // wiring are all still there, and two paths reach it.
+    // Kept, not deleted: the surface and pane declaration remain, while its
+    // native child is materialized after the first canvas present.
     var panes: [2]app.TerminalApp.WebViewPane = undefined;
     try testing.expectEqual(@as(usize, 1), app.webPanes(&state.model, support.mainChromeContext(), &panes));
     try testing.expectEqualStrings(app.webview_label, panes[0].label);

@@ -512,6 +512,10 @@ pub fn startFocusedTerminal(gpa: std.mem.Allocator, harness: anytype) !*Terminal
         .frame_index = 1,
         .timestamp_ns = 1_000_000,
     } });
+    // Production creates dormant WebKit and registers the weighted companions
+    // only after this first canvas present. Direct-UiApp fixtures call the same
+    // post-present seam explicitly because they bypass CockpitHost.
+    try app.installPostPresentResources(&harness.runtime, &app_state.model, 1);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_input = .{
         .window_id = 1,
@@ -597,7 +601,7 @@ pub fn startCockpit(harness: anytype) !*TerminalApp {
     errdefer stopCockpit(state);
     state.effects.executor = .fake;
     try harness.start(state.app());
-    try dispatchInitialFrame(harness, state.app());
+    try dispatchInitialFrame(harness, state);
     return state;
 }
 
@@ -619,11 +623,12 @@ pub fn startProductionCockpit(harness: anytype) !*TerminalApp {
     errdefer stopCockpit(state);
     state.effects.executor = .fake;
     try harness.start(state.app());
-    try dispatchInitialFrame(harness, state.app());
+    try dispatchInitialFrame(harness, state);
     return state;
 }
 
-fn dispatchInitialFrame(harness: anytype, app_iface: native_sdk.App) !void {
+fn dispatchInitialFrame(harness: anytype, state: *TerminalApp) !void {
+    const app_iface = state.app();
     try harness.runtime.dispatchPlatformEvent(app_iface, .{ .gpu_surface_frame = .{
         .label = app.canvas_label,
         .size = geometry.SizeF.init(980, 640),
@@ -631,6 +636,7 @@ fn dispatchInitialFrame(harness: anytype, app_iface: native_sdk.App) !void {
         .frame_index = 1,
         .timestamp_ns = 1_000_000,
     } });
+    try app.installPostPresentResources(&harness.runtime, &state.model, 1);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
 }
 

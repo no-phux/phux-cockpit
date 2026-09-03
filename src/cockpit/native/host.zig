@@ -25,6 +25,42 @@ const appShortcutKeyMask = update_module.appShortcutKeyMask;
 const commandShortcutKeyMask = update_module.commandShortcutKeyMask;
 const pointerCaptureFor = pointer_input.pointerCaptureFor;
 const modelHasSelectionAutoscroll = pointer_input.modelHasSelectionAutoscroll;
+const webview_layer: i32 = 20;
+
+fn registerDeferredFonts(runtime: *native_sdk.Runtime, model: *Model) !void {
+    const fonts = scene_module.cockpit_fonts[1..];
+    while (@as(usize, model.deferred_font_count) < fonts.len) {
+        const index: usize = model.deferred_font_count;
+        const registration = fonts[index];
+        try runtime.registerCanvasFont(registration.id, registration.ttf);
+        model.deferred_font_count += 1;
+    }
+}
+
+fn materializeWebView(runtime: *native_sdk.Runtime, model: *Model, window_id: native_sdk.platform.WindowId) !void {
+    if (model.webview_materialized) return;
+    _ = try runtime.createView(.{
+        .window_id = window_id,
+        .label = webview_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .frame = geometry.RectF.init(0, 0, scene_module.webkit_parking_extent, scene_module.webkit_parking_extent),
+        .layer = webview_layer,
+        .url = model.browser_page.url(),
+    });
+    model.webview_materialized = true;
+}
+
+/// Install work that is necessary after launch but not before useful canvas
+/// pixels. The regular face already rendered the first frame; late registration
+/// replaces transient bold/italic synthesis on the next rebuild. WebKit keeps
+/// the same parent, URL, and parking geometry it had as a scene child without
+/// putting its process startup in front of the first synchronous canvas flush.
+pub fn installPostPresentResources(runtime: *native_sdk.Runtime, model: *Model, window_id: native_sdk.platform.WindowId) !void {
+    try registerDeferredFonts(runtime, model);
+    try materializeWebView(runtime, model, window_id);
+}
+
 /// UiApp owns the deterministic model/view/effects loop. This host adds the
 /// one imperative operation native surface switching requires: moving the OS
 /// first responder after a global tab shortcut. Without it, a parked WebKit
@@ -145,9 +181,60 @@ pub const CockpitHost = struct {
         return if (workspace.window_id == 0) 1 else workspace.window_id;
     }
 
+    fn logPostPresentFailure(resource: []const u8, err: anyerror) void {
+        std.log.warn("post-present {s} initialization failed: {s}", .{ resource, @errorName(err) });
+    }
+
+    fn attemptPostPresentResources(self: *CockpitHost, runtime: *native_sdk.Runtime, window_id: native_sdk.platform.WindowId) void {
+        registerDeferredFonts(runtime, &self.inner.model) catch |err| logPostPresentFailure("font", err);
+        materializeWebView(runtime, &self.inner.model, window_id) catch |err| logPostPresentFailure("WebView", err);
+    }
+
+    fn installResourcesAfterFirstPresent(self: *CockpitHost, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) void {
+        const frame = switch (event_value) {
+            .gpu_surface_frame => |value| value,
+            else => return,
+        };
+        if (!frame.nonblank or !std.mem.eql(u8, frame.label, canvas_label)) return;
+        if (self.inner.model.post_present_resources_attempted) return;
+        self.inner.model.post_present_resources_attempted = true;
+        self.attemptPostPresentResources(runtime, frame.window_id);
+        if (self.inner.model.webview_materialized and self.inner.model.selectedTerminalRef() == null) {
+            runtime.focusView(frame.window_id, webview_label) catch |err| logPostPresentFailure("WebView focus", err);
+        }
+    }
+
+    fn resourceRetryEvent(event_value: native_sdk.Event) bool {
+        return switch (event_value) {
+            .command, .shortcut, .canvas_widget_keyboard, .canvas_widget_pointer => true,
+            else => false,
+        };
+    }
+
+    fn recoverResourcesOnDemand(self: *CockpitHost, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) void {
+        if (!self.inner.model.post_present_resources_attempted) return;
+        if (!resourceRetryEvent(event_value)) return;
+        if (self.inner.model.selectedTerminalRef() != null) return;
+        if (self.inner.model.webview_materialized and
+            @as(usize, self.inner.model.deferred_font_count) == scene_module.cockpit_fonts.len - 1) return;
+        self.attemptPostPresentResources(runtime, 1);
+        if (self.inner.model.webview_materialized) {
+            runtime.focusView(1, webview_label) catch |err| logPostPresentFailure("WebView focus", err);
+        }
+    }
+
+    fn installingMainCanvas(self: *const CockpitHost, event_value: native_sdk.Event) bool {
+        if (self.inner.installed) return false;
+        return switch (event_value) {
+            .gpu_surface_frame => |frame| std.mem.eql(u8, frame.label, canvas_label),
+            else => false,
+        };
+    }
+
     fn event(context: *anyopaque, runtime: *native_sdk.Runtime, event_value: native_sdk.Event) anyerror!void {
         const self: *CockpitHost = @ptrCast(@alignCast(context));
         defer self.syncSelectionAutoscrollTimer(runtime) catch {};
+        self.installResourcesAfterFirstPresent(runtime, event_value);
         try self.adoptEventWindow(runtime, event_value);
         switch (event_value) {
             .command => |command| {
@@ -205,7 +292,20 @@ pub const CockpitHost = struct {
             else => {},
         }
         const selected_before = self.inner.model.selectedSurface();
+        // UiApp's first install publishes AppKit accessibility synchronously
+        // after emitting the display list and before planning/presenting it.
+        // Reuse the SDK's documented "present follows immediately" batch seam:
+        // the display list still builds now, while only the platform a11y
+        // publication rides RuntimeGpuSurfaceEvents' post-present flush.
+        var startup_batch_active = self.installingMainCanvas(event_value);
+        if (startup_batch_active) runtime.beginCanvasWidgetDisplayListRefreshBatch();
+        defer if (startup_batch_active) runtime.cancelCanvasWidgetDisplayListRefreshBatch();
         try self.inner_app.event(runtime, event_value);
+        if (startup_batch_active) {
+            try runtime.endCanvasWidgetDisplayListRefreshBatch();
+            startup_batch_active = false;
+        }
+        self.recoverResourcesOnDemand(runtime, event_value);
         if (!selected_before.eql(self.inner.model.selectedSurface())) {
             const window_id = switch (event_value) {
                 .shortcut => |shortcut| shortcut.window_id,
@@ -243,8 +343,16 @@ pub const CockpitHost = struct {
         const index = self.windowIndexForId(window_id) orelse self.inner.model.active_window;
         const surface = scene_module.canvasLabelFor(index);
         const on_web = index == 0 and self.inner.model.selectedTerminalRef() == null;
-        const target = if (on_web) webview_label else surface;
-        try runtime.focusView(window_id, target);
+        if (on_web and !self.inner.model.webview_materialized) {
+            // An early Web selection must not reintroduce launch work or try to
+            // focus a view that does not exist. Keep the canvas first responder;
+            // the first successful post-present install transfers focus when
+            // the model still selects Web. Explicit later input is handled by
+            // recoverResourcesOnDemand above.
+            try runtime.focusView(window_id, surface);
+            return;
+        }
+        try runtime.focusView(window_id, if (on_web) webview_label else surface);
         if (!on_web) clearCanvasWidgetFocus(runtime, window_id, surface);
     }
 

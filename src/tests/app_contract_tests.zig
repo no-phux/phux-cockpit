@@ -18,6 +18,10 @@ test "Phux Cockpit identity and macOS pane commands are exact" {
     try testing.expectEqualStrings("phux-cockpit-canvas", app.canvas_label);
     try testing.expectEqualStrings(app.app_name, app.shell_scene.windows[0].title.?);
     try testing.expectEqualStrings(app.canvas_label, app.shell_scene.windows[0].views[0].label);
+    // Dormant WebKit is a post-present dynamic child, never startup-scene
+    // work ahead of the first canvas flush.
+    try testing.expectEqual(@as(usize, 1), app.shell_scene.windows[0].views.len);
+    try testing.expect(app.shell_scene.windows[0].views[0].kind == .gpu_surface);
     try testing.expectEqualStrings(app.app_name, app.appOptions().name);
     try testing.expectEqualStrings(app.canvas_label, app.appOptions().canvas_label);
 

@@ -31,6 +31,7 @@ pub fn startPointerHost(gpa: std.mem.Allocator, harness: anytype, size: geometry
         .frame_index = 1,
         .timestamp_ns = 1_000_000,
     } });
+    try app.installPostPresentResources(&harness.runtime, &host.inner.model, 1);
     try harness.runtime.dispatchPlatformEvent(app_iface, .frame_requested);
     return host;
 }
