@@ -69,19 +69,19 @@ fn ensureTsToolchain(b: *std.Build, dependency: *std.Build.Dependency) void {
     if (std.Io.Dir.cwd().access(b.graph.io, probe, .{})) |_| {
         return;
     } else |_| {}
-    std.log.warn("typescript-spike: installing the SDK package's TypeScript toolchain once in {s}", .{core_dir});
+    std.debug.print("typescript-spike: installing the SDK package's TypeScript toolchain once in {s}\n", .{core_dir});
     const result = std.process.run(b.allocator, b.graph.io, .{
         .argv = &.{ "npm", "ci", "--include=dev" },
         .cwd = .{ .path = core_dir },
     }) catch |err| {
-        std.log.err("typescript-spike: could not run npm ci in {s}: {s}. Install Node 24+ and run it by hand.", .{ core_dir, @errorName(err) });
+        std.debug.print("typescript-spike: could not run npm ci in {s}: {s}. Install Node 24+ and run it by hand.\n", .{ core_dir, @errorName(err) });
         return;
     };
     switch (result.term) {
         .exited => |code| if (code == 0) return,
         else => {},
     }
-    std.log.err("typescript-spike: npm ci failed in {s}:\n{s}", .{ core_dir, result.stderr });
+    std.debug.print("typescript-spike: npm ci failed in {s}:\n{s}\n", .{ core_dir, result.stderr });
 }
 
 fn addTsEngineModules(b: *std.Build, artifacts: native_sdk.AppArtifacts, measure: bool) void {
@@ -598,6 +598,10 @@ pub fn build(b: *std.Build) void {
         "typescript-spike",
         "Build the isolated TypeScript + Native markup Cockpit artifact",
     ) orelse false;
+    // Before the SDK's own configure-time check inside addAppArtifacts,
+    // which exits the build when the compiler is missing: the installer has
+    // to have had its turn first, or it never gets one (CI proved that).
+    if (typescript_spike) ensureTsToolchain(b, dependency);
     const artifacts = if (typescript_spike)
         native_sdk.addAppArtifacts(b, dependency, .{
             .name = "phux-cockpit-typescript-spike",
@@ -610,7 +614,6 @@ pub fn build(b: *std.Build) void {
     if (app_module.resolved_target.?.result.os.tag != .macos)
         @panic("phux-cockpit supports macOS only");
     if (typescript_spike) {
-        ensureTsToolchain(b, dependency);
         const measure_spike = b.option(
             bool,
             "measure",
