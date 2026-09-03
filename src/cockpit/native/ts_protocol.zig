@@ -20,6 +20,14 @@ pub const IntentKind = enum(u8) {
     new_terminal = 2,
     close_tab = 3,
     set_tab_placement = 4,
+    /// Apply and persist the theme at `argument` in the builtin catalog.
+    set_theme = 5,
+    /// Reveal the active configuration file in the OS file browser.
+    reveal_config = 6,
+    /// Ask the engine whether the config file exists and will take a write,
+    /// once, when the settings surface opens: a probe touches the disk, and
+    /// a snapshot must not.
+    probe_config = 7,
 };
 
 pub const invalidation_len: usize = 18;
@@ -79,6 +87,9 @@ pub fn decodeIntent(bytes: []const u8) ?Intent {
         2 => .new_terminal,
         3 => .close_tab,
         4 => .set_tab_placement,
+        5 => .set_theme,
+        6 => .reveal_config,
+        7 => .probe_config,
         else => return null,
     };
     return .{

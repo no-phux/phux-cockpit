@@ -25,6 +25,7 @@ const projection = @import("workspace_projection.zig");
 const view = @import("view.zig");
 const protocol = @import("ts_protocol.zig");
 const ts_snapshot = @import("ts_snapshot.zig");
+const theme_module = @import("../../config/theme.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -36,6 +37,7 @@ const max_terminals = model_module.max_terminals;
 /// `TerminalApp.Effects` and the TypeScript adapter's satisfy it; tests
 /// that want no processes pass `NoShells`.
 pub const NoShells = struct {
+    pub fn hostSend(_: *const NoShells, _: []const u8, _: []const u8) void {}
     pub fn ptySpawn(_: *const NoShells, _: anytype) void {}
     pub fn ptyWrite(_: *const NoShells, _: u64, _: []const u8) bool {
         return false;
@@ -61,6 +63,8 @@ pub const Engine = struct {
     /// a placement flip) is announced like an intent, because the core's
     /// chrome is wrong until it resyncs.
     last_run: ts_snapshot.TabRun = .{},
+    /// The config file's state as of the last `probe_config` intent.
+    config_probe: ts_snapshot.ConfigProbe = .{},
 
     /// The model is multi-MB and lives on the heap for the process lifetime;
     /// `gpa` sizes the emulator sessions the provider mints, `io` is what the
@@ -96,6 +100,9 @@ pub const Engine = struct {
             .new_terminal => self.newTerminal(),
             .close_tab => self.closeTab(intent.argument, fx),
             .set_tab_placement => self.setPlacement(intent.argument),
+            .set_theme => self.setTheme(intent.argument),
+            .reveal_config => self.revealConfig(fx),
+            .probe_config => self.probeConfig(),
         };
         if (!changed) return self.refuse();
         self.intent_refused = false;
@@ -144,6 +151,41 @@ pub const Engine = struct {
             if (model.provider.terminal(id)) |pane| fx.ptyKill(pane.pty_key);
             _ = model.provider.destroyTerminal(id);
         }
+        return true;
+    }
+
+    /// The settings surface's Save: mirrors update.zig's .settings_commit,
+    /// including the write and its refusal flag, minus the preview/restore
+    /// dance the core keeps to itself.
+    fn setTheme(self: *Engine, index: u8) bool {
+        if (index >= theme_module.builtins.len) return false;
+        const model = self.model;
+        if (!model.config.setTheme(theme_module.builtins[index].name)) return false;
+        switch (model.writeConfigTheme(model.provider.io)) {
+            .written => model.config_write_refused = false,
+            .refused => model.config_write_refused = true,
+            .no_destination => {},
+        }
+        return true;
+    }
+
+    fn revealConfig(self: *Engine, fx: anytype) bool {
+        const model = self.model;
+        if (!model.config_file.enabled() or !self.config_probe.exists) return false;
+        fx.hostSend("native-sdk.os.revealPath", model.config_file.path());
+        return true;
+    }
+
+    /// Asked once, when the surface opens, exactly as the shipping app asks:
+    /// a view is pure and must not touch a disk, and the answer only has to
+    /// be true at the moment the person reads the line.
+    fn probeConfig(self: *Engine) bool {
+        const model = self.model;
+        self.config_probe = .{
+            .exists = model.configFileExists(model.provider.io),
+            .writable = model.configFileWritable(model.provider.io),
+            .probed = true,
+        };
         return true;
     }
 
@@ -257,7 +299,7 @@ pub const Engine = struct {
 
     pub fn snapshot(self: *Engine, out: []u8) ts_snapshot.Error![]const u8 {
         self.last_run = self.currentRun();
-        const bytes = ts_snapshot.encode(self.model, self.sequence, self.revision, self.last_run, out);
+        const bytes = ts_snapshot.encode(self.model, self.sequence, self.revision, self.last_run, self.config_probe, out);
         if (self.intent_refused) out[22] |= intent_refused_flag;
         return bytes;
     }

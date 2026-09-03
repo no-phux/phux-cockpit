@@ -2,6 +2,7 @@ const std = @import("std");
 const model_module = @import("../model.zig");
 const projection = @import("workspace_projection.zig");
 const protocol = @import("ts_protocol.zig");
+const theme_module = @import("../../config/theme.zig");
 
 const Model = model_module.Model;
 
@@ -23,9 +24,19 @@ pub const TabRun = struct {
     extent: u16 = 168,
 };
 
+/// What the settings surface needs to know about the configuration file,
+/// probed by the engine on request (never by a snapshot: a snapshot is pure).
+pub const ConfigProbe = struct {
+    exists: bool = false,
+    writable: bool = true,
+    probed: bool = false,
+};
+
+pub const max_config_path_bytes: usize = 200;
+
 /// Serialize the active window's chrome projection. Raw cells, process state,
 /// provider slots, and platform window ids deliberately never cross this seam.
-pub fn encode(model: *const Model, sequence: u64, revision: u64, run: TabRun, out: []u8) Error![]const u8 {
+pub fn encode(model: *const Model, sequence: u64, revision: u64, run: TabRun, probe: ConfigProbe, out: []u8) Error![]const u8 {
     if (out.len < header_len) return error.BufferTooSmall;
     const framed = protocol.encodeSnapshotHeader(sequence, revision);
     @memcpy(out[0..framed.len], &framed);
@@ -56,7 +67,40 @@ pub fn encode(model: *const Model, sequence: u64, revision: u64, run: TabRun, ou
         @memcpy(out[written + 6 ..][0..bounded.len], bounded);
         written += needed;
     }
+    written = try encodeSettings(model, probe, out, written);
     return out[0..written];
+}
+
+/// The trailer after the tab records: the builtin theme catalog by name (the
+/// core has no catalog of its own and must not grow one), the theme in
+/// effect, the config file's state as last probed, and its path.
+fn encodeSettings(model: *const Model, probe: ConfigProbe, out: []u8, start: usize) Error!usize {
+    var written = start;
+    if (written + 1 > out.len) return error.BufferTooSmall;
+    out[written] = @intCast(theme_module.builtins.len);
+    written += 1;
+    for (theme_module.builtins) |theme| {
+        const name = theme.name[0..@min(theme.name.len, 32)];
+        if (written + 1 + name.len > out.len) return error.BufferTooSmall;
+        out[written] = @intCast(name.len);
+        @memcpy(out[written + 1 ..][0..name.len], name);
+        written += 1 + name.len;
+    }
+    if (written + 2 > out.len) return error.BufferTooSmall;
+    out[written] = if (theme_module.indexOf(model.config.theme.slice())) |index| @intCast(index) else 255;
+    var config_flags: u8 = 0;
+    if (model.config_file.enabled()) config_flags |= 1 << 0;
+    if (probe.exists) config_flags |= 1 << 1;
+    if (probe.writable) config_flags |= 1 << 2;
+    if (probe.probed) config_flags |= 1 << 3;
+    out[written + 1] = config_flags;
+    written += 2;
+    const path_all = if (model.config_file.enabled()) model.config_file.path() else "";
+    const path = path_all[0..@min(path_all.len, max_config_path_bytes)];
+    if (written + 1 + path.len > out.len) return error.BufferTooSmall;
+    out[written] = @intCast(path.len);
+    @memcpy(out[written + 1 ..][0..path.len], path);
+    return written + 1 + path.len;
 }
 
 fn snapshotFlags(model: *const Model) u8 {
