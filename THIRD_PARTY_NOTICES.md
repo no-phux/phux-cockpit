@@ -40,7 +40,7 @@ Source: https://github.com/ghostty-org/ghostty
 ## Phux Client FFI and Rust Dependencies
 
 Production builds statically link `phux-client-ffi` from Phux workspace
-version `0.23.3` at commit `0531189bf77db5a93f98e897219d6d7ced2cd491`,
+version `0.24.0` at commit `7ac821ad8c430289ad689a9756d498ad72f6034e`,
 with ABI `1`, using Cargo profile `ffi-release`. Phux is available under MIT
 OR Apache-2.0.
 
@@ -48,7 +48,7 @@ The complete generated license inventory and license texts for the Rust
 dependency graph are distributed beside this file as
 `Phux-FFI-THIRD-PARTY.html`.
 
-Source: https://github.com/no-phux/phux/tree/0531189bf77db5a93f98e897219d6d7ced2cd491
+Source: https://github.com/no-phux/phux/tree/7ac821ad8c430289ad689a9756d498ad72f6034e
 
 ## JetBrains Mono Nerd Font
 

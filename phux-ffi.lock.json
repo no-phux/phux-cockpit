@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "repository": "no-phux/phux",
-  "commit": "0531189bf77db5a93f98e897219d6d7ced2cd491",
-  "workspace_version": "0.23.3",
+  "commit": "7ac821ad8c430289ad689a9756d498ad72f6034e",
+  "workspace_version": "0.24.0",
   "client_abi_version": 1,
   "cargo_profile": "ffi-release"
 }
