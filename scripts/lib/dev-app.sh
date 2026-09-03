@@ -69,6 +69,10 @@
 DEV_APP_ID_SUFFIX=".dev"
 DEV_APP_EXECUTABLE_SUFFIX="-dev"
 DEV_APP_NAME_SUFFIX=" (dev)"
+# The app runner confines raw file effects to app_dirs roots derived from the
+# binary's runtime id. Point TMPDIR at the dev home and keep state under this
+# temp root so debounced saves are both isolated and admitted.
+DEV_APP_RUNTIME_ID="dev.phux.cockpit"
 
 # The bundle every non-dev path on this machine means: what the DMG installs,
 # and the thing three days of bug reports were filed against.
@@ -78,6 +82,10 @@ DEV_APP_INSTALLED_BUNDLE="/Applications/Phux Cockpit.app"
 dev_app_die() {
     printf 'dev-app: %s\n' "$*" >&2
     return 1
+}
+
+dev_app_state_path() {
+    printf '%s/%s/workspace.state\n' "$1" "$DEV_APP_RUNTIME_ID"
 }
 
 # Read one Info.plist key. Fails loudly rather than returning an empty string,
@@ -203,7 +211,7 @@ dev_app_stage() {
 # one, including your own.
 dev_app_home_init() {
     local home="$1"
-    mkdir -p -- "$home"
+    mkdir -p -- "$home" "${home}/${DEV_APP_RUNTIME_ID}"
     if [[ ! -e "${home}/config" ]]; then
         cat > "${home}/config" <<'CONFIG'
 # Config for LOCAL DEV RUNS only (scripts/dev-run.sh). Your real config at
@@ -228,8 +236,9 @@ dev_app_launch() {
     local executable="$1" home="$2" config="$3" log="$4"
     shift 4
     env -C "$home" \
+        TMPDIR="$home" \
         PHUX_COCKPIT_CONFIG="$config" \
-        PHUX_COCKPIT_STATE="${home}/workspace.state" \
+        PHUX_COCKPIT_STATE="$(dev_app_state_path "$home")" \
         "$@" \
         "$executable" >"$log" 2>&1 &
     # shellcheck disable=SC2034 # output variable consumed by the caller
