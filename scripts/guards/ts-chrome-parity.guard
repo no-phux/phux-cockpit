@@ -5,7 +5,7 @@
 # break puts the strip back on the unbounded tab list instead of the
 # engine's run, which is how sixteen tabs first ran 2000px past the window.
 test: the markup chrome passes the layout audit at every declared size, density and state
-red: 2026-09-02 at 30012da
+red: 2026-09-02 at f1c661d
 build: test -Dtypescript-spike=true -Dplatform=null
 diff --git a/typescript-spike/src/app.native b/typescript-spike/src/app.native
 index 5a0bd73..dc2ad23 100644

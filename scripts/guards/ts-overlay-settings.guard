@@ -4,6 +4,7 @@
 # apply it, or the panel is a picture of a picker. The break drops the
 # engine's setTheme so the config keeps its old theme after a Save.
 test: the settings surface shows the engine's theme catalog and saves through the seam
+red: 2026-09-02 at f1c661d
 build: test -Dtypescript-spike=true -Dplatform=null
 diff --git a/src/cockpit/native/ts_engine.zig b/src/cockpit/native/ts_engine.zig
 index 6c09d58..01b3c17 100644

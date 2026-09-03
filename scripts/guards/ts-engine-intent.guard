@@ -5,7 +5,7 @@
 # intent was then refused for a move it never heard about. The break applies
 # the intent and never posts the invalidation.
 test: an intent moves the engine and the core resyncs to the new revision
-red: 2026-09-02 at 30012da
+red: 2026-09-02 at f1c661d
 build: test -Dtypescript-spike=true -Dplatform=null
 diff --git a/typescript-spike/src/native_extension.zig b/typescript-spike/src/native_extension.zig
 index 51ebe28..e93832b 100644
