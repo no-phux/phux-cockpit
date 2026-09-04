@@ -1,5 +1,13 @@
 # Phux Cockpit
 
+> [!IMPORTANT]
+> **This standalone repository is archived and read-only.** Phux Cockpit is now
+> developed as a client in the Phux monorepo at
+> [`clients/cockpit`](https://github.com/no-phux/phux/tree/main/clients/cockpit).
+> Use [`no-phux/phux`](https://github.com/no-phux/phux) for current source,
+> issues, development, and releases. This repository remains available as the
+> historical record before the monorepo migration.
+
 Phux Cockpit is a native macOS spatial runtime for terminal, web, and future
 control-plane surfaces. Native Phux terminals use the same bounded tabs and
 split-pane substrate as local terminal processes.
