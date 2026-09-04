@@ -40,6 +40,7 @@ jobs:
         run: |
           ./scripts/lib/zon_test.sh
           ./scripts/lib/measure_test.sh
+          ./scripts/glyph-visibility-diagnose_test.sh
       # The SDK source the rasterizer check measures, materialized from the sha
       # in build.zig.zon rather than from a ref repeated here - a second copy of
       # the pin in this file would be one more thing a bump has to remember, and
